@@ -22,7 +22,7 @@ fi
 echo "  Python version OK: 3.$PYTHON_VERSION"
 
 # 2. Clone or update repo
-INSTALL_DIR="/home/pi/paper-trader"
+INSTALL_DIR="/home/blaine/paper-trader"
 if [ -d "$INSTALL_DIR" ]; then
     echo "[2/6] Updating existing install..."
     cd "$INSTALL_DIR"
@@ -49,8 +49,8 @@ if [ ! -f .env ]; then
     cp .env.example .env
     echo ""
     echo "  *** ACTION REQUIRED ***"
-    echo "  Edit /home/pi/paper-trader/.env and add your API keys:"
-    echo "    nano /home/pi/paper-trader/.env"
+    echo "  Edit /home/blaine/paper-trader/.env and add your API keys:"
+    echo "    nano /home/blaine/paper-trader/.env"
     echo ""
 else
     echo "[4/6] .env already exists, skipping."
@@ -71,11 +71,11 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Edit your API keys:  nano /home/pi/paper-trader/.env"
-echo "  2. Test single cycle:   cd /home/pi/paper-trader && source venv/bin/activate && python orchestrator.py once"
+echo "  1. Edit your API keys:  nano /home/blaine/paper-trader/.env"
+echo "  2. Test single cycle:   cd /home/blaine/paper-trader && source venv/bin/activate && python orchestrator.py once"
 echo "  3. Start the service:   sudo systemctl start paper-trader"
 echo "  4. Check logs:          sudo journalctl -u paper-trader -f"
-echo "                          tail -f /home/pi/paper-trader/logs/service.log"
+echo "                          tail -f /home/blaine/paper-trader/logs/service.log"
 echo ""
 echo "Service commands:"
 echo "  sudo systemctl start paper-trader"

@@ -52,10 +52,18 @@ All config lives in `.env`. Copy `.env.example` to get started.
 | Key | Default | Description |
 |---|---|---|
 | `FINNHUB_API_KEY` | required | Free at [finnhub.io](https://finnhub.io/register) |
-| `OPENAI_API_KEY` | required | Or use Anthropic instead |
-| `ANTHROPIC_API_KEY` | — | Set if using Claude |
-| `LLM_PROVIDER` | `openai` | `openai` or `anthropic` |
-| `LLM_MODEL` | `gpt-4o-mini` | Any compatible model |
+| `OPENAI_API_KEY` | — | Required if using OpenAI |
+| `ANTHROPIC_API_KEY` | — | Required if using Anthropic |
+| `LLM_PROVIDER` | `openai` | `openai`, `anthropic`, `mistral`, or `ollama` |
+| `LLM_MODEL` | `gpt-4o-mini` | Primary model |
+| `LLM_LOW_PROVIDER` | — | Provider for low-effort tasks (optional) |
+| `LLM_LOW_MODEL` | — | Model for low-effort tasks (optional) |
+| `MISTRAL_API_KEY` | — | Required if using Mistral |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
+| `OLLAMA_MODEL` | `llama3` | Ollama model name |
+| `OLLAMA_TIMEOUT` | `60` | Seconds before Ollama fallback triggers |
+| `OLLAMA_FALLBACK_PROVIDER` | `anthropic` | Fallback if Ollama hangs |
+| `OLLAMA_FALLBACK_MODEL` | `claude-haiku-4-5` | Fallback model |
 | `STARTING_BALANCE` | `100000` | Paper balance per profile (×3) |
 | `WATCHLIST` | `SPY,QQQ,IWM,TSLA,NVDA,AMD` | Core tickers, comma-separated |
 | `LOOP_INTERVAL_MINUTES` | `15` | How often intraday loop runs |
@@ -64,9 +72,9 @@ All config lives in `.env`. Copy `.env.example` to get started.
 
 | Use case | Model |
 |---|---|
-| Budget / fast intraday loops | `gpt-4o-mini` |
-| Better PM reasoning | `gpt-4o` |
-| Anthropic alternative | `claude-3-5-haiku-latest` (fast) or `claude-sonnet-4-5` (better) |
+| Budget / fast | `gpt-4o-mini` (OpenAI) or `claude-haiku-4-5` (Anthropic) |
+| Balanced production | `claude-sonnet-4-6` (Anthropic) |
+| Local / free low tier | Ollama with `llama3.2:3b` or larger |
 
 ---
 
@@ -318,36 +326,36 @@ Works locally or over SSH on the Pi.
 
 ```bash
 # Browse the case library
-python inspect.py cases
-python inspect.py cases --setup gap_and_go
-python inspect.py cases --outcome failure
-python inspect.py cases --symbol TSLA
-python inspect.py cases --regime risk_off
-python inspect.py cases --bias SHORT
-python inspect.py cases --setup vwap_reclaim -v   # verbose: shows lessons + conditions
+python portfolio_inspect.py cases
+python portfolio_inspect.py cases --setup gap_and_go
+python portfolio_inspect.py cases --outcome failure
+python portfolio_inspect.py cases --symbol TSLA
+python portfolio_inspect.py cases --regime risk_off
+python portfolio_inspect.py cases --bias SHORT
+python portfolio_inspect.py cases --setup vwap_reclaim -v   # verbose: shows lessons + conditions
 
 # Score trends over time
-python inspect.py scores
-python inspect.py scores --limit 50
+python portfolio_inspect.py scores
+python portfolio_inspect.py scores --limit 50
 
 # Agent feedback
-python inspect.py feedback                        # all profiles
-python inspect.py feedback --profile aggressive   # one profile
+python portfolio_inspect.py feedback                        # all profiles
+python portfolio_inspect.py feedback --profile aggressive   # one profile
 
 # What setup types are working?
-python inspect.py winrates
+python portfolio_inspect.py winrates
 
 # Trade history
-python inspect.py trades
-python inspect.py trades --profile conservative
-python inspect.py trades --limit 50
+python portfolio_inspect.py trades
+python portfolio_inspect.py trades --profile conservative
+python portfolio_inspect.py trades --limit 50
 
 # Current open positions (all profiles)
-python inspect.py positions
+python portfolio_inspect.py positions
 
 # Daily P&L log
-python inspect.py summary
-python inspect.py summary --limit 60
+python portfolio_inspect.py summary
+python portfolio_inspect.py summary --limit 60
 ```
 
 ---
@@ -360,13 +368,13 @@ A Pi 3B+ or better is sufficient. Your PC can be off.
 ### Setup
 ```bash
 # Copy project to Pi (from your PC)
-scp -r paper-trader/ pi@<pi-ip>:/home/pi/paper-trader
+scp -r paper-trader/ blaine@<pi-ip>:/home/blaine/
 
 # SSH into Pi
-ssh pi@<pi-ip>
+ssh blaine@<pi-ip>
 
 # Run setup script
-cd /home/pi/paper-trader
+cd /home/blaine/paper-trader
 bash deploy/setup_pi.sh
 
 # Add your API keys
@@ -389,20 +397,20 @@ sudo systemctl status paper-trader
 
 # Live logs
 sudo journalctl -u paper-trader -f
-tail -f /home/pi/paper-trader/logs/service.log
+tail -f /home/blaine/paper-trader/logs/service.log
 ```
 
 The service starts automatically on boot and restarts on crash.
 
 ### Checking in remotely
 ```bash
-ssh pi@<pi-ip>
-cd /home/pi/paper-trader
+ssh blaine@<pi-ip>
+cd /home/blaine/paper-trader
 source venv/bin/activate
 
-python inspect.py positions    # what's open right now
-python inspect.py trades       # what traded today
-python inspect.py summary      # daily P&L
+python portfolio_inspect.py positions    # what's open right now
+python portfolio_inspect.py trades       # what traded today
+python portfolio_inspect.py summary      # daily P&L
 ```
 
 ---
@@ -517,7 +525,7 @@ Most common causes:
 
 ### Check what happened today
 ```bash
-python inspect.py trades
-python inspect.py feedback
+python portfolio_inspect.py trades
+python portfolio_inspect.py feedback
 tail -100 logs/orchestrator.log
 ```

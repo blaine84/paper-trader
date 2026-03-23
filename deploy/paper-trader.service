@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/paper-trader
-EnvironmentFile=/home/pi/paper-trader/.env
-ExecStart=/home/pi/paper-trader/venv/bin/python orchestrator.py
+User=blaine
+WorkingDirectory=/home/blaine/paper-trader
+EnvironmentFile=/home/blaine/paper-trader/.env
+ExecStart=/home/blaine/paper-trader/venv/bin/python orchestrator.py
 Restart=on-failure
 RestartSec=30
-StandardOutput=append:/home/pi/paper-trader/logs/service.log
-StandardError=append:/home/pi/paper-trader/logs/service.log
+StandardOutput=append:/home/blaine/paper-trader/logs/service.log
+StandardError=append:/home/blaine/paper-trader/logs/service.log
 
 [Install]
 WantedBy=multi-user.target

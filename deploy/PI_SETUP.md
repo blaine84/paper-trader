@@ -14,13 +14,13 @@ A Pi 3B+ or better is sufficient.
 
 ```bash
 # Copy project files to Pi (from your PC):
-scp -r paper-trader/ pi@<pi-ip>:/home/pi/paper-trader
+scp -r paper-trader/ blaine@<pi-ip>:/home/blaine/paper-trader
 
 # SSH into Pi:
-ssh pi@<pi-ip>
+ssh blaine@<pi-ip>
 
 # Run setup script:
-cd /home/pi/paper-trader
+cd /home/blaine/paper-trader
 bash deploy/setup_pi.sh
 
 # Add your API keys:
@@ -47,7 +47,7 @@ sudo systemctl status paper-trader
 
 # Live logs
 sudo journalctl -u paper-trader -f
-tail -f /home/pi/paper-trader/logs/service.log
+tail -f /home/blaine/paper-trader/logs/service.log
 ```
 
 ## The service:
@@ -61,8 +61,8 @@ tail -f /home/pi/paper-trader/logs/service.log
 SSH in anytime to see what's happened:
 
 ```bash
-ssh pi@<pi-ip>
-cd /home/pi/paper-trader
+ssh blaine@<pi-ip>
+cd /home/blaine/paper-trader
 source venv/bin/activate
 
 # Quick status

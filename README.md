@@ -68,9 +68,15 @@ Tables:
 | Key | Default | Description |
 |---|---|---|
 | FINNHUB_API_KEY | required | Free at finnhub.io |
-| OPENAI_API_KEY | required | Or use Anthropic |
-| LLM_PROVIDER | openai | openai or anthropic |
-| LLM_MODEL | gpt-4o-mini | Any compatible model |
+| OPENAI_API_KEY | — | Required if using OpenAI |
+| ANTHROPIC_API_KEY | — | Required if using Anthropic |
+| LLM_PROVIDER | openai | `openai`, `anthropic`, `mistral`, `ollama` |
+| LLM_MODEL | gpt-4o-mini | Primary model |
+| LLM_LOW_PROVIDER | — | Provider for low-effort tasks |
+| LLM_LOW_MODEL | — | Model for low-effort tasks |
+| OLLAMA_BASE_URL | http://localhost:11434 | Ollama endpoint |
+| OLLAMA_FALLBACK_PROVIDER | anthropic | Fallback if Ollama hangs |
+| OLLAMA_FALLBACK_MODEL | claude-haiku-4-5 | Fallback model |
 | STARTING_BALANCE | 100000 | Paper trading balance |
 | WATCHLIST | SPY,QQQ,IWM,TSLA,NVDA,AMD | Comma-separated tickers |
 | LOOP_INTERVAL_MINUTES | 15 | Intraday loop frequency |
