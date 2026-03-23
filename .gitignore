@@ -1,17 +1,23 @@
 # secrets
 .env
+.env.*
 
 # python
 __pycache__/
 *.pyc
 venv/
+.venv/
 
 # logs / runtime
-*.log
 logs/
+*.log
+*.pid
 
-# db
+# local databases
 *.db
+*.sqlite3
 
-# misc
+# OS/editor
 .DS_Store
+Thumbs.db
+.vscode/
