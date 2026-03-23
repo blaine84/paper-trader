@@ -184,9 +184,33 @@ def run_once():
     run_intraday()
 
 
+def check_llm_connectivity():
+    """Ping LLM providers at startup to catch config issues early."""
+    from utils.llm import call_llm
+    probe = "Reply with one word: ok"
+
+    # High tier
+    try:
+        result = call_llm("You are a test.", probe, tier="high")
+        console.print(f"   [green]✓ LLM high tier OK[/green] ({os.getenv('LLM_PROVIDER')} / {os.getenv('LLM_MODEL')})")
+    except Exception as e:
+        console.print(f"   [red]✗ LLM high tier FAILED: {e}[/red]")
+        log.error(f"LLM high tier check failed: {e}")
+
+    # Low tier (only if configured separately)
+    if os.getenv("LLM_LOW_PROVIDER"):
+        try:
+            result = call_llm("You are a test.", probe, tier="low")
+            console.print(f"   [green]✓ LLM low tier OK[/green] ({os.getenv('LLM_LOW_PROVIDER')} / {os.getenv('LLM_LOW_MODEL')})")
+        except Exception as e:
+            console.print(f"   [yellow]⚠ LLM low tier FAILED: {e} (will use fallback)[/yellow]")
+            log.warning(f"LLM low tier check failed: {e}")
+
+
 def main():
     engine = get_engine()
     ensure_initial_balance(engine)
+    check_llm_connectivity()
 
     scheduler = BlockingScheduler(timezone="America/New_York")
 
