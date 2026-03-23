@@ -1,0 +1,11 @@
+finnhub-python
+openai
+anthropic
+pandas
+numpy
+ta
+sqlalchemy
+apscheduler
+python-dotenv
+requests
+rich

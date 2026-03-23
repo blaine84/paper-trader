@@ -1,0 +1,523 @@
+# Paper Trader — User Guide
+
+A multi-agent paper trading system that runs autonomously during market hours,
+learns from every trade, and improves over time through structured feedback loops.
+
+---
+
+## Table of Contents
+
+1. [Quick Start](#quick-start)
+2. [Configuration](#configuration)
+3. [How It Works](#how-it-works)
+4. [The Agents](#the-agents)
+5. [Risk Profiles](#risk-profiles)
+6. [The Case Library](#the-case-library)
+7. [Feedback Loops](#feedback-loops)
+8. [Daily Schedule](#daily-schedule)
+9. [Running the System](#running-the-system)
+10. [Inspect CLI](#inspect-cli)
+11. [Running on a Raspberry Pi](#running-on-a-raspberry-pi)
+12. [Watchlist](#watchlist)
+13. [Understanding the Scores](#understanding-the-scores)
+14. [Database](#database)
+15. [Troubleshooting](#troubleshooting)
+
+---
+
+## Quick Start
+
+```bash
+# 1. Install dependencies
+cd paper-trader
+pip install -r requirements.txt
+
+# 2. Set up environment
+cp .env.example .env
+nano .env   # add your API keys
+
+# 3. Test a single cycle (no scheduler)
+python orchestrator.py once
+
+# 4. Run live (market hours, Mon–Fri)
+python orchestrator.py
+```
+
+---
+
+## Configuration
+
+All config lives in `.env`. Copy `.env.example` to get started.
+
+| Key | Default | Description |
+|---|---|---|
+| `FINNHUB_API_KEY` | required | Free at [finnhub.io](https://finnhub.io/register) |
+| `OPENAI_API_KEY` | required | Or use Anthropic instead |
+| `ANTHROPIC_API_KEY` | — | Set if using Claude |
+| `LLM_PROVIDER` | `openai` | `openai` or `anthropic` |
+| `LLM_MODEL` | `gpt-4o-mini` | Any compatible model |
+| `STARTING_BALANCE` | `100000` | Paper balance per profile (×3) |
+| `WATCHLIST` | `SPY,QQQ,IWM,TSLA,NVDA,AMD` | Core tickers, comma-separated |
+| `LOOP_INTERVAL_MINUTES` | `15` | How often intraday loop runs |
+
+### Recommended models
+
+| Use case | Model |
+|---|---|
+| Budget / fast intraday loops | `gpt-4o-mini` |
+| Better PM reasoning | `gpt-4o` |
+| Anthropic alternative | `claude-3-5-haiku-latest` (fast) or `claude-sonnet-4-5` (better) |
+
+---
+
+## How It Works
+
+The system runs 7 agents on a market-hours schedule. Each agent has a single job.
+No agent does another agent's job.
+
+```
+8:30 AM ──► Scout ──► Researcher ──► Analyst
+                                         │
+9:30 AM ──► loop every 15 min ◄──────────┘
+            │
+            ├─ Bookkeeper (check stops)
+            ├─ Analyst (refresh signals)
+            └─ Portfolio Manager ×3 (decide trades)
+                   Conservative
+                   Moderate
+                   Aggressive
+
+4:15 PM ──► Reviewer (score trades, build cases)
+        ──► Bookkeeper (daily log)
+        ──► EOD scorecard printed to terminal
+```
+
+All three Portfolio Manager profiles run in **parallel** with **isolated portfolios**.
+They all see the same signals. They make different decisions based on their risk rules.
+
+---
+
+## The Agents
+
+### 🔭 Scout
+Runs at 8:30 AM. Scans ~50 liquid stocks for unusual activity (moves ≥3%).
+Surfaces 1–3 additional symbols worth watching today based on catalysts and
+historical case win rates. Returns **symbols and context only** — no trade opinions.
+
+### 📰 Researcher
+Covers the full watchlist (core tickers + Scout picks). Pulls news, earnings,
+analyst ratings, and market context from Finnhub. Assesses sentiment per symbol:
+bullish / bearish / neutral, with key catalysts and risks.
+
+### 📊 Analyst
+Runs technical analysis on every symbol. Computes RSI, MACD, EMA (9/21/50),
+Bollinger Bands, ATR, and VWAP. Produces a **signal** — not a trade recommendation.
+
+**Analyst output:**
+```
+signal:       LONG | SHORT | HOLD
+strength:     weak | moderate | strong
+confidence:   low | medium | high
+setup_type:   gap_and_go | vwap_reclaim | news_breakout | etc.
+key_levels:   support, resistance, vwap, prior_high, prior_low
+invalidation: the condition that would make this setup wrong
+indicators:   rsi, macd_bias, ema_trend, above_vwap, bb_position
+```
+
+The Analyst does **not** suggest entry price, stop, or target. That's the PM's job.
+
+### 🧠 Portfolio Manager (×3)
+Three profiles run in parallel — Conservative, Moderate, Aggressive.
+Each reads the same Analyst signals and Researcher context, then decides:
+
+- **Whether** to act (maybe the signal is right but timing is wrong for their profile)
+- **Action**: BUY / SHORT / CLOSE / pass
+- **Entry price** (based on key levels, not just current price)
+- **Stop** (placed at Analyst's invalidation level + profile risk tolerance)
+- **Target** (based on key levels and required R:R)
+- **Position size** (profile's max % / stop distance)
+
+### 📋 Bookkeeper
+Tracks all positions, cash, and P&L across all three portfolios. Monitors stop
+losses every cycle and force-closes positions that breach them. Prints the
+terminal dashboard. Saves end-of-day summaries.
+
+### 🔍 Reviewer
+Runs at 4:15 PM after market close. Reviews every closed trade, extracts a
+**structured case** for the case library, and routes feedback to the right agents.
+Scores are split — see [Understanding the Scores](#understanding-the-scores).
+
+---
+
+## Risk Profiles
+
+Three portfolios run simultaneously, each with $100k paper balance.
+
+### 🛡️ Conservative
+| Setting | Value |
+|---|---|
+| Max positions | 2 |
+| Max position size | 15% of portfolio |
+| Minimum R:R | 3:1 |
+| Min signal strength | strong |
+| Avoid first/last | 30 min |
+| Daily loss limit | 2% |
+
+Prefers ETFs (SPY, QQQ, IWM). Only acts on high-conviction setups.
+Stops trading for the day if down 2%.
+
+### ⚖️ Moderate
+| Setting | Value |
+|---|---|
+| Max positions | 3 |
+| Max position size | 25% |
+| Minimum R:R | 2:1 |
+| Min signal strength | moderate |
+| Avoid first/last | 15 min |
+| Daily loss limit | 3% |
+
+Balanced. Trades across the full watchlist. Trusts the analyst but applies judgment.
+
+### 🔥 Aggressive
+| Setting | Value |
+|---|---|
+| Max positions | 4 |
+| Max position size | 35% |
+| Minimum R:R | 1.5:1 |
+| Min signal strength | weak |
+| Avoid first/last | 5 min |
+| Daily loss limit | 5% |
+
+Chases momentum. Prefers individual stocks (TSLA, NVDA, AMD). Wider stops,
+bigger targets. Will trade Scout picks early. May pyramid into winners.
+
+---
+
+## The Case Library
+
+Every closed trade and every Scout pick becomes a **structured, queryable case record** — not a prose summary.
+
+```
+symbol:                 NVDA
+date:                   2026-03-22
+setup_type:             gap_and_go
+catalyst_type:          analyst_upgrade
+float_profile:          mega_cap
+sector:                 tech
+market_regime:          risk_on
+premarket_gap_pct:      4.2
+premarket_volume_rank:  high
+entry_timing:           first_15min
+bias:                   LONG
+signal_strength:        strong
+signal_confidence:      high
+rsi_at_entry:           58.3
+above_vwap:             true
+above_daily_resistance: true
+ema_trend:              bullish
+bb_position:            upper
+invalidation:           loses VWAP or closes below 118.50
+entry_vs_level:         above_vwap
+outcome:                success
+pnl_pct:                +2.1
+holding_minutes:        23
+lesson:                 gap_and_go strongest in first 15 min when regime risk_on and above daily resistance
+conditions_for_success: ["market_regime=risk_on", "above_daily_resistance=true", "premarket_gap_pct>3"]
+conditions_to_avoid:    ["entry_timing=open", "rsi_at_entry>75"]
+selection_score:        8.5
+execution_score:        6.5
+review_score:           7.5
+```
+
+This is the system's institutional memory. Over time, agents query it to find
+relevant precedents before making decisions.
+
+---
+
+## Feedback Loops
+
+```
+Reviewer
+  ├── selection_score + selection_feedback
+  │     ↓
+  │   Scout + Analyst
+  │   "Are we finding and reading the right setups?"
+  │
+  └── execution_score + execution_feedback (per profile)
+        ↓
+      Conservative PM  (gets its own history)
+      Moderate PM      (gets its own history)
+      Aggressive PM    (gets its own history)
+      "Are we entering, sizing, and exiting correctly?"
+```
+
+**Selection score** — was the setup correctly identified? Did the Analyst's read
+match what actually happened? Scored independently of how PM traded it.
+
+**Execution score** — did PM make good decisions given the signal? Entry level,
+stop logic, sizing, exit discipline. Scored independently of whether the setup was good.
+
+A great read on a poorly executed trade scores high on selection, low on execution.
+Clean execution on a bad setup scores low on selection, high on execution.
+
+This prevents bad signal reads from corrupting PM feedback and vice versa.
+
+---
+
+## Daily Schedule
+
+All times Eastern (ET), Monday–Friday.
+
+| Time | Event |
+|---|---|
+| **Sunday 5:00 PM** | Weekly prep — Scout builds watchlist, Researcher summarizes news, Reviewer rolls up lessons, PMs set stances |
+| 8:30 AM | Scout scans for movers (reads weekly context), Researcher covers full list, Analyst preps signals |
+| 9:30 AM | Market opens, intraday loop starts |
+| Every 15 min | Bookkeeper checks stops → Analyst refreshes → all 3 PMs decide (with weekly stance) |
+| 4:00 PM | Market closes |
+| 4:15 PM | Reviewer scores trades, EOD scorecard printed, daily log saved |
+
+The loop interval is configurable via `LOOP_INTERVAL_MINUTES` in `.env`.
+
+---
+
+## Running the System
+
+### Single test cycle
+```bash
+python orchestrator.py once
+```
+Runs pre-market + one intraday cycle immediately. Good for testing your API keys
+and checking everything works before letting it run live.
+
+### Test weekly prep
+```bash
+python orchestrator.py weekly
+```
+Runs the Sunday weekly prep immediately. Good for testing on any day.
+
+### Live market-hours scheduler
+```bash
+python orchestrator.py
+```
+Starts APScheduler. Waits for the scheduled times (8:30, 9:30–4:00, 4:15).
+Logs to `logs/orchestrator.log` and stdout.
+
+### Logs
+```bash
+tail -f logs/orchestrator.log
+tail -f logs/service.log   # if running as systemd service on Pi
+```
+
+---
+
+## Inspect CLI
+
+Query the case library, scores, feedback, and trade history from the command line.
+Works locally or over SSH on the Pi.
+
+```bash
+# Browse the case library
+python inspect.py cases
+python inspect.py cases --setup gap_and_go
+python inspect.py cases --outcome failure
+python inspect.py cases --symbol TSLA
+python inspect.py cases --regime risk_off
+python inspect.py cases --bias SHORT
+python inspect.py cases --setup vwap_reclaim -v   # verbose: shows lessons + conditions
+
+# Score trends over time
+python inspect.py scores
+python inspect.py scores --limit 50
+
+# Agent feedback
+python inspect.py feedback                        # all profiles
+python inspect.py feedback --profile aggressive   # one profile
+
+# What setup types are working?
+python inspect.py winrates
+
+# Trade history
+python inspect.py trades
+python inspect.py trades --profile conservative
+python inspect.py trades --limit 50
+
+# Current open positions (all profiles)
+python inspect.py positions
+
+# Daily P&L log
+python inspect.py summary
+python inspect.py summary --limit 60
+```
+
+---
+
+## Running on a Raspberry Pi
+
+The Pi only orchestrates — all heavy compute goes to Finnhub + OpenAI/Anthropic.
+A Pi 3B+ or better is sufficient. Your PC can be off.
+
+### Setup
+```bash
+# Copy project to Pi (from your PC)
+scp -r paper-trader/ pi@<pi-ip>:/home/pi/paper-trader
+
+# SSH into Pi
+ssh pi@<pi-ip>
+
+# Run setup script
+cd /home/pi/paper-trader
+bash deploy/setup_pi.sh
+
+# Add your API keys
+nano .env
+
+# Test
+source venv/bin/activate
+python orchestrator.py once
+
+# Start the service
+sudo systemctl start paper-trader
+```
+
+### Service management
+```bash
+sudo systemctl start paper-trader
+sudo systemctl stop paper-trader
+sudo systemctl restart paper-trader
+sudo systemctl status paper-trader
+
+# Live logs
+sudo journalctl -u paper-trader -f
+tail -f /home/pi/paper-trader/logs/service.log
+```
+
+The service starts automatically on boot and restarts on crash.
+
+### Checking in remotely
+```bash
+ssh pi@<pi-ip>
+cd /home/pi/paper-trader
+source venv/bin/activate
+
+python inspect.py positions    # what's open right now
+python inspect.py trades       # what traded today
+python inspect.py summary      # daily P&L
+```
+
+---
+
+## Watchlist
+
+The **core watchlist** is set in `.env` and never changes:
+```
+WATCHLIST=SPY,QQQ,IWM,TSLA,NVDA,AMD
+```
+
+Every morning the **Scout** adds 1–3 additional symbols based on unusual activity,
+news catalysts, and historical case win rates. These are active for that day only.
+
+To permanently add a ticker, add it to `WATCHLIST` in `.env`.
+
+---
+
+## Understanding the Scores
+
+All scores are 1–10. Color coding in the terminal:
+
+| Range | Color | Meaning |
+|---|---|---|
+| 7–10 | 🟢 Green | Strong |
+| 5–6.9 | 🟡 Yellow | Acceptable |
+| 1–4.9 | 🔴 Red | Poor |
+
+### Selection Score (→ Scout + Analyst)
+*"Was the setup correctly identified?"*
+
+High when:
+- Analyst called the right direction
+- Setup type matched what actually played out
+- Key levels were accurate
+- Invalidation condition was meaningful
+
+Low when:
+- Wrong direction called
+- Setup type misidentified
+- Market regime misread
+- Invalidation was arbitrary
+
+### Execution Score (→ PM, per profile)
+*"Did PM make good decisions given the signal?"*
+
+High when:
+- Entered at a logical level (key level, VWAP, breakout)
+- Stop placed at the invalidation level
+- Size appropriate for profile rules
+- Exit was disciplined
+
+Low when:
+- Chased entry above key levels
+- Stop was arbitrary or too tight/wide
+- Oversized relative to profile rules
+- Held past target or exited too early
+
+### Review Score
+Average of selection + execution. Used for overall tracking.
+
+---
+
+## Database
+
+SQLite at `db/paper_trader.db`. Back it up periodically.
+
+| Table | Contents |
+|---|---|
+| `trades` | All paper trades with entry/exit/P&L/scores |
+| `positions` | Current open positions (per profile + side) |
+| `balance` | Cash balance history (per profile) |
+| `agent_memory` | Shared notes between agents (signals, feedback) |
+| `daily_log` | End-of-day summaries |
+| `cases` | The case library — structured trade lessons |
+
+### Quick backup
+```bash
+cp db/paper_trader.db db/paper_trader.db.bak
+```
+
+---
+
+## Troubleshooting
+
+### "No module named finnhub"
+```bash
+pip install -r requirements.txt
+```
+
+### Finnhub returns empty candles
+Free tier has rate limits (~60 calls/min). If the loop interval is too short
+or the watchlist is too large, you may hit limits. Try increasing
+`LOOP_INTERVAL_MINUTES` to 30.
+
+### LLM returns invalid JSON
+Usually a model fluke. The system retries automatically. If persistent,
+try a more capable model (`gpt-4o` instead of `gpt-4o-mini`).
+
+### Orchestrator ran but no trades were taken
+Normal — the PM profiles have strict rules. On low-conviction days they will
+often pass entirely. Check `python inspect.py feedback` for PM notes on why.
+
+### Pi service not starting
+```bash
+sudo journalctl -u paper-trader -n 50
+```
+Most common causes:
+- `.env` missing API keys
+- Python version < 3.10 (`python3 --version`)
+- Wrong working directory in service file (check `WorkingDirectory` in `deploy/paper-trader.service`)
+
+### Check what happened today
+```bash
+python inspect.py trades
+python inspect.py feedback
+tail -100 logs/orchestrator.log
+```

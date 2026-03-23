@@ -1,0 +1,151 @@
+"""
+LLM abstraction layer.
+Supports OpenAI, Anthropic, Mistral, and Ollama.
+
+Tiers:
+  "high" (default) — primary provider set by LLM_PROVIDER / LLM_MODEL
+  "low"            — cheap/local provider set by LLM_LOW_PROVIDER / LLM_LOW_MODEL
+
+Set in .env:
+  LLM_LOW_PROVIDER=mistral   # or: ollama
+  LLM_LOW_MODEL=mistral-small-latest
+  MISTRAL_API_KEY=...
+  OLLAMA_BASE_URL=http://localhost:11434  # default
+  OLLAMA_MODEL=llama3                     # fallback if LLM_LOW_MODEL not set
+"""
+
+import os
+import json
+import time
+import logging
+
+log = logging.getLogger(__name__)
+
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 10  # seconds
+
+
+def _with_retry(fn):
+    """Retry on rate limit / overload errors with exponential backoff."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn()
+        except Exception as e:
+            err = str(e).lower()
+            is_rate_limit = "rate limit" in err or "429" in err or "overloaded" in err
+            if is_rate_limit and attempt < MAX_RETRIES - 1:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning(f"Rate limit hit, retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(delay)
+            else:
+                raise
+
+
+def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier: str = "high") -> str:
+    """
+    Call the LLM.
+    tier="high" uses LLM_PROVIDER/LLM_MODEL (default).
+    tier="low"  uses LLM_LOW_PROVIDER/LLM_LOW_MODEL for cheap/local tasks.
+    """
+    if tier == "low":
+        provider = os.getenv("LLM_LOW_PROVIDER", os.getenv("LLM_PROVIDER", "openai")).lower()
+        model = os.getenv("LLM_LOW_MODEL", None)
+    else:
+        provider = os.getenv("LLM_PROVIDER", "openai").lower()
+        model = None  # each provider reads its own default
+
+    if provider == "openai":
+        return _call_openai(system_prompt, user_prompt, json_mode, model)
+    elif provider == "anthropic":
+        return _call_anthropic(system_prompt, user_prompt, model)
+    elif provider == "mistral":
+        return _call_mistral(system_prompt, user_prompt, json_mode, model)
+    elif provider == "ollama":
+        return _call_ollama(system_prompt, user_prompt, model)
+    else:
+        raise ValueError(f"Unknown LLM provider: {provider}")
+
+
+def _call_openai(system_prompt: str, user_prompt: str, json_mode: bool, model: str = None) -> str:
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+    kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    return _with_retry(lambda: client.chat.completions.create(**kwargs).choices[0].message.content)
+
+
+def _call_anthropic(system_prompt: str, user_prompt: str, model: str = None) -> str:
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    model = model or os.getenv("LLM_MODEL", "claude-3-5-haiku-latest")
+
+    return _with_retry(lambda: client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+    ).content[0].text)
+
+
+def _call_mistral(system_prompt: str, user_prompt: str, json_mode: bool, model: str = None) -> str:
+    from mistralai import Mistral
+    client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
+    model = model or os.getenv("LLM_MODEL", "mistral-small-latest")
+
+    kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    return _with_retry(lambda: client.chat.complete(**kwargs).choices[0].message.content)
+
+
+def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str:
+    import requests
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    model = model or os.getenv("OLLAMA_MODEL", "llama3")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+    }
+
+    def _do():
+        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
+
+    return _with_retry(_do)
+
+
+def parse_json_response(text: str) -> dict:
+    """Safely parse JSON from LLM output, even with markdown fences."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse LLM JSON response: {e}\nRaw: {text}")

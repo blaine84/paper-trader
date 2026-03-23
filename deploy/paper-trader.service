@@ -1,0 +1,18 @@
+[Unit]
+Description=Paper Trader — Multi-Agent Trading System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/paper-trader
+EnvironmentFile=/home/pi/paper-trader/.env
+ExecStart=/home/pi/paper-trader/venv/bin/python orchestrator.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/pi/paper-trader/logs/service.log
+StandardError=append:/home/pi/paper-trader/logs/service.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,328 @@
+"""
+Quant Researcher Agent
+Matches current market conditions to historically effective strategies.
+Cross-references the strategy library against the internal case library
+to surface agreements and disagreements.
+Runs Sunday (weekly prep) and pre-market Monday.
+Outputs strategy recommendations that feed Analyst and PM.
+"""
+
+import json
+from datetime import datetime, timedelta, date
+from utils.llm import call_llm, parse_json_response
+from utils.case_library import query_cases, get_win_rate_by_setup, format_cases_for_prompt
+from db.schema import AgentMemory, get_session
+from models.strategies import STRATEGIES, SETUP_TYPE_MAP
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich import box
+
+console = Console()
+
+
+SYSTEM_PROMPT = """You are a quantitative researcher for day trading.
+You have access to a strategy library (documented historical edges) and an
+internal case library (actual trade results from this system).
+
+Your job: given the current market conditions, determine which strategies are
+most likely to have edge TODAY, and flag any divergence between what the
+textbooks say and what the internal case data shows.
+
+You are NOT making trade recommendations. You are answering:
+  "Which strategy playbook should the Analyst and PM be running today?"
+
+For each strategy you evaluate, assess:
+  - Fit: do current conditions match the strategy's ideal conditions?
+  - Textbook edge: what does documented history say?
+  - Internal confirmation: does our case library agree or disagree?
+  - Divergence: if our cases contradict the textbook, why might that be?
+  - Recommendation: lean into | use with caution | avoid today
+
+Respond in JSON:
+{
+  "market_conditions_summary": "brief read on current conditions",
+  "strategies": [
+    {
+      "strategy_key": "gap_and_go",
+      "strategy_name": "Gap and Go",
+      "fit_score": 8.5,
+      "recommendation": "lean_into|use_with_caution|avoid",
+      "textbook_win_rate": 0.58,
+      "internal_win_rate": 0.71,
+      "internal_cases": 14,
+      "agreement": "confirmed|diverges|insufficient_data",
+      "divergence_note": "if agreement=diverges, explain why",
+      "conditions_met": ["risk_on regime", "high premarket volume"],
+      "conditions_missing": ["catalyst required"],
+      "analyst_guidance": "what the Analyst should weight in signals today",
+      "pm_guidance": "what PM should watch for in execution today"
+    }
+  ],
+  "primary_strategy": "the single best strategy for today's conditions",
+  "strategies_to_avoid": ["strategy_key"],
+  "regime_note": "one line on how regime affects all strategies today"
+}
+
+Only include strategies with fit_score >= 5. Rank by fit_score descending.
+"""
+
+
+def get_internal_stats(engine) -> dict:
+    """
+    Pull internal win rates per setup_type from the case library,
+    mapped back to strategy keys.
+    """
+    win_rates = get_win_rate_by_setup(engine)
+    stats = {}
+    for r in win_rates:
+        setup_type = r["setup_type"]
+        strategy_key = SETUP_TYPE_MAP.get(setup_type)
+        if strategy_key:
+            if strategy_key not in stats:
+                stats[strategy_key] = {
+                    "total": 0, "wins": 0,
+                    "avg_pnl_pct": 0.0, "cases": []
+                }
+            stats[strategy_key]["total"] += r["total"]
+            stats[strategy_key]["wins"] += r["wins"]
+            stats[strategy_key]["avg_pnl_pct"] = round(
+                (stats[strategy_key]["avg_pnl_pct"] + r["avg_pnl_pct"]) / 2, 2
+            )
+
+    # Add win rate
+    for key in stats:
+        t = stats[key]["total"]
+        w = stats[key]["wins"]
+        stats[key]["win_rate"] = round(w / t, 3) if t > 0 else None
+
+    return stats
+
+
+def build_strategy_context(engine, market_regime: str = None) -> str:
+    """
+    Build a compact strategy context block for injection into agent prompts.
+    Shows recommended strategies and their guidance.
+    """
+    db = get_session(engine)
+
+    # Get latest quant researcher output
+    mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="quant_researcher", key="strategy_recommendations")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    db.close()
+
+    if not mem:
+        return "No strategy recommendations available yet."
+
+    data = json.loads(mem.value)
+
+    # Only use if from today or this week
+    ts = data.get("timestamp", "")
+    if ts < (datetime.utcnow() - timedelta(days=1)).isoformat():
+        return "Strategy recommendations are stale — run quant_researcher again."
+
+    lines = [f"Market conditions: {data.get('market_conditions_summary', '')}"]
+    lines.append(f"Primary strategy today: {data.get('primary_strategy', '?')}")
+    lines.append(f"Regime note: {data.get('regime_note', '')}")
+    lines.append("")
+
+    for s in data.get("strategies", []):
+        if s.get("recommendation") == "avoid":
+            continue
+        rec = s.get("recommendation", "?")
+        rec_color_char = "✅" if rec == "lean_into" else "⚠️"
+        lines.append(
+            f"{rec_color_char} {s['strategy_name']} "
+            f"(fit: {s.get('fit_score', '?')}/10, "
+            f"internal: {int((s.get('internal_win_rate') or 0)*100)}% "
+            f"over {s.get('internal_cases', 0)} cases)"
+        )
+        if s.get("analyst_guidance"):
+            lines.append(f"   → Analyst: {s['analyst_guidance']}")
+        if s.get("pm_guidance"):
+            lines.append(f"   → PM: {s['pm_guidance']}")
+
+    avoid = data.get("strategies_to_avoid", [])
+    if avoid:
+        lines.append(f"\nAvoid today: {', '.join(avoid)}")
+
+    return "\n".join(lines)
+
+
+def run(engine, market_regime: str = None, context: dict = None) -> dict:
+    """
+    Run the Quant Researcher.
+    market_regime: risk_on | risk_off | mixed (from Researcher)
+    context: any additional market context dict
+    """
+    db = get_session(engine)
+
+    # Pull latest market context from Researcher
+    regime_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="researcher", key="market_context")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    market_context_text = regime_mem.value if regime_mem else "No market context available."
+
+    # Pull weekly briefing if available
+    weekly_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="weekly_prep", key="weekly_briefing")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    weekly_briefing = {}
+    if weekly_mem:
+        data = json.loads(weekly_mem.value)
+        if data.get("week", "") >= (date.today() - timedelta(days=6)).isoformat():
+            weekly_briefing = data
+            if not market_regime:
+                market_regime = data.get("market_regime")
+
+    db.close()
+
+    # Build internal stats from case library
+    internal_stats = get_internal_stats(engine)
+
+    # Format strategy library for the prompt
+    strategy_lib = {}
+    for key, strat in STRATEGIES.items():
+        internal = internal_stats.get(key, {})
+        strategy_lib[key] = {
+            "name": strat["name"],
+            "description": strat["description"],
+            "bias": strat["bias"],
+            "ideal_conditions": strat["ideal_conditions"],
+            "failure_conditions": strat["failure_conditions"],
+            "textbook_win_rate": strat["win_rate_documented"],
+            "textbook_avg_rr": strat["avg_rr_documented"],
+            "internal_win_rate": internal.get("win_rate"),
+            "internal_total_cases": internal.get("total", 0),
+            "internal_avg_pnl_pct": internal.get("avg_pnl_pct"),
+        }
+
+    # Recent successful cases for additional context
+    recent_success = query_cases(engine, outcome="success", limit=5)
+    recent_fail = query_cases(engine, outcome="failure", limit=5)
+
+    user_prompt = f"""
+Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+Current market regime: {market_regime or 'unknown'}
+
+MARKET CONTEXT (from Researcher):
+{market_context_text}
+
+WEEKLY BRIEFING:
+{json.dumps(weekly_briefing, indent=2) if weekly_briefing else 'Not available'}
+
+STRATEGY LIBRARY (with internal case data):
+{json.dumps(strategy_lib, indent=2)}
+
+RECENT SUCCESSFUL CASES:
+{format_cases_for_prompt(recent_success)}
+
+RECENT FAILED CASES:
+{format_cases_for_prompt(recent_fail)}
+
+Evaluate which strategies have edge in today's conditions.
+Cross-reference textbook expectations against our internal case results.
+"""
+
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True)
+    result = parse_json_response(raw)
+    result["timestamp"] = datetime.utcnow().isoformat()
+
+    # Persist to agent memory
+    db = get_session(engine)
+    db.add(AgentMemory(
+        agent="quant_researcher",
+        symbol=None,
+        key="strategy_recommendations",
+        value=json.dumps(result),
+    ))
+    db.commit()
+    db.close()
+
+    return result
+
+
+def print_report(result: dict):
+    """Print a rich strategy report to terminal."""
+    console.print()
+    console.print(Panel(
+        f"[bold white]Quant Researcher — {datetime.utcnow().strftime('%Y-%m-%d')}[/bold white]\n"
+        f"[dim]{result.get('market_conditions_summary', '')}[/dim]",
+        style="bold blue", box=box.DOUBLE,
+    ))
+
+    strategies = result.get("strategies", [])
+    if strategies:
+        table = Table(
+            title="Strategy Fit Today",
+            box=box.SIMPLE_HEAVY,
+            header_style="bold cyan",
+        )
+        table.add_column("Strategy", style="bold")
+        table.add_column("Fit", justify="right")
+        table.add_column("Rec")
+        table.add_column("Textbook WR", justify="right")
+        table.add_column("Internal WR", justify="right")
+        table.add_column("Cases", justify="right")
+        table.add_column("Agreement")
+
+        for s in sorted(strategies, key=lambda x: x.get("fit_score", 0), reverse=True):
+            rec = s.get("recommendation", "?")
+            rec_color = {"lean_into": "green", "use_with_caution": "yellow", "avoid": "red"}.get(rec, "white")
+            agree = s.get("agreement", "?")
+            agree_color = {"confirmed": "green", "diverges": "red", "insufficient_data": "dim"}.get(agree, "white")
+            fit = s.get("fit_score", 0)
+            fit_color = "green" if fit >= 7 else "yellow" if fit >= 5 else "red"
+
+            iwr = s.get("internal_win_rate")
+            iwr_str = f"{int(iwr*100)}%" if iwr else "[dim]—[/dim]"
+
+            table.add_row(
+                s.get("strategy_name", "?"),
+                f"[{fit_color}]{fit}[/{fit_color}]",
+                f"[{rec_color}]{rec}[/{rec_color}]",
+                f"{int(s.get('textbook_win_rate', 0)*100)}%",
+                iwr_str,
+                str(s.get("internal_cases", 0)),
+                f"[{agree_color}]{agree}[/{agree_color}]",
+            )
+
+        console.print(table)
+
+    # Primary strategy
+    primary = result.get("primary_strategy")
+    if primary:
+        console.print(f"\n  [bold green]Primary strategy today:[/bold green] {primary}")
+
+    avoid = result.get("strategies_to_avoid", [])
+    if avoid:
+        console.print(f"  [bold red]Avoid today:[/bold red] {', '.join(avoid)}")
+
+    regime_note = result.get("regime_note", "")
+    if regime_note:
+        console.print(f"  [dim]{regime_note}[/dim]")
+
+    # Divergence alerts
+    for s in strategies:
+        if s.get("agreement") == "diverges" and s.get("divergence_note"):
+            console.print(Panel(
+                f"[bold]Strategy:[/bold] {s['strategy_name']}\n"
+                f"[bold]Textbook:[/bold] {int(s.get('textbook_win_rate', 0)*100)}% WR  "
+                f"[bold]Internal:[/bold] {int((s.get('internal_win_rate') or 0)*100)}% WR "
+                f"over {s.get('internal_cases', 0)} cases\n"
+                f"[bold]Why it diverges:[/bold] {s['divergence_note']}",
+                title="[bold red]⚠️ Strategy Divergence[/bold red]",
+                box=box.ROUNDED,
+            ))
+
+    console.print()
