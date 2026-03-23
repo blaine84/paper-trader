@@ -121,6 +121,7 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
     import requests
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
+    timeout = int(os.getenv("OLLAMA_TIMEOUT", 60))
 
     payload = {
         "model": model,
@@ -131,12 +132,20 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
         "stream": False,
     }
 
-    def _do():
-        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=120)
+    try:
+        resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
         resp.raise_for_status()
         return resp.json()["message"]["content"]
-
-    return _with_retry(_do)
+    except Exception as e:
+        fallback_model = os.getenv("OLLAMA_FALLBACK_MODEL", "claude-haiku-4-5")
+        fallback_provider = os.getenv("OLLAMA_FALLBACK_PROVIDER", "anthropic")
+        log.warning(f"Ollama failed ({e}), falling back to {fallback_provider}/{fallback_model}")
+        if fallback_provider == "anthropic":
+            return _call_anthropic(system_prompt, user_prompt, fallback_model)
+        elif fallback_provider == "openai":
+            return _call_openai(system_prompt, user_prompt, False, fallback_model)
+        else:
+            raise
 
 
 def parse_json_response(text: str) -> dict:
