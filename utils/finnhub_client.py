@@ -6,8 +6,11 @@ Free tier limit: 60 calls/minute — rate limiting is built in.
 
 import os
 import time
+import logging
 import finnhub
 from datetime import datetime, timedelta
+
+log = logging.getLogger(__name__)
 
 
 class FinnhubClient:
@@ -50,36 +53,60 @@ class FinnhubClient:
         """
         OHLCV candles.
         resolution: 1, 5, 15, 30, 60, D, W, M
-        Free Finnhub tier only supports daily (D) candles.
-        Intraday resolutions require a paid plan — falls back to daily if 403.
+        Free Finnhub tier only supports daily candles — falls back to yfinance for intraday.
         """
         now = int(time.time())
         since = int((datetime.utcnow() - timedelta(days=days)).timestamp())
         try:
             self._rate_limit()
             c = self.client.stock_candles(symbol, resolution, since, now)
+            if c.get("s") == "ok":
+                return {
+                    "symbol": symbol,
+                    "resolution": resolution,
+                    "timestamps": c["t"],
+                    "open": c["o"],
+                    "high": c["h"],
+                    "low": c["l"],
+                    "close": c["c"],
+                    "volume": c["v"],
+                }
         except Exception as e:
-            if "403" in str(e) and resolution != "D":
-                since = int((datetime.utcnow() - timedelta(days=30)).timestamp())
-                try:
-                    self._rate_limit()
-                    c = self.client.stock_candles(symbol, "D", since, now)
-                except Exception:
-                    return {}
-            else:
+            if "403" not in str(e):
                 return {}
-        if c.get("s") != "ok":
+
+        # Finnhub 403 or no data — fall back to yfinance
+        return self._get_candles_yfinance(symbol, resolution, days)
+
+    def _get_candles_yfinance(self, symbol: str, resolution: str, days: int) -> dict:
+        """yfinance fallback for intraday candles."""
+        try:
+            import yfinance as yf
+            # Map Finnhub resolution to yfinance interval
+            interval_map = {
+                "1": "1m", "5": "5m", "15": "15m",
+                "30": "30m", "60": "1h", "D": "1d",
+            }
+            interval = interval_map.get(resolution, "5m")
+            # yfinance limits: 1m = 7 days, 5m/15m/30m = 60 days
+            period = f"{min(days, 7)}d" if resolution == "1" else f"{min(days, 59)}d"
+            df = yf.download(symbol, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            if df.empty:
+                return {}
+            return {
+                "symbol": symbol,
+                "resolution": resolution,
+                "timestamps": [int(t.timestamp()) for t in df.index],
+                "open": df["Open"].tolist(),
+                "high": df["High"].tolist(),
+                "low": df["Low"].tolist(),
+                "close": df["Close"].tolist(),
+                "volume": df["Volume"].tolist(),
+            }
+        except Exception as e:
+            log.warning(f"yfinance fallback failed for {symbol}: {e}")
             return {}
-        return {
-            "symbol": symbol,
-            "resolution": resolution,
-            "timestamps": c["t"],
-            "open": c["o"],
-            "high": c["h"],
-            "low": c["l"],
-            "close": c["c"],
-            "volume": c["v"],
-        }
 
     def get_news(self, symbol: str, days: int = 1) -> list:
         """Recent company news."""
