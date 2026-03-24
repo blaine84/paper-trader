@@ -90,12 +90,20 @@ def _call_anthropic(system_prompt: str, user_prompt: str, model: str = None) -> 
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     model = model or os.getenv("LLM_MODEL", "claude-3-5-haiku-latest")
 
-    return _with_retry(lambda: client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    ).content[0].text)
+    for max_tokens in [4096, 8192]:
+        response = _with_retry(lambda: client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        ))
+        if response.stop_reason == "max_tokens":
+            log.warning(f"Anthropic response truncated at {max_tokens} tokens, retrying with {max_tokens * 2}")
+            continue
+        return response.content[0].text
+
+    log.error("Anthropic response truncated even at max tokens")
+    return response.content[0].text
 
 
 def _call_mistral(system_prompt: str, user_prompt: str, json_mode: bool, model: str = None) -> str:

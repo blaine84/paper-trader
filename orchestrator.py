@@ -256,8 +256,21 @@ def main():
         console.print("\n[yellow]Shutting down...[/yellow]")
         scheduler.shutdown(wait=False)
 
+    def _refresh(signum, frame):
+        log.info("SIGUSR1 received — triggering manual refresh")
+        console.print("[bold cyan]⚡ Manual refresh triggered...[/bold cyan]")
+        scheduler.add_job(run_pre_market, id="manual_refresh", replace_existing=True)
+
+    def _intraday_now(signum, frame):
+        log.info("SIGUSR2 received — triggering manual intraday cycle")
+        console.print("[bold cyan]⚡ Manual intraday cycle triggered...[/bold cyan]")
+        scheduler.add_job(run_intraday, id="manual_intraday", replace_existing=True)
+
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, _refresh)
+        signal.signal(signal.SIGUSR2, _intraday_now)
 
     try:
         scheduler.start()
