@@ -114,6 +114,9 @@ def run(engine, symbols: list[str]) -> dict:
 Symbol: {sym}
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
 
+SELECTION FEEDBACK (from Reviewer — your past signal quality):
+{lesson_text}
+
 CURRENT QUOTE:
 {json.dumps(quote, indent=2)}
 

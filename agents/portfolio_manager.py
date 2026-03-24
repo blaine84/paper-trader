@@ -11,7 +11,7 @@ from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, Position, Balance, Trade, get_session
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
-from utils.case_library import get_relevant_cases, format_cases_for_prompt
+from utils.case_library import get_relevant_cases, format_cases_for_prompt, get_win_rate_by_setup
 from agents.quant_researcher import build_strategy_context
 
 
@@ -334,6 +334,20 @@ def run_profile(engine, symbols: list[str], profile_id: str) -> dict:
     cases_text = format_cases_for_prompt(relevant_cases)
     strategy_context = build_strategy_context(engine)
 
+    # Win rates by setup type — PM uses this to adjust sizing
+    win_rates = get_win_rate_by_setup(engine)
+    if win_rates:
+        win_rate_lines = ["Setup type win rates from case library:"]
+        for r in sorted(win_rates, key=lambda x: x["win_rate"], reverse=True):
+            flag = " ⚠️ avoid or reduce size" if r["win_rate"] < 40 and r["total"] >= 5 else ""
+            win_rate_lines.append(
+                f"  {r['setup_type']}: {r['win_rate']}% ({r['wins']}/{r['total']}) "
+                f"avg pnl {r['avg_pnl_pct']:+.1f}%{flag}"
+            )
+        win_rate_text = "\n".join(win_rate_lines)
+    else:
+        win_rate_text = "No setup win rate data yet."
+
     user_prompt = f"""
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
 Profile: {profile['name']} {profile['emoji']}
@@ -346,6 +360,9 @@ ANALYST SIGNALS:
 
 EXECUTION FEEDBACK (your profile only):
 {feedback_text}{weekly_stance_text}
+
+SETUP WIN RATES (from case library — use to adjust position sizing):
+{win_rate_text}
 
 STRATEGY RECOMMENDATIONS (from Quant Researcher):
 {strategy_context}
