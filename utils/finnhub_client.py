@@ -94,6 +94,9 @@ class FinnhubClient:
                              progress=False, auto_adjust=True)
             if df.empty:
                 return {}
+            # flatten multi-level columns from newer yfinance versions
+            if isinstance(df.columns, __import__('pandas').MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             return {
                 "symbol": symbol,
                 "resolution": resolution,
