@@ -64,36 +64,49 @@ def run_pre_market():
     """8:30 AM ET — Research + Analysis prep before open."""
     log.info("=== PRE-MARKET RUN ===")
     engine = get_engine()
+
+    # Scout — find additional symbols
+    scout_symbols = []
     try:
-        # Scout runs first to find additional symbols
         console.print("[bold cyan]🔭 Scout scanning for movers...[/bold cyan]")
         scout_result = scout.run(engine, WATCHLIST)
         scout_symbols = scout_result.get("symbols", [])
         if scout_symbols:
             log.info(f"Scout picks: {', '.join(scout_symbols)} (tone: {scout_result.get('market_tone')})")
-            for pick in scout_result.get("picks", []):
-                log.info(f"  {pick['symbol']}: {pick['catalyst']} [{pick['conviction']} conviction]")
         else:
             log.info("Scout: no picks today")
+    except Exception as e:
+        log.error(f"Scout error: {e}", exc_info=True)
 
-        # Full watchlist = core + scout picks
-        full_watchlist = WATCHLIST + scout_symbols
+    full_watchlist = WATCHLIST + scout_symbols
 
+    # Researcher
+    market_regime = None
+    try:
         console.print("[bold yellow]📰 Researcher running...[/bold yellow]")
         res = researcher.run(engine, full_watchlist)
+        market_regime = res.get("market_regime")
         log.info(f"Researcher: {res.get('market_context', '')[:100]}")
+    except Exception as e:
+        log.error(f"Researcher error: {e}", exc_info=True)
 
+    # Quant Researcher
+    try:
         console.print("[bold blue]📐 Quant Researcher: matching strategies to conditions...[/bold blue]")
-        qr_result = quant_researcher.run(engine, market_regime=res.get("market_regime"))
+        qr_result = quant_researcher.run(engine, market_regime=market_regime)
         quant_researcher.print_report(qr_result)
         log.info(f"Quant Researcher: primary={qr_result.get('primary_strategy')} avoid={qr_result.get('strategies_to_avoid')}")
+    except Exception as e:
+        log.error(f"Quant Researcher error: {e}", exc_info=True)
 
+    # Analyst
+    try:
         console.print("[bold blue]📊 Analyst running...[/bold blue]")
         sigs = analyst.run(engine, full_watchlist)
         for sym, sig in sigs.items():
             log.info(f"  {sym}: {sig.get('signal')} ({sig.get('strength')})")
     except Exception as e:
-        log.error(f"Pre-market error: {e}", exc_info=True)
+        log.error(f"Analyst error: {e}", exc_info=True)
 
 
 def run_intraday():
