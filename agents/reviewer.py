@@ -189,9 +189,14 @@ Extract structured cases for each trade. Return the JSON.
         if trade:
             trade.review_score = case_data.get("review_score")
             trade.review_notes = case_data.get("lesson")
+    db.commit()
+    db.close()
+
+    for case_data in result.get("cases", []):
         store_case(engine, case_data)
 
-    # Route selection feedback → Scout + Analyst
+    # Route feedback — reopen session
+    db = get_session(engine)
     selection_fb = result.get("selection_feedback", "")
     if selection_fb:
         db.add(AgentMemory(
