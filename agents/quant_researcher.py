@@ -18,6 +18,9 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import box
 
+import logging
+log = logging.getLogger(__name__)
+
 console = Console()
 
 
@@ -190,6 +193,47 @@ def run(engine, market_regime: str = None, context: dict = None) -> dict:
     # Build internal stats from case library
     internal_stats = get_internal_stats(engine)
 
+    # Run backtest for recent edge data (weekly prep only — skip if already fresh)
+    backtest_results = {}
+    watchlist = [s.strip() for s in __import__('os').getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD").split(",")]
+    existing_bt = (
+        db.query(AgentMemory)
+        .filter_by(agent="quant_researcher", key="backtest_results")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    bt_stale = True
+    if existing_bt:
+        try:
+            bt_data = json.loads(existing_bt.value)
+            generated = datetime.fromisoformat(bt_data.get("generated_at", "2000-01-01"))
+            bt_stale = (datetime.utcnow() - generated).days >= 3
+        except Exception:
+            pass
+
+    if bt_stale:
+        try:
+            log.info("Quant Researcher: running backtest...")
+            from backtest import run_backtest
+            backtest_results = run_backtest(symbols=watchlist, days=90)
+            db2 = get_session(engine)
+            db2.add(AgentMemory(
+                agent="quant_researcher",
+                symbol=None,
+                key="backtest_results",
+                value=json.dumps(backtest_results),
+            ))
+            db2.commit()
+            db2.close()
+            log.info(f"Backtest complete: {backtest_results.get('total_trades', 0)} trades analyzed")
+        except Exception as e:
+            log.warning(f"Backtest failed (non-fatal): {e}")
+    else:
+        try:
+            backtest_results = json.loads(existing_bt.value)
+        except Exception:
+            pass
+
     # Format strategy library for the prompt
     strategy_lib = {}
     for key, strat in STRATEGIES.items():
@@ -224,6 +268,9 @@ WEEKLY BRIEFING:
 STRATEGY LIBRARY (with internal case data):
 {json.dumps(strategy_lib, indent=2)}
 
+BACKTEST RESULTS (last 90 days, rule-based simulation):
+{json.dumps(backtest_results.get('strategies', {}), indent=2) if backtest_results else 'Not available'}
+
 RECENT SUCCESSFUL CASES:
 {format_cases_for_prompt(recent_success)}
 
@@ -231,7 +278,9 @@ RECENT FAILED CASES:
 {format_cases_for_prompt(recent_fail)}
 
 Evaluate which strategies have edge in today's conditions.
-Cross-reference textbook expectations against our internal case results.
+Cross-reference textbook expectations against our internal case results and backtest data.
+Prefer strategies where backtest win_rate >= 50% AND has_edge=true in current regime.
+Flag strategies where backtest shows no edge even if textbook says otherwise.
 """
 
     raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True)

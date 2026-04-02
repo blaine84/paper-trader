@@ -156,6 +156,21 @@ def api_data():
             "risks": sent.get("risks", []),
         })
 
+    # Market regime from quant researcher
+    regime = None
+    mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="quant_researcher", key="regime")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if mem:
+        try:
+            regime_data = json.loads(mem.value)
+            regime = regime_data.get("regime") or regime_data.get("market_regime")
+        except Exception:
+            regime = mem.value
+
     db.close()
     return jsonify({
         "timestamp": datetime.utcnow().isoformat(),
@@ -163,22 +178,57 @@ def api_data():
         "watchlist": watchlist,
         "scout_picks": scout_picks,
         "portfolio": portfolio,
+        "regime": regime,
     })
 
 
 @app.route("/api/positions")
 def api_positions():
     db = get_session(engine)
+    fh = FinnhubClient()
     result = []
     for profile_id in ACTIVE_PROFILES:
         positions = db.query(Position).filter_by(profile=profile_id).all()
         for p in positions:
+            try:
+                q = fh.get_quote(p.symbol)
+                current_price = q.get("price", p.avg_cost)
+            except Exception:
+                current_price = p.avg_cost
+            if p.side == "long":
+                unrealized_pnl = (current_price - p.avg_cost) * p.quantity
+            else:
+                unrealized_pnl = (p.avg_cost - current_price) * p.quantity
+            unrealized_pct = (unrealized_pnl / (p.avg_cost * p.quantity)) * 100 if p.avg_cost else 0
+
+            # pull stop/target from agent memory if PM stored them
+            stop = target = None
+            mem = (
+                db.query(AgentMemory)
+                .filter_by(agent="pm", symbol=p.symbol, key="levels")
+                .filter(AgentMemory.value.contains(profile_id))
+                .order_by(AgentMemory.timestamp.desc())
+                .first()
+            )
+            if mem:
+                try:
+                    lvl = json.loads(mem.value)
+                    stop = lvl.get("stop")
+                    target = lvl.get("target")
+                except Exception:
+                    pass
+
             result.append({
                 "profile": profile_id,
                 "symbol": p.symbol,
                 "side": p.side,
                 "quantity": p.quantity,
                 "avg_cost": p.avg_cost,
+                "current_price": round(current_price, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "unrealized_pct": round(unrealized_pct, 2),
+                "stop": stop,
+                "target": target,
                 "opened_at": p.opened_at.isoformat() if p.opened_at else None,
             })
     db.close()
@@ -235,6 +285,152 @@ def api_daily():
     ]
     db.close()
     return jsonify(result)
+
+
+@app.route("/api/feedback")
+def api_feedback():
+    db = get_session(engine)
+    result = {"selection": None, "execution": {}, "regime": None, "quant": None}
+
+    # Selection feedback (for Scout + Analyst)
+    mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="reviewer", key="selection_feedback")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if mem:
+        try:
+            result["selection"] = json.loads(mem.value)
+        except Exception:
+            result["selection"] = {"feedback": mem.value}
+
+    # Execution feedback per profile
+    for profile_id in ACTIVE_PROFILES:
+        mem = (
+            db.query(AgentMemory)
+            .filter_by(agent="reviewer", key="execution_feedback")
+            .filter(AgentMemory.symbol == profile_id)
+            .order_by(AgentMemory.timestamp.desc())
+            .first()
+        )
+        if mem:
+            try:
+                result["execution"][profile_id] = json.loads(mem.value)
+            except Exception:
+                result["execution"][profile_id] = {"feedback": mem.value}
+
+    # Market regime from quant researcher
+    mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="quant_researcher", key="regime")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if mem:
+        try:
+            result["regime"] = json.loads(mem.value)
+        except Exception:
+            result["regime"] = {"regime": mem.value}
+
+    # Weekly stance per profile
+    stances = {}
+    for profile_id in ACTIVE_PROFILES:
+        mem = (
+            db.query(AgentMemory)
+            .filter_by(agent="weekly_prep", symbol=profile_id, key="stance")
+            .order_by(AgentMemory.timestamp.desc())
+            .first()
+        )
+        if mem:
+            try:
+                stances[profile_id] = json.loads(mem.value)
+            except Exception:
+                pass
+    result["stances"] = stances
+
+    db.close()
+    return jsonify(result)
+
+
+@app.route("/api/performance")
+def api_performance():
+    from models.case import Case
+    from sqlalchemy import func
+    from sqlalchemy.types import Integer as SAInteger
+    db = get_session(engine)
+
+    # Win rates by setup type
+    setup_rows = (
+        db.query(
+            Case.setup_type,
+            func.count(Case.id).label("total"),
+            func.sum((Case.outcome == "success").cast(SAInteger)).label("wins"),
+            func.avg(Case.pnl_pct).label("avg_pnl"),
+            func.avg(Case.review_score).label("avg_score"),
+        )
+        .filter(Case.setup_type != None)
+        .group_by(Case.setup_type)
+        .all()
+    )
+    setup_stats = [
+        {
+            "setup_type": r.setup_type,
+            "total": r.total,
+            "wins": r.wins or 0,
+            "win_rate": round((r.wins or 0) / r.total * 100, 1),
+            "avg_pnl": round(r.avg_pnl or 0, 2),
+            "avg_score": round(r.avg_score or 0, 1),
+        }
+        for r in setup_rows
+    ]
+
+    # Per-profile stats
+    profile_stats = {}
+    for profile_id in ACTIVE_PROFILES:
+        trades = db.query(Trade).filter_by(profile=profile_id, status="closed").all()
+        if not trades:
+            profile_stats[profile_id] = {"total": 0, "wins": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0}
+            continue
+        wins = sum(1 for t in trades if (t.pnl or 0) > 0)
+        total_pnl = sum(t.pnl or 0 for t in trades)
+        avg_pnl = total_pnl / len(trades)
+        profile_stats[profile_id] = {
+            "total": len(trades),
+            "wins": wins,
+            "win_rate": round(wins / len(trades) * 100, 1),
+            "avg_pnl": round(avg_pnl, 2),
+            "total_pnl": round(total_pnl, 2),
+        }
+
+    # Recent cases for case library preview
+    cases = (
+        db.query(Case)
+        .order_by(Case.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    case_list = [
+        {
+            "date": c.date,
+            "symbol": c.symbol,
+            "setup_type": c.setup_type,
+            "outcome": c.outcome,
+            "pnl_pct": c.pnl_pct,
+            "lesson": c.lesson,
+            "selection_score": c.selection_score,
+            "execution_score": c.execution_score,
+            "profile": c.profile,
+        }
+        for c in cases
+    ]
+
+    db.close()
+    return jsonify({
+        "setup_stats": setup_stats,
+        "profile_stats": profile_stats,
+        "cases": case_list,
+    })
 
 
 if __name__ == "__main__":
