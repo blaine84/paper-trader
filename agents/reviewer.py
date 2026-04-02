@@ -120,7 +120,7 @@ def run(engine, min_unreviewed: int = 1) -> dict:
         .filter_by(status="closed")
         .filter(Trade.review_score == None)
         .order_by(Trade.exit_time.desc())
-        .limit(5)
+        .limit(3)
         .all()
     )
 

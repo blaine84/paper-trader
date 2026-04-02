@@ -159,20 +159,22 @@ def run_post_market():
     """4:15 PM ET — End of day wrap-up."""
     log.info("=== POST-MARKET / END OF DAY ===")
     engine = get_engine()
+
+    # Reviewer runs independently — failure here doesn't block EOD
     try:
-        # Run reviewer on today's closed trades
         console.print("[bold magenta]🔍 Reviewer scoring trades...[/bold magenta]")
         review = reviewer.run(engine, min_unreviewed=1)
-        log.info(f"Reviewer: {review.get('batch_feedback', '')[:200]}")
+        log.info(f"Reviewer: {review.get('batch_feedback', review.get('message', ''))[:200]}")
+    except Exception as e:
+        log.error(f"Reviewer error: {e}", exc_info=True)
 
-        # Save daily log
+    # EOD bookkeeping always runs
+    try:
         summary = bookkeeper.end_of_day(engine)
         log.info(f"Day summary: P&L ${summary['daily_pnl']:+,.2f} | {summary['trades']} trades | {summary['wins']}W {summary['losses']}L")
-
-        # Final dashboard
         bookkeeper.print_dashboard(engine)
     except Exception as e:
-        log.error(f"Post-market error: {e}", exc_info=True)
+        log.error(f"EOD bookkeeper error: {e}", exc_info=True)
 
 
 def run_once():
