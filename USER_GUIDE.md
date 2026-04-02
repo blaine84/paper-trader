@@ -311,6 +311,32 @@ python orchestrator.py
 Starts APScheduler. Waits for the scheduled times (8:30, 9:30–4:00, 4:15).
 Logs to `logs/orchestrator.log` and stdout.
 
+### Web dashboard
+```bash
+python web/app.py
+```
+Opens a dashboard at `http://localhost:5000` (or `http://<pi-ip>:5000` from another machine).
+Shows live positions with unrealized P&L, watchlist signals, performance analytics, agent feedback, and case library.
+
+### Backtester
+```bash
+python backtest.py                          # all symbols, all strategies, 1 year
+python backtest.py --symbols SPY QQQ TSLA  # specific symbols
+python backtest.py --days 180              # last 180 days
+python backtest.py --strategy gap_and_go   # single strategy
+python backtest.py --export results.csv    # export to CSV
+```
+Rule-based backtest using the same technical indicators as the Analyst. The Quant Researcher also runs this automatically every 3 days and feeds results into its strategy recommendations.
+
+### On-demand signal refresh (Linux/Pi only)
+```bash
+# Trigger a full pre-market refresh (scout + researcher + analyst)
+kill -USR1 $(pgrep -f orchestrator.py)
+
+# Trigger an intraday cycle (analyst refresh + PM decisions)
+kill -USR2 $(pgrep -f orchestrator.py)
+```
+
 ### Logs
 ```bash
 tail -f logs/orchestrator.log
@@ -522,6 +548,9 @@ Most common causes:
 - `.env` missing API keys
 - Python version < 3.10 (`python3 --version`)
 - Wrong working directory in service file (check `WorkingDirectory` in `deploy/paper-trader.service`)
+
+### Daily P&L tab shows zeros
+The daily log is written at 4:15 PM EOD. If the Reviewer errors on a given day, the bookkeeper still runs and saves the log. If you see zeros for past dates, those EOD runs failed before the fix — they can't be backfilled. Going forward the log will populate correctly.
 
 ### Check what happened today
 ```bash
