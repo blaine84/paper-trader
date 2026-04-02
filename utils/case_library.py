@@ -15,6 +15,11 @@ def store_case(engine, case_data: dict) -> Case:
     Write a structured case to the library.
     case_data should match Case column names.
     """
+    import json as _json
+    # Serialize any list fields to JSON strings
+    for field in ("conditions_for_success", "conditions_to_avoid"):
+        if isinstance(case_data.get(field), list):
+            case_data[field] = _json.dumps(case_data[field])
     db = get_session(engine)
     case = Case(**{k: v for k, v in case_data.items() if hasattr(Case, k)})
     db.add(case)
