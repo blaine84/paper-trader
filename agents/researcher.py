@@ -67,10 +67,9 @@ CURRENT QUOTES:
 Analyze the above and return your research JSON.
 """
 
-    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True)
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low")
     result = parse_json_response(raw)
-
-    # Persist to agent memory
+    result["market_context"] = result.get("market_context", "")
     for sym, data in result.get("symbols", {}).items():
         mem = AgentMemory(
             agent="researcher",

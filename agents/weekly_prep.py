@@ -119,7 +119,7 @@ RECENT SELECTION FEEDBACK:
 Build the weekly watchlist and thesis for each symbol.
 """
 
-    raw = call_llm(SCOUT_WEEKLY_PROMPT, user_prompt, json_mode=True)
+    raw = call_llm(SCOUT_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low")
     return parse_json_response(raw)
 
 
@@ -166,7 +166,7 @@ M&A / CORPORATE:
 
 Write the weekly briefing.
 """
-    raw = call_llm(RESEARCHER_WEEKLY_PROMPT, user_prompt, json_mode=True)
+    raw = call_llm(RESEARCHER_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low")
     return parse_json_response(raw)
 
 
@@ -277,7 +277,7 @@ CASE LIBRARY SAMPLE (last 20):
 
 Produce the weekly retrospective.
 """
-    raw = call_llm(REVIEWER_WEEKLY_PROMPT, user_prompt, json_mode=True)
+    raw = call_llm(REVIEWER_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low")
     return parse_json_response(raw)
 
 
