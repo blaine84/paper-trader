@@ -115,9 +115,17 @@ def cmd_cases(args):
             if c.get("invalidation"):
                 lines.append(f"[bold]Invalidation:[/bold] {c['invalidation']}")
             if c.get("conditions_for_success"):
-                lines.append(f"[bold]Works when:[/bold] {', '.join(c['conditions_for_success'])}")
+                cfs = c['conditions_for_success']
+                if isinstance(cfs, str):
+                    try: cfs = json.loads(cfs)
+                    except Exception: cfs = [cfs]
+                lines.append(f"[bold]Works when:[/bold] {', '.join(cfs)}")
             if c.get("conditions_to_avoid"):
-                lines.append(f"[bold]Avoid when:[/bold] {', '.join(c['conditions_to_avoid'])}")
+                cta = c['conditions_to_avoid']
+                if isinstance(cta, str):
+                    try: cta = json.loads(cta)
+                    except Exception: cta = [cta]
+                lines.append(f"[bold]Avoid when:[/bold] {', '.join(cta)}")
             if lines:
                 console.print(Panel(
                     "\n".join(lines),
