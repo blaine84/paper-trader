@@ -16,10 +16,20 @@ def store_case(engine, case_data: dict) -> Case:
     case_data should match Case column names.
     """
     import json as _json
-    # Serialize any list fields to JSON strings
+    # Ensure list fields are stored as JSON strings (not raw lists or double-encoded)
     for field in ("conditions_for_success", "conditions_to_avoid"):
-        if isinstance(case_data.get(field), list):
-            case_data[field] = _json.dumps(case_data[field])
+        val = case_data.get(field)
+        if isinstance(val, list):
+            case_data[field] = _json.dumps(val)
+        elif isinstance(val, str):
+            # Already a JSON string — validate it parses correctly, fix if double-encoded
+            try:
+                parsed = _json.loads(val)
+                if isinstance(parsed, str):
+                    # double-encoded — unwrap one level
+                    case_data[field] = parsed
+            except Exception:
+                case_data[field] = _json.dumps([val])
     db = get_session(engine)
     case = Case(**{k: v for k, v in case_data.items() if hasattr(Case, k)})
     db.add(case)
