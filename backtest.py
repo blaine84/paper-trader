@@ -322,7 +322,7 @@ def run_backtest(symbols: list[str] = None, days: int = 90, strategies: list[str
             "win_rate": round(g["win"].mean() * 100, 1),
             "avg_pnl_pct": round(g["pnl_pct"].mean(), 2),
             "total_pnl_pct": round(g["pnl_pct"].sum(), 2),
-            "has_edge": g["win"].mean() >= 0.50 and g["pnl_pct"].mean() > 0,
+            "has_edge": bool(g["win"].mean() >= 0.50 and g["pnl_pct"].mean() > 0),
         }
 
     symbol_summary = {}

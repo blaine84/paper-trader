@@ -15,29 +15,44 @@ log = logging.getLogger(__name__)
 
 class FinnhubClient:
     CALLS_PER_MINUTE = 55  # stay under the 60 limit with a small buffer
+    _shared_call_times = []  # shared across all instances
+    _shared_lock = None
 
     def __init__(self):
         api_key = os.getenv("FINNHUB_API_KEY")
         if not api_key:
             raise ValueError("FINNHUB_API_KEY not set in environment")
         self.client = finnhub.Client(api_key=api_key)
-        self._call_times = []
 
     def _rate_limit(self):
-        """Block if we're approaching the per-minute call limit."""
+        """Block if we're approaching the per-minute call limit. Shared across all instances."""
         now = time.time()
-        self._call_times = [t for t in self._call_times if now - t < 60]
-        if len(self._call_times) >= self.CALLS_PER_MINUTE:
-            wait = 60 - (now - self._call_times[0]) + 0.5
+        FinnhubClient._shared_call_times = [t for t in FinnhubClient._shared_call_times if now - t < 60]
+        if len(FinnhubClient._shared_call_times) >= self.CALLS_PER_MINUTE:
+            wait = 60 - (now - FinnhubClient._shared_call_times[0]) + 0.5
             if wait > 0:
+                log.info(f"Finnhub rate limit: pausing {wait:.0f}s")
                 time.sleep(wait)
-            self._call_times = []
-        self._call_times.append(time.time())
+            FinnhubClient._shared_call_times = []
+        FinnhubClient._shared_call_times.append(time.time())
+
+    def _call_with_retry(self, fn, retries=2):
+        """Retry on 429/502 with a 60s pause."""
+        for attempt in range(retries + 1):
+            try:
+                return fn()
+            except Exception as e:
+                err = str(e)
+                if ("429" in err or "502" in err) and attempt < retries:
+                    log.warning(f"Finnhub {err[:60]}... retrying in 60s")
+                    time.sleep(60)
+                    continue
+                raise
 
     def get_quote(self, symbol: str) -> dict:
         """Current price quote."""
         self._rate_limit()
-        q = self.client.quote(symbol)
+        q = self._call_with_retry(lambda: self.client.quote(symbol))
         return {
             "symbol": symbol,
             "price": q["c"],        # current
@@ -59,7 +74,7 @@ class FinnhubClient:
         since = int((datetime.utcnow() - timedelta(days=days)).timestamp())
         try:
             self._rate_limit()
-            c = self.client.stock_candles(symbol, resolution, since, now)
+            c = self._call_with_retry(lambda: self.client.stock_candles(symbol, resolution, since, now))
             if c.get("s") == "ok":
                 return {
                     "symbol": symbol,
@@ -116,7 +131,7 @@ class FinnhubClient:
         self._rate_limit()
         today = datetime.utcnow().strftime("%Y-%m-%d")
         since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-        news = self.client.company_news(symbol, _from=since, to=today)
+        news = self._call_with_retry(lambda: self.client.company_news(symbol, _from=since, to=today))
         return [
             {
                 "headline": n.get("headline"),
@@ -131,7 +146,7 @@ class FinnhubClient:
     def get_market_news(self, category: str = "general") -> list:
         """General market news."""
         self._rate_limit()
-        news = self.client.general_news(category)
+        news = self._call_with_retry(lambda: self.client.general_news(category))
         return [
             {
                 "headline": n.get("headline"),
@@ -145,7 +160,7 @@ class FinnhubClient:
     def get_basic_financials(self, symbol: str) -> dict:
         """Key financial metrics."""
         self._rate_limit()
-        data = self.client.company_basic_financials(symbol, "all")
+        data = self._call_with_retry(lambda: self.client.company_basic_financials(symbol, "all"))
         metrics = data.get("metric", {})
         return {
             "symbol": symbol,
@@ -160,10 +175,10 @@ class FinnhubClient:
     def get_recommendation_trends(self, symbol: str) -> list:
         """Analyst recommendations."""
         self._rate_limit()
-        return self.client.recommendation_trends(symbol)[:3] or []
+        return self._call_with_retry(lambda: self.client.recommendation_trends(symbol)[:3] or [])
 
     def is_market_open(self) -> bool:
         """Check if US market is currently open."""
         self._rate_limit()
-        status = self.client.market_status(exchange="US")
+        status = self._call_with_retry(lambda: self.client.market_status(exchange="US"))
         return status.get("isOpen", False)
