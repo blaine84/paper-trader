@@ -1,6 +1,7 @@
 finnhub-python
 openai
 anthropic
+mistralai
 pandas
 numpy
 ta

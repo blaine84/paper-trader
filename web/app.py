@@ -199,7 +199,7 @@ def api_positions():
                 unrealized_pnl = (current_price - p.avg_cost) * p.quantity
             else:
                 unrealized_pnl = (p.avg_cost - current_price) * p.quantity
-            unrealized_pct = (unrealized_pnl / (p.avg_cost * p.quantity)) * 100 if p.avg_cost else 0
+            unrealized_pct = (unrealized_pnl / (p.avg_cost * p.quantity)) * 100 if (p.avg_cost and p.quantity) else 0
 
             # pull stop/target from agent memory if PM stored them
             stop = target = None
@@ -433,6 +433,27 @@ def api_performance():
     })
 
 
-if __name__ == "__main__":
+@app.route("/api/company/<symbol>")
+def api_company(symbol):
+    try:
+        fh = FinnhubClient()
+        fh._rate_limit()
+        profile = fh.client.company_profile2(symbol=symbol)
+        return jsonify({
+            "name": profile.get("name"),
+            "industry": profile.get("finnhubIndustry"),
+            "market_cap": profile.get("marketCapitalization"),
+            "employees": profile.get("employeeTotal"),
+            "country": profile.get("country"),
+            "exchange": profile.get("exchange"),
+            "ipo": profile.get("ipo"),
+            "logo": profile.get("logo"),
+            "weburl": profile.get("weburl"),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
     port = int(os.getenv("WEB_PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

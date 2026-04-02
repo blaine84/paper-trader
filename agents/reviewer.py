@@ -114,13 +114,13 @@ def run(engine, min_unreviewed: int = 1) -> dict:
     db = get_session(engine)
     fh = FinnhubClient()
 
-    # Get unreviewed closed trades
+    # Get unreviewed closed trades — process in small batches to avoid token limits
     unreviewed = (
         db.query(Trade)
         .filter_by(status="closed")
         .filter(Trade.review_score == None)
         .order_by(Trade.exit_time.desc())
-        .limit(10)
+        .limit(5)
         .all()
     )
 
