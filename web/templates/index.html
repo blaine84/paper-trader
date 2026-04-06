@@ -405,7 +405,8 @@
         <td class="right">${fmtPnl(t.pnl)}</td>
         <td class="center dim">${t.review_score != null ? t.review_score.toFixed(1) : '—'}</td>
         <td class="center ${t.status === 'open' ? 'cyan' : 'dim'}">${t.status}</td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
   }
 
   function renderPerformance(data) {
