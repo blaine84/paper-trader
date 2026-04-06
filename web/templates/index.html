@@ -80,6 +80,7 @@
     .tooltip .tt-row { color: #8b949e; }
     .tooltip .tt-row span { color: #e6edf3; }
     .sym-link { cursor: default; border-bottom: 1px dashed #30363d; }
+    .setup-link { cursor: default; border-bottom: 1px dashed #30363d; color: #8b949e; }
   </style>
 </head>
 <body>
@@ -159,7 +160,7 @@
     <div id="tab-trades" class="tab-content">
       <table>
         <thead><tr>
-          <th>Profile</th><th>Symbol</th><th class="center">Dir</th>
+          <th>Date</th><th>Profile</th><th>Symbol</th><th class="center">Dir</th>
           <th class="right">Qty</th><th class="right">Entry</th><th class="right">Exit</th>
           <th class="right">P&L</th><th class="center">Score</th><th class="center">Status</th>
         </tr></thead>
@@ -329,7 +330,7 @@
           <td class="right ${chgColor}">${w.change_pct >= 0 ? '+' : ''}${w.change_pct.toFixed(2)}%</td>
           <td class="center">${signalBadge(w.signal)}</td>
           <td class="center">${strengthBadge(w.strength)}</td>
-          <td class="dim">${w.setup_type}</td>
+          <td><span class="setup-link" data-setup="${w.setup_type}">${w.setup_type}</span></td>
           <td class="center dim">${w.confidence}</td>
           <td class="center">${w.is_scout ? '<span class="badge badge-scout">SCOUT</span>' : '<span class="dim">CORE</span>'}</td>
           <td>${hasR ? `<span class="expand-btn" onclick="toggleReasoning('${w.symbol}')">${exp ? '▲' : '▼'}</span>` : ''}</td>
@@ -389,9 +390,12 @@
 
   function renderTrades(trades) {
     const tbody = document.getElementById('tradesBody');
-    if (!trades.length) { tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No trades yet</td></tr>'; return; }
-    tbody.innerHTML = trades.map(t => `
+    if (!trades.length) { tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No trades yet</td></tr>'; return; }
+    tbody.innerHTML = trades.map(t => {
+      const time = t.entry_time ? new Date(t.entry_time + 'Z').toLocaleString([], {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
+      return `
       <tr>
+        <td class="dim" style="font-size:11px">${time}</td>
         <td class="dim">${t.profile}</td>
         <td><strong class="sym-link" data-sym="${t.symbol}">${t.symbol}</strong></td>
         <td class="center"><span class="badge ${t.direction === 'LONG' ? 'badge-long' : 'badge-short'}">${t.direction}</span></td>
@@ -578,15 +582,50 @@
     tooltip.style.display = 'none';
   }
 
+  // ── Strategy tooltip ─────────────────────────────────────────────
+  let strategyCache = null;
+
+  async function loadStrategies() {
+    if (!strategyCache) {
+      try {
+        const res = await fetch('/api/strategies');
+        strategyCache = await res.json();
+      } catch(e) { strategyCache = {}; }
+    }
+  }
+  loadStrategies();
+
   document.addEventListener('mouseover', e => {
-    const el = e.target.closest('[data-sym]');
-    if (el) {
+    const setupEl = e.target.closest('[data-setup]');
+    if (setupEl) {
       clearTimeout(ttTimer);
-      ttTimer = setTimeout(() => showTooltip(el.dataset.sym, el), 300);
+      ttTimer = setTimeout(() => {
+        const setup = setupEl.dataset.setup;
+        const s = strategyCache?.[setup];
+        if (!s) return;
+        const wr = s.win_rate ? `${(s.win_rate * 100).toFixed(0)}%` : '—';
+        tooltip.innerHTML = `
+          <div class="tt-name">${s.name}</div>
+          <div class="tt-row">${s.description}</div>
+          <div class="tt-row" style="margin-top:6px">Timeframe: <span>${s.timeframe || '—'}</span></div>
+          <div class="tt-row">Bias: <span>${s.bias || '—'}</span></div>
+          <div class="tt-row">Win rate: <span>${wr}</span></div>
+        `;
+        const rect = setupEl.getBoundingClientRect();
+        tooltip.style.display = 'block';
+        tooltip.style.left = (rect.right + 8) + 'px';
+        tooltip.style.top = (rect.top - 8) + 'px';
+      }, 300);
+      return;
+    }
+    const symEl = e.target.closest('[data-sym]');
+    if (symEl) {
+      clearTimeout(ttTimer);
+      ttTimer = setTimeout(() => showTooltip(symEl.dataset.sym, symEl), 300);
     }
   });
   document.addEventListener('mouseout', e => {
-    if (e.target.closest('[data-sym]')) {
+    if (e.target.closest('[data-sym]') || e.target.closest('[data-setup]')) {
       clearTimeout(ttTimer);
       hideTooltip();
     }

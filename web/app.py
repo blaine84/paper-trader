@@ -478,6 +478,33 @@ def api_decisions():
     return jsonify(result)
 
 
+@app.route("/api/strategies")
+def api_strategies():
+    from models.strategies import STRATEGIES, SETUP_TYPE_MAP
+    result = {}
+    # Map setup_type names to strategy descriptions
+    for setup_type, strategy_key in SETUP_TYPE_MAP.items():
+        strat = STRATEGIES.get(strategy_key, {})
+        result[setup_type] = {
+            "name": strat.get("name", setup_type),
+            "description": strat.get("description", ""),
+            "timeframe": strat.get("timeframe", ""),
+            "bias": strat.get("bias", ""),
+            "win_rate": strat.get("win_rate_documented"),
+        }
+    # Also add direct strategy keys
+    for key, strat in STRATEGIES.items():
+        if key not in result:
+            result[key] = {
+                "name": strat.get("name", key),
+                "description": strat.get("description", ""),
+                "timeframe": strat.get("timeframe", ""),
+                "bias": strat.get("bias", ""),
+                "win_rate": strat.get("win_rate_documented"),
+            }
+    return jsonify(result)
+
+
 @app.route("/api/company/<symbol>")
 def api_company(symbol):
 
