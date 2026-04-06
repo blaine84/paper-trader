@@ -269,6 +269,7 @@ SETUP_TYPE_MAP = {
     "gap_and_go":           "gap_and_go",
     "vwap_reclaim":         "vwap_reclaim",
     "range_breakout":       "orb",
+    "range":                "orb",
     "technical_breakout":   "orb",
     "momentum_fade":        "momentum_fade",
     "reversal":             "momentum_fade",

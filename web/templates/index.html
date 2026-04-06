@@ -321,7 +321,7 @@
   function renderWatchlist(watchlist) {
     document.getElementById('watchlistBody').innerHTML = watchlist.map(w => {
       const chgColor = w.change_pct >= 0 ? 'green' : 'red';
-      const hasR = w.reasoning?.length > 0;
+      const hasR = w.reasoning?.length > 0 || w.setup_reasoning?.length > 0;
       const exp = expandedRows.has(w.symbol);
       return `
         <tr>
@@ -335,7 +335,7 @@
           <td class="center">${w.is_scout ? '<span class="badge badge-scout">SCOUT</span>' : '<span class="dim">CORE</span>'}</td>
           <td>${hasR ? `<span class="expand-btn" onclick="toggleReasoning('${w.symbol}')">${exp ? '▲' : '▼'}</span>` : ''}</td>
         </tr>
-        ${hasR ? `<tr id="reasoning-${w.symbol}"><td colspan="9"><div class="reasoning ${exp ? 'visible' : ''}">${w.reasoning}</div></td></tr>` : ''}`;
+        ${hasR ? `<tr id="reasoning-${w.symbol}"><td colspan="9"><div class="reasoning ${exp ? 'visible' : ''}">${w.setup_reasoning ? `<strong>Setup:</strong> ${w.setup_reasoning}<br><br>` : ''}${w.reasoning || ''}</div></td></tr>` : ''}`;
     }).join('');
   }
 

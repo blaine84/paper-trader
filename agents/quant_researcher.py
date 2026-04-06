@@ -153,6 +153,17 @@ def build_strategy_context(engine, market_regime: str = None) -> str:
     if avoid:
         lines.append(f"\nAvoid today: {', '.join(avoid)}")
 
+    # Include active dynamic strategies
+    from utils.strategy_store import get_all_strategies
+    all_strats = get_all_strategies(engine)
+    dynamic = [k for k, v in all_strats.items() if v.get("source") == "dynamic"]
+    if dynamic:
+        lines.append("\nAgent-proposed strategies (active):")
+        for key in dynamic:
+            s = all_strats[key]
+            wr = f"{s['win_rate_documented']:.0f}%" if s.get('win_rate_documented') else "new"
+            lines.append(f"  📌 {s['name']} ({key}) — {s['description'][:80]} [{wr}, {s.get('total_trades', 0)} trades]")
+
     return "\n".join(lines)
 
 
@@ -281,6 +292,23 @@ Evaluate which strategies have edge in today's conditions.
 Cross-reference textbook expectations against our internal case results and backtest data.
 Prefer strategies where backtest win_rate >= 50% AND has_edge=true in current regime.
 Flag strategies where backtest shows no edge even if textbook says otherwise.
+
+If you identify a recurring pattern in the case data that doesn't fit any existing strategy,
+propose it as a new strategy. Include in your response:
+"proposed_strategies": [
+  {
+    "key": "snake_case_name",
+    "name": "Human Readable Name",
+    "description": "What this strategy does and when it works",
+    "timeframe": "5-15 min",
+    "bias": "LONG|SHORT|either",
+    "ideal_conditions": {"market_regime": ["risk_on"], ...},
+    "failure_conditions": ["condition1", "condition2"],
+    "execution_notes": ["note1", "note2"]
+  }
+]
+Only propose strategies backed by at least 3 similar cases with >50% win rate.
+If no new strategies are warranted, return "proposed_strategies": [].
 """
 
     raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True)
@@ -297,6 +325,22 @@ Flag strategies where backtest shows no edge even if textbook says otherwise.
     ))
     db.commit()
     db.close()
+
+    # Update dynamic strategy stats and retire underperformers
+    from utils.strategy_store import update_strategy_stats, propose_strategy
+    try:
+        update_strategy_stats(engine)
+    except Exception as e:
+        log.warning(f"Strategy stats update failed: {e}")
+
+    # Propose new strategies if the LLM suggested any
+    for proposed in result.get("proposed_strategies", []):
+        if proposed.get("key") and proposed.get("name") and proposed.get("description"):
+            try:
+                propose_strategy(engine, proposed)
+                log.info(f"New strategy proposed: {proposed['key']} — {proposed['name']}")
+            except Exception as e:
+                log.warning(f"Failed to propose strategy {proposed.get('key')}: {e}")
 
     return result
 

@@ -74,6 +74,30 @@ class AgentMemory(Base):
     value = Column(Text, nullable=False)
 
 
+class DynamicStrategy(Base):
+    """Agent-proposed strategies that supplement the hardcoded strategy library."""
+    __tablename__ = "dynamic_strategies"
+
+    id = Column(Integer, primary_key=True)
+    key = Column(String(64), nullable=False, unique=True)  # e.g. "vwap_fade_eod"
+    name = Column(String(128), nullable=False)
+    description = Column(Text, nullable=False)
+    timeframe = Column(String(32))
+    bias = Column(String(32))                    # LONG | SHORT | either
+    ideal_conditions = Column(Text)              # JSON
+    failure_conditions = Column(Text)            # JSON
+    execution_notes = Column(Text)               # JSON
+    proposed_by = Column(String(32), default="quant_researcher")
+    status = Column(String(16), default="active")  # active | retired | probation
+    total_trades = Column(Integer, default=0)
+    wins = Column(Integer, default=0)
+    win_rate = Column(Float, nullable=True)
+    avg_pnl_pct = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    retired_at = Column(DateTime, nullable=True)
+    retire_reason = Column(Text, nullable=True)
+
+
 class DailyLog(Base):
     """End-of-day summaries."""
     __tablename__ = "daily_log"

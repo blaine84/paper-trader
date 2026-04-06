@@ -40,7 +40,8 @@ Respond in JSON:
   "signal": "LONG|SHORT|HOLD",
   "strength": "weak|moderate|strong",
   "confidence": "low|medium|high",
-  "setup_type": "gap_and_go|vwap_reclaim|technical_breakout|momentum_fade|reversal|range|etc",
+  "setup_type": "gap_and_go|vwap_reclaim|orb|momentum_fade|trend_pullback|news_catalyst|sector_rotation|short_squeeze",
+  "setup_reasoning": "why this setup type was chosen — what specific price action, indicators, or conditions match this setup",
   "reasoning": "what the indicators and tape are saying — be specific",
   "key_levels": {
     "support": 122.00,
@@ -93,6 +94,10 @@ def run(engine, symbols: list[str]) -> dict:
     # Strategy context from Quant Researcher
     strategy_context = build_strategy_context(engine)
 
+    # Get all valid setup types (hardcoded + dynamic)
+    from utils.strategy_store import get_all_setup_types
+    valid_setups = get_all_setup_types(engine)
+
     signals = {}
 
     for sym in symbols:
@@ -113,6 +118,9 @@ def run(engine, symbols: list[str]) -> dict:
         user_prompt = f"""
 Symbol: {sym}
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+
+VALID SETUP TYPES (use one of these):
+{', '.join(valid_setups)}
 
 SELECTION FEEDBACK (from Reviewer — your past signal quality):
 {lesson_text}

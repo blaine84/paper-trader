@@ -148,6 +148,7 @@ def api_data():
             "strength": sig.get("strength", "—"),
             "confidence": sig.get("confidence", "—"),
             "setup_type": sig.get("setup_type", "—"),
+            "setup_reasoning": sig.get("setup_reasoning", ""),
             "reasoning": sig.get("reasoning", ""),
             "invalidation": sig.get("invalidation", ""),
             "key_levels": sig.get("key_levels", {}),
@@ -431,15 +432,14 @@ def api_performance():
 @app.route("/api/decisions")
 def api_decisions():
     db = get_session(engine)
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0)
+    cutoff = datetime.utcnow() - timedelta(hours=24)
     result = []
 
     for profile_id in ACTIVE_PROFILES:
-        # PM notes (reasoning each cycle)
         notes = (
             db.query(AgentMemory)
             .filter_by(agent=f"pm_{profile_id}", key="notes")
-            .filter(AgentMemory.timestamp >= today_start)
+            .filter(AgentMemory.timestamp >= cutoff)
             .order_by(AgentMemory.timestamp.desc())
             .all()
         )
@@ -451,10 +451,9 @@ def api_decisions():
                 "content": n.value,
             })
 
-    # Also include today's trades as decision events
     trades = (
         db.query(Trade)
-        .filter(Trade.entry_time >= today_start)
+        .filter(Trade.entry_time >= cutoff)
         .order_by(Trade.entry_time.desc())
         .all()
     )
@@ -481,6 +480,7 @@ def api_decisions():
 @app.route("/api/strategies")
 def api_strategies():
     from models.strategies import STRATEGIES, SETUP_TYPE_MAP
+    from utils.strategy_store import get_all_strategies
     result = {}
     # Map setup_type names to strategy descriptions
     for setup_type, strategy_key in SETUP_TYPE_MAP.items():
@@ -491,8 +491,9 @@ def api_strategies():
             "timeframe": strat.get("timeframe", ""),
             "bias": strat.get("bias", ""),
             "win_rate": strat.get("win_rate_documented"),
+            "source": "hardcoded",
         }
-    # Also add direct strategy keys
+    # Add direct strategy keys
     for key, strat in STRATEGIES.items():
         if key not in result:
             result[key] = {
@@ -501,6 +502,21 @@ def api_strategies():
                 "timeframe": strat.get("timeframe", ""),
                 "bias": strat.get("bias", ""),
                 "win_rate": strat.get("win_rate_documented"),
+                "source": "hardcoded",
+            }
+    # Add dynamic strategies
+    all_strats = get_all_strategies(engine)
+    for key, strat in all_strats.items():
+        if strat.get("source") == "dynamic":
+            result[key] = {
+                "name": strat.get("name", key),
+                "description": strat.get("description", ""),
+                "timeframe": strat.get("timeframe", ""),
+                "bias": strat.get("bias", ""),
+                "win_rate": strat.get("win_rate_documented"),
+                "source": "dynamic",
+                "total_trades": strat.get("total_trades", 0),
+                "status": strat.get("status"),
             }
     return jsonify(result)
 
