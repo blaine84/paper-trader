@@ -432,7 +432,7 @@ def api_performance():
 @app.route("/api/decisions")
 def api_decisions():
     db = get_session(engine)
-    cutoff = datetime.utcnow() - timedelta(hours=24)
+    cutoff = datetime.utcnow() - timedelta(days=7)
     result = []
 
     for profile_id in ACTIVE_PROFILES:

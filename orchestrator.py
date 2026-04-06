@@ -113,8 +113,9 @@ def run_intraday():
     """Every N minutes during market hours."""
     log.info("=== INTRADAY CYCLE ===")
     engine = get_engine()
+
+    # Check stop losses
     try:
-        # Check stop losses for all profiles
         stops = bookkeeper.check_stop_losses(engine)
         if stops:
             log.warning(f"Stop losses triggered: {[(s['symbol'], s['profile']) for s in stops]}")
@@ -130,29 +131,40 @@ def run_intraday():
                     "rationale": f"Stop loss hit at {stop['stop_loss']}",
                 }, stop["profile"])
                 db.close()
+    except Exception as e:
+        log.error(f"Stop loss check error: {e}", exc_info=True)
 
-        # Full watchlist = core + today's scout picks
+    # Full watchlist
+    scout_picks = []
+    try:
         scout_picks = scout.get_todays_picks(engine)
-        full_watchlist = WATCHLIST + scout_picks
+    except Exception as e:
+        log.error(f"Scout picks error: {e}", exc_info=True)
+    full_watchlist = WATCHLIST + scout_picks
 
-        # Refresh analysis
+    # Analyst refresh
+    try:
         console.print("[bold blue]📊 Analyst refresh...[/bold blue]")
         analyst.run(engine, full_watchlist)
+    except Exception as e:
+        log.error(f"Analyst error: {e}", exc_info=True)
 
-        # All PM profiles decide
-        console.print("[bold green]🧠 Portfolio Managers deciding...[/bold green]")
-        all_decisions = pm.run(engine, full_watchlist)
-        for profile_id, result in all_decisions.items():
-            profile_name = profile_id.capitalize()
+    # PM profiles decide — each independently
+    console.print("[bold green]🧠 Portfolio Managers deciding...[/bold green]")
+    for profile_id in pm.ACTIVE_PROFILES:
+        try:
+            result = pm.run_profile(engine, full_watchlist, profile_id)
             for d in result.get("decisions", []):
                 status = "✅" if d.get("executed") else "❌"
-                log.info(f"  [{profile_name}] {status} {d['action']} {d.get('quantity', '')} {d['symbol']} @ ${d.get('price', 0):.2f}")
+                log.info(f"  [{profile_id}] {status} {d['action']} {d.get('quantity', '')} {d['symbol']} @ ${d.get('price', 0):.2f}")
+        except Exception as e:
+            log.error(f"PM {profile_id} error: {e}", exc_info=True)
 
-        # Print dashboard
+    # Dashboard
+    try:
         bookkeeper.print_dashboard(engine)
-
     except Exception as e:
-        log.error(f"Intraday error: {e}", exc_info=True)
+        log.error(f"Dashboard error: {e}", exc_info=True)
 
 
 def run_weekly_prep():
