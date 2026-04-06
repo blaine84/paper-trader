@@ -201,22 +201,17 @@ def api_positions():
                 unrealized_pnl = (p.avg_cost - current_price) * p.quantity
             unrealized_pct = (unrealized_pnl / (p.avg_cost * p.quantity)) * 100 if (p.avg_cost and p.quantity) else 0
 
-            # pull stop/target from agent memory if PM stored them
+            # pull stop/target from the trade record
             stop = target = None
-            mem = (
-                db.query(AgentMemory)
-                .filter_by(agent="pm", symbol=p.symbol, key="levels")
-                .filter(AgentMemory.value.contains(profile_id))
-                .order_by(AgentMemory.timestamp.desc())
+            open_trade = (
+                db.query(Trade)
+                .filter_by(symbol=p.symbol, profile=profile_id, status="open")
+                .order_by(Trade.entry_time.desc())
                 .first()
             )
-            if mem:
-                try:
-                    lvl = json.loads(mem.value)
-                    stop = lvl.get("stop")
-                    target = lvl.get("target")
-                except Exception:
-                    pass
+            if open_trade:
+                stop = open_trade.stop_price
+                target = open_trade.target_price
 
             result.append({
                 "profile": profile_id,
@@ -433,8 +428,59 @@ def api_performance():
     })
 
 
+@app.route("/api/decisions")
+def api_decisions():
+    db = get_session(engine)
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0)
+    result = []
+
+    for profile_id in ACTIVE_PROFILES:
+        # PM notes (reasoning each cycle)
+        notes = (
+            db.query(AgentMemory)
+            .filter_by(agent=f"pm_{profile_id}", key="notes")
+            .filter(AgentMemory.timestamp >= today_start)
+            .order_by(AgentMemory.timestamp.desc())
+            .all()
+        )
+        for n in notes:
+            result.append({
+                "profile": profile_id,
+                "type": "notes",
+                "timestamp": n.timestamp.isoformat() if n.timestamp else None,
+                "content": n.value,
+            })
+
+    # Also include today's trades as decision events
+    trades = (
+        db.query(Trade)
+        .filter(Trade.entry_time >= today_start)
+        .order_by(Trade.entry_time.desc())
+        .all()
+    )
+    for t in trades:
+        result.append({
+            "profile": t.profile,
+            "type": "trade",
+            "timestamp": t.entry_time.isoformat() if t.entry_time else None,
+            "content": f"{t.direction} {t.quantity} {t.symbol} @ ${t.entry_price:.2f}"
+                       + (f" | stop: ${t.stop_price:.2f}" if t.stop_price else "")
+                       + (f" | target: ${t.target_price:.2f}" if t.target_price else "")
+                       + (f" | {t.reason_entry}" if t.reason_entry else ""),
+            "status": t.status,
+            "pnl": t.pnl,
+        })
+
+    # Sort all by timestamp descending
+    result.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+
+    db.close()
+    return jsonify(result)
+
+
 @app.route("/api/company/<symbol>")
 def api_company(symbol):
+
     try:
         fh = FinnhubClient()
         fh._rate_limit()

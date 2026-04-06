@@ -18,7 +18,7 @@ console = Console()
 def check_stop_losses(engine, profile_id: str = None) -> list:
     """
     Check if any open positions have hit their stop loss.
-    Returns list of symbols that need to be closed.
+    Reads stop_price directly from the Trade record.
     """
     fh = FinnhubClient()
     db = get_session(engine)
@@ -28,36 +28,30 @@ def check_stop_losses(engine, profile_id: str = None) -> list:
     if profile_id:
         query = query.filter_by(profile=profile_id)
     open_trades = query.all()
+
     for trade in open_trades:
-        quote = fh.get_quote(trade.symbol)
-        price = quote["price"]
-        # Stop loss is stored in the analyst signal memory
-        sig = (
-            db.query(AgentMemory)
-            .filter_by(agent="analyst", symbol=trade.symbol, key="signal")
-            .order_by(AgentMemory.timestamp.desc())
-            .first()
-        )
-        if sig:
-            signal = json.loads(sig.value)
-            stop = signal.get("stop_loss")
-            if stop:
-                # Long: stop triggers when price falls below stop
-                # Short: stop triggers when price rises above stop
-                pos = db.query(Position).filter_by(
-                    symbol=trade.symbol, profile=trade.profile
-                ).first()
-                side = pos.side if pos else "long"
-                triggered = (side == "long" and price <= stop) or \
-                            (side == "short" and price >= stop)
-                if triggered:
-                    to_close.append({
-                        "symbol": trade.symbol,
-                        "price": price,
-                        "stop_loss": stop,
-                        "trade_id": trade.id,
-                        "profile": trade.profile,
-                    })
+        if not trade.stop_price:
+            continue
+        try:
+            quote = fh.get_quote(trade.symbol)
+            price = quote["price"]
+        except Exception:
+            continue
+
+        pos = db.query(Position).filter_by(
+            symbol=trade.symbol, profile=trade.profile
+        ).first()
+        side = pos.side if pos else "long"
+        triggered = (side == "long" and price <= trade.stop_price) or \
+                    (side == "short" and price >= trade.stop_price)
+        if triggered:
+            to_close.append({
+                "symbol": trade.symbol,
+                "price": price,
+                "stop_loss": trade.stop_price,
+                "trade_id": trade.id,
+                "profile": trade.profile,
+            })
 
     db.close()
     return to_close

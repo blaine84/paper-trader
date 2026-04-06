@@ -114,6 +114,7 @@
       <div class="tab" onclick="switchTab('trades')">Trades</div>
       <div class="tab" onclick="switchTab('performance')">Performance</div>
       <div class="tab" onclick="switchTab('feedback')">Agent Feedback</div>
+      <div class="tab" onclick="switchTab('decisions')">Decision Log</div>
       <div class="tab" onclick="switchTab('daily')">Daily P&L</div>
     </div>
 
@@ -194,6 +195,11 @@
       <div id="feedbackContent"><div class="empty-state">Loading feedback...</div></div>
     </div>
 
+    <!-- Decision Log -->
+    <div id="tab-decisions" class="tab-content">
+      <div id="decisionsContent"><div class="empty-state">Loading decisions...</div></div>
+    </div>
+
     <!-- Daily P&L -->
     <div id="tab-daily" class="tab-content">
       <table>
@@ -220,13 +226,14 @@
     activeTab = name;
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    const tabs = ['watchlist','analysis','positions','trades','performance','feedback','daily'];
+    const tabs = ['watchlist','analysis','positions','trades','performance','feedback','decisions','daily'];
     document.querySelectorAll('.tab')[tabs.indexOf(name)]?.classList.add('active');
     document.getElementById('tab-' + name)?.classList.add('active');
     if (name === 'trades') loadTrades();
     if (name === 'daily') loadDaily();
     if (name === 'performance') loadPerformance();
     if (name === 'feedback') loadFeedback();
+    if (name === 'decisions') loadDecisions();
     if (name === 'positions') loadPositions();
   }
 
@@ -496,6 +503,41 @@
         <td class="right green">${l.wins || 0}</td>
         <td class="right red">${l.losses || 0}</td>
       </tr>`;
+    }).join('');
+  }
+
+  async function loadDecisions() {
+    try {
+      const res = await fetch('/api/decisions');
+      renderDecisions(await res.json());
+    } catch(e) {}
+  }
+
+  function renderDecisions(decisions) {
+    const el = document.getElementById('decisionsContent');
+    if (!decisions.length) {
+      el.innerHTML = '<div class="empty-state">No decisions today yet.</div>';
+      return;
+    }
+    const profileNames = {conservative: '🛡️ Conservative', moderate: '⚖️ Moderate', aggressive: '🔥 Aggressive'};
+    el.innerHTML = decisions.map(d => {
+      const time = d.timestamp ? new Date(d.timestamp + 'Z').toLocaleTimeString() : '—';
+      const profile = profileNames[d.profile] || d.profile;
+      if (d.type === 'trade') {
+        const pnlStr = d.pnl != null ? ` → ${fmtPnl(d.pnl)}` : '';
+        const statusBadge = d.status === 'open'
+          ? '<span class="badge" style="background:#1a2a3a;color:#58a6ff">OPEN</span>'
+          : '<span class="badge" style="background:#21262d;color:#8b949e">CLOSED</span>';
+        return `<div class="feedback-box">
+          <strong>${profile}</strong> <span class="dim">${time}</span> ${statusBadge}${pnlStr}<br>
+          <span style="color:#e6edf3">${d.content}</span>
+        </div>`;
+      } else {
+        return `<div class="feedback-box">
+          <strong>${profile}</strong> <span class="dim">${time}</span> <span class="badge" style="background:#21262d;color:#8b949e">NOTES</span><br>
+          ${d.content}
+        </div>`;
+      }
     }).join('');
   }
 

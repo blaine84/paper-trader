@@ -31,6 +31,8 @@ class Trade(Base):
     pnl_pct = Column(Float, nullable=True)
     reason_entry = Column(Text, nullable=True)
     reason_exit = Column(Text, nullable=True)
+    stop_price = Column(Float, nullable=True)     # PM's stop loss level
+    target_price = Column(Float, nullable=True)    # PM's profit target
     review_score = Column(Float, nullable=True)  # 1-10 from Reviewer
     review_notes = Column(Text, nullable=True)
 

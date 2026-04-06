@@ -79,15 +79,32 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
         except Exception:
             price = p.avg_cost
         market_value = p.quantity * price
-        unrealized_pnl = (price - p.avg_cost) * p.quantity
+        if p.side == "short":
+            unrealized_pnl = (p.avg_cost - price) * p.quantity
+        else:
+            unrealized_pnl = (price - p.avg_cost) * p.quantity
         total_pos_value += market_value
+
+        # Get stop/target from the open trade
+        open_trade = (
+            db.query(Trade)
+            .filter_by(symbol=p.symbol, profile=profile_id, status="open")
+            .order_by(Trade.entry_time.desc())
+            .first()
+        )
+
         pos_data.append({
             "symbol": p.symbol,
+            "side": p.side,
             "quantity": p.quantity,
             "avg_cost": p.avg_cost,
             "current_price": price,
             "market_value": round(market_value, 2),
             "unrealized_pnl": round(unrealized_pnl, 2),
+            "unrealized_pnl_pct": round(unrealized_pnl / (p.avg_cost * p.quantity) * 100, 2) if p.avg_cost and p.quantity else 0,
+            "stop_price": open_trade.stop_price if open_trade else None,
+            "target_price": open_trade.target_price if open_trade else None,
+            "entry_time": open_trade.entry_time.isoformat() if open_trade and open_trade.entry_time else None,
         })
 
     bal = (
@@ -167,6 +184,8 @@ def execute_trade(db, decision: dict, profile_id: str):
         db.add(Trade(
             symbol=symbol, direction="LONG", quantity=quantity,
             entry_price=price, reason_entry=decision.get("rationale"),
+            stop_price=decision.get("stop"),
+            target_price=decision.get("target"),
             profile=profile_id,
         ))
         db.add(Balance(cash=cash - cost, profile=profile_id))
@@ -194,6 +213,8 @@ def execute_trade(db, decision: dict, profile_id: str):
         db.add(Trade(
             symbol=symbol, direction="SHORT", quantity=quantity,
             entry_price=price, reason_entry=decision.get("rationale"),
+            stop_price=decision.get("stop"),
+            target_price=decision.get("target"),
             profile=profile_id,
         ))
         # Deduct margin from cash (returned + P&L on close)
