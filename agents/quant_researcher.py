@@ -296,16 +296,16 @@ Flag strategies where backtest shows no edge even if textbook says otherwise.
 If you identify a recurring pattern in the case data that doesn't fit any existing strategy,
 propose it as a new strategy. Include in your response:
 "proposed_strategies": [
-  {
+  {{
     "key": "snake_case_name",
     "name": "Human Readable Name",
     "description": "What this strategy does and when it works",
     "timeframe": "5-15 min",
     "bias": "LONG|SHORT|either",
-    "ideal_conditions": {"market_regime": ["risk_on"], ...},
+    "ideal_conditions": {{"market_regime": ["risk_on"]}},
     "failure_conditions": ["condition1", "condition2"],
     "execution_notes": ["note1", "note2"]
-  }
+  }}
 ]
 Only propose strategies backed by at least 3 similar cases with >50% win rate.
 If no new strategies are warranted, return "proposed_strategies": [].
