@@ -91,6 +91,15 @@ def run(engine, symbols: list[str]) -> dict:
     )
     lesson_text = sel_fb.value if sel_fb else "No selection feedback yet."
 
+    # Meta-reviewer recommendations for analyst
+    meta_rec = (
+        db.query(AgentMemory)
+        .filter_by(agent="meta_reviewer", symbol="analyst", key="agent_recommendation")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    meta_text = meta_rec.value if meta_rec else ""
+
     # Strategy context from Quant Researcher
     strategy_context = build_strategy_context(engine)
 
@@ -125,6 +134,9 @@ VALID SETUP TYPES (use one of these):
 SELECTION FEEDBACK (from Reviewer — your past signal quality):
 {lesson_text}
 
+META-REVIEWER RECOMMENDATIONS (system-level feedback for you):
+{meta_text if meta_text else 'None yet'}
+
 CURRENT QUOTE:
 {json.dumps(quote, indent=2)}
 
@@ -142,7 +154,7 @@ RELEVANT PAST CASES:
 
 Produce your trading signal JSON for {sym}.
 """
-        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True)
+        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low")
         signal = parse_json_response(raw)
         signals[sym] = signal
 

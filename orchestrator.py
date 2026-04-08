@@ -179,6 +179,15 @@ def run_weekly_prep():
     except Exception as e:
         log.error(f"Weekly prep error: {e}", exc_info=True)
 
+    # Meta Reviewer — runs after weekly prep
+    try:
+        import agents.meta_reviewer as meta_reviewer
+        console.print("[bold magenta]🔬 Meta Reviewer analyzing system performance...[/bold magenta]")
+        meta_result = meta_reviewer.run(engine)
+        log.info(f"Meta Reviewer: {meta_result.get('overall_assessment', '')[:200]}")
+    except Exception as e:
+        log.error(f"Meta Reviewer error: {e}", exc_info=True)
+
 
 def run_post_market():
     """4:15 PM ET — End of day wrap-up."""
@@ -248,16 +257,28 @@ def main():
         id="pre_market",
     )
 
-    # Intraday loop: every N minutes, 9:30 AM – 4:00 PM ET
+    # Intraday morning: every 15 min, 9:30 AM – 12:00 PM ET
     scheduler.add_job(
         run_intraday,
         CronTrigger(
             day_of_week="mon-fri",
-            hour="9-15",
+            hour="9-11",
             minute=f"*/{LOOP_INTERVAL}",
             timezone="America/New_York",
         ),
-        id="intraday",
+        id="intraday_morning",
+    )
+
+    # Intraday afternoon: every 30 min, 12:00 PM – 4:00 PM ET
+    scheduler.add_job(
+        run_intraday,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="12-15",
+            minute="0,30",
+            timezone="America/New_York",
+        ),
+        id="intraday_afternoon",
     )
 
     # Post-market: 4:15 PM ET
@@ -277,7 +298,7 @@ def main():
     console.print(f"[bold green]🚀 Paper Trader started[/bold green]")
     console.print(f"   Watchlist: {', '.join(WATCHLIST)}")
     console.print(f"   Loop interval: {LOOP_INTERVAL} min")
-    console.print(f"   Schedule: Sun 5PM weekly prep | 8:30 pre-market | 9:30-4:00 intraday | 4:15 EOD")
+    console.print(f"   Schedule: Sun 5PM weekly prep | 8:30 pre-market | 9:30-12 every {LOOP_INTERVAL}min | 12-4 every 30min | 4:15 EOD")
 
     def _shutdown(signum, frame):
         console.print("\n[yellow]Shutting down...[/yellow]")

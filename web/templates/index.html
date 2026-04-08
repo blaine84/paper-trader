@@ -116,6 +116,7 @@
       <div class="tab" onclick="switchTab('performance')">Performance</div>
       <div class="tab" onclick="switchTab('feedback')">Agent Feedback</div>
       <div class="tab" onclick="switchTab('decisions')">Decision Log</div>
+      <div class="tab" onclick="switchTab('meta')">System Review</div>
       <div class="tab" onclick="switchTab('daily')">Daily P&L</div>
     </div>
 
@@ -201,6 +202,11 @@
       <div id="decisionsContent"><div class="empty-state">Loading decisions...</div></div>
     </div>
 
+    <!-- System Review -->
+    <div id="tab-meta" class="tab-content">
+      <div id="metaContent"><div class="empty-state">Loading system review...</div></div>
+    </div>
+
     <!-- Daily P&L -->
     <div id="tab-daily" class="tab-content">
       <table>
@@ -227,7 +233,7 @@
     activeTab = name;
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    const tabs = ['watchlist','analysis','positions','trades','performance','feedback','decisions','daily'];
+    const tabs = ['watchlist','analysis','positions','trades','performance','feedback','decisions','meta','daily'];
     document.querySelectorAll('.tab')[tabs.indexOf(name)]?.classList.add('active');
     document.getElementById('tab-' + name)?.classList.add('active');
     if (name === 'trades') loadTrades();
@@ -235,6 +241,7 @@
     if (name === 'performance') loadPerformance();
     if (name === 'feedback') loadFeedback();
     if (name === 'decisions') loadDecisions();
+    if (name === 'meta') loadMeta();
     if (name === 'positions') loadPositions();
   }
 
@@ -509,6 +516,85 @@
         <td class="right red">${l.losses || 0}</td>
       </tr>`;
     }).join('');
+  }
+
+  async function loadMeta() {
+    try {
+      const res = await fetch('/api/meta_review');
+      renderMeta(await res.json());
+    } catch(e) {}
+  }
+
+  function renderMeta(data) {
+    const el = document.getElementById('metaContent');
+    if (!data || !data.overall_assessment) {
+      el.innerHTML = '<div class="empty-state">No system review yet — runs Sunday after weekly prep.</div>';
+      return;
+    }
+    const gradeColor = g => ({A:'green',B:'green',C:'yellow',D:'red',F:'red'}[g] || 'dim');
+    const trendIcon = t => ({improving:'📈',stable:'➡️',degrading:'📉'}[t] || '');
+    const prioColor = p => ({high:'red',medium:'yellow',low:'dim'}[p] || 'dim');
+
+    let html = `<div class="feedback-box"><strong>Overall Assessment</strong> <span class="dim">(${data.week || ''})</span><br>${data.overall_assessment}</div>`;
+
+    // Agent grades
+    const reviews = data.agent_reviews || {};
+    if (Object.keys(reviews).length) {
+      html += '<div class="section-title" style="padding:14px 14px 0">Agent Grades</div><div class="stat-grid">';
+      for (const [agent, r] of Object.entries(reviews)) {
+        html += `<div class="stat-box">
+          <div class="stat-label">${agent}</div>
+          <div class="stat-value ${gradeColor(r.grade)}">${r.grade || '—'} ${trendIcon(r.trend)}</div>
+          <div class="dim" style="font-size:11px;margin-top:4px">${r.findings || ''}</div>
+        </div>`;
+      }
+      html += '</div>';
+    }
+
+    // System recommendations
+    const recs = data.system_recommendations || [];
+    if (recs.length) {
+      html += '<div class="section-title" style="padding:14px 14px 0">System Recommendations</div>';
+      for (const r of recs) {
+        html += `<div class="feedback-box">
+          <span class="${prioColor(r.priority)}" style="font-weight:600">[${r.priority}]</span>
+          <strong>${r.title}</strong> <span class="dim">(${r.category})</span><br>
+          ${r.description}
+          ${r.affected_agents?.length ? `<br><span class="dim">Affects: ${r.affected_agents.join(', ')}</span>` : ''}
+        </div>`;
+      }
+    }
+
+    // Code suggestions
+    const code = data.code_suggestions || [];
+    if (code.length) {
+      html += '<div class="section-title" style="padding:14px 14px 0">Code Suggestions</div>';
+      for (const c of code) {
+        html += `<div class="feedback-box">
+          <span class="${prioColor(c.priority)}" style="font-weight:600">[${c.priority}]</span>
+          <span class="badge" style="background:#21262d;color:#58a6ff">${c.type}</span>
+          <strong>${c.title}</strong><br>
+          ${c.description}
+          ${c.files_affected?.length ? `<br><span class="dim">Files: ${c.files_affected.join(', ')}</span>` : ''}
+        </div>`;
+      }
+    }
+
+    // Key metrics
+    const m = data.key_metrics;
+    if (m) {
+      html += `<div class="section-title" style="padding:14px 14px 0">Key Metrics</div>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="stat-label">Total Trades</div><div class="stat-value">${m.total_trades || 0}</div></div>
+          <div class="stat-box"><div class="stat-label">Win Rate</div><div class="stat-value ${m.win_rate >= 50 ? 'green' : 'red'}">${m.win_rate || 0}%</div></div>
+          <div class="stat-box"><div class="stat-label">Avg P&L</div><div class="stat-value ${pnlColor(m.avg_pnl_pct)}">${m.avg_pnl_pct >= 0 ? '+' : ''}${m.avg_pnl_pct || 0}%</div></div>
+          <div class="stat-box"><div class="stat-label">Best Setup</div><div class="stat-value" style="font-size:14px">${m.best_setup || '—'}</div></div>
+          <div class="stat-box"><div class="stat-label">Worst Setup</div><div class="stat-value" style="font-size:14px">${m.worst_setup || '—'}</div></div>
+          <div class="stat-box"><div class="stat-label">Best Profile</div><div class="stat-value" style="font-size:14px">${m.best_profile || '—'}</div></div>
+        </div>`;
+    }
+
+    el.innerHTML = html;
   }
 
   async function loadDecisions() {

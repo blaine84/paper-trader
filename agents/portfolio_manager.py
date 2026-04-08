@@ -305,6 +305,15 @@ def run_profile(engine, symbols: list[str], profile_id: str) -> dict:
         )
     feedback_text = exec_fb.value if exec_fb else "No execution feedback yet."
 
+    # Meta-reviewer recommendations for this PM profile
+    meta_rec = (
+        db.query(AgentMemory)
+        .filter_by(agent="meta_reviewer", symbol=f"pm_{profile_id}", key="agent_recommendation")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    meta_text = meta_rec.value if meta_rec else ""
+
     portfolio = get_portfolio_for_profile(db, fh, profile_id)
 
     # Build profile-specific system prompt
@@ -381,6 +390,9 @@ ANALYST SIGNALS:
 
 EXECUTION FEEDBACK (your profile only):
 {feedback_text}{weekly_stance_text}
+
+META-REVIEWER RECOMMENDATIONS (system-level feedback for your profile):
+{meta_text if meta_text else 'None yet'}
 
 SETUP WIN RATES (from case library — use to adjust position sizing):
 {win_rate_text}

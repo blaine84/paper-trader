@@ -477,6 +477,39 @@ def api_decisions():
     return jsonify(result)
 
 
+@app.route("/api/meta_review")
+def api_meta_review():
+    db = get_session(engine)
+    mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="meta_reviewer", key="weekly_review")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    result = {}
+    if mem:
+        try:
+            result = json.loads(mem.value)
+        except Exception:
+            result = {"raw": mem.value}
+
+    # Code suggestions
+    code_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="meta_reviewer", key="code_suggestions")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if code_mem:
+        try:
+            result["code_suggestions"] = json.loads(code_mem.value)
+        except Exception:
+            pass
+
+    db.close()
+    return jsonify(result)
+
+
 @app.route("/api/strategies")
 def api_strategies():
     from models.strategies import STRATEGIES, SETUP_TYPE_MAP
