@@ -264,6 +264,16 @@ def check_llm_connectivity():
 
 def run_price_monitor():
     """Every 60 seconds — check prices against stops/targets/key levels."""
+    # Only run during market hours (9:30 AM - 4:00 PM ET)
+    from pytz import timezone
+    et = datetime.now(timezone("America/New_York"))
+    if et.weekday() >= 5:  # weekend
+        return
+    market_open = et.replace(hour=9, minute=30, second=0)
+    market_close = et.replace(hour=16, minute=0, second=0)
+    if not (market_open <= et <= market_close):
+        return
+
     engine = get_engine()
     try:
         import agents.price_monitor as price_monitor
