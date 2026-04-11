@@ -162,11 +162,18 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
 
 def parse_json_response(text: str) -> dict:
     """Safely parse JSON from LLM output, even with markdown fences."""
+    if not text or not text.strip():
+        raise ValueError("LLM returned empty response")
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1])
+    # Try to extract JSON from mixed text
+    if not text.startswith("{") and "{" in text:
+        start = text.index("{")
+        end = text.rindex("}") + 1
+        text = text[start:end]
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse LLM JSON response: {e}\nRaw: {text}")
+        raise ValueError(f"Failed to parse LLM JSON response: {e}\nRaw: {text[:500]}")
