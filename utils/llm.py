@@ -161,17 +161,26 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
 
 
 def parse_json_response(text: str) -> dict:
-    """Safely parse JSON from LLM output, even with markdown fences."""
+    """Safely parse JSON from LLM output, even with markdown fences or trailing text."""
     if not text or not text.strip():
         raise ValueError("LLM returned empty response")
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
-        text = "\n".join(lines[1:-1])
-    # Try to extract JSON from mixed text
-    if not text.startswith("{") and "{" in text:
+        text = "\n".join(lines[1:-1]).strip()
+    # Extract the first complete JSON object by matching braces
+    if "{" in text:
         start = text.index("{")
-        end = text.rindex("}") + 1
+        depth = 0
+        end = start
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
         text = text[start:end]
     try:
         return json.loads(text)
