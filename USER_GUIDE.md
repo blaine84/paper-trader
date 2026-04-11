@@ -55,49 +55,53 @@ All config lives in `.env`. Copy `.env.example` to get started.
 | `OPENAI_API_KEY` | — | Required if using OpenAI |
 | `ANTHROPIC_API_KEY` | — | Required if using Anthropic |
 | `LLM_PROVIDER` | `openai` | `openai`, `anthropic`, `mistral`, or `ollama` |
-| `LLM_MODEL` | `gpt-4o-mini` | Primary model |
-| `LLM_LOW_PROVIDER` | — | Provider for low-effort tasks (optional) |
-| `LLM_LOW_MODEL` | — | Model for low-effort tasks (optional) |
-| `MISTRAL_API_KEY` | — | Required if using Mistral |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
-| `OLLAMA_MODEL` | `llama3` | Ollama model name |
+| `LLM_MODEL` | `gpt-4o-mini` | Primary model (high tier) |
+| `LLM_MED_PROVIDER` | — | Provider for medium-effort tasks (Analyst, Quant Researcher) |
+| `LLM_MED_MODEL` | — | Model for medium tier (e.g. `llama3.1:8b`) |
+| `LLM_LOW_PROVIDER` | — | Provider for low-effort tasks (Scout, Researcher, Weekly Prep) |
+| `LLM_LOW_MODEL` | — | Model for low tier (e.g. `mistral:latest`) |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint (can point to another machine) |
 | `OLLAMA_TIMEOUT` | `60` | Seconds before Ollama fallback triggers |
-| `OLLAMA_FALLBACK_PROVIDER` | `anthropic` | Fallback if Ollama hangs |
+| `OLLAMA_FALLBACK_PROVIDER` | `anthropic` | Fallback if Ollama fails |
 | `OLLAMA_FALLBACK_MODEL` | `claude-haiku-4-5` | Fallback model |
 | `STARTING_BALANCE` | `100000` | Paper balance per profile (×3) |
 | `WATCHLIST` | `SPY,QQQ,IWM,TSLA,NVDA,AMD` | Core tickers, comma-separated |
 | `LOOP_INTERVAL_MINUTES` | `15` | How often intraday loop runs |
 
-### Recommended models
+### LLM Tiers
 
-| Use case | Model |
-|---|---|
-| Budget / fast | `gpt-4o-mini` (OpenAI) or `claude-haiku-4-5` (Anthropic) |
-| Balanced production | `claude-sonnet-4-6` (Anthropic) |
-| Local / free low tier | Ollama with `llama3.2:3b` or larger |
+| Tier | Used by | Recommended model |
+|---|---|---|
+| High | PM decisions, Meta Reviewer | `claude-sonnet-4-6` (Anthropic) |
+| Medium | Analyst, Quant Researcher | `llama3.1:8b` (Ollama, local) |
+| Low | Scout, Researcher, Weekly Prep | `mistral:latest` (Ollama, local) |
+
+Only PM decisions and the Meta Reviewer hit the cloud API. Everything else runs locally via Ollama.
 
 ---
 
 ## How It Works
 
-The system runs 7 agents on a market-hours schedule. Each agent has a single job.
+The system runs 9 agents on a market-hours schedule. Each agent has a single job.
 No agent does another agent's job.
 
 ```
-8:30 AM ──► Scout ──► Researcher ──► Analyst
-                                         │
-9:30 AM ──► loop every 15 min ◄──────────┘
-            │
-            ├─ Bookkeeper (check stops)
-            ├─ Analyst (refresh signals)
-            └─ Portfolio Manager ×3 (decide trades)
-                   Conservative
-                   Moderate
-                   Aggressive
+8:30 AM ──► Scout ──► Researcher ──► Quant Researcher ──► Analyst
+                                                              │
+9:30 AM ──► Price Monitor (every 60s) ◄──────────────────────┘
+            │                                                  │
+            ├─ Stop/target hit? → close immediately            │
+            └─ Key level breach? → trigger PM                  │
+                                                               │
+9:30-12  ──► PM decisions every 15 min ◄───────────────────────┘
+12-4 PM  ──► PM decisions every 30 min
+            Analyst refreshes every 15 min all day (free, local LLM)
 
 4:15 PM ──► Reviewer (score trades, build cases)
         ──► Bookkeeper (daily log)
-        ──► EOD scorecard printed to terminal
+
+Sunday  ──► Weekly Prep
+        ──► Meta Reviewer (grades agents, suggests improvements)
 ```
 
 All three Portfolio Manager profiles run in **parallel** with **isolated portfolios**.
@@ -151,9 +155,28 @@ losses every cycle and force-closes positions that breach them. Prints the
 terminal dashboard. Saves end-of-day summaries.
 
 ### 🔍 Reviewer
-Runs at 4:15 PM after market close. Reviews every closed trade, extracts a
-**structured case** for the case library, and routes feedback to the right agents.
-Scores are split — see [Understanding the Scores](#understanding-the-scores).
+Runs at 4:15 PM after market close. Reviews every closed trade (in batches of 3),
+extracts a **structured case** for the case library, and routes feedback to the
+right agents. Scores are split — see [Understanding the Scores](#understanding-the-scores).
+
+### 📐 Quant Researcher
+Evaluates which strategies have edge in current market conditions. Cross-references
+the strategy library against the case library and backtest results. Runs the
+backtester automatically every 3 days. Can propose new dynamic strategies based
+on patterns in the case data — strategies that underperform after 10+ trades are
+automatically retired.
+
+### ⚡ Price Monitor
+Runs every 60 seconds during market hours using yfinance (free, no rate limit).
+Checks open positions against stop/target levels and analyst signals against key
+levels. Triggers immediate PM action when conditions are met — no waiting for the
+next scheduled cycle.
+
+### 🔬 Meta Reviewer
+Runs weekly after Sunday prep. Grades each agent (A–F), tracks trends
+(improving/stable/degrading), and writes specific recommendations that agents
+read as context. Also suggests code refactors and feature additions visible in
+the web dashboard's System Review tab.
 
 ---
 
@@ -257,6 +280,17 @@ Reviewer
       Moderate PM      (gets its own history)
       Aggressive PM    (gets its own history)
       "Are we entering, sizing, and exiting correctly?"
+
+Meta Reviewer (weekly)
+  ├── grades each agent A–F with trend
+  ├── writes per-agent recommendations → agents read as context
+  ├── suggests code refactors and features
+  └── compares week-over-week performance
+
+Quant Researcher
+  ├── proposes new strategies from case patterns
+  ├── tracks dynamic strategy win rates
+  └── retires strategies that underperform
 ```
 
 **Selection score** — was the setup correctly identified? Did the Analyst's read
@@ -278,14 +312,13 @@ All times Eastern (ET), Monday–Friday.
 
 | Time | Event |
 |---|---|
-| **Sunday 5:00 PM** | Weekly prep — Scout builds watchlist, Researcher summarizes news, Reviewer rolls up lessons, PMs set stances |
-| 8:30 AM | Scout scans for movers (reads weekly context), Researcher covers full list, Analyst preps signals |
-| 9:30 AM | Market opens, intraday loop starts |
-| Every 15 min | Bookkeeper checks stops → Analyst refreshes → all 3 PMs decide (with weekly stance) |
-| 4:00 PM | Market closes |
-| 4:15 PM | Reviewer scores trades, EOD scorecard printed, daily log saved |
-
-The loop interval is configurable via `LOOP_INTERVAL_MINUTES` in `.env`.
+| **Sunday 5:00 PM** | Weekly prep + Meta Reviewer (grades agents, suggests improvements) |
+| 8:30 AM | Scout → Researcher → Quant Researcher → Analyst |
+| 9:30 AM | Market opens, price monitor starts (every 60s) |
+| 9:30–12:00 | PM decisions every 15 min, Analyst refresh every 15 min |
+| 12:00–4:00 | PM decisions every 30 min, Analyst refresh every 15 min |
+| 4:00 PM | Market closes, price monitor stops |
+| 4:15 PM | Reviewer scores trades (batches of 3), Bookkeeper saves daily log |
 
 ---
 
@@ -388,8 +421,8 @@ python portfolio_inspect.py summary --limit 60
 
 ## Running on a Raspberry Pi
 
-The Pi only orchestrates — all heavy compute goes to Finnhub + OpenAI/Anthropic.
-A Pi 3B+ or better is sufficient. Your PC can be off.
+The Pi orchestrates and the Mac Mini runs local LLMs via Ollama. Cloud API calls
+(Anthropic) are only used for PM decisions. A Pi 3B+ or better is sufficient.
 
 ### Setup
 ```bash
@@ -506,12 +539,13 @@ SQLite at `db/paper_trader.db`. Back it up periodically.
 
 | Table | Contents |
 |---|---|
-| `trades` | All paper trades with entry/exit/P&L/scores |
+| `trades` | All paper trades with entry/exit/P&L/scores/stop/target |
 | `positions` | Current open positions (per profile + side) |
 | `balance` | Cash balance history (per profile) |
-| `agent_memory` | Shared notes between agents (signals, feedback) |
+| `agent_memory` | Shared notes between agents (signals, feedback, meta reviews) |
 | `daily_log` | End-of-day summaries |
 | `cases` | The case library — structured trade lessons |
+| `dynamic_strategies` | Agent-proposed strategies with win rate tracking |
 
 ### Quick backup
 ```bash
@@ -538,7 +572,7 @@ try a more capable model (`gpt-4o` instead of `gpt-4o-mini`).
 
 ### Orchestrator ran but no trades were taken
 Normal — the PM profiles have strict rules. On low-conviction days they will
-often pass entirely. Check `python inspect.py feedback` for PM notes on why.
+often pass entirely. Check `python portfolio_inspect.py feedback` for PM notes on why.
 
 ### Pi service not starting
 ```bash
