@@ -109,8 +109,27 @@ def run_pre_market():
         log.error(f"Analyst error: {e}", exc_info=True)
 
 
+def run_analyst_refresh():
+    """Analyst-only refresh — runs every 15 min, free via local LLM."""
+    log.info("=== ANALYST REFRESH ===")
+    engine = get_engine()
+
+    scout_picks = []
+    try:
+        scout_picks = scout.get_todays_picks(engine)
+    except Exception as e:
+        log.error(f"Scout picks error: {e}", exc_info=True)
+    full_watchlist = WATCHLIST + scout_picks
+
+    try:
+        console.print("[bold blue]📊 Analyst refresh...[/bold blue]")
+        analyst.run(engine, full_watchlist)
+    except Exception as e:
+        log.error(f"Analyst error: {e}", exc_info=True)
+
+
 def run_intraday():
-    """Every N minutes during market hours."""
+    """PM decisions + stop checks — runs on the split schedule."""
     log.info("=== INTRADAY CYCLE ===")
     engine = get_engine()
 
@@ -142,7 +161,7 @@ def run_intraday():
         log.error(f"Scout picks error: {e}", exc_info=True)
     full_watchlist = WATCHLIST + scout_picks
 
-    # Analyst refresh
+    # Analyst refresh (also runs here so PMs have fresh signals)
     try:
         console.print("[bold blue]📊 Analyst refresh...[/bold blue]")
         analyst.run(engine, full_watchlist)
@@ -243,6 +262,49 @@ def check_llm_connectivity():
             log.warning(f"LLM low tier check failed: {e}")
 
 
+def run_price_monitor():
+    """Every 60 seconds — check prices against stops/targets/key levels."""
+    engine = get_engine()
+    try:
+        import agents.price_monitor as price_monitor
+        result = price_monitor.run(engine)
+
+        # Execute stop losses immediately
+        for trigger in result.get("stop_triggers", []):
+            try:
+                from db.schema import get_session
+                from agents.portfolio_manager import execute_trade
+                db = get_session(engine)
+                execute_trade(db, {
+                    "symbol": trigger["symbol"],
+                    "action": "CLOSE",
+                    "quantity": 0,
+                    "price": trigger["price"],
+                    "rationale": f"Price monitor: {trigger['type']} at {trigger['price']} (level: {trigger['level']})",
+                }, trigger["profile"])
+                db.close()
+                log.warning(f"Price monitor closed {trigger['symbol']} ({trigger['profile']}): {trigger['type']}")
+            except Exception as e:
+                log.error(f"Price monitor close error: {e}")
+
+        # For entry triggers, queue a PM decision for that profile
+        entry_triggers = result.get("entry_triggers", [])
+        if entry_triggers:
+            symbols = list(set(t["symbol"] for t in entry_triggers))
+            log.info(f"Price monitor: entry triggers on {symbols}, queuing PM decisions")
+            for profile_id in pm.ACTIVE_PROFILES:
+                try:
+                    pm_result = pm.run_profile(engine, WATCHLIST + symbols, profile_id)
+                    for d in pm_result.get("decisions", []):
+                        if d.get("executed"):
+                            log.info(f"  ⚡ [{profile_id}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
+                except Exception as e:
+                    log.error(f"Price monitor PM {profile_id} error: {e}")
+
+    except Exception as e:
+        log.error(f"Price monitor error: {e}", exc_info=True)
+
+
 def main():
     engine = get_engine()
     ensure_initial_balance(engine)
@@ -257,7 +319,19 @@ def main():
         id="pre_market",
     )
 
-    # Intraday morning: every 15 min, 9:30 AM – 12:00 PM ET
+    # Analyst refresh: every 15 min all day (free via local LLM)
+    scheduler.add_job(
+        run_analyst_refresh,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute=f"*/{LOOP_INTERVAL}",
+            timezone="America/New_York",
+        ),
+        id="analyst_refresh",
+    )
+
+    # Intraday morning (PM decisions): every 15 min, 9:30 AM – 12:00 PM ET
     scheduler.add_job(
         run_intraday,
         CronTrigger(
@@ -279,6 +353,14 @@ def main():
             timezone="America/New_York",
         ),
         id="intraday_afternoon",
+    )
+
+    # Price monitor: every 60 seconds during market hours (uses yfinance, free)
+    from apscheduler.triggers.interval import IntervalTrigger
+    scheduler.add_job(
+        run_price_monitor,
+        IntervalTrigger(seconds=60),
+        id="price_monitor",
     )
 
     # Post-market: 4:15 PM ET

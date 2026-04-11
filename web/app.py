@@ -24,11 +24,17 @@ engine = init_db("db/paper_trader.db")
 
 
 def get_quotes(symbols: list[str]) -> dict:
-    fh = FinnhubClient()
+    """Get current prices via yfinance (no rate limit, saves Finnhub quota for agents)."""
+    import yfinance as yf
     quotes = {}
     for sym in symbols:
         try:
-            quotes[sym] = fh.get_quote(sym)
+            t = yf.Ticker(sym)
+            info = t.fast_info
+            price = float(info.get("lastPrice", 0))
+            prev = float(info.get("previousClose", price))
+            change_pct = round((price - prev) / prev * 100, 2) if prev else 0
+            quotes[sym] = {"price": round(price, 2), "change_pct": change_pct}
         except Exception:
             quotes[sym] = {"price": 0, "change_pct": 0}
     return quotes
