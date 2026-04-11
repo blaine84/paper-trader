@@ -138,10 +138,11 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + "\n\nYou MUST respond with valid JSON only. No markdown, no explanation, no preamble."},
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
+        "format": "json",
     }
 
     try:
