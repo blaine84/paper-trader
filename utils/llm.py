@@ -44,15 +44,19 @@ def _with_retry(fn):
 def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier: str = "high") -> str:
     """
     Call the LLM.
-    tier="high" uses LLM_PROVIDER/LLM_MODEL (default).
-    tier="low"  uses LLM_LOW_PROVIDER/LLM_LOW_MODEL for cheap/local tasks.
+    tier="high"   — LLM_PROVIDER/LLM_MODEL (Sonnet for critical decisions)
+    tier="medium" — LLM_MED_PROVIDER/LLM_MED_MODEL (local 8b for heavy local work)
+    tier="low"    — LLM_LOW_PROVIDER/LLM_LOW_MODEL (fast local for simple tasks)
     """
-    if tier == "low":
+    if tier == "medium":
+        provider = os.getenv("LLM_MED_PROVIDER", os.getenv("LLM_LOW_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))).lower()
+        model = os.getenv("LLM_MED_MODEL", os.getenv("LLM_LOW_MODEL", None))
+    elif tier == "low":
         provider = os.getenv("LLM_LOW_PROVIDER", os.getenv("LLM_PROVIDER", "openai")).lower()
         model = os.getenv("LLM_LOW_MODEL", None)
     else:
         provider = os.getenv("LLM_PROVIDER", "openai").lower()
-        model = None  # each provider reads its own default
+        model = None
 
     if provider == "openai":
         return _call_openai(system_prompt, user_prompt, json_mode, model)

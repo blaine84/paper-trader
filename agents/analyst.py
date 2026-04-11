@@ -154,7 +154,7 @@ RELEVANT PAST CASES:
 
 Produce your trading signal JSON for {sym}.
 """
-        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low")
+        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
         signal = parse_json_response(raw)
         signals[sym] = signal
 
