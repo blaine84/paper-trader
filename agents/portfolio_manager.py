@@ -270,8 +270,8 @@ def execute_trade(db, decision: dict, profile_id: str):
     return True, "OK"
 
 
-def run_profile(engine, symbols: list[str], profile_id: str) -> dict:
-    """Run a single PM profile for one cycle."""
+def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high") -> dict:
+    """Run a single PM profile for one cycle. tier controls which LLM is used."""
     profile = PM_PROFILES[profile_id]
     fh = FinnhubClient()
     db = get_session(engine)
@@ -430,7 +430,7 @@ POSITION HEALTH (from health monitor):
 Make your trading decisions for this cycle.
 """
 
-    raw = call_llm(system_prompt, user_prompt, json_mode=True)
+    raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier)
     result = parse_json_response(raw)
 
     # Check daily loss limit before executing
