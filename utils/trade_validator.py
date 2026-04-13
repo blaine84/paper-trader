@@ -89,3 +89,30 @@ def validate_trade(decision: dict, profile_id: str, cash: float, total_equity: f
         raise TradeValidationError(f"{symbol}: invalid quantity ({quantity})")
 
     log.info(f"Trade validated: {direction} {quantity} {symbol} @ {price} | stop={stop} target={target} R:R={rr_ratio:.1f}")
+
+
+# Correlated pairs — don't hold the same direction simultaneously
+CORRELATED_PAIRS = {
+    frozenset({"SPY", "IWM"}),
+    frozenset({"SPY", "QQQ"}),
+    frozenset({"QQQ", "IWM"}),
+    frozenset({"SPY", "DIA"}),
+}
+
+
+def check_correlation(symbol: str, direction: str, profile_id: str, db) -> str:
+    """
+    Check if opening this position would create correlated exposure.
+    Returns warning message or empty string.
+    """
+    from db.schema import Position
+    positions = db.query(Position).filter_by(profile=profile_id).all()
+
+    for pos in positions:
+        if pos.side == direction.lower() or (direction == "LONG" and pos.side == "long") or \
+           (direction == "SHORT" and pos.side == "short"):
+            pair = frozenset({symbol, pos.symbol})
+            if pair in CORRELATED_PAIRS:
+                return (f"Correlated exposure: already {pos.side} {pos.symbol}, "
+                        f"adding {direction} {symbol} compounds regime risk")
+    return ""

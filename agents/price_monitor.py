@@ -66,10 +66,14 @@ def check_stops_and_targets(engine) -> list[dict]:
         ).first()
         side = pos.side if pos else "long"
 
-        # Stop loss check
+        # Stop loss check — require price to exceed stop by a small buffer (0.1%)
+        # to avoid false triggers from bid-ask spread noise
         if trade.stop_price:
-            hit = (side == "long" and price <= trade.stop_price) or \
-                  (side == "short" and price >= trade.stop_price)
+            buffer = trade.stop_price * 0.001  # 0.1% buffer
+            if side == "long":
+                hit = price <= (trade.stop_price - buffer)
+            else:
+                hit = price >= (trade.stop_price + buffer)
             if hit:
                 triggers.append({
                     "type": "stop_loss",

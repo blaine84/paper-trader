@@ -208,6 +208,14 @@ def execute_trade(db, decision: dict, profile_id: str):
             logging.getLogger(__name__).warning(f"Trade rejected: {e}")
             return False, str(e)
 
+        # Check correlated exposure
+        from utils.trade_validator import check_correlation
+        corr_warning = check_correlation(symbol, direction, profile_id, db)
+        if corr_warning:
+            import logging
+            logging.getLogger(__name__).warning(f"Trade rejected: {corr_warning}")
+            return False, corr_warning
+
     if action == "BUY":
         cost = quantity * price
         if cost > cash:
