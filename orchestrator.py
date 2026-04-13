@@ -479,8 +479,9 @@ def main():
 
             # Check for stale pending reviews (>24 hours)
             from db.schema import get_session, ReviewQueue
+            from datetime import timedelta as td24
             db = get_session(engine)
-            stale_cutoff = datetime.utcnow() - timedelta(hours=24)
+            stale_cutoff = datetime.utcnow() - td24(hours=24)
             stale = db.query(ReviewQueue).filter_by(status="pending").filter(
                 ReviewQueue.queued_at < stale_cutoff
             ).count()
