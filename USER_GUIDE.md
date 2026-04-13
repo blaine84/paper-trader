@@ -274,12 +274,25 @@ Reviewer
   │   Scout + Analyst
   │   "Are we finding and reading the right setups?"
   │
-  └── execution_score + execution_feedback (per profile)
+  ├── execution_score + execution_feedback (per profile)
+  │     ↓
+  │   Conservative PM  (gets its own history)
+  │   Moderate PM      (gets its own history)
+  │   Aggressive PM    (gets its own history)
+  │   "Are we entering, sizing, and exiting correctly?"
+  │
+  └── behavioral parameters (auto-extracted from feedback)
         ↓
-      Conservative PM  (gets its own history)
-      Moderate PM      (gets its own history)
-      Aggressive PM    (gets its own history)
-      "Are we entering, sizing, and exiting correctly?"
+      Prose feedback → LLM → executable parameters:
+        entry_offset_pct, size_multiplier, stop_buffer_pct,
+        avoid_setups, favor_setups, min_r_override, etc.
+      Applied automatically to every PM decision before execution.
+
+Confidence Adjustment (pre-trade)
+  ├── Query case library for setup_type + regime win rate
+  ├── Win rate < 35% (5+ cases) → BLOCK trade
+  ├── Win rate 35-50% → downgrade confidence modifier
+  └── Win rate ≥ 50% → no adjustment
 
 Meta Reviewer (weekly)
   ├── grades each agent A–F with trend
@@ -313,13 +326,30 @@ The full lifecycle of a trade from signal to exit:
 ```
 1. SIGNAL GENERATION
    Analyst detects setup → outputs signal (LONG/SHORT/HOLD)
-   with setup_type, key_levels, invalidation, strength, confidence
+   with setup_type, setup_reasoning, key_levels, invalidation, strength, confidence
 
-2. TRADE DECISION (PM)
+2. CONFIDENCE ADJUSTMENT (automatic, pre-trade)
+   Query case library for setup_type + market_regime win rate:
+   ├─ Win rate < 35% (5+ cases) → BLOCK trade entirely
+   ├─ Win rate 35-50% → downgrade confidence modifier (0.7-1.0)
+   └─ Win rate ≥ 50% or <5 cases → no adjustment
+
+3. TRADE DECISION (PM)
    PM reads: signal + portfolio state + feedback + news + position health
+           + behavioral parameters + meta-reviewer recommendations
    PM decides: action, entry price, stop, target, quantity, rationale
 
-3. TRADE VALIDATION (automatic)
+4. BEHAVIORAL ADJUSTMENT (automatic, post-decision)
+   Behavioral parameters (extracted from reviewer feedback) applied:
+   ├─ Entry offset (earlier/later entries)
+   ├─ Size multiplier (scale up/down)
+   ├─ Reduce size on low confidence
+   ├─ Block avoided setup types
+   ├─ Boost favored setup types
+   ├─ Stop buffer (widen/tighten)
+   └─ Min R:R override
+
+5. TRADE VALIDATION (automatic)
    Before any trade hits the database:
    ✓ Stop price is valid and on correct side of entry
    ✓ Target price is valid and on correct side of entry
@@ -329,18 +359,33 @@ The full lifecycle of a trade from signal to exit:
    ✓ Quantity is positive
    → If any check fails, trade is REJECTED with reason logged
 
-4. EXECUTION
+6. STOP DERIVATION (if LLM omits stop/target)
+   Priority: ATR-based (1.5× ATR) → key level (support/resistance) → 1.5% fallback
+
+7. EXECUTION
    Trade written to DB with stop_price and target_price persisted
    Position created, cash deducted
    Trade queued for review automatically
 
-5. MONITORING (continuous, every 60 seconds)
+8. PROFIT MANAGEMENT (every 60 seconds)
+   ├─ +1R: take partial profit (25-50% by profile), move stop to breakeven
+   ├─ +2R: take more profit (if profile allows), trail stop to +1R
+   ├─ +3R: trail stop to +2R
+   └─ Each action fires once per trade, tracked in memory
+
+   Partial profit rules by profile:
+   ├─ Conservative: 50% at +1R, 25% at +2R
+   ├─ Moderate: 33% at +1R, 25% at +2R
+   └─ Aggressive: 25% at +1R, let rest ride
+
+9. MONITORING (continuous, every 60 seconds)
    Price Monitor checks:
-   ├─ Stop hit? → close immediately (0.1% buffer to avoid noise)
-   ├─ Target hit? → close immediately
+   ├─ Stop hit? → close immediately (0.1% buffer, direction-validated)
+   ├─ Target hit? → close immediately (direction-validated)
    ├─ Key level breach? → filter through local LLM → trigger PM if actionable
    ├─ Rapid move (>1.5% in 5 min)? → filter → trigger PM
-   └─ Approaching key level (<0.3%)? → log for awareness
+   ├─ Approaching key level (<0.3%)? → log for awareness
+   └─ 15-min cooldown per symbol to prevent alert spam
 
    Position Timer checks (every 5 min):
    ├─ Setup-specific time limits (see below)
@@ -356,21 +401,22 @@ The full lifecycle of a trade from signal to exit:
    News Monitor (every 2 hours, local LLM):
    └─ Checks for breaking catalysts that could affect open positions
 
-6. EXIT
-   Trade closed → P&L calculated → cash returned
-   Trade auto-queued for review
+10. EXIT
+    Trade closed → P&L calculated → cash returned
+    Trade auto-queued for review
 
-7. REVIEW (every 15 min during market hours)
-   Reviewer pulls from queue → scores trade → creates case
-   Selection feedback → Scout + Analyst
-   Execution feedback → PM (per profile)
-   Stale review alert if pending >24 hours
+11. REVIEW (every 15 min during market hours)
+    Reviewer pulls from queue → scores trade → creates case
+    Selection feedback → Scout + Analyst
+    Execution feedback → PM (per profile)
+    Behavioral parameters extracted from feedback → applied next cycle
+    Stale review alert if pending >24 hours
 
-8. LEARNING (weekly)
-   Meta Reviewer grades all agents A–F
-   Quant Researcher proposes/retires dynamic strategies
-   Backtester validates strategy edge on historical data
-   All feedback written to agent_memory → agents read next cycle
+12. LEARNING (weekly)
+    Meta Reviewer grades all agents A–F
+    Quant Researcher proposes/retires dynamic strategies
+    Backtester validates strategy edge on historical data
+    All feedback written to agent_memory → agents read next cycle
 ```
 
 ### Position Time Limits
@@ -390,13 +436,43 @@ The full lifecycle of a trade from signal to exit:
 
 Every BUY/SHORT is validated before execution:
 1. Entry price must be a valid positive number
-2. Stop must be non-null (falls back to 2% default if LLM omits it)
+2. Stop must be non-null (fallback: ATR-based → key level → 1.5%)
 3. Target must be non-null
 4. Stop on correct side (LONG: below entry, SHORT: above entry)
 5. Target on correct side (LONG: above entry, SHORT: below entry)
 6. R:R ratio ≥ 1:1
 7. Position size ≤ profile max allocation %
 8. No correlated pair in same direction (SPY+IWM, SPY+QQQ, QQQ+IWM)
+9. Case library win rate ≥ 35% for this setup_type + regime (blocks if below)
+
+### Stop Derivation Priority
+
+When the LLM doesn't provide a stop price:
+1. **ATR-based** — 1.5× ATR from entry (adapts to current volatility)
+2. **Key level** — just below support (long) or above resistance (short) from analyst signal
+3. **Last resort** — 1.5% from entry (only if ATR and levels both unavailable)
+
+### Partial Profit Taking
+
+| R Multiple | Conservative | Moderate | Aggressive |
+|---|---|---|---|
+| +1R | Take 50%, stop → breakeven | Take 33%, stop → breakeven | Take 25%, stop → breakeven |
+| +2R | Take 25% more, trail to +1R | Take 25% more, trail to +1R | Trail to +1R |
+| +3R | Trail to +2R | Trail to +2R | Trail to +2R |
+
+### Behavioral Parameters
+
+The Reviewer automatically converts prose feedback into executable parameters:
+
+| Parameter | Effect |
+|---|---|
+| `entry_offset_pct` | Shift entry price (negative = enter earlier) |
+| `size_multiplier` | Scale position size (0.5 = half, 1.5 = 150%) |
+| `reduce_size_on_low_confidence` | Halve size when confidence is "low" |
+| `avoid_setups` | Setup types to skip entirely |
+| `favor_setups` | Setup types to boost size 20% |
+| `stop_buffer_pct` | Widen/tighten stops |
+| `min_r_override` | Require higher R:R than profile default |
 
 ### Momentum Fade Lifecycle
 
