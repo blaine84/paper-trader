@@ -251,6 +251,17 @@ Extract structured cases for each trade. Return the JSON.
     db.commit()
     db.close()
 
+    # Extract behavioral parameters from execution feedback
+    from utils.behavioral_params import extract_params_from_feedback
+    if isinstance(execution_fb, dict):
+        for profile_id, fb_text in execution_fb.items():
+            if fb_text:
+                try:
+                    extract_params_from_feedback(engine, profile_id, fb_text)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(f"Behavioral param extraction failed for {profile_id}: {e}")
+
     # Print EOD scorecard
     _print_scorecard(result)
 

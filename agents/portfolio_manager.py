@@ -467,6 +467,10 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     )
     health_text = health_mem.value if health_mem else "No health data"
 
+    # Get behavioral parameters (auto-extracted from reviewer feedback)
+    from utils.behavioral_params import get_behavioral_params
+    behav_params = get_behavioral_params(engine, profile_id)
+
     user_prompt = f"""
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
 Profile: {profile['name']} {profile['emoji']}
@@ -498,6 +502,9 @@ BREAKING NEWS (from news monitor):
 POSITION HEALTH (from health monitor):
 {health_text}
 
+BEHAVIORAL ADJUSTMENTS (auto-extracted from feedback — applied to your decisions):
+{json.dumps(behav_params, indent=2) if behav_params.get('notes') else 'No adjustments active'}
+
 Make your trading decisions for this cycle.
 """
 
@@ -511,9 +518,16 @@ Make your trading decisions for this cycle.
         db.close()
         return {"decisions": [], "portfolio_notes": notes, "profile": profile_id}
 
+    # Apply behavioral parameters to decisions
+    from utils.behavioral_params import apply_params_to_decision
+
     # Execute decisions
     executed = []
     for decision in result.get("decisions", []):
+        decision = apply_params_to_decision(decision, behav_params, profile)
+        if decision.get("action") == "PASS":
+            executed.append({**decision, "executed": False, "message": "Blocked by behavioral params", "profile": profile_id})
+            continue
         ok, msg = execute_trade(db, decision, profile_id)
         executed.append({**decision, "executed": ok, "message": msg, "profile": profile_id})
 
