@@ -86,8 +86,6 @@ def check_stops_and_targets(engine) -> list[dict]:
 
     db.close()
     return triggers
-
-
 def check_entry_triggers(engine) -> list[dict]:
     """Check analyst signals for key level breaches that could trigger entries."""
     db = get_session(engine)
@@ -170,6 +168,95 @@ def check_entry_triggers(engine) -> list[dict]:
     return triggers
 
 
+# ─── MOMENTUM / CHANGE DETECTION ─────────────────────────────────────────────
+
+# In-memory price history for change detection
+_price_history = {}  # {symbol: [(timestamp, price), ...]}
+ALERT_THRESHOLDS = {
+    "rapid_move_pct": 1.5,       # alert if price moves >1.5% in 5 min
+    "approach_level_pct": 0.3,   # alert if price is within 0.3% of a key level
+    "history_window": 5,         # minutes of history to keep
+}
+
+
+def check_momentum(engine) -> list[dict]:
+    """Detect rapid price changes and level approaches."""
+    db = get_session(engine)
+    alerts = []
+    now = datetime.utcnow()
+
+    # Get all symbols we care about (positions + watchlist signals)
+    import os
+    watchlist = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD").split(",")]
+
+    # Add symbols from open positions
+    positions = db.query(Position).all()
+    pos_symbols = [p.symbol for p in positions]
+    all_symbols = list(set(watchlist + pos_symbols))
+
+    quotes = get_batch_quotes(all_symbols)
+
+    for sym, price in quotes.items():
+        if not price:
+            continue
+
+        # Update history
+        if sym not in _price_history:
+            _price_history[sym] = []
+        _price_history[sym].append((now, price))
+
+        # Trim to window
+        cutoff = now - __import__('datetime').timedelta(minutes=ALERT_THRESHOLDS["history_window"])
+        _price_history[sym] = [(t, p) for t, p in _price_history[sym] if t >= cutoff]
+
+        # Check rapid move
+        if len(_price_history[sym]) >= 2:
+            oldest_price = _price_history[sym][0][1]
+            change_pct = abs((price - oldest_price) / oldest_price) * 100
+            if change_pct >= ALERT_THRESHOLDS["rapid_move_pct"]:
+                direction = "up" if price > oldest_price else "down"
+                alerts.append({
+                    "type": "rapid_move",
+                    "symbol": sym,
+                    "price": price,
+                    "change_pct": round(change_pct, 2),
+                    "direction": direction,
+                    "window_minutes": ALERT_THRESHOLDS["history_window"],
+                })
+
+        # Check approaching key levels from analyst signals
+        sig_mem = (
+            db.query(AgentMemory)
+            .filter_by(agent="analyst", symbol=sym, key="signal")
+            .order_by(AgentMemory.timestamp.desc())
+            .first()
+        )
+        if sig_mem:
+            try:
+                sig = json.loads(sig_mem.value)
+                levels = sig.get("key_levels", {})
+                for level_name, level_val in levels.items():
+                    try:
+                        lv = float(level_val)
+                        dist_pct = abs((price - lv) / lv) * 100
+                        if dist_pct <= ALERT_THRESHOLDS["approach_level_pct"]:
+                            alerts.append({
+                                "type": "approaching_level",
+                                "symbol": sym,
+                                "price": price,
+                                "level_name": level_name,
+                                "level_value": lv,
+                                "distance_pct": round(dist_pct, 2),
+                            })
+                    except (ValueError, TypeError):
+                        pass
+            except Exception:
+                pass
+
+    db.close()
+    return alerts
+
+
 def run(engine) -> dict:
     """
     Full price monitor check. Returns all triggers found.
@@ -177,6 +264,7 @@ def run(engine) -> dict:
     """
     stop_triggers = check_stops_and_targets(engine)
     entry_triggers = check_entry_triggers(engine)
+    momentum_alerts = check_momentum(engine)
 
     for t in stop_triggers:
         log.warning(f"⚡ {t['type'].upper()}: {t['symbol']} ({t['profile']}) "
@@ -186,8 +274,15 @@ def run(engine) -> dict:
         log.info(f"⚡ {t['type'].upper()}: {t['symbol']} {t['signal']} "
                   f"price={t['price']} broke {t['level_name']}={t['level']}")
 
+    for a in momentum_alerts:
+        if a["type"] == "rapid_move":
+            log.warning(f"📊 RAPID MOVE: {a['symbol']} {a['direction']} {a['change_pct']}% in {a['window_minutes']}min (${a['price']})")
+        elif a["type"] == "approaching_level":
+            log.info(f"📊 APPROACHING: {a['symbol']} ${a['price']} within {a['distance_pct']}% of {a['level_name']}={a['level_value']}")
+
     return {
         "stop_triggers": stop_triggers,
         "entry_triggers": entry_triggers,
+        "momentum_alerts": momentum_alerts,
         "checked_at": datetime.utcnow().isoformat(),
     }

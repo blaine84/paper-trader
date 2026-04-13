@@ -297,14 +297,18 @@ def run_price_monitor():
             except Exception as e:
                 log.error(f"Price monitor close error: {e}")
 
-        # For entry triggers, queue a PM decision for that profile
+        # For entry triggers or rapid moves, queue PM decisions
         entry_triggers = result.get("entry_triggers", [])
-        if entry_triggers:
-            symbols = list(set(t["symbol"] for t in entry_triggers))
-            log.info(f"Price monitor: entry triggers on {symbols}, queuing PM decisions")
+        momentum_alerts = [a for a in result.get("momentum_alerts", []) if a["type"] == "rapid_move"]
+        action_symbols = list(set(
+            [t["symbol"] for t in entry_triggers] +
+            [a["symbol"] for a in momentum_alerts]
+        ))
+        if action_symbols:
+            log.info(f"Price monitor: action triggers on {action_symbols}, queuing PM decisions")
             for profile_id in pm.ACTIVE_PROFILES:
                 try:
-                    pm_result = pm.run_profile(engine, WATCHLIST + symbols, profile_id)
+                    pm_result = pm.run_profile(engine, WATCHLIST + action_symbols, profile_id)
                     for d in pm_result.get("decisions", []):
                         if d.get("executed"):
                             log.info(f"  ⚡ [{profile_id}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
