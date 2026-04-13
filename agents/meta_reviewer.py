@@ -102,19 +102,13 @@ def _gather_weekly_data(engine) -> dict:
     trade_data = []
     for t in trades:
         trade_data.append({
-            "id": t.id,
             "symbol": t.symbol,
             "profile": t.profile,
             "direction": t.direction,
-            "entry_price": t.entry_price,
-            "exit_price": t.exit_price,
             "pnl": t.pnl,
             "pnl_pct": t.pnl_pct,
             "review_score": t.review_score,
             "stop_price": t.stop_price,
-            "target_price": t.target_price,
-            "reason_entry": t.reason_entry,
-            "reason_exit": t.reason_exit,
         })
 
     # Cases this week
@@ -134,7 +128,6 @@ def _gather_weekly_data(engine) -> dict:
             "selection_score": c.selection_score,
             "execution_score": c.execution_score,
             "profile": c.profile,
-            "lesson": c.lesson,
         })
 
     # Win rates by setup
@@ -195,7 +188,13 @@ def _gather_weekly_data(engine) -> dict:
     prev_review_data = None
     if prev_review:
         try:
-            prev_review_data = json.loads(prev_review.value)
+            full = json.loads(prev_review.value)
+            prev_review_data = {
+                "week": full.get("week"),
+                "key_metrics": full.get("key_metrics"),
+                "agent_grades": {k: {"grade": v.get("grade"), "trend": v.get("trend")}
+                                 for k, v in full.get("agent_reviews", {}).items()},
+            }
         except Exception:
             pass
 

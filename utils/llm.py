@@ -94,14 +94,14 @@ def _call_anthropic(system_prompt: str, user_prompt: str, model: str = None) -> 
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     model = model or os.getenv("LLM_MODEL", "claude-3-5-haiku-latest")
 
-    for max_tokens in [4096, 8192]:
+    for max_tokens in [4096, 8192, 16384]:
         response = _with_retry(lambda: client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         ))
-        if response.stop_reason == "max_tokens":
+        if response.stop_reason == "max_tokens" and max_tokens < 16384:
             log.warning(f"Anthropic response truncated at {max_tokens} tokens, retrying with {max_tokens * 2}")
             continue
         return response.content[0].text
