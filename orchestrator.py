@@ -319,14 +319,18 @@ def run_price_monitor():
             action_symbols = list(set(actionable_symbols))
             if action_symbols:
                 log.info(f"Price monitor: triggering PM (local LLM) for {action_symbols}")
-            for profile_id in pm.ACTIVE_PROFILES:
-                try:
-                    pm_result = pm.run_profile(engine, WATCHLIST + action_symbols, profile_id, tier="medium")
-                    for d in pm_result.get("decisions", []):
-                        if d.get("executed"):
-                            log.info(f"  ⚡ [{profile_id}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
-                except Exception as e:
-                    log.error(f"Price monitor PM {profile_id} error: {e}")
+                import threading
+                def _run_pm_async(syms):
+                    eng = get_engine()
+                    for pid in pm.ACTIVE_PROFILES:
+                        try:
+                            pm_result = pm.run_profile(eng, WATCHLIST + syms, pid, tier="medium")
+                            for d in pm_result.get("decisions", []):
+                                if d.get("executed"):
+                                    log.info(f"  ⚡ [{pid}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
+                        except Exception as e:
+                            log.error(f"Price monitor PM {pid} error: {e}")
+                threading.Thread(target=_run_pm_async, args=(action_symbols,), daemon=True).start()
 
     except Exception as e:
         log.error(f"Price monitor error: {e}", exc_info=True)
