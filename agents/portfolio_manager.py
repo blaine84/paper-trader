@@ -155,6 +155,34 @@ def execute_trade(db, decision: dict, profile_id: str):
     if not price:
         return False, "No price in decision"
 
+    # Extract stop/target from multiple possible keys the LLM might use
+    stop = decision.get("stop") or decision.get("stop_price") or decision.get("stop_loss")
+    target = decision.get("target") or decision.get("target_price") or decision.get("profit_target")
+
+    # If stop/target are in rationale text but not fields, try to parse them out
+    if not stop or not target:
+        rationale = decision.get("rationale", "")
+        import re
+        if not stop:
+            m = re.search(r'stop[:\s]*\$?([\d.]+)', rationale, re.IGNORECASE)
+            if m:
+                try: stop = float(m.group(1))
+                except: pass
+        if not target:
+            m = re.search(r'target[:\s]*\$?([\d.]+)', rationale, re.IGNORECASE)
+            if m:
+                try: target = float(m.group(1))
+                except: pass
+
+    # If still no stop, calculate a default (2% from entry)
+    if not stop and price:
+        if action == "BUY":
+            stop = round(price * 0.98, 2)
+        elif action == "SHORT":
+            stop = round(price * 1.02, 2)
+        import logging
+        logging.getLogger(__name__).warning(f"No stop provided for {symbol}, using default 2%: {stop}")
+
     starting = PM_PROFILES[profile_id]["starting_balance"]
     bal = (
         db.query(Balance)
@@ -186,8 +214,8 @@ def execute_trade(db, decision: dict, profile_id: str):
         db.add(Trade(
             symbol=symbol, direction="LONG", quantity=quantity,
             entry_price=price, reason_entry=decision.get("rationale"),
-            stop_price=decision.get("stop"),
-            target_price=decision.get("target"),
+            stop_price=stop,
+            target_price=target,
             profile=profile_id,
         ))
         db.add(Balance(cash=cash - cost, profile=profile_id))
@@ -215,8 +243,8 @@ def execute_trade(db, decision: dict, profile_id: str):
         db.add(Trade(
             symbol=symbol, direction="SHORT", quantity=quantity,
             entry_price=price, reason_entry=decision.get("rationale"),
-            stop_price=decision.get("stop"),
-            target_price=decision.get("target"),
+            stop_price=stop,
+            target_price=target,
             profile=profile_id,
         ))
         # Deduct margin from cash (returned + P&L on close)
