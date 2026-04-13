@@ -192,6 +192,22 @@ def execute_trade(db, decision: dict, profile_id: str):
     )
     cash = bal.cash if bal else float(starting)
 
+    # Validate trade before execution
+    if action in ("BUY", "SHORT"):
+        from utils.trade_validator import validate_trade, TradeValidationError
+        direction = "LONG" if action == "BUY" else "SHORT"
+        # Build a normalized decision for validation
+        validated = {**decision, "price": price, "stop": stop, "target": target, "quantity": quantity}
+        positions = db.query(Position).filter_by(profile=profile_id).all()
+        pos_value = sum(p.quantity * p.avg_cost for p in positions)
+        total_equity = cash + pos_value
+        try:
+            validate_trade(validated, profile_id, cash, total_equity, direction)
+        except TradeValidationError as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Trade rejected: {e}")
+            return False, str(e)
+
     if action == "BUY":
         cost = quantity * price
         if cost > cash:
