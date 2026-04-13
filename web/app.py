@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 from db.schema import init_db, get_session, Position, Balance, Trade, AgentMemory, DailyLog
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.finnhub_client import FinnhubClient
@@ -624,6 +624,49 @@ def api_company(symbol):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/api/journal")
+def api_journal():
+    """Returns Daily_Review entries from agent_memory, paginated."""
+    try:
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 10))
+    except (ValueError, TypeError):
+        page = 1
+        per_page = 10
+
+    if page < 1:
+        page = 1
+    if per_page < 1:
+        per_page = 10
+
+    offset = (page - 1) * per_page
+
+    db = get_session(engine)
+    try:
+        entries = (
+            db.query(AgentMemory)
+            .filter_by(agent="daily_review", key="daily_review")
+            .order_by(AgentMemory.symbol.desc())
+            .offset(offset)
+            .limit(per_page)
+            .all()
+        )
+
+        result = []
+        for entry in entries:
+            try:
+                review = json.loads(entry.value)
+                review["date"] = entry.symbol
+                result.append(review)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return jsonify(result)
+    except Exception:
+        return jsonify([])
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

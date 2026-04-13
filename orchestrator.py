@@ -25,6 +25,7 @@ import agents.reviewer as reviewer
 import agents.scout as scout
 import agents.weekly_prep as weekly_prep
 import agents.quant_researcher as quant_researcher
+import agents.daily_review as daily_review
 
 console = Console()
 logging.basicConfig(
@@ -236,6 +237,18 @@ def run_post_market():
         bookkeeper.print_dashboard(engine)
     except Exception as e:
         log.error(f"EOD bookkeeper error: {e}", exc_info=True)
+
+
+def run_daily_review():
+    """4:30 PM ET — Daily review journal generation."""
+    log.info("=== DAILY REVIEW ===")
+    engine = get_engine()
+    try:
+        console.print("[bold cyan]📓 Daily Review generating journal...[/bold cyan]")
+        result = daily_review.run(engine)
+        log.info(f"Daily Review: {result.get('date', 'unknown')} — confidence: {result.get('completeness', {}).get('confidence', 'unknown')}")
+    except Exception as e:
+        log.error(f"Daily Review error: {e}", exc_info=True)
 
 
 def run_once():
@@ -506,6 +519,13 @@ def main():
         id="post_market",
     )
 
+    # Daily Review: 4:30 PM ET (after Reviewer + Bookkeeper at 4:15)
+    scheduler.add_job(
+        run_daily_review,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone="America/New_York"),
+        id="daily_review",
+    )
+
     # Sunday weekly prep: 5:00 PM ET
     scheduler.add_job(
         run_weekly_prep,
@@ -516,7 +536,7 @@ def main():
     console.print(f"[bold green]🚀 Paper Trader started[/bold green]")
     console.print(f"   Watchlist: {', '.join(WATCHLIST)}")
     console.print(f"   Loop interval: {LOOP_INTERVAL} min")
-    console.print(f"   Schedule: Sun 5PM weekly prep | 8:30 pre-market | 9:30-12 every {LOOP_INTERVAL}min | 12-4 every 30min | 4:15 EOD")
+    console.print(f"   Schedule: Sun 5PM weekly prep | 8:30 pre-market | 9:30-12 every {LOOP_INTERVAL}min | 12-4 every 30min | 4:15 EOD | 4:30 daily review")
 
     def _shutdown(signum, frame):
         console.print("\n[yellow]Shutting down...[/yellow]")

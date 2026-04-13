@@ -1,0 +1,4 @@
+# file: C:\Users\blain\.openclaw\workspace\paper-trader\utils\case_library.py
+# hypothesis_version: 6.151.13
+
+[100, ' | ', 'above_vwap', 'avg_pnl_pct', 'avg_score', 'bias', 'catalyst_type', 'conditions_to_avoid', 'confidence', 'date', 'ema_trend', 'entry_timing', 'execution_score', 'float_profile', 'holding_minutes', 'id', 'lesson', 'market_regime', 'outcome', 'pnl_pct', 'premarket_gap_pct', 'profile', 'review_score', 'rsi_at_entry', 'sector', 'selection_score', 'setup_type', 'signal_strength', 'success', 'symbol', 'total', 'win_rate', 'wins']

@@ -118,6 +118,7 @@
       <div class="tab" onclick="switchTab('decisions')">Decision Log</div>
       <div class="tab" onclick="switchTab('meta')">System Review</div>
       <div class="tab" onclick="switchTab('daily')">Daily P&L</div>
+      <div class="tab" onclick="switchTab('journal')">📓 Journal</div>
     </div>
 
     <!-- Watchlist -->
@@ -219,6 +220,14 @@
         <tbody id="dailyBody"></tbody>
       </table>
     </div>
+
+    <!-- Journal -->
+    <div id="tab-journal" class="tab-content">
+      <div id="journalContent"><div class="empty-state">Loading journal...</div></div>
+      <div id="journalLoadMore" style="display:none; text-align:center; padding:14px;">
+        <button onclick="loadJournalMore()" style="background:#21262d; color:#58a6ff; border:1px solid #30363d; border-radius:6px; padding:8px 20px; cursor:pointer; font-size:13px; font-weight:600;">Load More</button>
+      </div>
+    </div>
   </div>
 
 </main>
@@ -235,7 +244,7 @@
     activeTab = name;
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    const tabs = ['watchlist','analysis','positions','trades','performance','feedback','decisions','meta','daily'];
+    const tabs = ['watchlist','analysis','positions','trades','performance','feedback','decisions','meta','daily','journal'];
     document.querySelectorAll('.tab')[tabs.indexOf(name)]?.classList.add('active');
     document.getElementById('tab-' + name)?.classList.add('active');
     if (name === 'trades') loadTrades();
@@ -245,6 +254,7 @@
     if (name === 'decisions') loadDecisions();
     if (name === 'meta') loadMeta();
     if (name === 'positions') loadPositions();
+    if (name === 'journal') loadJournal();
   }
 
   const pnlColor = v => v > 0 ? 'green' : v < 0 ? 'red' : 'dim';
@@ -543,6 +553,122 @@
         <td class="right red">${l.losses || 0}</td>
       </tr>`;
     }).join('');
+  }
+
+  let journalPage = 0;
+  const journalPerPage = 10;
+  let journalHasMore = false;
+
+  async function loadJournal() {
+    journalPage = 1;
+    try {
+      const res = await fetch(`/api/journal?page=1&per_page=${journalPerPage}`);
+      const data = await res.json();
+      const entries = data.entries || data;
+      renderJournal(entries, false);
+      journalHasMore = entries.length >= journalPerPage;
+      document.getElementById('journalLoadMore').style.display = journalHasMore ? 'block' : 'none';
+    } catch(e) {
+      document.getElementById('journalContent').innerHTML = '<div class="empty-state">Failed to load journal entries.</div>';
+      document.getElementById('journalLoadMore').style.display = 'none';
+    }
+  }
+
+  async function loadJournalMore() {
+    journalPage++;
+    try {
+      const res = await fetch(`/api/journal?page=${journalPage}&per_page=${journalPerPage}`);
+      const data = await res.json();
+      const entries = data.entries || data;
+      renderJournal(entries, true);
+      journalHasMore = entries.length >= journalPerPage;
+      document.getElementById('journalLoadMore').style.display = journalHasMore ? 'block' : 'none';
+    } catch(e) {}
+  }
+
+  function renderJournal(entries, append) {
+    const el = document.getElementById('journalContent');
+    if (!entries.length && !append) {
+      el.innerHTML = '<div class="empty-state">No journal entries yet — the Daily Review agent runs after market close on weekdays.</div>';
+      return;
+    }
+    const html = entries.map(entry => {
+      const date = entry.date || '—';
+      const id = 'journal-' + date.replace(/[^a-zA-Z0-9]/g, '');
+      const sections = [];
+
+      if (entry.market_summary) {
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#58a6ff">Market Summary</strong><br><span class="dim">${escHtml(entry.market_summary)}</span></div>`);
+      }
+      const tradePerfText = entry.trade_narrative || entry.trade_performance;
+      if (tradePerfText && typeof tradePerfText === 'string') {
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#3fb950">Trade Performance</strong><br><span class="dim">${escHtml(tradePerfText)}</span></div>`);
+      }
+      const gitText = entry.git_narrative || entry.git_changes;
+      if (gitText && typeof gitText === 'string') {
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#d29922">Git Changes</strong><br><span class="dim">${escHtml(gitText)}</span></div>`);
+      }
+      if (entry.correlations) {
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#bc8cff">Correlations</strong><br><span class="dim">${escHtml(entry.correlations)}</span></div>`);
+      }
+      if (entry.lessons_learned && entry.lessons_learned.length) {
+        const lessons = entry.lessons_learned.map(l => {
+          if (typeof l === 'string') return `<li>${escHtml(l)}</li>`;
+          return `<li><strong>${escHtml(l.category || '')}</strong>: ${escHtml(l.lesson || '')}${l.evidence ? `<br><span class="dim" style="font-size:11px">Evidence: ${escHtml(l.evidence)}</span>` : ''}${l.action ? `<br><span class="cyan" style="font-size:11px">Action: ${escHtml(l.action)}</span>` : ''}</li>`;
+        }).join('');
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#f0883e">Lessons Learned</strong><ul class="catalyst-list" style="margin-top:4px">${lessons}</ul></div>`);
+      }
+      if (entry.process_quality) {
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#3fb950">Process Quality</strong><br><span class="dim">${escHtml(entry.process_quality)}</span></div>`);
+      }
+      if (entry.outlook) {
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#58a6ff">Outlook</strong><br><span class="dim">${escHtml(entry.outlook)}</span></div>`);
+      }
+      if (entry.watchouts && entry.watchouts.length) {
+        const items = entry.watchouts.map(w => `<li style="color:#f85149">${escHtml(w)}</li>`).join('');
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#f85149">Watchouts</strong><ul class="catalyst-list" style="margin-top:4px">${items}</ul></div>`);
+      }
+      if (entry.completeness) {
+        const c = entry.completeness;
+        const confColor = {high:'green',medium:'yellow',low:'red'}[c.confidence] || 'dim';
+        const flags = ['trade_data','git_data','researcher_context','reviewer_feedback','analyst_signals','previous_review']
+          .filter(k => c[k] !== undefined)
+          .map(k => `<span class="level-tag">${k.replace(/_/g,' ')}: ${c[k] ? '✓' : '✗'}</span>`).join(' ');
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#8b949e">Completeness</strong> <span class="${confColor}" style="font-size:12px;font-weight:600">${c.confidence || '—'}</span><br><div class="levels" style="margin-top:4px">${flags}</div></div>`);
+      }
+
+      if (!sections.length) {
+        sections.push('<div class="dim">No narrative sections available for this entry.</div>');
+      }
+
+      return `<div class="feedback-box" style="cursor:pointer" onclick="toggleJournalEntry('${id}')">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <strong style="font-size:14px">📓 ${date}</strong>
+          <span class="expand-btn" id="${id}-btn">▼</span>
+        </div>
+        <div id="${id}" style="display:none;margin-top:10px">${sections.join('')}</div>
+      </div>`;
+    }).join('');
+
+    if (append) {
+      el.insertAdjacentHTML('beforeend', html);
+    } else {
+      el.innerHTML = html;
+    }
+  }
+
+  function toggleJournalEntry(id) {
+    const content = document.getElementById(id);
+    const btn = document.getElementById(id + '-btn');
+    if (!content) return;
+    const visible = content.style.display !== 'none';
+    content.style.display = visible ? 'none' : 'block';
+    if (btn) btn.textContent = visible ? '▼' : '▲';
+  }
+
+  function escHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
   async function loadMeta() {
