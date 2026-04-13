@@ -306,6 +306,115 @@ This prevents bad signal reads from corrupting PM feedback and vice versa.
 
 ---
 
+## Decision Logic Flow
+
+The full lifecycle of a trade from signal to exit:
+
+```
+1. SIGNAL GENERATION
+   Analyst detects setup → outputs signal (LONG/SHORT/HOLD)
+   with setup_type, key_levels, invalidation, strength, confidence
+
+2. TRADE DECISION (PM)
+   PM reads: signal + portfolio state + feedback + news + position health
+   PM decides: action, entry price, stop, target, quantity, rationale
+
+3. TRADE VALIDATION (automatic)
+   Before any trade hits the database:
+   ✓ Stop price is valid and on correct side of entry
+   ✓ Target price is valid and on correct side of entry
+   ✓ R:R ratio ≥ 1:1
+   ✓ Position size within profile max allocation
+   ✓ No correlated pair exposure (SPY+IWM, SPY+QQQ, QQQ+IWM)
+   ✓ Quantity is positive
+   → If any check fails, trade is REJECTED with reason logged
+
+4. EXECUTION
+   Trade written to DB with stop_price and target_price persisted
+   Position created, cash deducted
+   Trade queued for review automatically
+
+5. MONITORING (continuous, every 60 seconds)
+   Price Monitor checks:
+   ├─ Stop hit? → close immediately (0.1% buffer to avoid noise)
+   ├─ Target hit? → close immediately
+   ├─ Key level breach? → filter through local LLM → trigger PM if actionable
+   ├─ Rapid move (>1.5% in 5 min)? → filter → trigger PM
+   └─ Approaching key level (<0.3%)? → log for awareness
+
+   Position Timer checks (every 5 min):
+   ├─ Setup-specific time limits (see below)
+   ├─ Stale trade detection (momentum_fade: <0.5R after 35 min)
+   ├─ Thesis revalidation at 60 min (LLM checks VWAP, volume, structure)
+   ├─ Force close at setup max time
+   └─ Hard wall: ALL intraday positions closed at 3:45 PM ET
+
+   Position Health (every hour, local LLM):
+   └─ Reviews all positions against current indicators
+       Flags deteriorating positions even if stops haven't hit
+
+   News Monitor (every 2 hours, local LLM):
+   └─ Checks for breaking catalysts that could affect open positions
+
+6. EXIT
+   Trade closed → P&L calculated → cash returned
+   Trade auto-queued for review
+
+7. REVIEW (every 15 min during market hours)
+   Reviewer pulls from queue → scores trade → creates case
+   Selection feedback → Scout + Analyst
+   Execution feedback → PM (per profile)
+   Stale review alert if pending >24 hours
+
+8. LEARNING (weekly)
+   Meta Reviewer grades all agents A–F
+   Quant Researcher proposes/retires dynamic strategies
+   Backtester validates strategy edge on historical data
+   All feedback written to agent_memory → agents read next cycle
+```
+
+### Position Time Limits
+
+| Setup Type | Stale | Alert | Revalidate | Force Close |
+|---|---|---|---|---|
+| momentum_fade | 35 min (<0.5R) | 45 min | 60 min (LLM) | 75 min |
+| gap_and_go | — | 60 min | — | 90 min |
+| vwap_reclaim | — | 60 min | — | 90 min |
+| orb | — | 45 min | — | 75 min |
+| trend_pullback | — | 90 min | — | 120 min |
+| news_catalyst | — | 60 min | — | 90 min |
+| short_squeeze | — | 30 min | — | 60 min |
+| **All intraday** | — | — | — | **3:45 PM ET hard wall** |
+
+### Trade Validation Rules
+
+Every BUY/SHORT is validated before execution:
+1. Entry price must be a valid positive number
+2. Stop must be non-null (falls back to 2% default if LLM omits it)
+3. Target must be non-null
+4. Stop on correct side (LONG: below entry, SHORT: above entry)
+5. Target on correct side (LONG: above entry, SHORT: below entry)
+6. R:R ratio ≥ 1:1
+7. Position size ≤ profile max allocation %
+8. No correlated pair in same direction (SPY+IWM, SPY+QQQ, QQQ+IWM)
+
+### Momentum Fade Lifecycle
+
+```
+0 min   → Trade opened
+35 min  → If <0.5R achieved → mark STALE
+45 min  → If still stale → ALERT PM
+60 min  → REVALIDATE thesis via LLM:
+           - Still below VWAP?
+           - Volume fading?
+           - Lower highs/lower lows intact?
+           → If invalid → EXIT IMMEDIATELY
+75 min  → FORCE EXIT regardless
+3:45 PM → HARD WALL close
+```
+
+---
+
 ## Daily Schedule
 
 All times Eastern (ET), Monday–Friday.
@@ -314,11 +423,15 @@ All times Eastern (ET), Monday–Friday.
 |---|---|
 | **Sunday 5:00 PM** | Weekly prep + Meta Reviewer (grades agents, suggests improvements) |
 | 8:30 AM | Scout → Researcher → Quant Researcher → Analyst |
-| 9:30 AM | Market opens, price monitor starts (every 60s) |
+| 9:30 AM | Market opens, price monitor starts (every 60s), position timer starts (every 5 min) |
 | 9:30–12:00 | PM decisions every 15 min, Analyst refresh every 15 min |
+| 10:00, 12:00, 2:00 | News monitor checks for breaking catalysts |
+| 10:30–3:30 | Position health check every hour |
+| 10:00–4:00 | Reviewer queue processes pending reviews every 15 min |
 | 12:00–4:00 | PM decisions every 30 min, Analyst refresh every 15 min |
+| 3:45 PM | Hard wall: all intraday positions force-closed |
 | 4:00 PM | Market closes, price monitor stops |
-| 4:15 PM | Reviewer scores trades (batches of 3), Bookkeeper saves daily log |
+| 4:15 PM | Reviewer scores remaining trades, Bookkeeper saves daily log |
 
 ---
 
@@ -546,6 +659,7 @@ SQLite at `db/paper_trader.db`. Back it up periodically.
 | `daily_log` | End-of-day summaries |
 | `cases` | The case library — structured trade lessons |
 | `dynamic_strategies` | Agent-proposed strategies with win rate tracking |
+| `review_queue` | Trades pending review (auto-queued on close) |
 
 ### Quick backup
 ```bash
