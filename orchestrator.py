@@ -371,6 +371,20 @@ def run_position_health():
         log.error(f"Position health error: {e}", exc_info=True)
 
 
+def run_position_timer():
+    """Every 5 minutes — check position hold times and enforce exits."""
+    engine = get_engine()
+    try:
+        import agents.position_timer as position_timer
+        result = position_timer.run(engine)
+        if result.get("force_closes"):
+            log.warning(f"Position timer: {len(result['force_closes'])} force closes")
+        if result.get("hard_wall_closes"):
+            log.warning(f"Position timer: {len(result['hard_wall_closes'])} hard wall closes")
+    except Exception as e:
+        log.error(f"Position timer error: {e}", exc_info=True)
+
+
 def main():
     engine = get_engine()
     ensure_initial_balance(engine)
@@ -443,6 +457,15 @@ def main():
         run_position_health,
         CronTrigger(day_of_week="mon-fri", hour="10-15", minute=30, timezone="America/New_York"),
         id="position_health",
+    )
+
+    # Position timer: every 5 minutes during market hours (no LLM, pure math)
+    scheduler.add_job(
+        run_position_timer,
+        CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone="America/New_York"),
+        id="position_timer",
+        max_instances=1,
+        coalesce=True,
     )
 
     # Post-market: 4:15 PM ET
