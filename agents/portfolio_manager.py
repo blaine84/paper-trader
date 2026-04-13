@@ -262,7 +262,6 @@ def execute_trade(db, decision: dict, profile_id: str):
 
         # Try 1: ATR-based stop (1.5x ATR from entry)
         try:
-            from utils.finnhub_client import FinnhubClient
             from utils.technicals import compute_indicators
             fh = FinnhubClient()
             candles = fh.get_candles(symbol, resolution="5", days=2)
