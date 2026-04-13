@@ -61,10 +61,8 @@ def check_stops_and_targets(engine) -> list[dict]:
         if not price:
             continue
 
-        pos = db.query(Position).filter_by(
-            symbol=trade.symbol, profile=trade.profile
-        ).first()
-        side = pos.side if pos else "long"
+        # Determine side from the trade's direction field
+        side = "short" if trade.direction == "SHORT" else "long"
 
         # Stop loss check — require price to exceed stop by a small buffer (0.1%)
         # to avoid false triggers from bid-ask spread noise
