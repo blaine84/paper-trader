@@ -825,6 +825,71 @@ _EMPTY_NARRATIVE = {
 }
 
 
+def _build_llm_prompt(summary: dict) -> str:
+    """
+    Build a condensed prompt from the deterministic summary.
+
+    Strips verbose data (full commit file lists, raw analyst signal dicts)
+    and keeps only what the LLM needs to write the narrative. This reduces
+    token count significantly for local models.
+    """
+    prompt = {"date": summary.get("date")}
+
+    # Trade performance — pass through as-is, it's already compact
+    tp = summary.get("trade_performance", {})
+    prompt["trade_performance"] = {
+        k: tp[k] for k in [
+            "total_trades", "wins", "losses", "total_pnl", "total_pnl_pct",
+            "realized_pnl", "unrealized_pnl", "net_daily_change",
+            "per_profile", "best_trade", "worst_trade", "setup_breakdown",
+            "no_trades",
+        ] if k in tp
+    }
+
+    # Git changes — summarize commits to one line each, drop file lists
+    gc = summary.get("git_changes", {})
+    condensed_commits = []
+    for c in (gc.get("commits") or [])[:15]:  # cap at 15 most recent
+        condensed_commits.append(
+            f"{c.get('category', 'other')}: {c.get('message', '')} ({', '.join((c.get('files') or [])[:3])})"
+        )
+    prompt["git_changes"] = {
+        "total_commits": gc.get("total_commits", 0),
+        "categories": gc.get("categories", {}),
+        "no_commits": gc.get("no_commits", True),
+        "commit_summaries": condensed_commits,
+    }
+
+    # Agent context — keep market context and feedback as strings, summarize signals
+    ctx = summary.get("agent_context", {})
+    prompt["agent_context"] = {
+        "market_context": ctx.get("market_context"),
+        "selection_feedback": ctx.get("selection_feedback"),
+        "execution_feedback": ctx.get("execution_feedback"),
+        "missing_sources": ctx.get("missing_sources", []),
+    }
+    # Analyst signals: just symbol + bias + strength, not full dicts
+    signals = ctx.get("analyst_signals")
+    if signals and isinstance(signals, dict):
+        prompt["agent_context"]["analyst_signals_summary"] = {
+            sym: f"{s.get('signal', '?')} ({s.get('strength', '?')})"
+            if isinstance(s, dict) else str(s)
+            for sym, s in list(signals.items())[:10]  # cap at 10 symbols
+        }
+
+    # Cases — keep only key fields
+    cases = summary.get("cases_today") or []
+    prompt["cases_today"] = [
+        {k: c.get(k) for k in ["symbol", "setup_type", "outcome", "pnl_pct", "lesson"]}
+        for c in cases[:10]
+    ]
+
+    prompt["previous_review_summary"] = summary.get("previous_review_summary")
+    prompt["completeness"] = summary.get("completeness", {})
+
+    return json.dumps(prompt, default=str)
+
+
 def generate_narrative(deterministic_summary: dict, tier: str = "medium") -> dict:
     """
     Pass the deterministic summary to the LLM for narrative generation.
@@ -846,7 +911,7 @@ def generate_narrative(deterministic_summary: dict, tier: str = "medium") -> dic
 
     # Attempt LLM narrative generation
     try:
-        user_prompt = json.dumps(deterministic_summary, default=str)
+        user_prompt = _build_llm_prompt(deterministic_summary)
         raw = call_llm(NARRATIVE_SYSTEM_PROMPT, user_prompt, tier=tier)
         narrative = parse_json_response(raw)
     except Exception as e:
