@@ -74,6 +74,17 @@ class AgentMemory(Base):
     value = Column(Text, nullable=False)
 
 
+class ReviewQueue(Base):
+    """Queue for trades pending review."""
+    __tablename__ = "review_queue"
+
+    id = Column(Integer, primary_key=True)
+    trade_id = Column(Integer, nullable=False)
+    status = Column(String(16), default="pending")  # pending | reviewed | failed
+    queued_at = Column(DateTime, default=datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)
+
+
 class DynamicStrategy(Base):
     """Agent-proposed strategies that supplement the hardcoded strategy library."""
     __tablename__ = "dynamic_strategies"

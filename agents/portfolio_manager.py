@@ -296,6 +296,10 @@ def execute_trade(db, decision: dict, profile_id: str):
             open_trade.pnl_pct = round(pnl_pct, 2)
             open_trade.reason_exit = decision.get("rationale")
 
+            # Queue for review
+            from db.schema import ReviewQueue
+            db.add(ReviewQueue(trade_id=open_trade.id))
+
         if close_qty >= pos.quantity:
             db.delete(pos)
         else:

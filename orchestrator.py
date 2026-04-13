@@ -468,6 +468,36 @@ def main():
         coalesce=True,
     )
 
+    # Reviewer queue: every 15 min during market hours, process pending reviews
+    def run_reviewer_queue():
+        engine = get_engine()
+        try:
+            review = reviewer.run(engine, min_unreviewed=1)
+            msg = review.get("batch_feedback", review.get("message", ""))
+            if msg:
+                log.info(f"Reviewer queue: {str(msg)[:100]}")
+
+            # Check for stale pending reviews (>24 hours)
+            from db.schema import get_session, ReviewQueue
+            db = get_session(engine)
+            stale_cutoff = datetime.utcnow() - timedelta(hours=24)
+            stale = db.query(ReviewQueue).filter_by(status="pending").filter(
+                ReviewQueue.queued_at < stale_cutoff
+            ).count()
+            if stale > 0:
+                log.critical(f"🚨 STALE REVIEWS: {stale} trades pending review for >24 hours!")
+            db.close()
+        except Exception as e:
+            log.error(f"Reviewer queue error: {e}", exc_info=True)
+
+    scheduler.add_job(
+        run_reviewer_queue,
+        CronTrigger(day_of_week="mon-fri", hour="10-16", minute="*/15", timezone="America/New_York"),
+        id="reviewer_queue",
+        max_instances=1,
+        coalesce=True,
+    )
+
     # Post-market: 4:15 PM ET
     scheduler.add_job(
         run_post_market,

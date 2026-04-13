@@ -114,15 +114,29 @@ def run(engine, min_unreviewed: int = 1) -> dict:
     db = get_session(engine)
     fh = FinnhubClient()
 
-    # Get unreviewed closed trades — process in small batches to avoid token limits
-    unreviewed = (
-        db.query(Trade)
-        .filter_by(status="closed")
-        .filter(Trade.review_score == None)
-        .order_by(Trade.exit_time.desc())
+    # Pull from review queue first, fall back to scanning unreviewed trades
+    from db.schema import ReviewQueue
+    queued = (
+        db.query(ReviewQueue)
+        .filter_by(status="pending")
+        .order_by(ReviewQueue.queued_at)
         .limit(3)
         .all()
     )
+
+    if queued:
+        trade_ids = [q.trade_id for q in queued]
+        unreviewed = db.query(Trade).filter(Trade.id.in_(trade_ids)).all()
+    else:
+        # Fallback: scan for unreviewed closed trades not in queue
+        unreviewed = (
+            db.query(Trade)
+            .filter_by(status="closed")
+            .filter(Trade.review_score == None)
+            .order_by(Trade.exit_time.desc())
+            .limit(3)
+            .all()
+        )
 
     if len(unreviewed) < min_unreviewed:
         db.close()
@@ -197,6 +211,14 @@ Extract structured cases for each trade. Return the JSON.
 
     # Route feedback — reopen session
     db = get_session(engine)
+
+    # Mark queue entries as reviewed
+    from db.schema import ReviewQueue
+    reviewed_ids = [t.id for t in unreviewed]
+    for q in db.query(ReviewQueue).filter(ReviewQueue.trade_id.in_(reviewed_ids)).all():
+        q.status = "reviewed"
+        q.reviewed_at = datetime.utcnow()
+
     selection_fb = result.get("selection_feedback", "")
     if selection_fb:
         db.add(AgentMemory(
