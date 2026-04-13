@@ -198,6 +198,7 @@ Extract structured cases for each trade. Return the JSON.
     result = parse_json_response(raw)
 
     # Store cases in the case library
+    reviewed_trade_ids = [t.id for t in unreviewed]  # capture before session closes
     for case_data in result.get("cases", []):
         trade = db.query(Trade).filter_by(id=case_data.get("trade_id")).first()
         if trade:
@@ -214,8 +215,7 @@ Extract structured cases for each trade. Return the JSON.
 
     # Mark queue entries as reviewed
     from db.schema import ReviewQueue
-    reviewed_ids = [t.id for t in unreviewed]
-    for q in db.query(ReviewQueue).filter(ReviewQueue.trade_id.in_(reviewed_ids)).all():
+    for q in db.query(ReviewQueue).filter(ReviewQueue.trade_id.in_(reviewed_trade_ids)).all():
         q.status = "reviewed"
         q.reviewed_at = datetime.utcnow()
 
