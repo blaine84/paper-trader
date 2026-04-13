@@ -174,14 +174,57 @@ def execute_trade(db, decision: dict, profile_id: str):
                 try: target = float(m.group(1))
                 except: pass
 
-    # If still no stop, calculate a default (2% from entry) — only for new positions
+    # If still no stop, derive from ATR or analyst key levels — never use flat %
     if action in ("BUY", "SHORT") and not stop and price:
-        if action == "BUY":
-            stop = round(price * 0.98, 2)
-        elif action == "SHORT":
-            stop = round(price * 1.02, 2)
         import logging
-        logging.getLogger(__name__).warning(f"No stop provided for {symbol}, using default 2%: {stop}")
+        _log = logging.getLogger(__name__)
+
+        # Try 1: ATR-based stop (1.5x ATR from entry)
+        try:
+            from utils.finnhub_client import FinnhubClient
+            from utils.technicals import compute_indicators
+            fh = FinnhubClient()
+            candles = fh.get_candles(symbol, resolution="5", days=2)
+            indicators = compute_indicators(candles)
+            atr = indicators.get("atr")
+            if atr and atr > 0:
+                if action == "BUY":
+                    stop = round(price - (atr * 1.5), 2)
+                else:
+                    stop = round(price + (atr * 1.5), 2)
+                _log.info(f"Stop derived from ATR ({atr:.2f} × 1.5) for {symbol}: {stop}")
+        except Exception:
+            pass
+
+        # Try 2: Key level from analyst signal
+        if not stop:
+            try:
+                sig_mem = (
+                    db.query(AgentMemory)
+                    .filter_by(agent="analyst", symbol=symbol, key="signal")
+                    .order_by(AgentMemory.timestamp.desc())
+                    .first()
+                )
+                if sig_mem:
+                    import json as _json
+                    sig = _json.loads(sig_mem.value)
+                    levels = sig.get("key_levels", {})
+                    if action == "BUY" and levels.get("support"):
+                        stop = round(float(levels["support"]) * 0.995, 2)  # just below support
+                        _log.info(f"Stop derived from support level for {symbol}: {stop}")
+                    elif action == "SHORT" and levels.get("resistance"):
+                        stop = round(float(levels["resistance"]) * 1.005, 2)  # just above resistance
+                        _log.info(f"Stop derived from resistance level for {symbol}: {stop}")
+            except Exception:
+                pass
+
+        # Try 3: Last resort — 2x ATR or 1.5% (whichever is available)
+        if not stop:
+            if action == "BUY":
+                stop = round(price * 0.985, 2)
+            else:
+                stop = round(price * 1.015, 2)
+            _log.warning(f"No ATR or key level for {symbol}, using 1.5% fallback: {stop}")
 
     starting = PM_PROFILES[profile_id]["starting_balance"]
     bal = (
