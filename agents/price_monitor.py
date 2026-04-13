@@ -118,6 +118,16 @@ def check_stops_and_targets(engine) -> list[dict]:
                         "trade_id": trade.id,
                     })
 
+    # Run profit management on all open trades
+    from agents.profit_manager import run as run_profit
+    trades_and_prices = []
+    for trade in open_trades:
+        price = quotes.get(trade.symbol)
+        if price:
+            trades_and_prices.append((trade, price))
+    if trades_and_prices:
+        run_profit(engine, trades_and_prices)
+
     db.close()
     return triggers
 def check_entry_triggers(engine) -> list[dict]:
