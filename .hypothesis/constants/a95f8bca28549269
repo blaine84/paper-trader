@@ -1,0 +1,4 @@
+# file: C:\Users\blain\.openclaw\workspace\paper-trader\utils\llm.py
+# hypothesis_version: 6.151.13
+
+[0.3, 4096, 8192, 16384, '429', 'ANTHROPIC_API_KEY', 'LLM_LOW_MODEL', 'LLM_LOW_PROVIDER', 'LLM_MED_MODEL', 'LLM_MED_PROVIDER', 'LLM_MODEL', 'LLM_PROVIDER', 'MISTRAL_API_KEY', 'OLLAMA_BASE_URL', 'OLLAMA_MODEL', 'OLLAMA_TIMEOUT', 'OPENAI_API_KEY', '```', 'anthropic', 'claude-haiku-4-5', 'content', 'format', 'gpt-4o-mini', 'high', 'json', 'json_object', 'llama3', 'low', 'max_tokens', 'medium', 'message', 'messages', 'mistral', 'mistral-small-latest', 'model', 'ollama', 'openai', 'overloaded', 'rate limit', 'response_format', 'role', 'stream', 'system', 'temperature', 'type', 'user', '{', '}']

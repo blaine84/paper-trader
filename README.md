@@ -13,6 +13,18 @@ A multi-agent paper trading system for day trading SPY, QQQ, IWM, TSLA, NVDA, AM
 | 🔍 Reviewer | Scores closed trades, extracts lessons, feeds back |
 | 🎯 Orchestrator | Runs the market-hours loop via APScheduler |
 
+### Core Modules (Tier 1)
+
+Three deterministic, LLM-free modules in `core/` gate every trade:
+
+| Module | File | Purpose |
+|---|---|---|
+| Edge Score | `core/edge_score.py` | 6-component trade quality score (0.0–1.0) |
+| Similarity Engine | `core/similarity.py` | Historical pattern matching via weighted scoring |
+| Portfolio Risk | `core/portfolio_risk.py` | Cross-position exposure control with adaptive throttling |
+
+Every BUY/SHORT runs through: similarity lookup → edge score → portfolio risk → existing validation.
+
 ## Feedback Loop
 
 Reviewer → lessons/feedback → AgentMemory DB → Analyst + PM read before deciding
@@ -57,7 +69,7 @@ python orchestrator.py once
 SQLite at `db/paper_trader.db`
 
 Tables:
-- `trades` — all paper trades with entry/exit/P&L/scores
+- `trades` — all paper trades with entry/exit/P&L/scores/edge_score/similarity data
 - `positions` — current open positions
 - `balance` — cash balance history
 - `agent_memory` — shared notes between agents (signals, lessons, feedback)

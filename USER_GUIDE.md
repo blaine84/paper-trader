@@ -20,8 +20,9 @@ learns from every trade, and improves over time through structured feedback loop
 11. [Running on a Raspberry Pi](#running-on-a-raspberry-pi)
 12. [Watchlist](#watchlist)
 13. [Understanding the Scores](#understanding-the-scores)
-14. [Database](#database)
-15. [Troubleshooting](#troubleshooting)
+14. [Edge Score & Risk Engine](#edge-score--risk-engine)
+15. [Database](#database)
+16. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -339,7 +340,40 @@ The full lifecycle of a trade from signal to exit:
            + behavioral parameters + meta-reviewer recommendations
    PM decides: action, entry price, stop, target, quantity, rationale
 
-4. BEHAVIORAL ADJUSTMENT (automatic, post-decision)
+4. EDGE SCORE & RISK GATING (automatic, pre-validation)
+   Three deterministic modules run before existing validation:
+
+   a. SIMILARITY ENGINE
+      Query case library for historically similar trades (weighted scoring).
+      Returns similarity_winrate, similarity_avg_r, similarity_confidence.
+      If no matches → skip similarity weighting (no penalty).
+
+   b. EDGE SCORE
+      6-component weighted formula (0.0–1.0):
+        0.25 × setup win rate
+        0.20 × similarity win rate
+        0.15 × signal strength
+        0.10 × signal confidence
+        0.15 × indicator confluence
+        0.15 × similarity quality (sample-size confidence)
+
+      Hard rejection: if setup has 10+ cases and win rate < 35% → block outright.
+      Soft rejection: if edge score < 0.4 → block trade.
+      Position sizing: quantity × edge_score, capped at 1.2× base size.
+
+   c. PORTFOLIO RISK ENGINE
+      Checks exposure across correlated buckets:
+        index (SPY, QQQ, IWM, DIA)
+        semis (NVDA, AMD, INTC, TSM)
+        ev (TSLA, LCID, RIVN)
+        mega_growth (NVDA, TSLA, META, AMZN)
+      Symbols can belong to multiple buckets.
+      Rules: max 50% per bucket, configurable total exposure (1.2–1.5×).
+      Adaptive throttling: 3+ consecutive losses → reduce size 25–50%.
+
+   d. All three modules are deterministic (no LLM calls), fast (<10ms).
+
+5. BEHAVIORAL ADJUSTMENT (automatic, post-decision)
    Behavioral parameters (extracted from reviewer feedback) applied:
    ├─ Entry offset (earlier/later entries)
    ├─ Size multiplier (scale up/down)
@@ -349,7 +383,7 @@ The full lifecycle of a trade from signal to exit:
    ├─ Stop buffer (widen/tighten)
    └─ Min R:R override
 
-5. TRADE VALIDATION (automatic)
+6. TRADE VALIDATION (automatic)
    Before any trade hits the database:
    ✓ Stop price is valid and on correct side of entry
    ✓ Target price is valid and on correct side of entry
@@ -359,15 +393,16 @@ The full lifecycle of a trade from signal to exit:
    ✓ Quantity is positive
    → If any check fails, trade is REJECTED with reason logged
 
-6. STOP DERIVATION (if LLM omits stop/target)
+7. STOP DERIVATION (if LLM omits stop/target)
    Priority: ATR-based (1.5× ATR) → key level (support/resistance) → 1.5% fallback
 
-7. EXECUTION
-   Trade written to DB with stop_price and target_price persisted
+8. EXECUTION
+   Trade written to DB with stop_price, target_price, edge_score,
+   similarity_winrate, similarity_sample_size, and similarity_confidence persisted
    Position created, cash deducted
    Trade queued for review automatically
 
-8. PROFIT MANAGEMENT (every 60 seconds)
+9. PROFIT MANAGEMENT (every 60 seconds)
    ├─ +1R: take partial profit (25-50% by profile), move stop to breakeven
    ├─ +2R: take more profit (if profile allows), trail stop to +1R
    ├─ +3R: trail stop to +2R
@@ -378,7 +413,7 @@ The full lifecycle of a trade from signal to exit:
    ├─ Moderate: 33% at +1R, 25% at +2R
    └─ Aggressive: 25% at +1R, let rest ride
 
-9. MONITORING (continuous, every 60 seconds)
+10. MONITORING (continuous, every 60 seconds)
    Price Monitor checks:
    ├─ Stop hit? → close immediately (0.1% buffer, direction-validated)
    ├─ Target hit? → close immediately (direction-validated)
@@ -722,13 +757,91 @@ Average of selection + execution. Used for overall tracking.
 
 ---
 
+## Edge Score & Risk Engine
+
+Three deterministic modules in `core/` gate every BUY/SHORT trade before it reaches
+the existing validation pipeline. No LLM calls — pure Python, fast, deterministic.
+
+### Edge Score (`core/edge_score.py`)
+
+Computes a continuous 0.0–1.0 score for each proposed trade using six weighted components:
+
+| Component | Weight | Source |
+|---|---|---|
+| Setup win rate | 0.25 | Case library (setup_type + regime) |
+| Similarity win rate | 0.20 | Similarity engine matches |
+| Signal strength | 0.15 | Analyst signal (weak/moderate/strong) |
+| Signal confidence | 0.10 | Analyst signal (low/medium/high) |
+| Indicator confluence | 0.15 | VWAP, EMA, RSI, MACD, BB alignment |
+| Similarity quality | 0.15 | Sample-size confidence: min(1.0, n/10) |
+
+Gating rules:
+- Hard reject: setup has 10+ cases and win rate < 35% → blocked outright
+- Soft reject: edge score < 0.4 → blocked
+- Position sizing: `quantity × edge_score`, capped at `base_size × 1.2`
+
+### Similarity Engine (`core/similarity.py`)
+
+Finds historically similar trades using weighted scoring (not strict filtering):
+
+| Criterion | Weight |
+|---|---|
+| Setup type match | 0.30 |
+| Market regime match | 0.25 |
+| RSI distance (continuous) | 0.15 |
+| VWAP alignment | 0.15 |
+| EMA trend alignment | 0.15 |
+
+Returns top 10 matches by similarity score. Computes aggregate stats:
+`similarity_winrate`, `similarity_avg_r`, `similarity_confidence`.
+When no matches are found, similarity weighting is skipped entirely (no penalty).
+
+### Portfolio Risk Engine (`core/portfolio_risk.py`)
+
+Prevents overexposure across correlated positions.
+
+Exposure buckets (symbols can belong to multiple):
+
+| Bucket | Symbols |
+|---|---|
+| index | SPY, QQQ, IWM, DIA |
+| semis | NVDA, AMD, INTC, TSM |
+| ev | TSLA, LCID, RIVN |
+| mega_growth | NVDA, TSLA, META, AMZN |
+
+Rules:
+- Max 50% of equity per bucket
+- Configurable total exposure threshold (default 1.5×)
+- Adaptive throttling: 3+ consecutive losses → reduce position size 25–50%
+
+Outputs a composite `risk_score` (0.0–1.0) summarizing overall portfolio risk.
+
+### Error Handling
+
+| Module | On failure | Behavior |
+|---|---|---|
+| Edge Score | Exception | Reject trade (fail-closed) |
+| Similarity | Exception | Proceed with zero stats (fail-open) |
+| Portfolio Risk | Exception | Proceed with existing validation (fail-open) |
+
+### Structured Logging
+
+Every BUY/SHORT trade logs three blocks:
+```
+EDGE SCORE: 0.64 | setup_winrate=0.58 (n=12) | similarity_winrate=0.60 (n=8) | similarity_confidence=0.80 | confluence=0.80 | similarity_quality=0.80
+PORTFOLIO RISK: total_exposure=0.42 | index=0.17, semis=0.25, ev=0.00, mega_growth=0.15, other=0.00
+DECISION: size_scaled=64 status=EXECUTED edge=0.640
+```
+
+---
+
 ## Database
 
 SQLite at `db/paper_trader.db`. Back it up periodically.
 
 | Table | Contents |
 |---|---|
-| `trades` | All paper trades with entry/exit/P&L/scores/stop/target |
+| `trades` | All paper trades with entry/exit/P&L/scores/stop/target/edge_score/similarity data |
 | `positions` | Current open positions (per profile + side) |
 | `balance` | Cash balance history (per profile) |
 | `agent_memory` | Shared notes between agents (signals, feedback, meta reviews) |

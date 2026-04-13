@@ -35,6 +35,10 @@ class Trade(Base):
     target_price = Column(Float, nullable=True)    # PM's profit target
     review_score = Column(Float, nullable=True)  # 1-10 from Reviewer
     review_notes = Column(Text, nullable=True)
+    edge_score = Column(Float, nullable=True)                # 0.0-1.0
+    similarity_winrate = Column(Float, nullable=True)        # 0.0-1.0
+    similarity_sample_size = Column(Integer, nullable=True)  # count of matched cases
+    similarity_confidence = Column(Float, nullable=True)     # min(1.0, sample_size/10)
 
 
 class Position(Base):

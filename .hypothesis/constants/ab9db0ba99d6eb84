@@ -1,0 +1,4 @@
+# file: C:\Users\blain\.openclaw\workspace\paper-trader\core\edge_score.py
+# hypothesis_version: 6.151.13
+
+[0.0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.6, 1.0, 1.2, 5.0, 10.0, 'LONG', 'above_vwap', 'bb_position', 'bearish', 'bias', 'bullish', 'confidence', 'confluence', 'ema_trend', 'high', 'indicators', 'low', 'lower', 'macd_bias', 'medium', 'moderate', 'rsi', 'sample_size', 'setup_winrate', 'signal_confidence', 'signal_strength', 'similarity_quality', 'similarity_winrate', 'strength', 'strong', 'upper', 'weak', 'win_rate']

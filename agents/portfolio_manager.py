@@ -5,6 +5,7 @@ Scout provides symbols only — all entry/exit decisions are made here.
 """
 
 import json
+import logging
 import os
 from datetime import datetime
 from utils.finnhub_client import FinnhubClient
@@ -13,6 +14,16 @@ from db.schema import AgentMemory, Position, Balance, Trade, get_session
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.case_library import get_relevant_cases, format_cases_for_prompt, get_win_rate_by_setup
 from agents.quant_researcher import build_strategy_context
+from core.similarity import find_similar_cases, compute_similarity_stats
+from core.edge_score import (
+    compute_edge_score, check_hard_rejection, cap_position_size,
+    confluence_score, similarity_quality,
+)
+from core.portfolio_risk import (
+    validate_portfolio_risk, compute_portfolio_risk, adaptive_risk_throttle,
+)
+
+log = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are a portfolio manager for paper day trading.
@@ -139,6 +150,58 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
     }
 
 
+def _count_recent_consecutive_losses(db, profile_id: str) -> int:
+    """Count consecutive recent losing trades for a profile (most recent first)."""
+    recent_trades = (
+        db.query(Trade)
+        .filter_by(profile=profile_id, status="closed")
+        .order_by(Trade.exit_time.desc())
+        .limit(20)
+        .all()
+    )
+    count = 0
+    for t in recent_trades:
+        if t.pnl is not None and t.pnl < 0:
+            count += 1
+        else:
+            break
+    return count
+
+
+def _build_signal_for_symbol(db, symbol: str, decision: dict) -> dict:
+    """Build a signal dict for the similarity/edge score engines from analyst memory."""
+    sig_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="analyst", symbol=symbol, key="signal")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if sig_mem:
+        try:
+            return json.loads(sig_mem.value)
+        except Exception:
+            pass
+    # Fallback: build minimal signal from decision fields
+    return {
+        "setup_type": decision.get("setup_type") or decision.get("setup") or "",
+        "market_regime": decision.get("market_regime") or decision.get("regime") or "",
+        "strength": decision.get("strength") or "moderate",
+        "confidence": decision.get("confidence") or "medium",
+        "bias": "LONG" if decision.get("action") == "BUY" else "SHORT",
+        "indicators": {},
+    }
+
+
+def _build_case_stats(db, setup_type: str, market_regime: str = None) -> dict:
+    """Build case_stats dict from the case library for edge score computation."""
+    from utils.trade_validator import adjust_confidence
+    conf_result = adjust_confidence(db.bind, setup_type, market_regime)
+    return {
+        "win_rate": conf_result.get("win_rate") or 0.0,
+        "sample_size": conf_result.get("total_cases", 0),
+    }
+
+
 def execute_trade(db, decision: dict, profile_id: str):
     """
     Apply a trade decision to the paper portfolio.
@@ -235,7 +298,146 @@ def execute_trade(db, decision: dict, profile_id: str):
     )
     cash = bal.cash if bal else float(starting)
 
-    # Validate trade before execution
+    # ── Tier-1 pre-validation: similarity → edge score → portfolio risk ──
+    # Tracks edge data to store on the Trade record later
+    _edge_data = {}
+
+    if action in ("BUY", "SHORT"):
+        base_quantity = quantity  # preserve original for cap calculation
+
+        # --- Build signal context for this symbol ---
+        signal_for_symbol = _build_signal_for_symbol(db, symbol, decision)
+
+        # --- 1. Similarity engine (fail-open: proceed with zero stats on error) ---
+        sim_stats = {
+            "similarity_winrate": 0.0, "similarity_avg_r": 0.0,
+            "sample_size": 0, "similarity_confidence": 0.0, "skip_similarity": True,
+        }
+        try:
+            similar_cases = find_similar_cases(signal_for_symbol, db.bind)
+            sim_stats = compute_similarity_stats(similar_cases)
+        except Exception as exc:
+            log.warning("Similarity engine error (proceeding with zero stats): %s", exc)
+
+        # --- 2. Case stats from existing win rate data ---
+        setup_type = decision.get("setup_type") or decision.get("setup") or signal_for_symbol.get("setup_type") or ""
+        regime = decision.get("market_regime") or decision.get("regime") or signal_for_symbol.get("market_regime")
+        case_stats = _build_case_stats(db, setup_type, regime)
+
+        # --- 3. Hard rejection check (fail-closed) ---
+        try:
+            if check_hard_rejection(case_stats):
+                log.warning(
+                    "DECISION: status=REJECTED reason=hard_rejection "
+                    "setup_winrate=%.2f sample_size=%d",
+                    case_stats["win_rate"], case_stats["sample_size"],
+                )
+                return False, (
+                    f"Hard reject: setup winrate too low "
+                    f"({case_stats['win_rate']:.2f} over {case_stats['sample_size']} cases)"
+                )
+        except Exception as exc:
+            log.error("Hard rejection check failed (rejecting trade): %s", exc)
+            return False, f"Edge score pre-check error: {exc}"
+
+        # --- 4. Compute edge score (fail-closed) ---
+        try:
+            edge = compute_edge_score(signal_for_symbol, case_stats, sim_stats)
+        except Exception as exc:
+            log.error("Edge score computation failed (rejecting trade): %s", exc)
+            return False, f"Edge score computation error: {exc}"
+
+        # Compute sub-components for logging
+        _confluence = confluence_score(
+            signal_for_symbol.get("indicators", {}),
+            signal_for_symbol.get("bias", ""),
+        )
+        _sim_qual = similarity_quality(sim_stats.get("sample_size", 0))
+
+        # --- EDGE SCORE structured log ---
+        log.info(
+            "EDGE SCORE: %.3f | setup_winrate=%.2f (n=%d) | "
+            "similarity_winrate=%.2f (n=%d) | similarity_confidence=%.2f | "
+            "confluence=%.2f | similarity_quality=%.2f",
+            edge,
+            case_stats.get("win_rate", 0), case_stats.get("sample_size", 0),
+            sim_stats.get("similarity_winrate", 0), sim_stats.get("sample_size", 0),
+            sim_stats.get("similarity_confidence", 0),
+            _confluence, _sim_qual,
+        )
+
+        if edge < 0.4:
+            log.info(
+                "DECISION: status=REJECTED reason=edge_score_too_low (%.3f < 0.4)", edge
+            )
+            return False, f"Edge score too low ({edge:.3f})"
+
+        # --- 5. Scale position size by edge score, cap at 1.2× base ---
+        scaled_size = max(1, int(quantity * edge))
+        quantity = int(cap_position_size(scaled_size, base_quantity))
+        decision["quantity"] = quantity
+
+        # --- 6. Adaptive risk throttling (fail-open) ---
+        try:
+            recent_losses = _count_recent_consecutive_losses(db, profile_id)
+            if recent_losses >= 3:
+                throttled = adaptive_risk_throttle(quantity, recent_losses)
+                quantity = max(1, int(throttled))
+                decision["quantity"] = quantity
+                log.info(
+                    "Adaptive risk throttle: recent_losses=%d, size %d → %d",
+                    recent_losses, scaled_size, quantity,
+                )
+        except Exception as exc:
+            log.warning("Adaptive risk throttle error (proceeding): %s", exc)
+            recent_losses = 0
+
+        # --- 7. Portfolio risk validation (fail-open) ---
+        try:
+            positions = db.query(Position).filter_by(profile=profile_id).all()
+            pos_list = [
+                {"symbol": p.symbol, "quantity": p.quantity, "avg_cost": p.avg_cost, "side": p.side}
+                for p in positions
+            ]
+            pos_value = sum(p.quantity * p.avg_cost for p in positions)
+            total_equity = cash + pos_value
+
+            risk_result = compute_portfolio_risk(pos_list, total_equity)
+
+            # --- PORTFOLIO RISK structured log ---
+            bucket_str = ", ".join(
+                f"{k}={v:.2f}" for k, v in risk_result.get("bucket_exposure", {}).items()
+            )
+            log.info(
+                "PORTFOLIO RISK: total_exposure=%.2f | %s",
+                risk_result.get("total_exposure", 0), bucket_str,
+            )
+
+            risk_ok, risk_msg = validate_portfolio_risk(
+                {"symbol": symbol, "quantity": quantity, "price": price},
+                pos_list, total_equity,
+            )
+            if not risk_ok:
+                log.info("DECISION: status=REJECTED reason=%s", risk_msg)
+                return False, risk_msg
+        except Exception as exc:
+            log.warning("Portfolio risk check error (proceeding with existing validation): %s", exc)
+
+        # --- Store edge data for Trade record (Task 5.4) ---
+        _edge_data = {
+            "edge_score": round(edge, 4),
+            "similarity_winrate": round(sim_stats.get("similarity_winrate", 0), 4),
+            "similarity_sample_size": sim_stats.get("sample_size", 0),
+            "similarity_confidence": round(sim_stats.get("similarity_confidence", 0), 4),
+        }
+
+        # --- DECISION structured log (executed) ---
+        log.info(
+            "DECISION: size_scaled=%d status=EXECUTED edge=%.3f",
+            quantity, edge,
+        )
+
+    # Validate trade before execution (existing validation)
     if action in ("BUY", "SHORT"):
         from utils.trade_validator import validate_trade, TradeValidationError
         direction = "LONG" if action == "BUY" else "SHORT"
@@ -297,6 +499,10 @@ def execute_trade(db, decision: dict, profile_id: str):
             stop_price=stop,
             target_price=target,
             profile=profile_id,
+            edge_score=_edge_data.get("edge_score"),
+            similarity_winrate=_edge_data.get("similarity_winrate"),
+            similarity_sample_size=_edge_data.get("similarity_sample_size"),
+            similarity_confidence=_edge_data.get("similarity_confidence"),
         ))
         db.add(Balance(cash=cash - cost, profile=profile_id))
 
@@ -326,6 +532,10 @@ def execute_trade(db, decision: dict, profile_id: str):
             stop_price=stop,
             target_price=target,
             profile=profile_id,
+            edge_score=_edge_data.get("edge_score"),
+            similarity_winrate=_edge_data.get("similarity_winrate"),
+            similarity_sample_size=_edge_data.get("similarity_sample_size"),
+            similarity_confidence=_edge_data.get("similarity_confidence"),
         ))
         # Deduct margin from cash (returned + P&L on close)
         db.add(Balance(cash=cash - margin_required, profile=profile_id))

@@ -1,0 +1,30 @@
+# Tasks
+
+- [x] 1. Create core package and Edge Score Calculator
+  - [x] 1.1 Create `core/__init__.py` package
+  - [x] 1.2 Create `core/edge_score.py` with `normalize_winrate`, `map_strength`, `map_confidence`, `confluence_score`, `similarity_quality`, `check_hard_rejection`, `cap_position_size`, and `compute_edge_score` functions implementing the 6-component weighted formula (0.25 × setup winrate + 0.20 × similarity winrate + 0.15 × strength + 0.10 × confidence + 0.15 × confluence + 0.15 × similarity quality) with output clamped to [0.0, 1.0], hard rejection when case_sample_size >= 10 and setup_winrate < 0.35, and position sizing cap at min(scaled_size, base_size * 1.2)
+  - [x] 1.3 Write property-based tests for edge score formula correctness (Property 1, 6-component v2 formula) and output range invariant (Property 2) using Hypothesis with min 100 examples in `tests/test_edge_score.py`
+  - [x] 1.4 Write property-based test for confluence score correctness (Property 3) in `tests/test_edge_score.py`
+  - [x] 1.5 Write property-based tests for hard rejection rule (Property 4) and position sizing cap invariant (Property 5) in `tests/test_edge_score.py`
+  - [x] 1.6 Write property-based test for similarity confidence computation (Property 6) in `tests/test_edge_score.py`
+  - [x] 1.7 Write unit tests for `map_strength`, `map_confidence`, `normalize_winrate`, `similarity_quality` mappings and no-LLM-calls verification in `tests/test_edge_score.py`
+- [x] 2. Create Similarity Matching Engine
+  - [x] 2.1 Create `core/similarity.py` with `find_similar_cases(signal, engine)` using weighted scoring across setup_type, market_regime, RSI distance (continuous), VWAP alignment, and EMA trend alignment, returning top 10 matches sorted by descending similarity score
+  - [x] 2.2 Create `compute_similarity_stats(cases)` that computes similarity_winrate, similarity_avg_r, sample_size, and similarity_confidence (min(1.0, sample_size/10)) from matched cases; when sample_size == 0, return skip_similarity flag instead of penalizing with zeros
+  - [x] 2.3 Write unit tests for similarity engine in `tests/test_similarity.py` covering: empty case list with skip_similarity flag, correct stat aggregation with similarity_confidence, weighted scoring returning partial matches, and RSI distance-based matching
+- [x] 3. Create Portfolio Risk Engine
+  - [x] 3.1 Create `core/portfolio_risk.py` with expanded `BUCKETS` dict including "mega_growth" bucket (NVDA, TSLA, META, AMZN) where symbols can belong to multiple buckets, `compute_portfolio_risk(positions, total_equity)` returning total exposure, per-bucket exposure, and risk_score
+  - [x] 3.2 Create `validate_portfolio_risk(new_trade, positions, total_equity, max_total_exposure, recent_losses)` that rejects trades exceeding 50% per-bucket or configurable total risk threshold (1.2–1.5×), and applies adaptive risk throttling (25–50% size reduction when recent_losses >= 3)
+  - [x] 3.3 Create `adaptive_risk_throttle(base_size, recent_losses)` and `compute_risk_score(total_exposure, bucket_exposure, recent_losses)` helper functions
+  - [x] 3.4 Write property-based tests for adaptive risk throttling (Property 7) and multi-bucket exposure accounting (Property 8) in `tests/test_portfolio_risk.py`
+  - [x] 3.5 Write unit tests for portfolio risk engine in `tests/test_portfolio_risk.py` covering: mega_growth bucket classification, multi-bucket membership (NVDA in semis + mega_growth), configurable total exposure threshold, overexposure rejection, safe trade acceptance, empty positions, zero equity guard, risk_score output, and adaptive throttle size reduction
+- [x] 4. Database schema changes
+  - [x] 4.1 Add `edge_score` (Float, nullable), `similarity_winrate` (Float, nullable), `similarity_sample_size` (Integer, nullable), and `similarity_confidence` (Float, nullable) columns to the `Trade` model in `db/schema.py`
+- [x] 5. Integrate into PM pipeline
+  - [x] 5.1 Modify `execute_trade()` in `agents/portfolio_manager.py` to call similarity engine (weighted scoring), check hard rejection rule (case_sample_size >= 10 and setup_winrate < 0.35), compute edge score (6-component formula), reject trades with edge_score < 0.4, and scale position quantity by edge_score capped at min(scaled_size, base_size * 1.2) before existing validation
+  - [x] 5.2 Add adaptive risk throttling in `execute_trade()`: count recent consecutive losses, reduce position size by 25–50% when recent_losses >= 3
+  - [x] 5.3 Add portfolio risk validation call in `execute_trade()` with configurable total exposure threshold and multi-bucket support before existing `validate_trade()` call
+  - [x] 5.4 Store edge_score, similarity_winrate, similarity_sample_size, and similarity_confidence on the Trade record when creating BUY/SHORT trades
+  - [x] 5.5 Add structured logging: EDGE SCORE block (with setup_winrate, similarity_winrate, similarity_confidence, confluence, similarity_quality), PORTFOLIO RISK block (total_exposure, per-bucket exposure), and DECISION block (size_scaled, status, rejection reason)
+- [x] 6. Integration tests
+  - [x] 6.1 Write integration tests in `tests/test_pm_integration.py` verifying: edge score rejection, hard rejection for proven-bad setups, position size scaling with 1.2× cap, adaptive risk throttling after loss streak, trade record persistence of edge_score + similarity_winrate + similarity_sample_size + similarity_confidence, portfolio risk rejection with multi-bucket support, and structured logging output

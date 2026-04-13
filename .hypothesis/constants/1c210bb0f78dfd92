@@ -1,0 +1,4 @@
+# file: C:\Users\blain\.openclaw\workspace\paper-trader\core\portfolio_risk.py
+# hypothesis_version: 6.151.13
+
+[0.0, 0.2, 0.25, 0.4, 0.5, 0.75, 1.0, 1.5, 6.0, 'AMD', 'AMZN', 'DIA', 'INTC', 'IWM', 'LCID', 'META', 'NVDA', 'OK', 'QQQ', 'RIVN', 'SPY', 'TSLA', 'TSM', 'avg_cost', 'bucket_exposure', 'ev', 'index', 'long', 'mega_growth', 'other', 'price', 'quantity', 'risk_score', 'semis', 'side', 'symbol', 'total_exposure', 'zero equity']
