@@ -151,7 +151,9 @@ def execute_trade(db, decision: dict, profile_id: str):
     action = decision["action"]
     symbol = decision["symbol"]
     quantity = decision.get("quantity", 0)
-    price = decision["price"]
+    price = decision.get("price") or decision.get("entry_price") or 0
+    if not price:
+        return False, "No price in decision"
 
     starting = PM_PROFILES[profile_id]["starting_balance"]
     bal = (
@@ -347,7 +349,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 f"\nWEEKLY STANCE (set Sunday):\n"
                 f"  stance: {data.get('weekly_stance')}\n"
                 f"  reason: {data.get('stance_reason')}\n"
-                f"  size_adjustment: {data.get('size_adjustment', 0):+.0%}\n"
+                f"  size_adjustment: {data.get('size_adjustment') or 0:+.0%}\n"
                 f"  signal_threshold: {data.get('signal_threshold_adjustment', 'normal')}\n"
                 f"  avoid: {data.get('symbols_avoid', [])}\n"
                 f"  favor: {data.get('symbols_favor', [])}\n"
@@ -372,7 +374,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
             flag = " ⚠️ avoid or reduce size" if r["win_rate"] < 40 and r["total"] >= 5 else ""
             win_rate_lines.append(
                 f"  {r['setup_type']}: {r['win_rate']}% ({r['wins']}/{r['total']}) "
-                f"avg pnl {r['avg_pnl_pct']:+.1f}%{flag}"
+                f"avg pnl {r['avg_pnl_pct'] or 0:+.1f}%{flag}"
             )
         win_rate_text = "\n".join(win_rate_lines)
     else:
