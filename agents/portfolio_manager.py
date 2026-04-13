@@ -216,6 +216,19 @@ def execute_trade(db, decision: dict, profile_id: str):
             logging.getLogger(__name__).warning(f"Trade rejected: {corr_warning}")
             return False, corr_warning
 
+        # Confidence adjustment based on case library win rates
+        from utils.trade_validator import adjust_confidence
+        setup_type = decision.get("setup_type") or decision.get("setup") or ""
+        regime = decision.get("market_regime") or decision.get("regime")
+        conf_adj = adjust_confidence(db.bind, setup_type, regime)
+        if conf_adj["block"]:
+            import logging
+            logging.getLogger(__name__).warning(f"Trade BLOCKED: {conf_adj['reason']}")
+            return False, conf_adj["reason"]
+        if conf_adj["modifier"] < 1.0:
+            import logging
+            logging.getLogger(__name__).info(f"Confidence adjusted: {conf_adj['reason']}")
+
     if action == "BUY":
         cost = quantity * price
         if cost > cash:

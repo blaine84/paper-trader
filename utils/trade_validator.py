@@ -116,3 +116,91 @@ def check_correlation(symbol: str, direction: str, profile_id: str, db) -> str:
                 return (f"Correlated exposure: already {pos.side} {pos.symbol}, "
                         f"adding {direction} {symbol} compounds regime risk")
     return ""
+
+
+# ─── CONFIDENCE ADJUSTMENT BASED ON CASE LIBRARY ─────────────────────────────
+
+WIN_RATE_BLOCK_THRESHOLD = 0.35    # block trade if win rate below this
+WIN_RATE_DOWNGRADE_THRESHOLD = 0.50  # downgrade confidence if below this
+MIN_CASES_FOR_ADJUSTMENT = 5        # need at least this many cases to adjust
+
+
+def adjust_confidence(engine, setup_type: str, market_regime: str = None) -> dict:
+    """
+    Query case library for this setup_type + regime.
+    Returns confidence modifier and whether trade should be blocked.
+
+    Returns:
+        {
+            "modifier": 0.0-1.0 (multiply against base confidence),
+            "block": True/False,
+            "reason": "explanation",
+            "win_rate": float or None,
+            "total_cases": int,
+        }
+    """
+    from models.case import Case
+    from db.schema import get_session
+
+    db = get_session(engine)
+
+    # Query cases matching setup_type
+    query = db.query(Case).filter_by(setup_type=setup_type)
+    if market_regime:
+        regime_cases = query.filter_by(market_regime=market_regime).all()
+    else:
+        regime_cases = []
+
+    # Fall back to all cases for this setup if regime-specific data is sparse
+    all_setup_cases = query.all()
+    db.close()
+
+    # Use regime-specific if enough data, otherwise all setup cases
+    if len(regime_cases) >= MIN_CASES_FOR_ADJUSTMENT:
+        cases = regime_cases
+        context = f"{setup_type} in {market_regime}"
+    elif len(all_setup_cases) >= MIN_CASES_FOR_ADJUSTMENT:
+        cases = all_setup_cases
+        context = f"{setup_type} (all regimes)"
+    else:
+        return {
+            "modifier": 1.0,
+            "block": False,
+            "reason": f"Insufficient data ({len(all_setup_cases)} cases) — no adjustment",
+            "win_rate": None,
+            "total_cases": len(all_setup_cases),
+        }
+
+    total = len(cases)
+    wins = sum(1 for c in cases if c.outcome == "success")
+    win_rate = wins / total
+
+    # Block if win rate is terrible
+    if win_rate < WIN_RATE_BLOCK_THRESHOLD:
+        return {
+            "modifier": 0.0,
+            "block": True,
+            "reason": f"{context}: win rate {win_rate:.0%} ({wins}/{total}) below {WIN_RATE_BLOCK_THRESHOLD:.0%} threshold — BLOCKED",
+            "win_rate": round(win_rate, 3),
+            "total_cases": total,
+        }
+
+    # Downgrade if win rate is mediocre
+    if win_rate < WIN_RATE_DOWNGRADE_THRESHOLD:
+        modifier = win_rate / WIN_RATE_DOWNGRADE_THRESHOLD  # scales 0.7-1.0
+        return {
+            "modifier": round(modifier, 2),
+            "block": False,
+            "reason": f"{context}: win rate {win_rate:.0%} ({wins}/{total}) — confidence downgraded to {modifier:.0%}",
+            "win_rate": round(win_rate, 3),
+            "total_cases": total,
+        }
+
+    # Good win rate — no adjustment
+    return {
+        "modifier": 1.0,
+        "block": False,
+        "reason": f"{context}: win rate {win_rate:.0%} ({wins}/{total}) — no adjustment needed",
+        "win_rate": round(win_rate, 3),
+        "total_cases": total,
+    }
