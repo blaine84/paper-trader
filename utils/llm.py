@@ -133,7 +133,7 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
     import requests
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
-    timeout = int(os.getenv("OLLAMA_TIMEOUT", 60))
+    timeout = int(os.getenv("OLLAMA_TIMEOUT", 600))
 
     payload = {
         "model": model,
