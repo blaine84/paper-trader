@@ -109,22 +109,23 @@ def run(engine, symbols: list[str]) -> dict:
 
     signals = {}
 
-    for sym in symbols:
-        candles = fh.get_candles(sym, resolution="5", days=2)
-        indicators = compute_indicators(candles)
-        quote = fh.get_quote(sym)
-        sentiment = recent_sentiment.get(sym, {})
+    def _analyze_symbol(sym):
+        """Analyze a single symbol — runs in its own thread."""
+        try:
+            candles = fh.get_candles(sym, resolution="5", days=2)
+            indicators = compute_indicators(candles)
+            quote = fh.get_quote(sym)
+            sentiment = recent_sentiment.get(sym, {})
 
-        # Query case library for relevant precedents
-        case_context = {
-            "market_regime": "risk_on" if sentiment.get("sentiment") == "bullish" else
-                             "risk_off" if sentiment.get("sentiment") == "bearish" else "mixed",
-            "bias": "long" if indicators.get("trend") == "bullish" else "short",
-        }
-        relevant_cases = get_relevant_cases(engine, case_context, limit=5)
-        cases_text = format_cases_for_prompt(relevant_cases)
+            case_context = {
+                "market_regime": "risk_on" if sentiment.get("sentiment") == "bullish" else
+                                 "risk_off" if sentiment.get("sentiment") == "bearish" else "mixed",
+                "bias": "long" if indicators.get("trend") == "bullish" else "short",
+            }
+            relevant_cases = get_relevant_cases(engine, case_context, limit=3)
+            cases_text = format_cases_for_prompt(relevant_cases)
 
-        user_prompt = f"""
+            user_prompt = f"""
 Symbol: {sym}
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
 
@@ -154,19 +155,30 @@ RELEVANT PAST CASES:
 
 Produce your trading signal JSON for {sym}.
 """
-        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
-        signal = parse_json_response(raw)
-        signals[sym] = signal
+            raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
+            signal = parse_json_response(raw)
+            signals[sym] = signal
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Analyst error for {sym}: {e}")
+            signals[sym] = {"signal": "HOLD", "strength": "weak", "confidence": "low", "setup_type": "error", "reasoning": str(e)}
 
-        # Save to memory
-        mem = AgentMemory(
+    # Run all symbols in parallel
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_analyze_symbol, sym): sym for sym in symbols}
+        for f in as_completed(futures):
+            pass  # results stored in signals dict
+
+    # Save all signals to memory
+    db2 = get_session(engine)
+    for sym, signal in signals.items():
+        db2.add(AgentMemory(
             agent="analyst",
             symbol=sym,
             key="signal",
             value=json.dumps(signal),
-        )
-        db.add(mem)
-
-    db.commit()
-    db.close()
+        ))
+    db2.commit()
+    db2.close()
     return signals

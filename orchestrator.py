@@ -168,16 +168,24 @@ def run_intraday():
     except Exception as e:
         log.error(f"Analyst error: {e}", exc_info=True)
 
-    # PM profiles decide — each independently
+    # PM profiles decide — each independently, in parallel
     console.print("[bold green]🧠 Portfolio Managers deciding...[/bold green]")
-    for profile_id in pm.ACTIVE_PROFILES:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _run_pm(profile_id):
         try:
-            result = pm.run_profile(engine, full_watchlist, profile_id)
+            eng = get_engine()
+            result = pm.run_profile(eng, full_watchlist, profile_id)
             for d in result.get("decisions", []):
                 status = "✅" if d.get("executed") else "❌"
                 log.info(f"  [{profile_id}] {status} {d['action']} {d.get('quantity', '')} {d['symbol']} @ ${d.get('price', 0):.2f}")
         except Exception as e:
             log.error(f"PM {profile_id} error: {e}", exc_info=True)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(_run_pm, pid) for pid in pm.ACTIVE_PROFILES]
+        for f in as_completed(futures):
+            pass
 
     # Dashboard
     try:
