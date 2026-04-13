@@ -69,36 +69,56 @@ def check_stops_and_targets(engine) -> list[dict]:
         # Stop loss check — require price to exceed stop by a small buffer (0.1%)
         # to avoid false triggers from bid-ask spread noise
         if trade.stop_price:
-            buffer = trade.stop_price * 0.001  # 0.1% buffer
-            if side == "long":
-                hit = price <= (trade.stop_price - buffer)
-            else:
-                hit = price >= (trade.stop_price + buffer)
-            if hit:
-                triggers.append({
-                    "type": "stop_loss",
-                    "symbol": trade.symbol,
-                    "profile": trade.profile,
-                    "price": price,
-                    "level": trade.stop_price,
-                    "side": side,
-                    "trade_id": trade.id,
-                })
+            # Sanity: for long, stop should be below entry; for short, above
+            stop_valid = True
+            if side == "long" and trade.stop_price >= trade.entry_price:
+                stop_valid = False
+                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): LONG stop {trade.stop_price} is above entry {trade.entry_price} — skipping stop check")
+            elif side == "short" and trade.stop_price <= trade.entry_price:
+                stop_valid = False
+                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): SHORT stop {trade.stop_price} is below entry {trade.entry_price} — skipping stop check")
 
-        # Target check
+            if stop_valid:
+                buffer = trade.stop_price * 0.001
+                if side == "long":
+                    hit = price <= (trade.stop_price - buffer)
+                else:
+                    hit = price >= (trade.stop_price + buffer)
+                if hit:
+                    triggers.append({
+                        "type": "stop_loss",
+                        "symbol": trade.symbol,
+                        "profile": trade.profile,
+                        "price": price,
+                        "level": trade.stop_price,
+                        "side": side,
+                        "trade_id": trade.id,
+                    })
+
+        # Target check — verify target is on the correct side before triggering
         if trade.target_price:
-            hit = (side == "long" and price >= trade.target_price) or \
-                  (side == "short" and price <= trade.target_price)
-            if hit:
-                triggers.append({
-                    "type": "target_hit",
-                    "symbol": trade.symbol,
-                    "profile": trade.profile,
-                    "price": price,
-                    "level": trade.target_price,
-                    "side": side,
-                    "trade_id": trade.id,
-                })
+            # Sanity: for long, target should be above entry; for short, below
+            target_valid = True
+            if side == "long" and trade.target_price <= trade.entry_price:
+                target_valid = False
+                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): LONG target {trade.target_price} is below entry {trade.entry_price} — skipping target check")
+            elif side == "short" and trade.target_price >= trade.entry_price:
+                target_valid = False
+                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): SHORT target {trade.target_price} is above entry {trade.entry_price} — skipping target check")
+
+            if target_valid:
+                hit = (side == "long" and price >= trade.target_price) or \
+                      (side == "short" and price <= trade.target_price)
+                if hit:
+                    triggers.append({
+                        "type": "target_hit",
+                        "symbol": trade.symbol,
+                        "profile": trade.profile,
+                        "price": price,
+                        "level": trade.target_price,
+                        "side": side,
+                        "trade_id": trade.id,
+                    })
 
     db.close()
     return triggers
