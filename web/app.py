@@ -360,6 +360,7 @@ def api_performance():
     from models.case import Case
     from sqlalchemy import func
     from sqlalchemy.types import Integer as SAInteger
+    from db.schema import DynamicStrategy
     db = get_session(engine)
 
     # Win rates by setup type
@@ -427,11 +428,31 @@ def api_performance():
         for c in cases
     ]
 
+    # Dynamic strategies
+    dynamic_strats = db.query(DynamicStrategy).order_by(DynamicStrategy.created_at.desc()).all()
+    dynamic_list = [
+        {
+            "key": d.key,
+            "name": d.name,
+            "description": d.description,
+            "status": d.status,
+            "total_trades": d.total_trades,
+            "wins": d.wins,
+            "win_rate": d.win_rate,
+            "avg_pnl_pct": d.avg_pnl_pct,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+            "retired_at": d.retired_at.isoformat() if d.retired_at else None,
+            "retire_reason": d.retire_reason,
+        }
+        for d in dynamic_strats
+    ]
+
     db.close()
     return jsonify({
         "setup_stats": setup_stats,
         "profile_stats": profile_stats,
         "cases": case_list,
+        "dynamic_strategies": dynamic_list,
     })
 
 

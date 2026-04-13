@@ -174,8 +174,8 @@ def execute_trade(db, decision: dict, profile_id: str):
                 try: target = float(m.group(1))
                 except: pass
 
-    # If still no stop, calculate a default (2% from entry)
-    if not stop and price:
+    # If still no stop, calculate a default (2% from entry) — only for new positions
+    if action in ("BUY", "SHORT") and not stop and price:
         if action == "BUY":
             stop = round(price * 0.98, 2)
         elif action == "SHORT":

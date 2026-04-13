@@ -190,6 +190,8 @@
         </tr></thead>
         <tbody id="casesBody"></tbody>
       </table>
+      <div class="section-title" style="padding: 14px 14px 0">Agent-Proposed Strategies</div>
+      <div id="dynamicStrategies"><div class="empty-state">No dynamic strategies yet</div></div>
     </div>
 
     <!-- Agent Feedback -->
@@ -459,6 +461,27 @@
           <td class="right dim">${c.execution_score != null ? c.execution_score.toFixed(1) : '—'}</td>
           <td class="dim" style="font-size:11px">${c.lesson || '—'}</td>
         </tr>`).join('');
+    }
+
+    // Dynamic strategies
+    const dynEl = document.getElementById('dynamicStrategies');
+    const dyn = data.dynamic_strategies || [];
+    if (!dyn.length) {
+      dynEl.innerHTML = '<div class="empty-state">No agent-proposed strategies yet</div>';
+    } else {
+      dynEl.innerHTML = dyn.map(d => {
+        const statusColor = {active:'green',probation:'yellow',retired:'red'}[d.status] || 'dim';
+        const wr = d.win_rate != null ? `${d.win_rate}%` : 'no data';
+        return `<div class="feedback-box">
+          <strong>${d.name}</strong> <span class="dim">(${d.key})</span>
+          <span class="badge" style="background:#21262d;color:var(--${statusColor})">${d.status}</span><br>
+          <span class="dim">${d.description}</span><br>
+          <span style="font-size:11px">
+            Trades: ${d.total_trades || 0} · Win rate: ${wr} · Avg P&L: ${d.avg_pnl_pct != null ? d.avg_pnl_pct + '%' : '—'}
+            ${d.retire_reason ? `<br><span class="red">Retired: ${d.retire_reason}</span>` : ''}
+          </span>
+        </div>`;
+      }).join('');
     }
   }
 

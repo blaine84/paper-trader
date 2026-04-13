@@ -245,26 +245,22 @@ def run(engine, market_regime: str = None, context: dict = None) -> dict:
         except Exception:
             pass
 
-    # Format strategy library for the prompt
+    # Format strategy library for the prompt — compact version to reduce token usage
     strategy_lib = {}
     for key, strat in STRATEGIES.items():
         internal = internal_stats.get(key, {})
         strategy_lib[key] = {
             "name": strat["name"],
-            "description": strat["description"],
             "bias": strat["bias"],
-            "ideal_conditions": strat["ideal_conditions"],
-            "failure_conditions": strat["failure_conditions"],
-            "textbook_win_rate": strat["win_rate_documented"],
-            "textbook_avg_rr": strat["avg_rr_documented"],
-            "internal_win_rate": internal.get("win_rate"),
-            "internal_total_cases": internal.get("total", 0),
-            "internal_avg_pnl_pct": internal.get("avg_pnl_pct"),
+            "textbook_wr": strat["win_rate_documented"],
+            "internal_wr": internal.get("win_rate"),
+            "internal_cases": internal.get("total", 0),
+            "internal_pnl": internal.get("avg_pnl_pct"),
         }
 
     # Recent successful cases for additional context
-    recent_success = query_cases(engine, outcome="success", limit=5)
-    recent_fail = query_cases(engine, outcome="failure", limit=5)
+    recent_success = query_cases(engine, outcome="success", limit=3)
+    recent_fail = query_cases(engine, outcome="failure", limit=3)
 
     user_prompt = f"""
 Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
