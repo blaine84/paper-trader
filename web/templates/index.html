@@ -163,7 +163,7 @@
         <thead><tr>
           <th>Date</th><th>Profile</th><th>Symbol</th><th class="center">Dir</th>
           <th class="right">Qty</th><th class="right">Entry</th><th class="right">Exit</th>
-          <th class="right">P&L</th><th class="center">Score</th><th class="center">Status</th>
+          <th class="right">P&L</th><th class="right">Unreal.</th><th class="center">Score</th><th class="center">Status</th>
         </tr></thead>
         <tbody id="tradesBody"></tbody>
       </table>
@@ -399,9 +399,12 @@
 
   function renderTrades(trades) {
     const tbody = document.getElementById('tradesBody');
-    if (!trades.length) { tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No trades yet</td></tr>'; return; }
+    if (!trades.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty-state">No trades yet</td></tr>'; return; }
     tbody.innerHTML = trades.map(t => {
       const time = t.entry_time ? new Date(t.entry_time + 'Z').toLocaleString([], {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
+      const unrealStr = t.unrealized_pnl != null
+        ? `<span class="${pnlColor(t.unrealized_pnl)}">${t.unrealized_pnl >= 0 ? '+' : ''}${fmt(t.unrealized_pnl)}</span>`
+        : '<span class="dim">—</span>';
       return `
       <tr>
         <td class="dim" style="font-size:11px">${time}</td>
@@ -412,6 +415,7 @@
         <td class="right">${fmt(t.entry_price)}</td>
         <td class="right">${t.exit_price != null ? fmt(t.exit_price) : '—'}</td>
         <td class="right">${fmtPnl(t.pnl)}</td>
+        <td class="right">${unrealStr}</td>
         <td class="center dim">${t.review_score != null ? t.review_score.toFixed(1) : '—'}</td>
         <td class="center ${t.status === 'open' ? 'cyan' : 'dim'}">${t.status}</td>
       </tr>`;

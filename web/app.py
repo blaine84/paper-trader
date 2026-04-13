@@ -240,6 +240,7 @@ def api_positions():
 @app.route("/api/trades")
 def api_trades():
     db = get_session(engine)
+    import yfinance as yf
     cutoff = datetime.utcnow() - timedelta(days=30)
     trades = (
         db.query(Trade)
@@ -248,8 +249,29 @@ def api_trades():
         .limit(100)
         .all()
     )
-    result = [
-        {
+
+    # Batch fetch current prices for open trades
+    open_symbols = list(set(t.symbol for t in trades if t.status == "open"))
+    current_prices = {}
+    for sym in open_symbols:
+        try:
+            current_prices[sym] = float(yf.Ticker(sym).fast_info.get("lastPrice", 0))
+        except Exception:
+            pass
+
+    result = []
+    for t in trades:
+        unrealized_pnl = None
+        unrealized_pct = None
+        if t.status == "open" and t.symbol in current_prices:
+            price = current_prices[t.symbol]
+            if t.direction == "LONG":
+                unrealized_pnl = round((price - t.entry_price) * t.quantity, 2)
+            else:
+                unrealized_pnl = round((t.entry_price - price) * t.quantity, 2)
+            unrealized_pct = round(unrealized_pnl / (t.entry_price * t.quantity) * 100, 2) if t.entry_price and t.quantity else 0
+
+        result.append({
             "id": t.id,
             "profile": t.profile,
             "symbol": t.symbol,
@@ -262,10 +284,10 @@ def api_trades():
             "status": t.status,
             "pnl": t.pnl,
             "pnl_pct": t.pnl_pct,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pct": unrealized_pct,
             "review_score": t.review_score,
-        }
-        for t in trades
-    ]
+        })
     db.close()
     return jsonify(result)
 
