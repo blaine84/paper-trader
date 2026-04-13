@@ -378,6 +378,24 @@ def run_profile(engine, symbols: list[str], profile_id: str) -> dict:
     else:
         win_rate_text = "No setup win rate data yet."
 
+    # Breaking news from news monitor
+    news_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="news_monitor", key="breaking_news")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    news_text = news_mem.value if news_mem else "No breaking news"
+
+    # Position health from health monitor
+    health_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="position_health", key="health_check")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    health_text = health_mem.value if health_mem else "No health data"
+
     user_prompt = f"""
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
 Profile: {profile['name']} {profile['emoji']}
@@ -402,6 +420,12 @@ STRATEGY RECOMMENDATIONS (from Quant Researcher):
 
 RELEVANT PAST CASES:
 {cases_text}
+
+BREAKING NEWS (from news monitor):
+{news_text}
+
+POSITION HEALTH (from health monitor):
+{health_text}
 
 Make your trading decisions for this cycle.
 """

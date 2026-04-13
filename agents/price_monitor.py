@@ -286,3 +286,65 @@ def run(engine) -> dict:
         "momentum_alerts": momentum_alerts,
         "checked_at": datetime.utcnow().isoformat(),
     }
+
+
+# ─── LLM-ASSISTED ALERT FILTERING ────────────────────────────────────────────
+
+from utils.llm import call_llm, parse_json_response
+
+FILTER_PROMPT = """You are a quick-reaction trading filter. You receive a price alert and current market context.
+Decide if this alert warrants immediate PM attention or is just noise.
+
+Respond in JSON:
+{
+  "actionable": true or false,
+  "urgency": "high|medium|low",
+  "reasoning": "one sentence why",
+  "suggested_action": "BUY|SHORT|CLOSE|HOLD|none"
+}
+
+Be conservative — only flag as actionable if the move is clearly tradeable, not just volatility noise.
+"""
+
+_alert_cooldowns = {}  # {symbol: last_alert_time}
+COOLDOWN_MINUTES = 15
+
+
+def filter_alert_with_llm(alert: dict, engine) -> dict:
+    """Use local LLM to assess whether a price alert is actionable."""
+    sym = alert.get("symbol", "")
+
+    # Cooldown check
+    now = datetime.utcnow()
+    last = _alert_cooldowns.get(sym)
+    if last and (now - last).total_seconds() < COOLDOWN_MINUTES * 60:
+        return {"actionable": False, "reasoning": "cooldown active"}
+
+    # Get current analyst signal for context
+    db = get_session(engine)
+    sig_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="analyst", symbol=sym, key="signal")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    signal_ctx = sig_mem.value if sig_mem else "{}"
+    db.close()
+
+    user_prompt = f"""
+Alert: {json.dumps(alert)}
+Current analyst signal: {signal_ctx}
+Time: {now.strftime('%Y-%m-%d %H:%M UTC')}
+
+Is this alert actionable? Should the PM be notified?
+"""
+
+    try:
+        raw = call_llm(FILTER_PROMPT, user_prompt, json_mode=True, tier="low")
+        result = parse_json_response(raw)
+        if result.get("actionable"):
+            _alert_cooldowns[sym] = now
+        return result
+    except Exception as e:
+        log.warning(f"Alert filter LLM failed: {e}")
+        return {"actionable": True, "reasoning": "filter failed, passing through"}

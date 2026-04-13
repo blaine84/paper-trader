@@ -297,15 +297,28 @@ def run_price_monitor():
             except Exception as e:
                 log.error(f"Price monitor close error: {e}")
 
-        # For entry triggers or rapid moves, queue PM decisions
+        # For entry triggers or rapid moves, filter with local LLM then queue PM
         entry_triggers = result.get("entry_triggers", [])
         momentum_alerts = [a for a in result.get("momentum_alerts", []) if a["type"] == "rapid_move"]
-        action_symbols = list(set(
-            [t["symbol"] for t in entry_triggers] +
-            [a["symbol"] for a in momentum_alerts]
-        ))
-        if action_symbols:
-            log.info(f"Price monitor: action triggers on {action_symbols}, queuing PM decisions")
+        all_alerts = entry_triggers + momentum_alerts
+
+        if all_alerts:
+            from agents.price_monitor import filter_alert_with_llm
+            actionable_symbols = []
+            for alert in all_alerts:
+                try:
+                    assessment = filter_alert_with_llm(alert, engine)
+                    if assessment.get("actionable"):
+                        actionable_symbols.append(alert["symbol"])
+                        log.info(f"  Alert ACTIONABLE: {alert['symbol']} — {assessment.get('reasoning', '')}")
+                    else:
+                        log.info(f"  Alert filtered out: {alert['symbol']} — {assessment.get('reasoning', '')}")
+                except Exception as e:
+                    actionable_symbols.append(alert["symbol"])  # pass through on error
+
+            action_symbols = list(set(actionable_symbols))
+            if action_symbols:
+                log.info(f"Price monitor: triggering PM for {action_symbols}")
             for profile_id in pm.ACTIVE_PROFILES:
                 try:
                     pm_result = pm.run_profile(engine, WATCHLIST + action_symbols, profile_id)
@@ -317,6 +330,33 @@ def run_price_monitor():
 
     except Exception as e:
         log.error(f"Price monitor error: {e}", exc_info=True)
+
+
+def run_news_monitor():
+    """Every 2 hours — check for breaking news catalysts."""
+    log.info("=== NEWS MONITOR ===")
+    engine = get_engine()
+    try:
+        import agents.news_monitor as news_monitor
+        result = news_monitor.run(engine)
+        if result.get("alerts"):
+            log.info(f"News monitor: {len(result['alerts'])} alerts found")
+        else:
+            log.info(f"News monitor: {result.get('market_update', 'no updates')}")
+    except Exception as e:
+        log.error(f"News monitor error: {e}", exc_info=True)
+
+
+def run_position_health():
+    """Every hour — review open position health."""
+    log.info("=== POSITION HEALTH CHECK ===")
+    engine = get_engine()
+    try:
+        import agents.position_health as position_health
+        result = position_health.run(engine)
+        log.info(f"Position health: {result.get('summary', '')}")
+    except Exception as e:
+        log.error(f"Position health error: {e}", exc_info=True)
 
 
 def main():
@@ -375,6 +415,20 @@ def main():
         run_price_monitor,
         CT(day_of_week="mon-fri", hour="9-15", second="0", timezone="America/New_York"),
         id="price_monitor",
+    )
+
+    # News monitor: every 2 hours during market hours (local LLM, free)
+    scheduler.add_job(
+        run_news_monitor,
+        CronTrigger(day_of_week="mon-fri", hour="10,12,14", minute=0, timezone="America/New_York"),
+        id="news_monitor",
+    )
+
+    # Position health check: every hour during market hours (local LLM, free)
+    scheduler.add_job(
+        run_position_health,
+        CronTrigger(day_of_week="mon-fri", hour="10-15", minute=30, timezone="America/New_York"),
+        id="position_health",
     )
 
     # Post-market: 4:15 PM ET
