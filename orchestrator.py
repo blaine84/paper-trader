@@ -415,6 +415,8 @@ def main():
         run_price_monitor,
         CT(day_of_week="mon-fri", hour="9-15", second="0", timezone="America/New_York"),
         id="price_monitor",
+        max_instances=1,
+        coalesce=True,
     )
 
     # News monitor: every 2 hours during market hours (local LLM, free)

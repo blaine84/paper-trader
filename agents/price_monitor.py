@@ -19,16 +19,28 @@ log = logging.getLogger(__name__)
 
 
 def get_batch_quotes(symbols: list[str]) -> dict:
-    """Get current prices for multiple symbols via yfinance."""
+    """Get current prices for multiple symbols via yfinance — batch fetch."""
     quotes = {}
-    for sym in symbols:
-        try:
-            t = yf.Ticker(sym)
-            price = t.fast_info.get("lastPrice")
-            if price:
-                quotes[sym] = round(float(price), 2)
-        except Exception:
-            pass
+    try:
+        import yfinance as yf
+        tickers = yf.Tickers(" ".join(symbols))
+        for sym in symbols:
+            try:
+                price = tickers.tickers[sym].fast_info.get("lastPrice")
+                if price:
+                    quotes[sym] = round(float(price), 2)
+            except Exception:
+                pass
+    except Exception:
+        # Fallback to individual fetches
+        for sym in symbols:
+            try:
+                t = yf.Ticker(sym)
+                price = t.fast_info.get("lastPrice")
+                if price:
+                    quotes[sym] = round(float(price), 2)
+            except Exception:
+                pass
     return quotes
 
 
