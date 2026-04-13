@@ -218,6 +218,24 @@ def execute_trade(db, decision: dict, profile_id: str):
     if not price:
         return False, "No price in decision"
 
+    # Sanity-check the LLM's price against a live quote.
+    # Reject if the decision price deviates more than 5% from current market.
+    try:
+        fh = FinnhubClient()
+        live_quote = fh.get_quote(symbol)
+        live_price = live_quote.get("price", 0)
+        if live_price and live_price > 0:
+            deviation = abs(price - live_price) / live_price
+            if deviation > 0.05:
+                log.warning(
+                    "Price sanity check failed for %s: LLM price=%.2f, "
+                    "live price=%.2f (%.1f%% deviation). Using live price.",
+                    symbol, price, live_price, deviation * 100,
+                )
+                price = live_price
+    except Exception as exc:
+        log.warning("Could not verify price for %s: %s", symbol, exc)
+
     # Extract stop/target from multiple possible keys the LLM might use
     stop = decision.get("stop") or decision.get("stop_price") or decision.get("stop_loss")
     target = decision.get("target") or decision.get("target_price") or decision.get("profit_target")
