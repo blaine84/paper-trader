@@ -592,67 +592,91 @@
       el.innerHTML = '<div class="empty-state">No journal entries yet — the Daily Review agent runs after market close on weekdays.</div>';
       return;
     }
+    // Coerce any value to a display string (LLM sometimes returns objects)
+    const toStr = v => {
+      if (!v) return '';
+      if (typeof v === 'string') return v;
+      if (typeof v === 'object') return JSON.stringify(v);
+      return String(v);
+    };
+    const sec = (color, title, text) =>
+      '<div style="margin-bottom:10px"><strong style="color:' + color + '">' + title + '</strong><br><span class="dim">' + escHtml(toStr(text)) + '</span></div>';
+
     const html = entries.map(entry => {
-      const date = entry.date || '—';
+      const date = entry.date || '\u2014';
       const id = 'journal-' + date.replace(/[^a-zA-Z0-9]/g, '');
       const sections = [];
 
-      if (entry.market_summary) {
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#58a6ff">Market Summary</strong><br><span class="dim">${escHtml(entry.market_summary)}</span></div>`);
-      }
-      const tradePerfText = entry.trade_narrative;
-      if (tradePerfText && typeof tradePerfText === 'string') {
+      if (entry.market_summary) sections.push(sec('#58a6ff', 'Market Summary', entry.market_summary));
+
+      if (entry.trade_narrative) {
         let statsLine = '';
         const ts = entry.trade_stats;
         if (ts && ts.total_trades > 0) {
-          statsLine = `<div style="margin-top:6px;font-size:11px"><span class="level-tag">${ts.total_trades} trades</span> <span class="level-tag green">${ts.wins}W</span> <span class="level-tag red">${ts.losses}L</span> <span class="level-tag ${ts.total_pnl >= 0 ? 'green' : 'red'}">$${ts.total_pnl.toFixed(2)}</span></div>`;
+          const pc = ts.total_pnl >= 0 ? 'green' : 'red';
+          statsLine = '<div style="margin-top:6px;font-size:11px">'
+            + '<span class="level-tag">' + ts.total_trades + ' trades</span> '
+            + '<span class="level-tag green">' + ts.wins + 'W</span> '
+            + '<span class="level-tag red">' + ts.losses + 'L</span> '
+            + '<span class="level-tag ' + pc + '">$' + ts.total_pnl.toFixed(2) + '</span>'
+            + '</div>';
         }
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#3fb950">Trade Performance</strong><br><span class="dim">${escHtml(tradePerfText)}</span>${statsLine}</div>`);
+        sections.push('<div style="margin-bottom:10px"><strong style="color:#3fb950">Trade Performance</strong><br><span class="dim">' + escHtml(toStr(entry.trade_narrative)) + '</span>' + statsLine + '</div>');
       }
-      const gitText = entry.git_narrative;
-      if (gitText && typeof gitText === 'string') {
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#d29922">Git Changes</strong><br><span class="dim">${escHtml(gitText)}</span></div>`);
-      }
-      if (entry.correlations) {
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#bc8cff">Correlations</strong><br><span class="dim">${escHtml(entry.correlations)}</span></div>`);
-      }
+
+      if (entry.git_narrative) sections.push(sec('#d29922', 'Git Changes', entry.git_narrative));
+      if (entry.correlations) sections.push(sec('#bc8cff', 'Correlations', entry.correlations));
+
       if (entry.lessons_learned && entry.lessons_learned.length) {
-        const lessons = entry.lessons_learned.map(l => {
-          if (typeof l === 'string') return `<li>${escHtml(l)}</li>`;
-          return `<li><strong>${escHtml(l.category || '')}</strong>: ${escHtml(l.lesson || '')}${l.evidence ? `<br><span class="dim" style="font-size:11px">Evidence: ${escHtml(l.evidence)}</span>` : ''}${l.action ? `<br><span class="cyan" style="font-size:11px">Action: ${escHtml(l.action)}</span>` : ''}</li>`;
+        const lessons = entry.lessons_learned.map(function(l) {
+          if (typeof l === 'string') return '<li>' + escHtml(l) + '</li>';
+          if (typeof l === 'object') {
+            let s = '<li><strong>' + escHtml(l.category || '') + '</strong>: ' + escHtml(l.lesson || '');
+            if (l.evidence) s += '<br><span class="dim" style="font-size:11px">Evidence: ' + escHtml(l.evidence) + '</span>';
+            if (l.action) s += '<br><span class="cyan" style="font-size:11px">Action: ' + escHtml(l.action) + '</span>';
+            return s + '</li>';
+          }
+          return '<li>' + escHtml(String(l)) + '</li>';
         }).join('');
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#f0883e">Lessons Learned</strong><ul class="catalyst-list" style="margin-top:4px">${lessons}</ul></div>`);
+        sections.push('<div style="margin-bottom:10px"><strong style="color:#f0883e">Lessons Learned</strong><ul class="catalyst-list" style="margin-top:4px">' + lessons + '</ul></div>');
       }
-      if (entry.process_quality) {
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#3fb950">Process Quality</strong><br><span class="dim">${escHtml(entry.process_quality)}</span></div>`);
-      }
-      if (entry.outlook) {
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#58a6ff">Outlook</strong><br><span class="dim">${escHtml(entry.outlook)}</span></div>`);
-      }
+
+      if (entry.process_quality) sections.push(sec('#3fb950', 'Process Quality', entry.process_quality));
+      if (entry.outlook) sections.push(sec('#58a6ff', 'Outlook', entry.outlook));
+
       if (entry.watchouts && entry.watchouts.length) {
-        const items = entry.watchouts.map(w => `<li style="color:#f85149">${escHtml(w)}</li>`).join('');
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#f85149">Watchouts</strong><ul class="catalyst-list" style="margin-top:4px">${items}</ul></div>`);
+        const items = entry.watchouts.map(function(w) {
+          if (typeof w === 'string') return '<li style="color:#f85149">' + escHtml(w) + '</li>';
+          if (typeof w === 'object') {
+            const parts = [w.symbol, w.setup_type, w.reason || w.note].filter(Boolean);
+            return '<li style="color:#f85149">' + escHtml(parts.join(' — ')) + '</li>';
+          }
+          return '<li style="color:#f85149">' + escHtml(String(w)) + '</li>';
+        }).join('');
+        sections.push('<div style="margin-bottom:10px"><strong style="color:#f85149">Watchouts</strong><ul class="catalyst-list" style="margin-top:4px">' + items + '</ul></div>');
       }
+
       if (entry.completeness) {
         const c = entry.completeness;
-        const confColor = {high:'green',medium:'yellow',low:'red'}[c.confidence] || 'dim';
+        const confColor = ({high:'green',medium:'yellow',low:'red'})[c.confidence] || 'dim';
         const flags = ['trade_data','git_data','researcher_context','reviewer_feedback','analyst_signals','previous_review']
-          .filter(k => c[k] !== undefined)
-          .map(k => `<span class="level-tag">${k.replace(/_/g,' ')}: ${c[k] ? '✓' : '✗'}</span>`).join(' ');
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#8b949e">Completeness</strong> <span class="${confColor}" style="font-size:12px;font-weight:600">${c.confidence || '—'}</span><br><div class="levels" style="margin-top:4px">${flags}</div></div>`);
+          .filter(function(k) { return c[k] !== undefined; })
+          .map(function(k) { return '<span class="level-tag">' + k.replace(/_/g,' ') + ': ' + (c[k] ? '\u2713' : '\u2717') + '</span>'; })
+          .join(' ');
+        sections.push('<div style="margin-bottom:10px"><strong style="color:#8b949e">Completeness</strong> <span class="' + confColor + '" style="font-size:12px;font-weight:600">' + (c.confidence || '\u2014') + '</span><br><div class="levels" style="margin-top:4px">' + flags + '</div></div>');
       }
 
       if (!sections.length) {
         sections.push('<div class="dim">No narrative sections available for this entry.</div>');
       }
 
-      return `<div class="feedback-box" style="cursor:pointer" onclick="toggleJournalEntry('${id}')">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <strong style="font-size:14px">📓 ${date}</strong>
-          <span class="expand-btn" id="${id}-btn">▼</span>
-        </div>
-        <div id="${id}" style="display:none;margin-top:10px">${sections.join('')}</div>
-      </div>`;
+      return '<div class="feedback-box" style="cursor:pointer" onclick="toggleJournalEntry(\'' + id + '\')">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+        + '<strong style="font-size:14px">\uD83D\uDCD3 ' + date + '</strong>'
+        + '<span class="expand-btn" id="' + id + '-btn">\u25BC</span>'
+        + '</div>'
+        + '<div id="' + id + '" style="display:none;margin-top:10px">' + sections.join('') + '</div>'
+        + '</div>';
     }).join('');
 
     if (append) {
@@ -661,6 +685,7 @@
       el.innerHTML = html;
     }
   }
+
 
   function toggleJournalEntry(id) {
     const content = document.getElementById(id);
