@@ -26,10 +26,17 @@ def _make_summary():
 def _make_llm_response():
     """Return a valid LLM narrative JSON string."""
     return json.dumps({
-        "market_summary": "Markets rallied today.",
-        "trade_narrative": "Two trades were taken.",
-        "git_narrative": "No code changes.",
-        "correlations": "No correlations observed.",
+        "executive_summary": "Net +$50 on 2 trades. Tight stops saved the day.",
+        "day_classification": "modest_win",
+        "primary_driver": "Disciplined stop management on AAPL limited downside.",
+        "driver_ranking": [
+            {"driver": "Stop discipline on AAPL", "impact": "+$50", "controllable": True}
+        ],
+        "performance_story": "Two trades were taken. One won, one lost. Net positive.",
+        "system_observations": "Agents coordinated well on entry signals.",
+        "what_worked": ["Tight stops on momentum setups"],
+        "what_failed": ["Late entry on second trade"],
+        "highest_leverage_fix": "Improve entry timing on momentum setups.",
         "lessons_learned": [
             {
                 "category": "execution",
@@ -39,8 +46,12 @@ def _make_llm_response():
             }
         ],
         "process_quality": "Execution discipline was solid.",
-        "outlook": "Watch for continuation in tech.",
+        "correlations": "No correlations observed.",
+        "git_narrative": "No code changes.",
+        "tomorrows_focus": ["Monitor AAPL continuation"],
         "watchouts": ["TSLA approaching resistance"],
+        "email_subject": "Modest win: +$50 on 2 trades",
+        "email_preview": "Tight stops saved the day with a net +$50 across 2 trades.",
     })
 
 
@@ -63,12 +74,16 @@ class TestGenerateNarrative:
         assert result["completeness"]["confidence"] == "medium"
 
         # Narrative fields present
-        assert result["market_summary"] == "Markets rallied today."
-        assert result["trade_narrative"] == "Two trades were taken."
+        assert result["executive_summary"] == "Net +$50 on 2 trades. Tight stops saved the day."
+        assert result["day_classification"] == "modest_win"
+        assert result["primary_driver"] == "Disciplined stop management on AAPL limited downside."
         assert result["correlations"] == "No correlations observed."
         assert result["process_quality"] == "Execution discipline was solid."
-        assert result["outlook"] == "Watch for continuation in tech."
         assert result["watchouts"] == ["TSLA approaching resistance"]
+        assert result["what_worked"] == ["Tight stops on momentum setups"]
+        assert result["what_failed"] == ["Late entry on second trade"]
+        assert result["highest_leverage_fix"] == "Improve entry timing on momentum setups."
+        assert result["tomorrows_focus"] == ["Monitor AAPL continuation"]
 
     @patch("agents.daily_review.call_llm")
     @patch("agents.daily_review.parse_json_response")
@@ -84,14 +99,14 @@ class TestGenerateNarrative:
     @patch("agents.daily_review.call_llm")
     @patch("agents.daily_review.parse_json_response")
     def test_calls_llm_with_medium_tier(self, mock_parse, mock_llm):
-        """LLM is called with the correct tier."""
+        """LLM is called twice (diagnostic + analysis) with the correct tier."""
         mock_llm.return_value = _make_llm_response()
         mock_parse.return_value = json.loads(_make_llm_response())
 
         generate_narrative(_make_summary())
-        mock_llm.assert_called_once()
-        _, kwargs = mock_llm.call_args
-        assert kwargs.get("tier", mock_llm.call_args[0][2] if len(mock_llm.call_args[0]) > 2 else None) is not None
+        assert mock_llm.call_count == 2
+        for call_args in mock_llm.call_args_list:
+            assert call_args.kwargs.get("tier") == "medium"
 
     @patch("agents.daily_review.call_llm")
     @patch("agents.daily_review.parse_json_response")
@@ -118,10 +133,15 @@ class TestGenerateNarrative:
         assert result["trade_performance"]["total_trades"] == 2
 
         # Narrative fields are empty defaults
-        assert result["market_summary"] == ""
+        assert result["executive_summary"] == ""
+        assert result["day_classification"] == "breakeven"
+        assert result["primary_driver"] == ""
         assert result["lessons_learned"] == []
         assert result["watchouts"] == []
         assert result["process_quality"] == ""
+        assert result["what_worked"] == []
+        assert result["what_failed"] == []
+        assert result["tomorrows_focus"] == []
 
         # generated_at still present
         assert "generated_at" in result
@@ -146,7 +166,7 @@ class TestGenerateNarrative:
         """Non-dict entries in lessons_learned are filtered out."""
         mock_llm.return_value = "ignored"
         mock_parse.return_value = {
-            "market_summary": "ok",
+            "executive_summary": "ok",
             "lessons_learned": ["not a dict", {"category": "risk", "lesson": "good"}],
             "watchouts": [],
         }
@@ -164,27 +184,28 @@ class TestGenerateNarrative:
         """Missing narrative fields get empty defaults."""
         mock_llm.return_value = "ignored"
         mock_parse.return_value = {
-            "market_summary": "Partial response",
+            "executive_summary": "Partial response",
             # All other fields missing
         }
 
         result = generate_narrative(_make_summary())
-        assert result["market_summary"] == "Partial response"
-        assert result["trade_narrative"] == ""
+        assert result["executive_summary"] == "Partial response"
+        assert result["performance_story"] == ""
         assert result["correlations"] == ""
         assert result["lessons_learned"] == []
         assert result["watchouts"] == []
+        assert result["day_classification"] == "breakeven"  # default
 
     @patch("agents.daily_review.call_llm")
     @patch("agents.daily_review.parse_json_response")
     def test_system_prompt_contains_required_rules(self, mock_parse, mock_llm):
-        """SYSTEM_PROMPT includes the key rules from the design doc."""
-        assert "observational language" in NARRATIVE_SYSTEM_PROMPT
-        assert "hedging language" in NARRATIVE_SYSTEM_PROMPT
-        assert "sample size < 5" in NARRATIVE_SYSTEM_PROMPT
-        assert "specific trades" in NARRATIVE_SYSTEM_PROMPT
-        assert "process quality" in NARRATIVE_SYSTEM_PROMPT
-        assert "watchouts" in NARRATIVE_SYSTEM_PROMPT
+        """System prompts include the key rules from the design doc."""
+        from agents.daily_review import _DIAGNOSTIC_PROMPT, _ANALYSIS_PROMPT
+        for prompt in [_DIAGNOSTIC_PROMPT, _ANALYSIS_PROMPT]:
+            assert "observational" in prompt
+            assert "sample size < 5" in prompt
+            assert "specific trades" in prompt
+            assert "process quality" in prompt
 
     @patch("agents.daily_review.call_llm")
     @patch("agents.daily_review.parse_json_response")
@@ -206,7 +227,7 @@ class TestGenerateNarrative:
         """Narrative merge does not clobber deterministic fields like completeness."""
         mock_llm.return_value = "ignored"
         mock_parse.return_value = {
-            "market_summary": "ok",
+            "executive_summary": "ok",
             "completeness": {"overwritten": True},  # LLM tries to overwrite
         }
 
@@ -216,3 +237,62 @@ class TestGenerateNarrative:
         # completeness should still be the deterministic version since we only
         # merge _NARRATIVE_FIELDS, not arbitrary keys
         assert result["completeness"]["confidence"] == "medium"
+
+    @patch("agents.daily_review.call_llm")
+    @patch("agents.daily_review.parse_json_response")
+    def test_invalid_day_classification_defaults_to_breakeven(self, mock_parse, mock_llm):
+        """Invalid day_classification values are corrected to 'breakeven'."""
+        mock_llm.return_value = "ignored"
+        mock_parse.return_value = {
+            "executive_summary": "ok",
+            "day_classification": "invalid_value",
+        }
+
+        result = generate_narrative(_make_summary())
+        assert result["day_classification"] == "breakeven"
+
+    @patch("agents.daily_review.call_llm")
+    @patch("agents.daily_review.parse_json_response")
+    def test_valid_day_classifications_accepted(self, mock_parse, mock_llm):
+        """All valid day_classification values are preserved."""
+        for classification in ["strong_win", "modest_win", "breakeven", "modest_loss", "bad_day", "system_failure"]:
+            mock_llm.return_value = "ignored"
+            mock_parse.return_value = {
+                "executive_summary": "ok",
+                "day_classification": classification,
+            }
+            result = generate_narrative(_make_summary())
+            assert result["day_classification"] == classification
+
+    @patch("agents.daily_review.call_llm")
+    @patch("agents.daily_review.parse_json_response")
+    def test_list_fields_validated(self, mock_parse, mock_llm):
+        """Non-list values for list fields are replaced with defaults."""
+        mock_llm.return_value = "ignored"
+        mock_parse.return_value = {
+            "executive_summary": "ok",
+            "what_worked": "not a list",
+            "what_failed": 42,
+            "tomorrows_focus": None,
+            "driver_ranking": "bad",
+        }
+
+        result = generate_narrative(_make_summary())
+        assert result["what_worked"] == []
+        assert result["what_failed"] == []
+        assert result["tomorrows_focus"] == []
+        assert result["driver_ranking"] == []
+
+    @patch("agents.daily_review.call_llm")
+    @patch("agents.daily_review.parse_json_response")
+    def test_string_fields_validated(self, mock_parse, mock_llm):
+        """Non-string values for string fields are coerced to strings."""
+        mock_llm.return_value = "ignored"
+        mock_parse.return_value = {
+            "executive_summary": 42,
+            "primary_driver": ["not", "a", "string"],
+        }
+
+        result = generate_narrative(_make_summary())
+        assert isinstance(result["executive_summary"], str)
+        assert isinstance(result["primary_driver"], str)

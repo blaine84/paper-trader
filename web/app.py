@@ -646,9 +646,14 @@ def api_journal():
     # Fields the Journal tab UI actually renders
     _UI_FIELDS = [
         "date", "generated_at",
-        "market_summary", "trade_narrative", "git_narrative",
-        "correlations", "lessons_learned", "process_quality",
-        "outlook", "watchouts", "completeness",
+        "executive_summary", "day_classification", "primary_driver",
+        "driver_ranking", "performance_story", "system_observations",
+        "what_worked", "what_failed", "highest_leverage_fix",
+        "lessons_learned", "process_quality", "correlations",
+        "git_narrative", "tomorrows_focus", "watchouts",
+        "email_subject", "email_preview", "completeness",
+        # Legacy fields for backward compat with old entries
+        "market_summary", "trade_narrative", "outlook",
     ]
 
     db = get_session(engine)

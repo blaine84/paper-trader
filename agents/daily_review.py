@@ -755,6 +755,35 @@ def build_deterministic_summary(
         "confidence": confidence,
     }
 
+    # --- process_metrics (deterministic) ---
+    tp = trade_perf or {}
+    total = tp.get("total_trades", 0)
+    wins = tp.get("wins", 0)
+    process_metrics = {
+        "win_rate": round(wins / total * 100, 1) if total > 0 else 0,
+        "avg_pnl_per_trade": round(tp.get("total_pnl", 0) / total, 2) if total > 0 else 0,
+        "largest_win": tp.get("best_trade", {}).get("pnl_pct") if tp.get("best_trade") else None,
+        "largest_loss": tp.get("worst_trade", {}).get("pnl_pct") if tp.get("worst_trade") else None,
+        "profiles_active": [p for p, v in (tp.get("per_profile") or {}).items() if v.get("trades", 0) > 0],
+    }
+
+    # --- activity_flags ---
+    activity_flags = {
+        "had_trades": not tp.get("no_trades", True),
+        "had_git_commits": len(git_commits) > 0,
+        "had_cases": len(cases) > 0,
+        "had_previous_review": previous_review is not None,
+        "high_volume_day": total >= 10,
+        "loss_day": tp.get("total_pnl", 0) < 0,
+    }
+
+    # --- day_context ---
+    day_context = {
+        "day_of_week": date.today().strftime("%A"),
+        "is_monday": date.today().weekday() == 0,
+        "is_friday": date.today().weekday() == 4,
+    }
+
     return {
         "date": date.today().isoformat(),
         "trade_performance": trade_perf,
@@ -769,6 +798,9 @@ def build_deterministic_summary(
         "cases_today": cases,
         "previous_review_summary": previous_review_summary,
         "completeness": completeness,
+        "process_metrics": process_metrics,
+        "activity_flags": activity_flags,
+        "day_context": day_context,
     }
 
 
@@ -776,52 +808,106 @@ def build_deterministic_summary(
 # LLM narrative generator
 # ---------------------------------------------------------------------------
 
-NARRATIVE_SYSTEM_PROMPT = """You are a trading journal writer for a multi-agent paper trading system.
-You receive a structured data summary and produce a narrative daily review for the system's overseer.
+NARRATIVE_SYSTEM_PROMPT = """You are the chief diagnostician for a multi-agent paper trading system.
+You receive a structured data summary and produce an opinionated, diagnostic daily review.
+Your audience is the system's builder — they want to know what broke, what worked, and what to fix first.
 
-Rules:
-- Use observational language for correlations, never causal claims
-- When sample size < 5, use hedging language ("may", "possibly", "early indication")
-- Reference specific trades by symbol and setup type
-- Keep lessons actionable with evidence
-- Separate process quality from financial outcomes
-- Include watchouts as machine-readable flags
+Voice rules:
+- Be direct and opinionated. "The system lost money because X" not "The system experienced losses."
+- Lead with the single most important thing that happened today.
+- Rank drivers by impact — don't give equal weight to everything.
+- When sample size < 5, say so explicitly but still give your best read.
+- Reference specific trades by symbol, setup type, and P&L.
+- Correlations are observational, never causal. Say "coincided with" not "caused by."
+- Separate process quality from outcomes — a good process can lose money.
+- Be concise. Every sentence should earn its place.
+"""
 
-Return JSON with these fields:
+# --- Two-phase prompts to keep output complexity manageable for local models ---
+
+_DIAGNOSTIC_PROMPT = NARRATIVE_SYSTEM_PROMPT + """
+Return JSON with ONLY these fields:
 {
-    "market_summary": "...",
-    "trade_narrative": "...",
-    "git_narrative": "...",
-    "correlations": "...",
-    "lessons_learned": [{"category": "...", "lesson": "...", "evidence": "...", "action": "..."}],
-    "process_quality": "...",
-    "outlook": "...",
-    "watchouts": ["...", "..."]
+    "executive_summary": "2-3 sentence TL;DR. Lead with the headline number and the why.",
+    "day_classification": "one of: strong_win | modest_win | breakeven | modest_loss | bad_day | system_failure",
+    "primary_driver": "Single sentence: the #1 factor that determined today's outcome.",
+    "performance_story": "3-5 sentence narrative: setup, execution, outcome.",
+    "what_worked": ["specific thing 1", "specific thing 2"],
+    "what_failed": ["specific thing 1", "specific thing 2"],
+    "highest_leverage_fix": "The single change with the biggest positive impact if done tomorrow.",
+    "email_subject": "Short subject line for email digest (under 60 chars).",
+    "email_preview": "One sentence preview (under 120 chars)."
 }
 """
 
+_ANALYSIS_PROMPT = NARRATIVE_SYSTEM_PROMPT + """
+Return JSON with ONLY these fields:
+{
+    "driver_ranking": [{"driver": "description", "impact": "$ or % impact", "controllable": true/false}],
+    "system_observations": "What the agents did well or poorly as a system.",
+    "lessons_learned": [{"category": "...", "lesson": "...", "evidence": "...", "action": "..."}],
+    "process_quality": "Evaluate execution discipline and risk management independent of P&L.",
+    "correlations": "Observational connections between code changes and trading outcomes.",
+    "git_narrative": "Brief summary of code changes and their relevance.",
+    "tomorrows_focus": ["priority 1", "priority 2", "priority 3"],
+    "watchouts": ["specific risk or flag for tomorrow"]
+}
+"""
+
+# Phase 1 fields (diagnostic)
+_DIAGNOSTIC_FIELDS = [
+    "executive_summary", "day_classification", "primary_driver",
+    "performance_story", "what_worked", "what_failed",
+    "highest_leverage_fix", "email_subject", "email_preview",
+]
+
+# Phase 2 fields (analysis)
+_ANALYSIS_FIELDS = [
+    "driver_ranking", "system_observations", "lessons_learned",
+    "process_quality", "correlations", "git_narrative",
+    "tomorrows_focus", "watchouts",
+]
+
 # Fields the LLM is expected to produce
 _NARRATIVE_FIELDS = [
-    "market_summary",
-    "trade_narrative",
-    "git_narrative",
-    "correlations",
+    "executive_summary",
+    "day_classification",
+    "primary_driver",
+    "driver_ranking",
+    "performance_story",
+    "system_observations",
+    "what_worked",
+    "what_failed",
+    "highest_leverage_fix",
     "lessons_learned",
     "process_quality",
-    "outlook",
+    "correlations",
+    "git_narrative",
+    "tomorrows_focus",
     "watchouts",
+    "email_subject",
+    "email_preview",
 ]
 
 # Empty defaults used when the LLM fails or returns incomplete data
 _EMPTY_NARRATIVE = {
-    "market_summary": "",
-    "trade_narrative": "",
-    "git_narrative": "",
-    "correlations": "",
+    "executive_summary": "",
+    "day_classification": "breakeven",
+    "primary_driver": "",
+    "driver_ranking": [],
+    "performance_story": "",
+    "system_observations": "",
+    "what_worked": [],
+    "what_failed": [],
+    "highest_leverage_fix": "",
     "lessons_learned": [],
     "process_quality": "",
-    "outlook": "",
+    "correlations": "",
+    "git_narrative": "",
+    "tomorrows_focus": [],
     "watchouts": [],
+    "email_subject": "",
+    "email_preview": "",
 }
 
 
@@ -887,38 +973,50 @@ def _build_llm_prompt(summary: dict) -> str:
     prompt["previous_review_summary"] = summary.get("previous_review_summary")
     prompt["completeness"] = summary.get("completeness", {})
 
+    # Include new deterministic fields for the LLM
+    prompt["process_metrics"] = summary.get("process_metrics", {})
+    prompt["activity_flags"] = summary.get("activity_flags", {})
+    prompt["day_context"] = summary.get("day_context", {})
+
     return json.dumps(prompt, default=str)
 
 
 def generate_narrative(deterministic_summary: dict, tier: str = "medium") -> dict:
     """
-    Pass the deterministic summary to the LLM for narrative generation.
-    Merges narrative fields into the deterministic summary and returns
-    the complete Daily_Review JSON.
+    Generate the narrative review via two focused LLM calls.
 
-    On LLM failure, returns the deterministic summary with empty narrative
-    fields so the review is still usable.
+    Phase 1 (diagnostic): executive summary, classification, what worked/failed, fix
+    Phase 2 (analysis): driver ranking, lessons, correlations, process quality, watchouts
 
-    Args:
-        deterministic_summary: The structured summary from build_deterministic_summary.
-        tier: LLM tier to use (default "medium" for local inference).
+    Each call gets the same condensed input but a simpler output schema,
+    keeping output complexity manageable for local models.
 
-    Returns:
-        Complete Daily_Review dict with both deterministic and narrative fields.
+    On failure of either call, the other's fields still populate.
     """
     review = dict(deterministic_summary)
     review["generated_at"] = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    user_prompt = _build_llm_prompt(deterministic_summary)
 
-    # Attempt LLM narrative generation
+    # --- Phase 1: Diagnostic ---
+    diagnostic = {}
     try:
-        user_prompt = _build_llm_prompt(deterministic_summary)
-        raw = call_llm(NARRATIVE_SYSTEM_PROMPT, user_prompt, tier=tier)
-        narrative = parse_json_response(raw)
+        raw = call_llm(_DIAGNOSTIC_PROMPT, user_prompt, tier=tier)
+        diagnostic = parse_json_response(raw)
+        logger.info("Daily review phase 1 (diagnostic) complete")
     except Exception as e:
-        logger.error(f"LLM narrative generation failed: {e}")
-        narrative = {}
+        logger.error(f"LLM diagnostic phase failed: {e}")
 
-    # Merge narrative fields into the review, using empty defaults for missing keys
+    # --- Phase 2: Analysis ---
+    analysis = {}
+    try:
+        raw = call_llm(_ANALYSIS_PROMPT, user_prompt, tier=tier)
+        analysis = parse_json_response(raw)
+        logger.info("Daily review phase 2 (analysis) complete")
+    except Exception as e:
+        logger.error(f"LLM analysis phase failed: {e}")
+
+    # Merge both phases into the review
+    narrative = {**diagnostic, **analysis}
     for field in _NARRATIVE_FIELDS:
         review[field] = narrative.get(field, _EMPTY_NARRATIVE[field])
 
@@ -935,5 +1033,22 @@ def generate_narrative(deterministic_summary: dict, tier: str = "medium") -> dic
                     "action": str(item.get("action", "")),
                 })
     review["lessons_learned"] = validated_lessons
+
+    # Validate day_classification
+    valid_classifications = {"strong_win", "modest_win", "breakeven", "modest_loss", "bad_day", "system_failure"}
+    if review.get("day_classification") not in valid_classifications:
+        review["day_classification"] = "breakeven"
+
+    # Validate list fields
+    for list_field in ["driver_ranking", "what_worked", "what_failed", "tomorrows_focus", "watchouts"]:
+        if not isinstance(review.get(list_field), list):
+            review[list_field] = _EMPTY_NARRATIVE[list_field]
+
+    # Validate string fields
+    for str_field in ["executive_summary", "primary_driver", "performance_story",
+                      "system_observations", "highest_leverage_fix", "process_quality",
+                      "correlations", "git_narrative", "email_subject", "email_preview"]:
+        if not isinstance(review.get(str_field), str):
+            review[str_field] = str(review.get(str_field, "")) if review.get(str_field) else ""
 
     return review

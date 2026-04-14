@@ -587,83 +587,253 @@
   }
 
   function renderJournal(entries, append) {
-    const el = document.getElementById('journalContent');
+    var el = document.getElementById('journalContent');
     if (!entries.length && !append) {
-      el.innerHTML = '<div class="empty-state">No journal entries yet — the Daily Review agent runs after market close on weekdays.</div>';
+      el.innerHTML = '<div class="empty-state">No journal entries yet \u2014 the Daily Review agent runs after market close on weekdays.</div>';
       return;
     }
     // Coerce any value to a display string (LLM sometimes returns objects)
-    const toStr = v => {
+    var toStr = function(v) {
       if (!v) return '';
       if (typeof v === 'string') return v;
-      if (typeof v === 'object') return JSON.stringify(v);
+      if (typeof v === 'object') {
+        return Object.entries(v)
+          .filter(function(kv) { return kv[1] !== null && kv[1] !== undefined; })
+          .map(function(kv) {
+            var label = kv[0].replace(/_/g, ' ');
+            var val = kv[1];
+            if (typeof val === 'number') val = val.toLocaleString('en-US', {maximumFractionDigits: 2});
+            return label + ': ' + val;
+          }).join(' \u00b7 ');
+      }
       return String(v);
     };
-    const sec = (color, title, text) =>
-      '<div style="margin-bottom:10px"><strong style="color:' + color + '">' + title + '</strong><br><span class="dim">' + escHtml(toStr(text)) + '</span></div>';
+    var sec = function(color, title, text) {
+      return '<div style="margin-bottom:10px"><strong style="color:' + color + '">' + title + '</strong><br><span class="dim">' + escHtml(toStr(text)) + '</span></div>';
+    };
 
-    const html = entries.map(entry => {
-      const date = entry.date || '\u2014';
-      const id = 'journal-' + date.replace(/[^a-zA-Z0-9]/g, '');
-      const sections = [];
+    var classificationColors = {
+      'strong_win': '#3fb950', 'modest_win': '#3fb950',
+      'breakeven': '#d29922',
+      'modest_loss': '#f85149', 'bad_day': '#f85149',
+      'system_failure': '#f85149'
+    };
 
-      if (entry.market_summary) sections.push(sec('#58a6ff', 'Market Summary', entry.market_summary));
+    var html = entries.map(function(entry) {
+      var date = entry.date || '\u2014';
+      var id = 'journal-' + date.replace(/[^a-zA-Z0-9]/g, '');
+      var sections = [];
+      var isNewFormat = !!(entry.executive_summary || entry.day_classification || entry.primary_driver);
 
-      if (entry.trade_narrative) {
-        let statsLine = '';
-        const ts = entry.trade_stats;
+      // --- Badge for day_classification ---
+      var badgeHtml = '';
+      if (entry.day_classification) {
+        var bc = classificationColors[entry.day_classification] || '#8b949e';
+        var isBold = entry.day_classification === 'system_failure';
+        badgeHtml = ' <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;'
+          + 'background:' + bc + '22;color:' + bc + ';border:1px solid ' + bc + ';'
+          + (isBold ? 'font-weight:700;' : '') + '">'
+          + escHtml(entry.day_classification.replace(/_/g, ' ')) + '</span>';
+      }
+
+      // --- Preview line: executive_summary shown without expanding ---
+      var previewHtml = '';
+      if (entry.executive_summary) {
+        previewHtml = '<div style="margin-top:6px;font-size:13px;color:#e6edf3;line-height:1.4">'
+          + escHtml(toStr(entry.executive_summary)) + '</div>';
+      }
+
+      if (isNewFormat) {
+        // ---- NEW FORMAT ----
+
+        // 1. Primary driver
+        if (entry.primary_driver) {
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#bc8cff">Primary Driver</strong><br>'
+            + '<span style="color:#e6edf3">' + escHtml(toStr(entry.primary_driver)) + '</span></div>');
+        }
+
+        // 2. Trade stats line
+        var ts = entry.trade_stats;
         if (ts && ts.total_trades > 0) {
-          const pc = ts.total_pnl >= 0 ? 'green' : 'red';
-          statsLine = '<div style="margin-top:6px;font-size:11px">'
+          var pc = ts.total_pnl >= 0 ? 'green' : 'red';
+          sections.push('<div style="margin-bottom:10px;font-size:11px">'
             + '<span class="level-tag">' + ts.total_trades + ' trades</span> '
             + '<span class="level-tag green">' + ts.wins + 'W</span> '
             + '<span class="level-tag red">' + ts.losses + 'L</span> '
             + '<span class="level-tag ' + pc + '">$' + ts.total_pnl.toFixed(2) + '</span>'
-            + '</div>';
+            + '</div>');
         }
-        sections.push('<div style="margin-bottom:10px"><strong style="color:#3fb950">Trade Performance</strong><br><span class="dim">' + escHtml(toStr(entry.trade_narrative)) + '</span>' + statsLine + '</div>');
-      }
 
-      if (entry.git_narrative) sections.push(sec('#d29922', 'Git Changes', entry.git_narrative));
-      if (entry.correlations) sections.push(sec('#bc8cff', 'Correlations', entry.correlations));
+        // 3. Highest leverage fix (callout box)
+        if (entry.highest_leverage_fix) {
+          sections.push('<div style="margin-bottom:10px;padding:10px 12px;border-left:3px solid #d29922;'
+            + 'background:#d2992210;border-radius:4px">'
+            + '<strong style="color:#d29922">\u26a1 Highest Leverage Fix</strong><br>'
+            + '<span style="color:#e6edf3">' + escHtml(toStr(entry.highest_leverage_fix)) + '</span></div>');
+        }
 
-      if (entry.lessons_learned && entry.lessons_learned.length) {
-        const lessons = entry.lessons_learned.map(function(l) {
-          if (typeof l === 'string') return '<li>' + escHtml(l) + '</li>';
-          if (typeof l === 'object') {
-            let s = '<li><strong>' + escHtml(l.category || '') + '</strong>: ' + escHtml(l.lesson || '');
-            if (l.evidence) s += '<br><span class="dim" style="font-size:11px">Evidence: ' + escHtml(l.evidence) + '</span>';
-            if (l.action) s += '<br><span class="cyan" style="font-size:11px">Action: ' + escHtml(l.action) + '</span>';
-            return s + '</li>';
+        // 4. Performance story
+        if (entry.performance_story) {
+          sections.push(sec('#58a6ff', 'Performance Story', entry.performance_story));
+        }
+
+        // 5. Driver ranking
+        if (entry.driver_ranking && entry.driver_ranking.length) {
+          var driverItems = entry.driver_ranking.map(function(d, i) {
+            if (typeof d === 'string') return '<li>' + escHtml(d) + '</li>';
+            if (typeof d === 'object') {
+              var ctrl = d.controllable ? ' \u2705' : ' \u274c';
+              return '<li><strong>' + (i + 1) + '.</strong> ' + escHtml(d.driver || '')
+                + ' <span class="dim" style="font-size:11px">(' + escHtml(String(d.impact || '')) + ')' + ctrl + '</span></li>';
+            }
+            return '<li>' + escHtml(String(d)) + '</li>';
+          }).join('');
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#bc8cff">Driver Ranking</strong>'
+            + '<ul class="catalyst-list" style="margin-top:4px">' + driverItems + '</ul></div>');
+        }
+
+        // 6. What worked (green) and what failed (red)
+        var hasWorked = entry.what_worked && entry.what_worked.length;
+        var hasFailed = entry.what_failed && entry.what_failed.length;
+        if (hasWorked || hasFailed) {
+          var wfHtml = '<div style="margin-bottom:10px;display:flex;gap:16px;flex-wrap:wrap">';
+          if (hasWorked) {
+            var workedItems = entry.what_worked.map(function(w) {
+              return '<li style="color:#3fb950">' + escHtml(typeof w === 'string' ? w : toStr(w)) + '</li>';
+            }).join('');
+            wfHtml += '<div style="flex:1;min-width:200px"><strong style="color:#3fb950">\u2705 What Worked</strong>'
+              + '<ul class="catalyst-list" style="margin-top:4px">' + workedItems + '</ul></div>';
           }
-          return '<li>' + escHtml(String(l)) + '</li>';
-        }).join('');
-        sections.push('<div style="margin-bottom:10px"><strong style="color:#f0883e">Lessons Learned</strong><ul class="catalyst-list" style="margin-top:4px">' + lessons + '</ul></div>');
-      }
-
-      if (entry.process_quality) sections.push(sec('#3fb950', 'Process Quality', entry.process_quality));
-      if (entry.outlook) sections.push(sec('#58a6ff', 'Outlook', entry.outlook));
-
-      if (entry.watchouts && entry.watchouts.length) {
-        const items = entry.watchouts.map(function(w) {
-          if (typeof w === 'string') return '<li style="color:#f85149">' + escHtml(w) + '</li>';
-          if (typeof w === 'object') {
-            const parts = [w.symbol, w.setup_type, w.reason || w.note].filter(Boolean);
-            return '<li style="color:#f85149">' + escHtml(parts.join(' — ')) + '</li>';
+          if (hasFailed) {
+            var failedItems = entry.what_failed.map(function(f) {
+              return '<li style="color:#f85149">' + escHtml(typeof f === 'string' ? f : toStr(f)) + '</li>';
+            }).join('');
+            wfHtml += '<div style="flex:1;min-width:200px"><strong style="color:#f85149">\u274c What Failed</strong>'
+              + '<ul class="catalyst-list" style="margin-top:4px">' + failedItems + '</ul></div>';
           }
-          return '<li style="color:#f85149">' + escHtml(String(w)) + '</li>';
-        }).join('');
-        sections.push('<div style="margin-bottom:10px"><strong style="color:#f85149">Watchouts</strong><ul class="catalyst-list" style="margin-top:4px">' + items + '</ul></div>');
+          wfHtml += '</div>';
+          sections.push(wfHtml);
+        }
+
+        // 7. System observations
+        if (entry.system_observations) {
+          sections.push(sec('#58a6ff', 'System Observations', entry.system_observations));
+        }
+
+        // 8. Lessons learned
+        if (entry.lessons_learned && entry.lessons_learned.length) {
+          var lessons = entry.lessons_learned.map(function(l) {
+            if (typeof l === 'string') return '<li>' + escHtml(l) + '</li>';
+            if (typeof l === 'object') {
+              var s = '<li><strong>' + escHtml(l.category || '') + '</strong>: ' + escHtml(l.lesson || '');
+              if (l.evidence) s += '<br><span class="dim" style="font-size:11px">Evidence: ' + escHtml(l.evidence) + '</span>';
+              if (l.action) s += '<br><span class="cyan" style="font-size:11px">Action: ' + escHtml(l.action) + '</span>';
+              return s + '</li>';
+            }
+            return '<li>' + escHtml(String(l)) + '</li>';
+          }).join('');
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#f0883e">Lessons Learned</strong>'
+            + '<ul class="catalyst-list" style="margin-top:4px">' + lessons + '</ul></div>');
+        }
+
+        // 9. Tomorrow's focus
+        if (entry.tomorrows_focus && entry.tomorrows_focus.length) {
+          var focusItems = entry.tomorrows_focus.map(function(f, i) {
+            return '<li>' + (i + 1) + '. ' + escHtml(typeof f === 'string' ? f : toStr(f)) + '</li>';
+          }).join('');
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#58a6ff">\ud83c\udfaf Tomorrow\'s Focus</strong>'
+            + '<ul class="catalyst-list" style="margin-top:4px;list-style:none;padding-left:0">' + focusItems + '</ul></div>');
+        }
+
+        // 10. Git narrative
+        if (entry.git_narrative) sections.push(sec('#d29922', 'Git Changes', entry.git_narrative));
+
+        // 11. Correlations
+        if (entry.correlations) sections.push(sec('#bc8cff', 'Correlations', entry.correlations));
+
+        // 12. Process quality
+        if (entry.process_quality) sections.push(sec('#3fb950', 'Process Quality', entry.process_quality));
+
+        // 13. Watchouts
+        if (entry.watchouts && entry.watchouts.length) {
+          var watchItems = entry.watchouts.map(function(w) {
+            if (typeof w === 'string') return '<li style="color:#f85149">' + escHtml(w) + '</li>';
+            if (typeof w === 'object') {
+              var parts = [w.symbol, w.setup_type, w.reason || w.note].filter(Boolean);
+              return '<li style="color:#f85149">' + escHtml(parts.join(' \u2014 ')) + '</li>';
+            }
+            return '<li style="color:#f85149">' + escHtml(String(w)) + '</li>';
+          }).join('');
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#f85149">\u26a0 Watchouts</strong>'
+            + '<ul class="catalyst-list" style="margin-top:4px">' + watchItems + '</ul></div>');
+        }
+
+      } else {
+        // ---- LEGACY FORMAT (backward compat) ----
+        if (entry.market_summary) sections.push(sec('#58a6ff', 'Market Summary', entry.market_summary));
+
+        if (entry.trade_narrative) {
+          var statsLine = '';
+          var ts2 = entry.trade_stats;
+          if (ts2 && ts2.total_trades > 0) {
+            var pc2 = ts2.total_pnl >= 0 ? 'green' : 'red';
+            statsLine = '<div style="margin-top:6px;font-size:11px">'
+              + '<span class="level-tag">' + ts2.total_trades + ' trades</span> '
+              + '<span class="level-tag green">' + ts2.wins + 'W</span> '
+              + '<span class="level-tag red">' + ts2.losses + 'L</span> '
+              + '<span class="level-tag ' + pc2 + '">$' + ts2.total_pnl.toFixed(2) + '</span>'
+              + '</div>';
+          }
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#3fb950">Trade Performance</strong><br>'
+            + '<span class="dim">' + escHtml(toStr(entry.trade_narrative)) + '</span>' + statsLine + '</div>');
+        }
+
+        if (entry.git_narrative) sections.push(sec('#d29922', 'Git Changes', entry.git_narrative));
+        if (entry.correlations) sections.push(sec('#bc8cff', 'Correlations', entry.correlations));
+
+        if (entry.lessons_learned && entry.lessons_learned.length) {
+          var legacyLessons = entry.lessons_learned.map(function(l) {
+            if (typeof l === 'string') return '<li>' + escHtml(l) + '</li>';
+            if (typeof l === 'object') {
+              var s = '<li><strong>' + escHtml(l.category || '') + '</strong>: ' + escHtml(l.lesson || '');
+              if (l.evidence) s += '<br><span class="dim" style="font-size:11px">Evidence: ' + escHtml(l.evidence) + '</span>';
+              if (l.action) s += '<br><span class="cyan" style="font-size:11px">Action: ' + escHtml(l.action) + '</span>';
+              return s + '</li>';
+            }
+            return '<li>' + escHtml(String(l)) + '</li>';
+          }).join('');
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#f0883e">Lessons Learned</strong>'
+            + '<ul class="catalyst-list" style="margin-top:4px">' + legacyLessons + '</ul></div>');
+        }
+
+        if (entry.process_quality) sections.push(sec('#3fb950', 'Process Quality', entry.process_quality));
+        if (entry.outlook) sections.push(sec('#58a6ff', 'Outlook', entry.outlook));
+
+        if (entry.watchouts && entry.watchouts.length) {
+          var legacyWatch = entry.watchouts.map(function(w) {
+            if (typeof w === 'string') return '<li style="color:#f85149">' + escHtml(w) + '</li>';
+            if (typeof w === 'object') {
+              var parts = [w.symbol, w.setup_type, w.reason || w.note].filter(Boolean);
+              return '<li style="color:#f85149">' + escHtml(parts.join(' \u2014 ')) + '</li>';
+            }
+            return '<li style="color:#f85149">' + escHtml(String(w)) + '</li>';
+          }).join('');
+          sections.push('<div style="margin-bottom:10px"><strong style="color:#f85149">Watchouts</strong>'
+            + '<ul class="catalyst-list" style="margin-top:4px">' + legacyWatch + '</ul></div>');
+        }
       }
 
+      // 14. Completeness (both formats)
       if (entry.completeness) {
-        const c = entry.completeness;
-        const confColor = ({high:'green',medium:'yellow',low:'red'})[c.confidence] || 'dim';
-        const flags = ['trade_data','git_data','researcher_context','reviewer_feedback','analyst_signals','previous_review']
+        var c = entry.completeness;
+        var confColor = ({high:'green',medium:'yellow',low:'red'})[c.confidence] || 'dim';
+        var flags = ['trade_data','git_data','researcher_context','reviewer_feedback','analyst_signals','previous_review']
           .filter(function(k) { return c[k] !== undefined; })
           .map(function(k) { return '<span class="level-tag">' + k.replace(/_/g,' ') + ': ' + (c[k] ? '\u2713' : '\u2717') + '</span>'; })
           .join(' ');
-        sections.push('<div style="margin-bottom:10px"><strong style="color:#8b949e">Completeness</strong> <span class="' + confColor + '" style="font-size:12px;font-weight:600">' + (c.confidence || '\u2014') + '</span><br><div class="levels" style="margin-top:4px">' + flags + '</div></div>');
+        sections.push('<div style="margin-bottom:10px"><strong style="color:#8b949e">Completeness</strong> '
+          + '<span class="' + confColor + '" style="font-size:12px;font-weight:600">' + (c.confidence || '\u2014') + '</span>'
+          + '<br><div class="levels" style="margin-top:4px">' + flags + '</div></div>');
       }
 
       if (!sections.length) {
@@ -673,8 +843,9 @@
       return '<div class="feedback-box" style="cursor:pointer" onclick="toggleJournalEntry(\'' + id + '\')">'
         + '<div style="display:flex;justify-content:space-between;align-items:center">'
         + '<strong style="font-size:14px">\uD83D\uDCD3 ' + date + '</strong>'
-        + '<span class="expand-btn" id="' + id + '-btn">\u25BC</span>'
+        + '<span>' + badgeHtml + ' <span class="expand-btn" id="' + id + '-btn">\u25BC</span></span>'
         + '</div>'
+        + previewHtml
         + '<div id="' + id + '" style="display:none;margin-top:10px">' + sections.join('') + '</div>'
         + '</div>';
     }).join('');
