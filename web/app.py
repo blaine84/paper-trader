@@ -627,7 +627,8 @@ def api_company(symbol):
 
 @app.route("/api/journal")
 def api_journal():
-    """Returns Daily_Review entries from agent_memory, paginated."""
+    """Returns Daily_Review entries from agent_memory, paginated.
+    Only returns the fields needed by the Journal tab UI to keep responses small."""
     try:
         page = int(request.args.get("page", 1))
         per_page = int(request.args.get("per_page", 10))
@@ -641,6 +642,14 @@ def api_journal():
         per_page = 10
 
     offset = (page - 1) * per_page
+
+    # Fields the Journal tab UI actually renders
+    _UI_FIELDS = [
+        "date", "generated_at",
+        "market_summary", "trade_narrative", "git_narrative",
+        "correlations", "lessons_learned", "process_quality",
+        "outlook", "watchouts", "completeness",
+    ]
 
     db = get_session(engine)
     try:
@@ -657,8 +666,22 @@ def api_journal():
         for entry in entries:
             try:
                 review = json.loads(entry.value)
-                review["date"] = entry.symbol
-                result.append(review)
+                # Build a slim response with only UI-relevant fields
+                slim = {k: review[k] for k in _UI_FIELDS if k in review}
+                slim["date"] = entry.symbol
+
+                # Include trade performance summary stats (not the raw object)
+                tp = review.get("trade_performance", {})
+                if tp and isinstance(tp, dict):
+                    slim["trade_stats"] = {
+                        "total_trades": tp.get("total_trades", 0),
+                        "wins": tp.get("wins", 0),
+                        "losses": tp.get("losses", 0),
+                        "total_pnl": tp.get("total_pnl", 0),
+                        "no_trades": tp.get("no_trades", False),
+                    }
+
+                result.append(slim)
             except (json.JSONDecodeError, TypeError):
                 continue
 

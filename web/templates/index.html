@@ -600,11 +600,16 @@
       if (entry.market_summary) {
         sections.push(`<div style="margin-bottom:10px"><strong style="color:#58a6ff">Market Summary</strong><br><span class="dim">${escHtml(entry.market_summary)}</span></div>`);
       }
-      const tradePerfText = entry.trade_narrative || entry.trade_performance;
+      const tradePerfText = entry.trade_narrative;
       if (tradePerfText && typeof tradePerfText === 'string') {
-        sections.push(`<div style="margin-bottom:10px"><strong style="color:#3fb950">Trade Performance</strong><br><span class="dim">${escHtml(tradePerfText)}</span></div>`);
+        let statsLine = '';
+        const ts = entry.trade_stats;
+        if (ts && ts.total_trades > 0) {
+          statsLine = `<div style="margin-top:6px;font-size:11px"><span class="level-tag">${ts.total_trades} trades</span> <span class="level-tag green">${ts.wins}W</span> <span class="level-tag red">${ts.losses}L</span> <span class="level-tag ${ts.total_pnl >= 0 ? 'green' : 'red'}">$${ts.total_pnl.toFixed(2)}</span></div>`;
+        }
+        sections.push(`<div style="margin-bottom:10px"><strong style="color:#3fb950">Trade Performance</strong><br><span class="dim">${escHtml(tradePerfText)}</span>${statsLine}</div>`);
       }
-      const gitText = entry.git_narrative || entry.git_changes;
+      const gitText = entry.git_narrative;
       if (gitText && typeof gitText === 'string') {
         sections.push(`<div style="margin-bottom:10px"><strong style="color:#d29922">Git Changes</strong><br><span class="dim">${escHtml(gitText)}</span></div>`);
       }
