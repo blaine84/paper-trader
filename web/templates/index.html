@@ -160,6 +160,30 @@
 
     <!-- Trades -->
     <div id="tab-trades" class="tab-content">
+      <div style="padding:10px 12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;border-bottom:1px solid #21262d">
+        <input id="tradeFilterSymbol" type="text" placeholder="Symbol..." oninput="filterTrades()" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:12px;width:80px">
+        <select id="tradeFilterProfile" onchange="filterTrades()" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:12px">
+          <option value="">All Profiles</option>
+          <option value="conservative">Conservative</option>
+          <option value="moderate">Moderate</option>
+          <option value="aggressive">Aggressive</option>
+        </select>
+        <select id="tradeFilterDir" onchange="filterTrades()" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:12px">
+          <option value="">All Directions</option>
+          <option value="LONG">Long</option>
+          <option value="SHORT">Short</option>
+        </select>
+        <select id="tradeFilterStatus" onchange="filterTrades()" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:12px">
+          <option value="">All Status</option>
+          <option value="open">Open</option>
+          <option value="closed">Closed</option>
+        </select>
+        <label class="dim" style="font-size:11px">From</label>
+        <input id="tradeFilterDateFrom" type="date" onchange="filterTrades()" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:12px">
+        <label class="dim" style="font-size:11px">To</label>
+        <input id="tradeFilterDateTo" type="date" onchange="filterTrades()" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:12px">
+        <span id="tradeFilterCount" class="dim" style="font-size:11px;margin-left:auto"></span>
+      </div>
       <table>
         <thead><tr>
           <th>Date</th><th>Profile</th><th>Symbol</th><th class="center">Dir</th>
@@ -407,28 +431,60 @@
     }).join('');
   }
 
+  let _allTrades = [];
+
   function renderTrades(trades) {
+    _allTrades = trades;
+    filterTrades();
+  }
+
+  function filterTrades() {
+    const sym = (document.getElementById('tradeFilterSymbol').value || '').toUpperCase();
+    const profile = document.getElementById('tradeFilterProfile').value;
+    const dir = document.getElementById('tradeFilterDir').value;
+    const status = document.getElementById('tradeFilterStatus').value;
+    const dateFrom = document.getElementById('tradeFilterDateFrom').value;
+    const dateTo = document.getElementById('tradeFilterDateTo').value;
+
+    const filtered = _allTrades.filter(t => {
+      if (sym && !(t.symbol || '').toUpperCase().includes(sym)) return false;
+      if (profile && t.profile !== profile) return false;
+      if (dir && t.direction !== dir) return false;
+      if (status && t.status !== status) return false;
+      if (dateFrom || dateTo) {
+        var d = (t.entry_time || '').slice(0, 10);
+        if (dateFrom && d < dateFrom) return false;
+        if (dateTo && d > dateTo) return false;
+      }
+      return true;
+    });
+
     const tbody = document.getElementById('tradesBody');
-    if (!trades.length) { tbody.innerHTML = '<tr><td colspan="11" class="empty-state">No trades yet</td></tr>'; return; }
-    tbody.innerHTML = trades.map(t => {
-      const time = t.entry_time ? new Date(t.entry_time + 'Z').toLocaleString([], {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
+    const countEl = document.getElementById('tradeFilterCount');
+    countEl.textContent = filtered.length + ' of ' + _allTrades.length + ' trades';
+
+    if (!filtered.length) {
+      tbody.innerHTML = '<tr><td colspan="11" class="empty-state">' + (_allTrades.length ? 'No trades match filters' : 'No trades yet') + '</td></tr>';
+      return;
+    }
+    tbody.innerHTML = filtered.map(t => {
+      const time = t.entry_time ? new Date(t.entry_time + 'Z').toLocaleString([], {month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}) : '\u2014';
       const unrealStr = t.unrealized_pnl != null
-        ? `<span class="${pnlColor(t.unrealized_pnl)}">${t.unrealized_pnl >= 0 ? '+' : ''}${fmt(t.unrealized_pnl)}</span>`
-        : '<span class="dim">—</span>';
-      return `
-      <tr>
-        <td class="dim" style="font-size:11px">${time}</td>
-        <td class="dim">${t.profile}</td>
-        <td><strong class="sym-link" data-sym="${t.symbol}">${t.symbol}</strong></td>
-        <td class="center"><span class="badge ${t.direction === 'LONG' ? 'badge-long' : 'badge-short'}">${t.direction}</span></td>
-        <td class="right">${t.quantity}</td>
-        <td class="right">${fmt(t.entry_price)}</td>
-        <td class="right">${t.exit_price != null ? fmt(t.exit_price) : '—'}</td>
-        <td class="right">${fmtPnl(t.pnl)}</td>
-        <td class="right">${unrealStr}</td>
-        <td class="center dim">${t.review_score != null ? t.review_score.toFixed(1) : '—'}</td>
-        <td class="center ${t.status === 'open' ? 'cyan' : 'dim'}">${t.status}</td>
-      </tr>`;
+        ? '<span class="' + pnlColor(t.unrealized_pnl) + '">' + (t.unrealized_pnl >= 0 ? '+' : '') + fmt(t.unrealized_pnl) + '</span>'
+        : '<span class="dim">\u2014</span>';
+      return '<tr>'
+        + '<td class="dim" style="font-size:11px">' + time + '</td>'
+        + '<td class="dim">' + t.profile + '</td>'
+        + '<td><strong class="sym-link" data-sym="' + t.symbol + '">' + t.symbol + '</strong></td>'
+        + '<td class="center"><span class="badge ' + (t.direction === 'LONG' ? 'badge-long' : 'badge-short') + '">' + t.direction + '</span></td>'
+        + '<td class="right">' + t.quantity + '</td>'
+        + '<td class="right">' + fmt(t.entry_price) + '</td>'
+        + '<td class="right">' + (t.exit_price != null ? fmt(t.exit_price) : '\u2014') + '</td>'
+        + '<td class="right">' + fmtPnl(t.pnl) + '</td>'
+        + '<td class="right">' + unrealStr + '</td>'
+        + '<td class="center dim">' + (t.review_score != null ? t.review_score.toFixed(1) : '\u2014') + '</td>'
+        + '<td class="center ' + (t.status === 'open' ? 'cyan' : 'dim') + '">' + t.status + '</td>'
+        + '</tr>';
     }).join('');
   }
 
@@ -840,13 +896,13 @@
         sections.push('<div class="dim">No narrative sections available for this entry.</div>');
       }
 
-      return '<div class="feedback-box" style="cursor:pointer" onclick="toggleJournalEntry(\'' + id + '\')">'
-        + '<div style="display:flex;justify-content:space-between;align-items:center">'
+      return '<div class="feedback-box">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="toggleJournalEntry(\'' + id + '\')">'
         + '<strong style="font-size:14px">\uD83D\uDCD3 ' + date + '</strong>'
         + '<span>' + badgeHtml + ' <span class="expand-btn" id="' + id + '-btn">\u25BC</span></span>'
         + '</div>'
         + previewHtml
-        + '<div id="' + id + '" style="display:none;margin-top:10px">' + sections.join('') + '</div>'
+        + '<div id="' + id + '" style="display:none;margin-top:10px;user-select:text">' + sections.join('') + '</div>'
         + '</div>';
     }).join('');
 
