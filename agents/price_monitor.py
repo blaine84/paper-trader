@@ -118,6 +118,37 @@ def check_stops_and_targets(engine) -> list[dict]:
                         "trade_id": trade.id,
                     })
 
+        # Thesis invalidator evaluation — check structured invalidation conditions
+        if getattr(trade, "invalidators", None):
+            breached = evaluate_invalidators(trade, price)
+            for inv in breached:
+                now = datetime.utcnow()
+                trigger = {
+                    "type": "thesis_invalidation",
+                    "symbol": trade.symbol,
+                    "profile": trade.profile,
+                    "trade_id": trade.id,
+                    "price": price,
+                    "invalidator": inv,
+                    "timestamp": now.isoformat() + "Z",
+                }
+                triggers.append(trigger)
+                # Store in AgentMemory for PM to read during Reversal/Close Review
+                db.add(AgentMemory(
+                    agent="price_monitor",
+                    symbol=trade.symbol,
+                    key="thesis_invalidation",
+                    value=json.dumps(trigger),
+                    timestamp=now,
+                ))
+                log.warning(
+                    f"⚡ THESIS INVALIDATION: {trade.symbol} ({trade.profile}) "
+                    f"trade_id={trade.id} price={price} "
+                    f"invalidator={inv.get('type')}@{inv.get('reference')}"
+                )
+            if breached:
+                db.commit()
+
     # Run profit management on all open trades
     from agents.profit_manager import run as run_profit
     trades_and_prices = []
@@ -130,6 +161,161 @@ def check_stops_and_targets(engine) -> list[dict]:
 
     db.close()
     return triggers
+
+
+def _resolve_reference(reference: str, current_price: float, candle_data: dict | None = None) -> float | None:
+    """
+    Resolve an invalidator reference to a numeric price value.
+
+    Handles:
+    - Literal numeric strings (e.g., "162.50") → float
+    - Named indicators (e.g., "VWAP") → looked up from candle_data indicators
+    Returns None if the reference cannot be resolved.
+    """
+    # Try literal numeric first
+    try:
+        return float(reference)
+    except (ValueError, TypeError):
+        pass
+
+    # Try named indicator from candle_data
+    if candle_data and isinstance(candle_data, dict):
+        # Normalize lookup: try lowercase key match
+        ref_lower = reference.lower()
+        for key, val in candle_data.items():
+            if key.lower() == ref_lower:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+
+    return None
+
+
+def _check_candle_confirmation(invalidator: dict, reference_value: float, candle_data: dict | None) -> bool:
+    """
+    Check if a 5m_close confirmation is met using candle close data.
+
+    For `price_below_level`: candle close must be below reference_value
+    for `lookback_bars` consecutive bars.
+    For `price_above_level`: candle close must be above reference_value
+    for `lookback_bars` consecutive bars.
+
+    candle_data should contain a "closes" key with a list of recent close prices
+    (most recent last).
+    """
+    if not candle_data or not isinstance(candle_data, dict):
+        return False
+
+    closes = candle_data.get("closes")
+    if not closes or not isinstance(closes, list):
+        return False
+
+    lookback = invalidator.get("lookback_bars", 1)
+    if lookback < 1:
+        lookback = 1
+
+    inv_type = invalidator.get("type", "")
+
+    # Need at least lookback_bars worth of close data
+    if len(closes) < lookback:
+        return False
+
+    # Check the most recent `lookback` candle closes
+    recent_closes = closes[-lookback:]
+
+    if inv_type == "price_below_level":
+        return all(c < reference_value for c in recent_closes)
+    elif inv_type == "price_above_level":
+        return all(c > reference_value for c in recent_closes)
+
+    return False
+
+
+def evaluate_invalidators(trade, current_price: float, candle_data: dict | None = None) -> list[dict]:
+    """
+    Evaluate structured invalidator conditions against current market data.
+
+    Args:
+        trade: Trade object with an `invalidators` JSON text column.
+        current_price: The latest price for the trade's symbol.
+        candle_data: Optional dict with indicator values (e.g., {"vwap": 163.20})
+                     and/or candle closes (e.g., {"closes": [162.1, 161.8]})
+                     for 5m_close confirmation.
+
+    Returns:
+        List of breached invalidator dicts. Empty list if none breached or on error.
+    """
+    # Parse invalidators JSON
+    raw = getattr(trade, "invalidators", None)
+    if not raw or (isinstance(raw, str) and not raw.strip()):
+        return []
+
+    try:
+        invalidators = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        log.error(f"Malformed invalidators JSON for trade {getattr(trade, 'id', '?')}: {e}")
+        return []
+
+    if not isinstance(invalidators, list):
+        log.error(f"Invalidators is not a list for trade {getattr(trade, 'id', '?')}")
+        return []
+
+    breached = []
+
+    for inv in invalidators:
+        if not isinstance(inv, dict):
+            log.warning(f"Skipping non-dict invalidator for trade {getattr(trade, 'id', '?')}: {inv}")
+            continue
+
+        inv_type = inv.get("type", "")
+
+        # Skip structure_break — handled by LLM in Reversal Review
+        if inv_type == "structure_break":
+            continue
+
+        if inv_type not in ("price_below_level", "price_above_level"):
+            log.warning(f"Unknown invalidator type '{inv_type}' for trade {getattr(trade, 'id', '?')}, skipping")
+            continue
+
+        reference = inv.get("reference")
+        if reference is None:
+            log.warning(f"Invalidator missing reference for trade {getattr(trade, 'id', '?')}, skipping")
+            continue
+
+        # Resolve reference to a numeric value
+        ref_value = _resolve_reference(reference, current_price, candle_data)
+        if ref_value is None:
+            log.warning(
+                f"Cannot resolve reference '{reference}' for trade {getattr(trade, 'id', '?')}, skipping"
+            )
+            continue
+
+        confirmation = inv.get("confirmation", "tick")
+
+        if confirmation == "tick":
+            # Immediate tick-level breach check
+            if inv_type == "price_below_level" and current_price < ref_value:
+                breached.append(inv)
+            elif inv_type == "price_above_level" and current_price > ref_value:
+                breached.append(inv)
+
+        elif confirmation == "5m_close":
+            # Candle close confirmation required
+            if candle_data is None:
+                # No candle data available this cycle — skip, don't treat as breached
+                continue
+            if _check_candle_confirmation(inv, ref_value, candle_data):
+                breached.append(inv)
+
+        else:
+            log.warning(
+                f"Unknown confirmation type '{confirmation}' for trade {getattr(trade, 'id', '?')}, skipping"
+            )
+
+    return breached
+
+
 def check_entry_triggers(engine) -> list[dict]:
     """Check analyst signals for key level breaches that could trigger entries."""
     db = get_session(engine)
@@ -311,6 +497,9 @@ def run(engine) -> dict:
     momentum_alerts = check_momentum(engine)
 
     for t in stop_triggers:
+        if t["type"] == "thesis_invalidation":
+            # Already logged inside check_stops_and_targets
+            continue
         log.warning(f"⚡ {t['type'].upper()}: {t['symbol']} ({t['profile']}) "
                      f"price={t['price']} level={t['level']}")
 

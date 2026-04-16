@@ -502,3 +502,173 @@ def test_structured_logging_output(caplog):
     )
 
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. test_entry_contract_persisted_on_buy
+# ---------------------------------------------------------------------------
+
+def test_entry_contract_persisted_on_buy():
+    """
+    Execute a successful BUY with a signal containing structured invalidation.
+    Verify thesis, setup_type, and invalidators are persisted on the Trade record.
+    """
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=100_000.0)
+
+    signal_with_invalidation = {
+        **_strong_signal(),
+        "invalidation": [
+            {
+                "type": "price_below_level",
+                "reference": "145.00",
+                "confirmation": "5m_close",
+                "lookback_bars": 1,
+            }
+        ],
+    }
+    _seed_analyst_signal(db, "AAPL", signal_with_invalidation)
+
+    decision = _base_decision(symbol="AAPL", quantity=50, price=150.0,
+                              stop=145.0, target=160.0)
+
+    good_conf = {
+        "modifier": 1.0, "block": False, "reason": "ok",
+        "win_rate": 0.75, "total_cases": 12,
+    }
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=good_conf),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+    ):
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is True, f"Trade should have succeeded: {msg}"
+
+    trade = db.query(Trade).filter_by(symbol="AAPL", profile=profile_id).first()
+    assert trade is not None
+
+    # Entry contract fields must be populated
+    assert trade.thesis is not None, "thesis should be populated"
+    assert trade.thesis != "", "thesis should not be empty"
+    assert trade.setup_type is not None, "setup_type should be populated"
+    assert trade.setup_type == "gap_and_go", "setup_type should match signal"
+
+    # Invalidators should be valid JSON
+    assert trade.invalidators is not None, "invalidators should be populated"
+    invalidators = json.loads(trade.invalidators)
+    assert isinstance(invalidators, list)
+    assert len(invalidators) >= 1
+    assert invalidators[0]["type"] == "price_below_level"
+    assert invalidators[0]["reference"] == "145.00"
+
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 9. test_entry_contract_persisted_on_short
+# ---------------------------------------------------------------------------
+
+def test_entry_contract_persisted_on_short():
+    """
+    Execute a successful SHORT. Verify entry contract fields are persisted.
+    """
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=100_000.0)
+
+    signal = {
+        **_strong_signal(),
+        "bias": "SHORT",
+        "signal": "SHORT",
+    }
+    _seed_analyst_signal(db, "AAPL", signal)
+
+    decision = _base_decision(symbol="AAPL", action="SHORT", quantity=50,
+                              price=150.0, stop=155.0, target=140.0)
+
+    good_conf = {
+        "modifier": 1.0, "block": False, "reason": "ok",
+        "win_rate": 0.75, "total_cases": 12,
+    }
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=good_conf),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+    ):
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is True, f"Trade should have succeeded: {msg}"
+
+    trade = db.query(Trade).filter_by(symbol="AAPL", profile=profile_id).first()
+    assert trade is not None
+
+    # Entry contract fields must be populated
+    assert trade.thesis is not None, "thesis should be populated"
+    assert trade.setup_type is not None, "setup_type should be populated"
+    assert trade.invalidators is not None, "invalidators should be populated"
+
+    # Invalidators should be valid JSON with at least one entry
+    invalidators = json.loads(trade.invalidators)
+    assert isinstance(invalidators, list)
+    assert len(invalidators) >= 1
+
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. test_entry_contract_fallback_to_stop_price_default
+# ---------------------------------------------------------------------------
+
+def test_entry_contract_fallback_to_stop_price_default():
+    """
+    Execute a BUY with a signal that has no invalidation field.
+    Verify the default stop-price-based invalidator is used.
+    """
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=100_000.0)
+
+    # Signal without invalidation field
+    _seed_analyst_signal(db, "AAPL", _strong_signal())
+
+    decision = _base_decision(symbol="AAPL", quantity=50, price=150.0,
+                              stop=145.0, target=160.0)
+
+    good_conf = {
+        "modifier": 1.0, "block": False, "reason": "ok",
+        "win_rate": 0.75, "total_cases": 12,
+    }
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=good_conf),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+    ):
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is True, f"Trade should have succeeded: {msg}"
+
+    trade = db.query(Trade).filter_by(symbol="AAPL", profile=profile_id).first()
+    assert trade is not None
+    assert trade.invalidators is not None
+
+    invalidators = json.loads(trade.invalidators)
+    assert len(invalidators) >= 1
+    # Default invalidator should reference the stop price
+    assert invalidators[0]["reference"] == "145.0"
+    assert invalidators[0]["type"] == "price_below_level"
+
+    db.close()

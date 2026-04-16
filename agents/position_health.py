@@ -13,6 +13,7 @@ from utils.technicals import compute_indicators
 from utils.finnhub_client import FinnhubClient
 from db.schema import Trade, Position, AgentMemory, get_session
 from models.pm_profiles import ACTIVE_PROFILES
+from agents.portfolio_manager import detect_drifting
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +76,21 @@ def run(engine) -> dict:
         else:
             unrealized_pnl_pct = (price - p.avg_cost) / p.avg_cost * 100
 
+        # Detect DRIFTING state
+        drifting = detect_drifting(db, trade) if trade else True
+
+        # Parse invalidators from JSON for display
+        invalidators_raw = trade.invalidators if trade else None
+        if isinstance(invalidators_raw, str):
+            try:
+                invalidators_parsed = json.loads(invalidators_raw)
+            except (json.JSONDecodeError, TypeError):
+                invalidators_parsed = []
+        elif isinstance(invalidators_raw, list):
+            invalidators_parsed = invalidators_raw
+        else:
+            invalidators_parsed = []
+
         pos_data.append({
             "symbol": p.symbol,
             "profile": p.profile,
@@ -84,6 +100,10 @@ def run(engine) -> dict:
             "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
             "stop_price": trade.stop_price if trade else None,
             "target_price": trade.target_price if trade else None,
+            "thesis": trade.thesis if trade else None,
+            "setup_type": trade.setup_type if trade else None,
+            "invalidators": invalidators_parsed,
+            "drifting": drifting,
             "indicators": {
                 "rsi": indicators.get("rsi"),
                 "trend": indicators.get("trend"),

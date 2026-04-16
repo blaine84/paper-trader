@@ -77,6 +77,389 @@ If no trades make sense for your profile, return empty decisions array.
 """
 
 
+MAINTENANCE_REVIEW_PROMPT = """You are a portfolio manager performing a routine maintenance review of open positions.
+Your job is to decide whether to HOLD, TIGHTEN STOP, RAISE TARGET, or TRIM a partial position.
+You CANNOT close a position in this review. Closing requires a separate Reversal/Close Review triggered by thesis invalidation.
+
+Profile: {profile_name} {emoji}
+
+ENTRY CONTRACT (the original trade thesis — your anchor):
+  Thesis: {thesis}
+  Setup Type: {setup_type}
+  Entry Price: ${entry_price}
+  Stop Price: ${stop_price}
+  Target Price: ${target_price}
+  Invalidators: {invalidators}
+
+CURRENT POSITION:
+  Symbol: {symbol}
+  Side: {side}
+  Quantity: {quantity}
+  Current Price: ${current_price}
+  Unrealized P&L: {unrealized_pnl_pct}%
+  DRIFTING: {drifting} (no recent analyst signal since entry)
+
+CURRENT INDICATORS:
+{indicators_text}
+
+ADVISORY ANALYST SIGNALS (informational only — do NOT override the Entry Contract):
+{advisory_signals_text}
+
+POSITION HEALTH ASSESSMENT:
+{health_text}
+
+RULES:
+1. The Entry Contract thesis is your anchor. Hold unless there is a clear reason to adjust.
+2. You CANNOT produce a close action. Only Reversal/Close Review can close positions.
+3. If the position is DRIFTING, that alone is NOT a reason to act. Evaluate against the Entry Contract.
+4. Tighten stop only if the position has moved favorably and you want to lock in gains.
+5. Raise target only if new evidence supports a higher target while the thesis remains intact.
+6. Trim partial only if the position is significantly profitable and you want to reduce risk.
+
+Respond with JSON only:
+{{
+  "reviews": [
+    {{
+      "symbol": "{symbol}",
+      "action": "hold|tighten_stop|raise_target|trim_partial",
+      "new_stop": null,
+      "new_target": null,
+      "trim_pct": null,
+      "reasoning": "why you chose this action, referencing the Entry Contract thesis"
+    }}
+  ],
+  "notes": "overall maintenance review summary"
+}}
+
+VALID ACTIONS: hold, tighten_stop, raise_target, trim_partial
+DO NOT use close, close_full, close_partial, or CLOSE.
+"""
+
+VALID_MAINTENANCE_ACTIONS = {"hold", "tighten_stop", "raise_target", "trim_partial"}
+
+
+REVERSAL_CLOSE_PROMPT = """You are a portfolio manager performing a Reversal/Close Review.
+A specific trigger has fired that may warrant closing this position. Your job is to evaluate
+whether the original trade thesis is truly broken and decide whether to CLOSE FULL, CLOSE PARTIAL,
+or HOLD with a tightened stop.
+
+Profile: {profile_name} {emoji}
+
+TRIGGER THAT CAUSED THIS REVIEW:
+  Trigger Type: {trigger_type}
+  Trigger Details: {trigger_details}
+
+ENTRY CONTRACT (the original trade thesis — your anchor):
+  Thesis: {thesis}
+  Setup Type: {setup_type}
+  Entry Price: ${entry_price}
+  Stop Price: ${stop_price}
+  Target Price: ${target_price}
+  Invalidators: {invalidators}
+
+CURRENT POSITION:
+  Symbol: {symbol}
+  Side: {side}
+  Quantity: {quantity}
+  Current Price: ${current_price}
+  Unrealized P&L: {unrealized_pnl_pct}%
+
+CURRENT MARKET CONDITIONS:
+{market_conditions_text}
+
+OPPOSING EVIDENCE:
+{opposing_evidence_text}
+
+RULES:
+1. This review was triggered by: {trigger_type}. Evaluate whether the thesis is truly broken.
+2. If the thesis is clearly invalidated (e.g., key level lost on confirmed close), close the position.
+3. If the evidence is ambiguous, hold with a tightened stop to protect capital while giving the trade room.
+4. close_partial is appropriate when some thesis elements are broken but others remain intact.
+5. hold_tighten means: tighten stop to breakeven if profitable, otherwise hold current stop.
+
+Respond with JSON only:
+{{
+  "symbol": "{symbol}",
+  "action": "close_full|close_partial|hold_tighten",
+  "reasoning": "why you chose this action, referencing the Entry Contract thesis and the trigger",
+  "trigger": "{trigger_type}",
+  "invalidator": {invalidator_json}
+}}
+
+VALID ACTIONS: close_full, close_partial, hold_tighten
+"""
+
+VALID_REVERSAL_ACTIONS = {"close_full", "close_partial", "hold_tighten"}
+
+
+def run_maintenance_review(position_data: dict, profile: dict, tier: str = "high") -> dict:
+    """
+    Run a Maintenance Review for a single open position.
+
+    Accepts position data (with Entry Contract, current price, indicators,
+    advisory signals, health data, drifting state), formats the prompt,
+    calls the LLM, validates the action, and returns the parsed review result.
+
+    On LLM failure, defaults to "hold" (no action taken).
+
+    Args:
+        position_data: dict with keys:
+            symbol, side, quantity, entry_price, stop_price, target_price,
+            current_price, unrealized_pnl_pct, drifting,
+            thesis, setup_type, invalidators,
+            indicators, advisory_signals, health_text
+        profile: PM profile dict from PM_PROFILES
+        tier: LLM tier to use (default "high")
+
+    Returns:
+        dict with keys: symbol, action, new_stop, new_target, trim_pct, reasoning
+    """
+    symbol = position_data.get("symbol", "UNKNOWN")
+
+    # Format invalidators for display
+    invalidators_raw = position_data.get("invalidators")
+    if isinstance(invalidators_raw, str):
+        try:
+            invalidators_list = json.loads(invalidators_raw)
+        except (json.JSONDecodeError, TypeError):
+            invalidators_list = []
+    elif isinstance(invalidators_raw, list):
+        invalidators_list = invalidators_raw
+    else:
+        invalidators_list = []
+    invalidators_text = json.dumps(invalidators_list, indent=2) if invalidators_list else "None"
+
+    # Format indicators
+    indicators = position_data.get("indicators")
+    if isinstance(indicators, dict):
+        indicators_text = json.dumps(indicators, indent=2)
+    elif isinstance(indicators, str):
+        indicators_text = indicators
+    else:
+        indicators_text = "No indicator data available"
+
+    # Format advisory signals
+    advisory_signals = position_data.get("advisory_signals")
+    if isinstance(advisory_signals, dict):
+        advisory_signals_text = json.dumps(advisory_signals, indent=2)
+    elif isinstance(advisory_signals, str):
+        advisory_signals_text = advisory_signals
+    else:
+        advisory_signals_text = "No advisory signals available"
+
+    # Format health text
+    health_text = position_data.get("health_text")
+    if not health_text:
+        health_text = "No health assessment available"
+
+    prompt = MAINTENANCE_REVIEW_PROMPT.format(
+        profile_name=profile.get("name", "Unknown"),
+        emoji=profile.get("emoji", ""),
+        thesis=position_data.get("thesis") or "No thesis recorded",
+        setup_type=position_data.get("setup_type") or "unknown",
+        entry_price=position_data.get("entry_price") or "N/A",
+        stop_price=position_data.get("stop_price") or "N/A",
+        target_price=position_data.get("target_price") or "N/A",
+        invalidators=invalidators_text,
+        symbol=symbol,
+        side=position_data.get("side") or "unknown",
+        quantity=position_data.get("quantity") or 0,
+        current_price=position_data.get("current_price") or "N/A",
+        unrealized_pnl_pct=position_data.get("unrealized_pnl_pct") or 0,
+        drifting="YES" if position_data.get("drifting") else "NO",
+        indicators_text=indicators_text,
+        advisory_signals_text=advisory_signals_text,
+        health_text=health_text,
+    )
+
+    system_prompt = (
+        "You are a portfolio manager performing routine maintenance reviews. "
+        "Respond with valid JSON only. No markdown, no explanation outside the JSON."
+    )
+
+    # Default result on failure
+    default_result = {
+        "symbol": symbol,
+        "action": "hold",
+        "new_stop": None,
+        "new_target": None,
+        "trim_pct": None,
+        "reasoning": "LLM review failed — defaulting to hold (no action taken)",
+    }
+
+    try:
+        raw = call_llm(system_prompt, prompt, json_mode=True, tier=tier)
+        result = parse_json_response(raw)
+    except Exception as exc:
+        log.error("Maintenance Review LLM call failed for %s: %s", symbol, exc)
+        return default_result
+
+    # Extract the review for this symbol from the reviews array
+    reviews = result.get("reviews", [])
+    review = None
+    for r in reviews:
+        if r.get("symbol") == symbol:
+            review = r
+            break
+    # If no matching symbol found, use the first review or default
+    if review is None:
+        review = reviews[0] if reviews else {}
+
+    # Validate the action
+    action = review.get("action", "hold")
+    if action not in VALID_MAINTENANCE_ACTIONS:
+        log.warning(
+            "Maintenance Review returned invalid action '%s' for %s. Defaulting to hold.",
+            action, symbol,
+        )
+        action = "hold"
+
+    return {
+        "symbol": symbol,
+        "action": action,
+        "new_stop": review.get("new_stop"),
+        "new_target": review.get("new_target"),
+        "trim_pct": review.get("trim_pct"),
+        "reasoning": review.get("reasoning") or "No reasoning provided",
+    }
+
+
+def run_reversal_close_review(position_data: dict, trigger_info: dict, profile: dict, tier: str = "high") -> dict:
+    """
+    Run a Reversal/Close Review for a single open position.
+
+    Only invoked when a trigger fires (thesis_invalidation, opposing signal,
+    explicit CLOSE). Evaluates the Entry Contract thesis against current
+    market conditions and produces one of: close_full, close_partial,
+    or hold_tighten.
+
+    On LLM failure, defaults to "hold_tighten" (tighten stop to breakeven
+    if profitable, otherwise hold).
+
+    Args:
+        position_data: dict with keys:
+            symbol, side, quantity, entry_price, stop_price, target_price,
+            current_price, unrealized_pnl_pct,
+            thesis, setup_type, invalidators,
+            market_conditions, opposing_evidence
+        trigger_info: dict with keys:
+            type: str — one of "thesis_invalidation", "opposing_signal", "explicit_close"
+            details: str — human-readable description of the trigger
+            invalidator: dict | None — the specific invalidator that was breached (if applicable)
+        profile: PM profile dict from PM_PROFILES
+        tier: LLM tier to use (default "high")
+
+    Returns:
+        dict with keys: symbol, action, reasoning, trigger, invalidator
+    """
+    symbol = position_data.get("symbol", "UNKNOWN")
+    trigger_type = trigger_info.get("type", "unknown")
+    trigger_details = trigger_info.get("details", "No details available")
+    trigger_invalidator = trigger_info.get("invalidator")
+
+    # Log the specific trigger that caused this review
+    log.info(
+        "Reversal/Close Review triggered for %s: trigger=%s, details=%s",
+        symbol, trigger_type, trigger_details,
+    )
+
+    # Format invalidators for display
+    invalidators_raw = position_data.get("invalidators")
+    if isinstance(invalidators_raw, str):
+        try:
+            invalidators_list = json.loads(invalidators_raw)
+        except (json.JSONDecodeError, TypeError):
+            invalidators_list = []
+    elif isinstance(invalidators_raw, list):
+        invalidators_list = invalidators_raw
+    else:
+        invalidators_list = []
+    invalidators_text = json.dumps(invalidators_list, indent=2) if invalidators_list else "None"
+
+    # Format market conditions
+    market_conditions = position_data.get("market_conditions")
+    if isinstance(market_conditions, dict):
+        market_conditions_text = json.dumps(market_conditions, indent=2)
+    elif isinstance(market_conditions, str):
+        market_conditions_text = market_conditions
+    else:
+        market_conditions_text = "No market condition data available"
+
+    # Format opposing evidence
+    opposing_evidence = position_data.get("opposing_evidence")
+    if isinstance(opposing_evidence, dict):
+        opposing_evidence_text = json.dumps(opposing_evidence, indent=2)
+    elif isinstance(opposing_evidence, str):
+        opposing_evidence_text = opposing_evidence
+    else:
+        opposing_evidence_text = "No opposing evidence available"
+
+    # Format the trigger invalidator for the prompt
+    if trigger_invalidator and isinstance(trigger_invalidator, dict):
+        invalidator_json = json.dumps(trigger_invalidator)
+    else:
+        invalidator_json = "null"
+
+    prompt = REVERSAL_CLOSE_PROMPT.format(
+        profile_name=profile.get("name", "Unknown"),
+        emoji=profile.get("emoji", ""),
+        trigger_type=trigger_type,
+        trigger_details=trigger_details,
+        thesis=position_data.get("thesis") or "No thesis recorded",
+        setup_type=position_data.get("setup_type") or "unknown",
+        entry_price=position_data.get("entry_price") or "N/A",
+        stop_price=position_data.get("stop_price") or "N/A",
+        target_price=position_data.get("target_price") or "N/A",
+        invalidators=invalidators_text,
+        symbol=symbol,
+        side=position_data.get("side") or "unknown",
+        quantity=position_data.get("quantity") or 0,
+        current_price=position_data.get("current_price") or "N/A",
+        unrealized_pnl_pct=position_data.get("unrealized_pnl_pct") or 0,
+        market_conditions_text=market_conditions_text,
+        opposing_evidence_text=opposing_evidence_text,
+        invalidator_json=invalidator_json,
+    )
+
+    system_prompt = (
+        "You are a portfolio manager performing a Reversal/Close Review. "
+        "Respond with valid JSON only. No markdown, no explanation outside the JSON."
+    )
+
+    # Default result on failure — hold_tighten is conservative
+    default_result = {
+        "symbol": symbol,
+        "action": "hold_tighten",
+        "reasoning": "LLM review failed — defaulting to hold_tighten (tighten stop to breakeven if profitable)",
+        "trigger": trigger_type,
+        "invalidator": trigger_invalidator,
+    }
+
+    try:
+        raw = call_llm(system_prompt, prompt, json_mode=True, tier=tier)
+        result = parse_json_response(raw)
+    except Exception as exc:
+        log.error("Reversal/Close Review LLM call failed for %s: %s", symbol, exc)
+        return default_result
+
+    # Validate the action
+    action = result.get("action", "hold_tighten")
+    if action not in VALID_REVERSAL_ACTIONS:
+        log.warning(
+            "Reversal/Close Review returned invalid action '%s' for %s. Defaulting to hold_tighten.",
+            action, symbol,
+        )
+        action = "hold_tighten"
+
+    return {
+        "symbol": symbol,
+        "action": action,
+        "reasoning": result.get("reasoning") or "No reasoning provided",
+        "trigger": result.get("trigger") or trigger_type,
+        "invalidator": result.get("invalidator") or trigger_invalidator,
+    }
+
+
 def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
     """Build portfolio snapshot for a specific profile."""
     positions = db.query(Position).filter_by(profile=profile_id).all()
@@ -104,6 +487,9 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
             .first()
         )
 
+        # Detect DRIFTING state for this position
+        drifting = detect_drifting(db, open_trade) if open_trade else True
+
         pos_data.append({
             "symbol": p.symbol,
             "side": p.side,
@@ -116,6 +502,7 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
             "stop_price": open_trade.stop_price if open_trade else None,
             "target_price": open_trade.target_price if open_trade else None,
             "entry_time": open_trade.entry_time.isoformat() if open_trade and open_trade.entry_time else None,
+            "drifting": drifting,
         })
 
     bal = (
@@ -200,6 +587,327 @@ def _build_case_stats(db, setup_type: str, market_regime: str = None) -> dict:
         "win_rate": conf_result.get("win_rate") or 0.0,
         "sample_size": conf_result.get("total_cases", 0),
     }
+
+
+# Strength ordering for opposing evidence threshold comparison (Req 7.5)
+# Higher value = stronger signal. A signal "meets" a threshold when its
+# numeric strength >= the threshold's numeric strength.
+STRENGTH_ORDER = {"weak": 1, "moderate": 2, "strong": 3}
+
+
+def _meets_threshold(signal_strength: str, threshold: str) -> bool:
+    """Return True if signal_strength meets or exceeds the opposing_evidence_threshold."""
+    sig_val = STRENGTH_ORDER.get(str(signal_strength).lower(), 0)
+    thr_val = STRENGTH_ORDER.get(str(threshold).lower(), 0)
+    return sig_val >= thr_val
+
+
+def _check_reversal_triggers(
+    db, trade, position_data: dict, signal: dict | None, profile: dict
+) -> dict | None:
+    """
+    Check whether a position has any Reversal/Close Review triggers.
+
+    Returns a trigger_info dict if a trigger is found, or None if the
+    position should go to Maintenance Review.
+
+    Trigger types:
+      - thesis_invalidation: Price Monitor detected an invalidator breach
+      - opposing_signal: Analyst signal contradicts Entry Contract direction
+        and meets the profile's opposing_evidence_threshold
+      - explicit_close: Analyst signal contains an explicit CLOSE action
+    """
+    symbol = trade.symbol
+
+    # 1. Check AgentMemory for thesis_invalidation triggers from Price Monitor
+    invalidation_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="price_monitor", symbol=symbol, key="thesis_invalidation")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if invalidation_mem:
+        try:
+            inv_data = json.loads(invalidation_mem.value)
+        except (json.JSONDecodeError, TypeError):
+            inv_data = {}
+        return {
+            "type": "thesis_invalidation",
+            "details": (
+                f"Price Monitor detected thesis invalidation for {symbol}: "
+                f"{inv_data.get('invalidator', 'unknown invalidator')}"
+            ),
+            "invalidator": inv_data.get("invalidator"),
+        }
+
+    if not signal:
+        return None
+
+    # 2. Check for explicit CLOSE signal
+    signal_action = str(signal.get("signal", "") or signal.get("action", "")).upper()
+    if signal_action == "CLOSE":
+        return {
+            "type": "explicit_close",
+            "details": f"Analyst issued explicit CLOSE signal for {symbol}",
+            "invalidator": None,
+        }
+
+    # 3. Check for opposing signal that meets the profile threshold
+    signal_bias = str(signal.get("bias", "")).upper()
+    trade_direction = str(trade.direction).upper()  # LONG or SHORT
+
+    # Determine if the signal opposes the position direction
+    is_opposing = (
+        (trade_direction == "LONG" and signal_bias == "SHORT")
+        or (trade_direction == "SHORT" and signal_bias == "LONG")
+    )
+
+    if is_opposing:
+        signal_strength = str(signal.get("strength", "")).lower()
+        threshold = profile.get("opposing_evidence_threshold", "strong")
+        if _meets_threshold(signal_strength, threshold):
+            return {
+                "type": "opposing_signal",
+                "details": (
+                    f"Opposing {signal_bias} signal (strength={signal_strength}) "
+                    f"for {symbol} meets {threshold} threshold"
+                ),
+                "invalidator": None,
+            }
+
+    return None
+
+
+VALID_INVALIDATOR_TYPES = {"price_below_level", "price_above_level", "structure_break"}
+VALID_CONFIRMATION_METHODS = {"tick", "5m_close"}
+
+
+def _parse_invalidator(raw: dict) -> dict | None:
+    """Parse and validate a single invalidator dict. Returns None if invalid."""
+    if not isinstance(raw, dict):
+        return None
+    inv_type = raw.get("type", "")
+    reference = raw.get("reference", "")
+    confirmation = raw.get("confirmation", "5m_close")
+    lookback_bars = raw.get("lookback_bars", 1)
+
+    # Validate type
+    if inv_type not in VALID_INVALIDATOR_TYPES:
+        return None
+    # Reference must be a non-empty string
+    if not reference:
+        return None
+    reference = str(reference)
+    # Validate confirmation
+    if confirmation not in VALID_CONFIRMATION_METHODS:
+        confirmation = "5m_close"
+    # Validate lookback_bars
+    try:
+        lookback_bars = int(lookback_bars)
+        if lookback_bars < 0:
+            lookback_bars = 0
+    except (TypeError, ValueError):
+        lookback_bars = 1
+
+    return {
+        "type": inv_type,
+        "reference": reference,
+        "confirmation": confirmation,
+        "lookback_bars": lookback_bars,
+    }
+
+
+def _default_invalidator(stop: float) -> dict:
+    """Build a default stop-price-based invalidator."""
+    return {
+        "type": "price_below_level",
+        "reference": str(stop),
+        "confirmation": "5m_close",
+        "lookback_bars": 1,
+    }
+
+
+def build_entry_contract(decision: dict, signal: dict, stop: float, target: float) -> dict:
+    """
+    Build an Entry Contract from a trade decision and analyst signal.
+
+    Extracts thesis, setup_type, and structured invalidators.
+    Falls back to a stop-price-based default invalidator when the signal
+    lacks an invalidation field.
+
+    Returns:
+        {"thesis": str, "setup_type": str, "invalidators": list[dict]}
+    """
+    # --- Thesis ---
+    rationale = decision.get("rationale") or ""
+    signal_context_parts = []
+    if signal.get("bias"):
+        signal_context_parts.append(f"Bias: {signal['bias']}")
+    if signal.get("confidence"):
+        signal_context_parts.append(f"Confidence: {signal['confidence']}")
+    if signal.get("setup_type") or signal.get("setup"):
+        signal_context_parts.append(
+            f"Setup: {signal.get('setup_type') or signal.get('setup')}"
+        )
+    if signal.get("key_levels"):
+        signal_context_parts.append(f"Key levels: {signal['key_levels']}")
+
+    signal_context = "; ".join(signal_context_parts)
+    if rationale and signal_context:
+        thesis = f"{rationale} [Signal context: {signal_context}]"
+    elif rationale:
+        thesis = rationale
+    elif signal_context:
+        thesis = f"[Signal context: {signal_context}]"
+    else:
+        thesis = "No thesis recorded"
+
+    # --- Setup type ---
+    setup_type = (
+        signal.get("setup_type")
+        or signal.get("setup")
+        or decision.get("setup_type")
+        or decision.get("setup")
+        or "unknown"
+    )
+
+    # --- Invalidators ---
+    invalidators = []
+    invalidation_raw = signal.get("invalidation")
+
+    if invalidation_raw:
+        # Parse invalidation field — could be a list of dicts, a single dict,
+        # or a string description
+        parsed_any = False
+        if isinstance(invalidation_raw, list):
+            for item in invalidation_raw:
+                inv = _parse_invalidator(item)
+                if inv:
+                    invalidators.append(inv)
+                    parsed_any = True
+        elif isinstance(invalidation_raw, dict):
+            inv = _parse_invalidator(invalidation_raw)
+            if inv:
+                invalidators.append(inv)
+                parsed_any = True
+        # If invalidation was present but we couldn't parse any structured
+        # invalidators from it, fall back to default
+        if not parsed_any:
+            log.warning(
+                "Could not parse structured invalidators from signal invalidation "
+                "field (value: %s). Falling back to stop-price default.",
+                invalidation_raw,
+            )
+            invalidators.append(_default_invalidator(stop))
+    else:
+        # No invalidation field at all — use stop-price default
+        log.warning(
+            "Signal lacks invalidation field. Using stop-price default "
+            "invalidator (stop=%.2f).",
+            stop,
+        )
+        invalidators.append(_default_invalidator(stop))
+
+    return {
+        "thesis": thesis,
+        "setup_type": setup_type,
+        "invalidators": invalidators,
+    }
+
+
+def build_legacy_entry_contract(trade) -> dict | None:
+    """
+    Build a best-effort Entry Contract for a legacy trade that was opened
+    before the thesis-anchored exits feature.
+
+    Migration rules:
+      - If trade.thesis is already populated → return None (no migration needed)
+      - If trade.stop_price and trade.target_price exist → full Entry Contract
+      - If only trade.stop_price exists → partial contract with stop-based invalidator
+      - If neither exists → return None (fall back to signal-based evaluation)
+
+    Logs a warning for each legacy trade migrated, identifying the trade
+    and which fields were missing or inferred.
+
+    Returns:
+        dict with keys {"thesis", "setup_type", "invalidators"} or None
+    """
+    # Already has a thesis — no migration needed
+    if trade.thesis:
+        return None
+
+    has_stop = trade.stop_price is not None
+    has_target = trade.target_price is not None
+
+    # Neither stop nor target — cannot construct a meaningful contract
+    if not has_stop and not has_target:
+        return None
+
+    # Build thesis from reason_entry or use a default
+    thesis = trade.reason_entry or "Legacy trade — no thesis recorded"
+    setup_type = "unknown"
+
+    # Build invalidator from stop price
+    invalidators = []
+    if has_stop:
+        invalidators.append(_default_invalidator(trade.stop_price))
+
+    # Determine what was missing/inferred for the log message
+    missing_parts = []
+    if not trade.reason_entry:
+        missing_parts.append("reason_entry (used default thesis)")
+    if not has_target:
+        missing_parts.append("target_price")
+    missing_parts.append("setup_type (inferred as 'unknown')")
+
+    trade_id = getattr(trade, "id", "?")
+    symbol = getattr(trade, "symbol", "?")
+    log.warning(
+        "Legacy trade migration: trade_id=%s symbol=%s — "
+        "constructed %s Entry Contract. Missing/inferred: %s",
+        trade_id,
+        symbol,
+        "full" if (has_stop and has_target) else "partial",
+        ", ".join(missing_parts),
+    )
+
+    return {
+        "thesis": thesis,
+        "setup_type": setup_type,
+        "invalidators": invalidators,
+    }
+
+
+def detect_drifting(db, trade) -> bool:
+    """
+    Detect whether a position is in DRIFTING state.
+
+    A position is DRIFTING when no analyst signal for the trade's symbol
+    has been recorded after the trade's entry_time. This is a computed
+    state — not stored in the DB — to avoid stale state if signals arrive
+    between cycles.
+
+    Args:
+        db: SQLAlchemy session
+        trade: Trade record with .symbol and .entry_time
+
+    Returns:
+        True if no analyst signal exists after entry_time (drifting),
+        False if a signal exists after entry_time (not drifting).
+    """
+    if not trade.entry_time:
+        # No entry time recorded — treat as drifting (conservative)
+        return True
+
+    latest_signal = (
+        db.query(AgentMemory)
+        .filter_by(agent="analyst", symbol=trade.symbol, key="signal")
+        .filter(AgentMemory.timestamp > trade.entry_time)
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+
+    return latest_signal is None
 
 
 def execute_trade(db, decision: dict, profile_id: str):
@@ -491,6 +1199,24 @@ def execute_trade(db, decision: dict, profile_id: str):
             import logging
             logging.getLogger(__name__).info(f"Confidence adjusted: {conf_adj['reason']}")
 
+    # ── Build Entry Contract for BUY/SHORT actions ──
+    _entry_contract = {}
+    if action in ("BUY", "SHORT"):
+        try:
+            signal_for_contract = _build_signal_for_symbol(db, symbol, decision)
+            _entry_contract = build_entry_contract(
+                decision, signal_for_contract,
+                stop or 0.0, target or 0.0,
+            )
+            log.info(
+                "Entry contract built for %s: setup_type=%s, invalidators=%d",
+                symbol,
+                _entry_contract.get("setup_type", "unknown"),
+                len(_entry_contract.get("invalidators", [])),
+            )
+        except Exception as exc:
+            log.warning("Failed to build entry contract for %s: %s", symbol, exc)
+
     if action == "BUY":
         cost = quantity * price
         if cost > cash:
@@ -520,6 +1246,9 @@ def execute_trade(db, decision: dict, profile_id: str):
             similarity_winrate=_edge_data.get("similarity_winrate"),
             similarity_sample_size=_edge_data.get("similarity_sample_size"),
             similarity_confidence=_edge_data.get("similarity_confidence"),
+            thesis=_entry_contract.get("thesis"),
+            setup_type=_entry_contract.get("setup_type"),
+            invalidators=json.dumps(_entry_contract["invalidators"]) if _entry_contract.get("invalidators") else None,
         ))
         db.add(Balance(cash=cash - cost, profile=profile_id))
 
@@ -553,6 +1282,9 @@ def execute_trade(db, decision: dict, profile_id: str):
             similarity_winrate=_edge_data.get("similarity_winrate"),
             similarity_sample_size=_edge_data.get("similarity_sample_size"),
             similarity_confidence=_edge_data.get("similarity_confidence"),
+            thesis=_entry_contract.get("thesis"),
+            setup_type=_entry_contract.get("setup_type"),
+            invalidators=json.dumps(_entry_contract["invalidators"]) if _entry_contract.get("invalidators") else None,
         ))
         # Deduct margin from cash (returned + P&L on close)
         db.add(Balance(cash=cash - margin_required, profile=profile_id))
@@ -612,7 +1344,21 @@ def execute_trade(db, decision: dict, profile_id: str):
 
 
 def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high") -> dict:
-    """Run a single PM profile for one cycle. tier controls which LLM is used."""
+    """
+    Run a single PM profile for one cycle with two-tier review routing.
+
+    The decision loop:
+    1. Load all open positions with their Entry Contracts
+    2. Check for pending Reversal triggers (thesis_invalidation from AgentMemory,
+       opposing signals, explicit CLOSE)
+    3. For positions WITH a Reversal trigger → call Reversal/Close Review
+    4. For positions WITHOUT a Reversal trigger → call Maintenance Review
+    5. For NEW entries (no existing position) → use existing entry logic unchanged
+    6. Execute resulting decisions via execute_trade()
+    7. Log each cycle whether signals were used in advisory or authoritative capacity
+
+    tier controls which LLM is used.
+    """
     profile = PM_PROFILES[profile_id]
     fh = FinnhubClient()
     db = get_session(engine)
@@ -657,7 +1403,223 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
 
     portfolio = get_portfolio_for_profile(db, fh, profile_id)
 
-    # Build profile-specific system prompt
+    # Check daily loss limit before doing any work
+    max_loss = portfolio["starting_balance"] * profile["max_daily_loss_pct"]
+    if abs(portfolio["daily_pnl"]) >= max_loss and portfolio["daily_pnl"] < 0:
+        notes = f"Daily loss limit hit (${portfolio['daily_pnl']:,.2f}). No more trades today."
+        db.close()
+        return {"decisions": [], "portfolio_notes": notes, "profile": profile_id}
+
+    # Position health from health monitor
+    health_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="position_health", key="health_check")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    health_text = health_mem.value if health_mem else "No health data"
+
+    # ── PHASE 1: Two-tier review for existing open positions ──
+    # Track signal usage for audit logging (Req 4.4)
+    signal_usage_log = []  # list of {"symbol", "usage": "advisory"|"authoritative"}
+    review_decisions = []
+
+    open_positions = db.query(Position).filter_by(profile=profile_id).all()
+
+    for pos in open_positions:
+        symbol = pos.symbol
+
+        # Load the open trade with Entry Contract
+        open_trade = (
+            db.query(Trade)
+            .filter_by(symbol=symbol, profile=profile_id, status="open")
+            .order_by(Trade.entry_time.desc())
+            .first()
+        )
+        if not open_trade:
+            continue
+
+        # Check if this position has an Entry Contract
+        has_entry_contract = bool(open_trade.thesis)
+
+        if not has_entry_contract:
+            # Attempt legacy migration before skipping (Req 8.2, 8.3)
+            contract = build_legacy_entry_contract(open_trade)
+            if contract:
+                open_trade.thesis = contract["thesis"]
+                open_trade.setup_type = contract["setup_type"]
+                open_trade.invalidators = json.dumps(contract["invalidators"])
+                db.commit()
+                has_entry_contract = True
+            else:
+                # No Entry Contract and migration not possible — skip two-tier review.
+                log.info(
+                    "Position %s has no Entry Contract — skipping two-tier review "
+                    "(will be handled by legacy migration or existing logic).",
+                    symbol,
+                )
+                continue
+
+        # Get current price
+        try:
+            quote = fh.get_quote(symbol)
+            current_price = quote["price"]
+        except Exception:
+            current_price = pos.avg_cost
+
+        # Compute unrealized P&L
+        if pos.side == "short":
+            unrealized_pnl = (pos.avg_cost - current_price) * pos.quantity
+        else:
+            unrealized_pnl = (current_price - pos.avg_cost) * pos.quantity
+        unrealized_pnl_pct = round(
+            unrealized_pnl / (pos.avg_cost * pos.quantity) * 100, 2
+        ) if pos.avg_cost and pos.quantity else 0
+
+        # Detect DRIFTING state
+        drifting = detect_drifting(db, open_trade)
+
+        # Get analyst signal for this symbol (if any)
+        signal_for_symbol = signals.get(symbol)
+
+        # Check for Reversal triggers
+        trigger_info = _check_reversal_triggers(
+            db, open_trade, {}, signal_for_symbol, profile
+        )
+
+        # Build position data dict for review handlers
+        position_data = {
+            "symbol": symbol,
+            "side": pos.side,
+            "quantity": pos.quantity,
+            "entry_price": open_trade.entry_price,
+            "stop_price": open_trade.stop_price,
+            "target_price": open_trade.target_price,
+            "current_price": current_price,
+            "unrealized_pnl_pct": unrealized_pnl_pct,
+            "drifting": drifting,
+            "thesis": open_trade.thesis,
+            "setup_type": open_trade.setup_type,
+            "invalidators": open_trade.invalidators,
+            "indicators": signal_for_symbol.get("indicators") if signal_for_symbol else None,
+            "advisory_signals": signal_for_symbol if signal_for_symbol else None,
+            "health_text": health_text,
+            "market_conditions": signal_for_symbol if signal_for_symbol else None,
+            "opposing_evidence": signal_for_symbol if (
+                trigger_info and trigger_info.get("type") == "opposing_signal"
+            ) else None,
+        }
+
+        if trigger_info:
+            # ── Reversal/Close Review (authoritative signal usage) ──
+            log.info(
+                "Routing %s to Reversal/Close Review: trigger=%s",
+                symbol, trigger_info["type"],
+            )
+            review_result = run_reversal_close_review(
+                position_data, trigger_info, profile, tier=tier
+            )
+
+            # Log authoritative signal usage (Req 4.4)
+            if signal_for_symbol:
+                signal_usage_log.append({
+                    "symbol": symbol,
+                    "usage": "authoritative",
+                    "trigger": trigger_info["type"],
+                })
+
+            # Convert review result to an executable decision
+            action = review_result.get("action", "hold_tighten")
+            if action in ("close_full", "close_partial"):
+                close_decision = {
+                    "symbol": symbol,
+                    "action": "CLOSE",
+                    "quantity": pos.quantity if action == "close_full" else max(1, int(pos.quantity * 0.5)),
+                    "price": current_price,
+                    "rationale": (
+                        f"Reversal/Close Review ({trigger_info['type']}): "
+                        f"{review_result.get('reasoning', 'No reasoning')}"
+                    ),
+                }
+                review_decisions.append(close_decision)
+            elif action == "hold_tighten":
+                # Tighten stop to breakeven if profitable
+                if unrealized_pnl > 0 and open_trade.stop_price:
+                    new_stop = open_trade.entry_price  # breakeven
+                    open_trade.stop_price = new_stop
+                    db.commit()
+                    log.info(
+                        "Reversal/Close Review hold_tighten for %s: "
+                        "tightened stop to breakeven (%.2f)",
+                        symbol, new_stop,
+                    )
+        else:
+            # ── Maintenance Review (advisory signal usage) ──
+            log.info("Routing %s to Maintenance Review", symbol)
+            review_result = run_maintenance_review(
+                position_data, profile, tier=tier
+            )
+
+            # Log advisory signal usage (Req 4.4)
+            if signal_for_symbol:
+                signal_usage_log.append({
+                    "symbol": symbol,
+                    "usage": "advisory",
+                })
+
+            # Apply maintenance actions
+            action = review_result.get("action", "hold")
+            if action == "tighten_stop" and review_result.get("new_stop"):
+                open_trade.stop_price = review_result["new_stop"]
+                db.commit()
+                log.info(
+                    "Maintenance Review tighten_stop for %s: new stop=%.2f",
+                    symbol, review_result["new_stop"],
+                )
+            elif action == "raise_target" and review_result.get("new_target"):
+                open_trade.target_price = review_result["new_target"]
+                db.commit()
+                log.info(
+                    "Maintenance Review raise_target for %s: new target=%.2f",
+                    symbol, review_result["new_target"],
+                )
+            elif action == "trim_partial" and review_result.get("trim_pct"):
+                trim_qty = max(1, int(pos.quantity * review_result["trim_pct"] / 100))
+                trim_decision = {
+                    "symbol": symbol,
+                    "action": "CLOSE",
+                    "quantity": trim_qty,
+                    "price": current_price,
+                    "rationale": (
+                        f"Maintenance Review trim_partial ({review_result['trim_pct']}%): "
+                        f"{review_result.get('reasoning', 'No reasoning')}"
+                    ),
+                }
+                review_decisions.append(trim_decision)
+
+    # Log signal usage summary for this cycle (Req 4.4)
+    advisory_count = sum(1 for s in signal_usage_log if s["usage"] == "advisory")
+    authoritative_count = sum(1 for s in signal_usage_log if s["usage"] == "authoritative")
+    log.info(
+        "SIGNAL USAGE [%s]: advisory=%d, authoritative=%d, details=%s",
+        profile_id, advisory_count, authoritative_count,
+        json.dumps(signal_usage_log) if signal_usage_log else "no signals used",
+    )
+
+    # Execute review-generated decisions (close/trim from two-tier review)
+    executed = []
+    for decision in review_decisions:
+        ok, msg = execute_trade(db, decision, profile_id)
+        executed.append({
+            **decision, "executed": ok, "message": msg,
+            "profile": profile_id, "source": "two_tier_review",
+        })
+
+    # ── PHASE 2: Existing entry logic for NEW positions (unchanged) ──
+    # Symbols that already have open positions are excluded from new entry consideration.
+    held_symbols = {p.symbol for p in db.query(Position).filter_by(profile=profile_id).all()}
+
+    # Build profile-specific system prompt for entry decisions
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         profile_name=profile["name"],
         emoji=profile["emoji"],
@@ -728,18 +1690,15 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     )
     news_text = news_mem.value if news_mem else "No breaking news"
 
-    # Position health from health monitor
-    health_mem = (
-        db.query(AgentMemory)
-        .filter_by(agent="position_health", key="health_check")
-        .order_by(AgentMemory.timestamp.desc())
-        .first()
-    )
-    health_text = health_mem.value if health_mem else "No health data"
-
     # Get behavioral parameters (auto-extracted from reviewer feedback)
     from utils.behavioral_params import get_behavioral_params
     behav_params = get_behavioral_params(engine, profile_id)
+
+    # Filter signals to only symbols without open positions (entry candidates)
+    entry_signals = {sym: sig for sym, sig in signals.items() if sym not in held_symbols}
+
+    # Refresh portfolio snapshot (may have changed from review-phase closes)
+    portfolio = get_portfolio_for_profile(db, fh, profile_id)
 
     user_prompt = f"""
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
@@ -749,7 +1708,7 @@ CURRENT PORTFOLIO:
 {json.dumps(portfolio, indent=2)}
 
 ANALYST SIGNALS:
-{json.dumps(signals, indent=2)}
+{json.dumps(entry_signals, indent=2)}
 
 EXECUTION FEEDBACK (your profile only):
 {feedback_text}{weekly_stance_text}
@@ -776,30 +1735,45 @@ BEHAVIORAL ADJUSTMENTS (auto-extracted from feedback — applied to your decisio
 {json.dumps(behav_params, indent=2) if behav_params.get('notes') else 'No adjustments active'}
 
 Make your trading decisions for this cycle.
+NOTE: Open positions are managed by the two-tier review system. Only consider NEW entries here.
 """
 
     raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier)
     result = parse_json_response(raw)
 
-    # Check daily loss limit before executing
-    max_loss = portfolio["starting_balance"] * profile["max_daily_loss_pct"]
-    if abs(portfolio["daily_pnl"]) >= max_loss and portfolio["daily_pnl"] < 0:
-        notes = f"Daily loss limit hit (${portfolio['daily_pnl']:,.2f}). No more trades today."
-        db.close()
-        return {"decisions": [], "portfolio_notes": notes, "profile": profile_id}
-
     # Apply behavioral parameters to decisions
     from utils.behavioral_params import apply_params_to_decision
 
-    # Execute decisions
-    executed = []
+    # Execute entry decisions (only BUY/SHORT for new positions)
     for decision in result.get("decisions", []):
         decision = apply_params_to_decision(decision, behav_params, profile)
         if decision.get("action") == "PASS":
-            executed.append({**decision, "executed": False, "message": "Blocked by behavioral params", "profile": profile_id})
+            executed.append({
+                **decision, "executed": False,
+                "message": "Blocked by behavioral params",
+                "profile": profile_id, "source": "entry_logic",
+            })
             continue
+
+        # Filter out CLOSE/HOLD actions for held symbols — those are handled
+        # by the two-tier review system above
+        action = decision.get("action", "").upper()
+        sym = decision.get("symbol", "")
+        if action == "CLOSE" and sym in held_symbols:
+            log.info(
+                "Ignoring LLM CLOSE for %s — close decisions are handled by "
+                "two-tier review system only.",
+                sym,
+            )
+            continue
+        if action == "HOLD":
+            continue
+
         ok, msg = execute_trade(db, decision, profile_id)
-        executed.append({**decision, "executed": ok, "message": msg, "profile": profile_id})
+        executed.append({
+            **decision, "executed": ok, "message": msg,
+            "profile": profile_id, "source": "entry_logic",
+        })
 
     # Save PM notes
     notes = result.get("portfolio_notes", "")

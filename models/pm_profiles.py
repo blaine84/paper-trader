@@ -20,6 +20,7 @@ PM_PROFILES = {
         "avoid_first_minutes": 30,       # No trades in first 30 min
         "avoid_last_minutes": 30,        # No trades in last 30 min
         "max_daily_loss_pct": 0.02,      # Stop trading if down 2% on day
+        "opposing_evidence_threshold": "moderate",  # Moderate opposing signal triggers Reversal Review
         "personality": """
 You are a conservative portfolio manager. Capital preservation is your top priority.
 Rules:
@@ -48,6 +49,7 @@ Rules:
         "avoid_first_minutes": 15,
         "avoid_last_minutes": 15,
         "max_daily_loss_pct": 0.03,
+        "opposing_evidence_threshold": "strong",  # Only strong opposing signals trigger Reversal Review
         "personality": """
 You are a balanced portfolio manager. You seek quality setups with good risk/reward.
 Rules:
@@ -75,6 +77,7 @@ Rules:
         "avoid_first_minutes": 5,
         "avoid_last_minutes": 5,
         "max_daily_loss_pct": 0.05,
+        "opposing_evidence_threshold": "strong",  # Only strong opposing signals trigger Reversal Review
         "personality": """
 You are an aggressive day trader. You chase momentum and aren't afraid of risk.
 Rules:

@@ -8,7 +8,7 @@ A multi-agent paper trading system for day trading SPY, QQQ, IWM, TSLA, NVDA, AM
 |---|---|
 | 📰 Researcher | News, sentiment, market context via Finnhub |
 | 📊 Analyst | Technical analysis (RSI, MACD, EMA, BB, VWAP) |
-| 🧠 Portfolio Manager | Trade decisions, position sizing, execution |
+| 🧠 Portfolio Manager | Trade decisions, position sizing, thesis-anchored exits |
 | 📋 Bookkeeper | Tracks positions, P&L, stop losses, daily summaries |
 | 🔍 Reviewer | Scores closed trades, extracts lessons, feeds back |
 | 🎯 Orchestrator | Runs the market-hours loop via APScheduler |
@@ -24,6 +24,20 @@ Three deterministic, LLM-free modules in `core/` gate every trade:
 | Portfolio Risk | `core/portfolio_risk.py` | Cross-position exposure control with adaptive throttling |
 
 Every BUY/SHORT runs through: similarity lookup → edge score → portfolio risk → existing validation.
+
+### Thesis-Anchored Exits
+
+Exit decisions are anchored to the original trade thesis, not signal freshness:
+
+| Concept | Description |
+|---|---|
+| Entry Contract | Thesis, setup type, and structured invalidators recorded at trade open |
+| Maintenance Review | Default review for open positions — can hold, tighten stop, raise target, or trim. Cannot close. |
+| Reversal/Close Review | Only triggered by thesis invalidation, strong opposing signal, or explicit CLOSE. The only path that can close a position. |
+| DRIFTING state | Positions without recent analyst signals. Explicitly does NOT trigger exits. |
+| Thesis Invalidation Engine | Price Monitor evaluates structured invalidator conditions every 60s. |
+
+PM profiles have an `opposing_evidence_threshold` (conservative: moderate, moderate/aggressive: strong) that gates when opposing signals trigger a Reversal/Close Review.
 
 ## Feedback Loop
 
@@ -69,7 +83,7 @@ python orchestrator.py once
 SQLite at `db/paper_trader.db`
 
 Tables:
-- `trades` — all paper trades with entry/exit/P&L/scores/edge_score/similarity data
+- `trades` — all paper trades with entry/exit/P&L/scores/edge_score/similarity/entry_contract data
 - `positions` — current open positions
 - `balance` — cash balance history
 - `agent_memory` — shared notes between agents (signals, lessons, feedback)

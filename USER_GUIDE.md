@@ -150,6 +150,35 @@ Each reads the same Analyst signals and Researcher context, then decides:
 - **Target** (based on key levels and required R:R)
 - **Position size** (profile's max % / stop distance)
 
+#### Thesis-Anchored Exits
+
+Exit decisions are anchored to the **Entry Contract** — the original trade thesis
+captured at the moment of entry. Analyst signals become advisory context for open
+positions, not authoritative exit triggers.
+
+**Entry Contract** — recorded on every BUY/SHORT:
+- Thesis narrative (from PM rationale + analyst signal context)
+- Setup type (from analyst signal)
+- Structured invalidators (machine-readable conditions that would break the thesis)
+
+**Two-tier review system** replaces the old flat decision loop:
+
+| Review | When | Allowed actions |
+|---|---|---|
+| Maintenance Review | Every PM cycle (default) | hold, tighten_stop, raise_target, trim_partial |
+| Reversal/Close Review | Only on trigger event | close_full, close_partial, hold_tighten |
+
+Reversal/Close Review triggers:
+1. **Thesis invalidation** — Price Monitor detects a structured invalidator breach
+2. **Opposing signal** — Analyst signal contradicts position direction and meets the profile's `opposing_evidence_threshold`
+3. **Explicit CLOSE** — Analyst issues a CLOSE signal
+
+**DRIFTING state** — positions without recent analyst signals are labeled DRIFTING
+but explicitly NOT exited. The system holds to the Entry Contract thesis.
+
+**Legacy trades** — trades opened before this feature get a best-effort Entry
+Contract built from stop/target/reason_entry at runtime.
+
 ### 📋 Bookkeeper
 Tracks all positions, cash, and P&L across all three portfolios. Monitors stop
 losses every cycle and force-closes positions that breach them. Prints the
@@ -169,9 +198,16 @@ automatically retired.
 
 ### ⚡ Price Monitor
 Runs every 60 seconds during market hours using yfinance (free, no rate limit).
-Checks open positions against stop/target levels and analyst signals against key
-levels. Triggers immediate PM action when conditions are met — no waiting for the
+Checks open positions against stop/target levels and **structured thesis invalidators**.
+Triggers immediate PM action when conditions are met — no waiting for the
 next scheduled cycle.
+
+**Thesis Invalidation Engine** — evaluates each trade's structured invalidator
+conditions (stored as JSON on the Trade record) against live prices:
+- `price_below_level` / `price_above_level` with tick or 5m_close confirmation
+- `structure_break` types are skipped (handled by LLM in Reversal Review)
+- Breached invalidators emit `thesis_invalidation` triggers to AgentMemory
+- PM reads these triggers during the next Reversal/Close Review
 
 ### 🔬 Meta Reviewer
 Runs weekly after Sunday prep. Grades each agent (A–F), tracks trends
@@ -194,9 +230,11 @@ Three portfolios run simultaneously, each with $100k paper balance.
 | Min signal strength | strong |
 | Avoid first/last | 30 min |
 | Daily loss limit | 2% |
+| Opposing evidence threshold | moderate |
 
 Prefers ETFs (SPY, QQQ, IWM). Only acts on high-conviction setups.
-Stops trading for the day if down 2%.
+Stops trading for the day if down 2%. Lower opposing evidence threshold means
+moderate-strength opposing signals trigger a Reversal/Close Review.
 
 ### ⚖️ Moderate
 | Setting | Value |
@@ -207,8 +245,10 @@ Stops trading for the day if down 2%.
 | Min signal strength | moderate |
 | Avoid first/last | 15 min |
 | Daily loss limit | 3% |
+| Opposing evidence threshold | strong |
 
 Balanced. Trades across the full watchlist. Trusts the analyst but applies judgment.
+Only strong opposing signals trigger a Reversal/Close Review.
 
 ### 🔥 Aggressive
 | Setting | Value |
@@ -219,6 +259,7 @@ Balanced. Trades across the full watchlist. Trusts the analyst but applies judgm
 | Min signal strength | weak |
 | Avoid first/last | 5 min |
 | Daily loss limit | 5% |
+| Opposing evidence threshold | strong |
 
 Chases momentum. Prefers individual stocks (TSLA, NVDA, AMD). Wider stops,
 bigger targets. Will trade Scout picks early. May pyramid into winners.
@@ -339,6 +380,7 @@ The full lifecycle of a trade from signal to exit:
    PM reads: signal + portfolio state + feedback + news + position health
            + behavioral parameters + meta-reviewer recommendations
    PM decides: action, entry price, stop, target, quantity, rationale
+   Entry Contract built: thesis, setup_type, structured invalidators persisted on Trade
 
 4. EDGE SCORE & RISK GATING (automatic, pre-validation)
    Three deterministic modules run before existing validation:
@@ -398,7 +440,8 @@ The full lifecycle of a trade from signal to exit:
 
 8. EXECUTION
    Trade written to DB with stop_price, target_price, edge_score,
-   similarity_winrate, similarity_sample_size, and similarity_confidence persisted
+   similarity_winrate, similarity_sample_size, similarity_confidence,
+   thesis, setup_type, and invalidators (JSON) persisted as Entry Contract
    Position created, cash deducted
    Trade queued for review automatically
 
@@ -417,10 +460,31 @@ The full lifecycle of a trade from signal to exit:
    Price Monitor checks:
    ├─ Stop hit? → close immediately (0.1% buffer, direction-validated)
    ├─ Target hit? → close immediately (direction-validated)
+   ├─ Thesis invalidator breached? → emit thesis_invalidation trigger to AgentMemory
+   │    (structured invalidators: price_below_level, price_above_level with tick/5m_close confirmation)
    ├─ Key level breach? → filter through local LLM → trigger PM if actionable
    ├─ Rapid move (>1.5% in 5 min)? → filter → trigger PM
    ├─ Approaching key level (<0.3%)? → log for awareness
    └─ 15-min cooldown per symbol to prevent alert spam
+
+   PM Two-Tier Review (every 15-30 min):
+   For each open position with an Entry Contract:
+   ├─ Check for Reversal triggers:
+   │    ├─ thesis_invalidation from Price Monitor (in AgentMemory)
+   │    ├─ Opposing analyst signal meeting profile threshold
+   │    └─ Explicit CLOSE signal from analyst
+   ├─ WITH trigger → Reversal/Close Review:
+   │    ├─ close_full: exit entire position
+   │    ├─ close_partial: exit portion of position
+   │    └─ hold_tighten: tighten stop to breakeven if profitable
+   ├─ WITHOUT trigger → Maintenance Review:
+   │    ├─ hold: no action
+   │    ├─ tighten_stop: move stop up to lock in gains
+   │    ├─ raise_target: increase target on strong momentum
+   │    └─ trim_partial: reduce position size
+   └─ DRIFTING positions (no recent signal) → Maintenance Review (NOT exit)
+
+   Signal usage logged each cycle: advisory (Maintenance) vs authoritative (Reversal)
 
    Position Timer checks (every 5 min):
    ├─ Setup-specific time limits (see below)
@@ -431,6 +495,8 @@ The full lifecycle of a trade from signal to exit:
 
    Position Health (every hour, local LLM):
    └─ Reviews all positions against current indicators
+       Includes Entry Contract data (thesis, invalidators, setup_type)
+       Includes DRIFTING state label
        Flags deteriorating positions even if stops haven't hit
 
    News Monitor (every 2 hours, local LLM):
@@ -841,7 +907,7 @@ SQLite at `db/paper_trader.db`. Back it up periodically.
 
 | Table | Contents |
 |---|---|
-| `trades` | All paper trades with entry/exit/P&L/scores/stop/target/edge_score/similarity data |
+| `trades` | All paper trades with entry/exit/P&L/scores/stop/target/edge_score/similarity/entry_contract data |
 | `positions` | Current open positions (per profile + side) |
 | `balance` | Cash balance history (per profile) |
 | `agent_memory` | Shared notes between agents (signals, feedback, meta reviews) |

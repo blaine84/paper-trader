@@ -39,6 +39,10 @@ class Trade(Base):
     similarity_winrate = Column(Float, nullable=True)        # 0.0-1.0
     similarity_sample_size = Column(Integer, nullable=True)  # count of matched cases
     similarity_confidence = Column(Float, nullable=True)     # min(1.0, sample_size/10)
+    # Entry Contract fields (thesis-anchored exits)
+    thesis = Column(Text, nullable=True)                     # trade thesis narrative
+    setup_type = Column(String(64), nullable=True)           # analyst's setup classification
+    invalidators = Column(Text, nullable=True)               # JSON array of invalidator objects
 
 
 class Position(Base):
