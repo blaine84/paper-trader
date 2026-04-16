@@ -61,6 +61,52 @@ def ensure_initial_balance(engine):
     db.close()
 
 
+def check_schema(engine):
+    """Verify the DB schema has all expected columns. Fail fast if not."""
+    import sqlite3
+    from sqlalchemy import inspect as sa_inspect
+
+    inspector = sa_inspect(engine)
+
+    # Expected columns per table that have been added over time.
+    # If a column is missing, the system will crash on first query anyway —
+    # better to catch it here with a clear message and auto-fix.
+    expected = {
+        "trades": ["thesis", "setup_type", "invalidators"],
+    }
+
+    missing = {}
+    for table, columns in expected.items():
+        if not inspector.has_table(table):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        table_missing = [c for c in columns if c not in existing]
+        if table_missing:
+            missing[table] = table_missing
+
+    if not missing:
+        return
+
+    # Auto-fix: add missing columns
+    col_types = {
+        "thesis": "TEXT",
+        "setup_type": "VARCHAR(64)",
+        "invalidators": "TEXT",
+    }
+
+    raw_conn = engine.raw_connection()
+    cursor = raw_conn.cursor()
+    for table, cols in missing.items():
+        for col in cols:
+            col_type = col_types.get(col, "TEXT")
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            log.warning(f"Schema migration: added {table}.{col} ({col_type})")
+    raw_conn.commit()
+    raw_conn.close()
+
+    console.print(f"   [yellow]⚠ Auto-migrated missing columns: {missing}[/yellow]")
+
+
 def run_pre_market():
     """8:30 AM ET — Research + Analysis prep before open."""
     log.info("=== PRE-MARKET RUN ===")
@@ -255,6 +301,7 @@ def run_once():
     """Run a single full cycle manually (for testing)."""
     engine = get_engine()
     ensure_initial_balance(engine)
+    check_schema(engine)
     console.print("[bold]Running single cycle...[/bold]")
     run_pre_market()
     run_intraday()
@@ -401,6 +448,7 @@ def run_position_timer():
 def main():
     engine = get_engine()
     ensure_initial_balance(engine)
+    check_schema(engine)
     check_llm_connectivity()
 
     scheduler = BlockingScheduler(timezone="America/New_York")
