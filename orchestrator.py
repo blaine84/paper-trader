@@ -7,6 +7,7 @@ Uses APScheduler for intraday loops.
 import os
 import signal
 import logging
+import logging.handlers
 from datetime import datetime
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -32,7 +33,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("logs/orchestrator.log"),
+        logging.handlers.RotatingFileHandler(
+            "logs/orchestrator.log", maxBytes=10_000_000, backupCount=5
+        ),
         logging.StreamHandler(),
     ],
 )
