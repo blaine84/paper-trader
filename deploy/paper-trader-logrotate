@@ -1,0 +1,12 @@
+/home/blaine/paper-trader/logs/service.log
+/home/blaine/paper-trader/logs/web.log
+{
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    size 10M
+}

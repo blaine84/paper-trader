@@ -1,0 +1,18 @@
+[Unit]
+Description=Paper Trader — Web Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blaine
+WorkingDirectory=/home/blaine/paper-trader
+EnvironmentFile=/home/blaine/paper-trader/.env
+ExecStart=/home/blaine/paper-trader/venv/bin/python web/app.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/blaine/paper-trader/logs/web.log
+StandardError=append:/home/blaine/paper-trader/logs/web.log
+
+[Install]
+WantedBy=multi-user.target
