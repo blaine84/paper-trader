@@ -1,4 +1,0 @@
-# file: C:\Users\blain\.openclaw\workspace\paper-trader\utils\trade_validator.py
-# hypothesis_version: 6.151.13
-
-[0.0, 0.35, 0.5, 1.0, '?', 'CLOSE', 'DIA', 'IWM', 'LONG', 'QQQ', 'SHORT', 'SPY', 'action', 'block', 'entry_price', 'long', 'max_position_pct', 'modifier', 'price', 'profit_target', 'quantity', 'reason', 'short', 'stop', 'stop_loss', 'stop_price', 'success', 'symbol', 'target', 'target_price', 'total_cases', 'win_rate']

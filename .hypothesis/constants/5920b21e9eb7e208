@@ -1,4 +1,0 @@
-# file: C:\Users\blain\.openclaw\workspace\paper-trader\core\similarity.py
-# hypothesis_version: 6.151.13
-
-[0.0, 0.15, 0.25, 0.3, 1.0, 10.0, 100.0, 'above_vwap', 'bias', 'catalyst_type', 'conditions_to_avoid', 'confidence', 'date', 'ema_trend', 'entry_timing', 'execution_score', 'false', 'float_profile', 'holding_minutes', 'id', 'lesson', 'market_regime', 'outcome', 'pnl_pct', 'premarket_gap_pct', 'profile', 'regime_match', 'review_score', 'rsi', 'rsi_at_entry', 'rsi_distance', 'sample_size', 'sector', 'selection_score', 'setup_match', 'setup_type', 'signal_strength', 'similarity_avg_r', 'similarity_score', 'similarity_winrate', 'skip_similarity', 'success', 'symbol', 'trend_alignment', 'true', 'vwap_alignment']

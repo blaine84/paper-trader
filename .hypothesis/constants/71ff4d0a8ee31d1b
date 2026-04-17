@@ -1,4 +1,0 @@
-# file: C:\Users\blain\.openclaw\workspace\paper-trader\utils\finnhub_client.py
-# hypothesis_version: 6.151.13
-
-[0.5, 100, '%Y-%m-%d', '1', '15', '15m', '1d', '1h', '1m', '30', '30m', '403', '429', '5', '502', '52WeekHigh', '52WeekLow', '52w_high', '52w_low', '5m', '60', 'Close', 'D', 'FINNHUB_API_KEY', 'High', 'Low', 'Open', 'US', 'Volume', 'all', 'beta', 'c', 'change_pct', 'close', 'datetime', 'eps', 'general', 'h', 'headline', 'high', 'isOpen', 'l', 'low', 'metric', 'o', 'ok', 'open', 'pandas', 'pc', 'peBasicExclExtraTTM', 'pe_ratio', 'prev_close', 'price', 'resolution', 'rsi', 'rsi14D', 's', 'source', 'summary', 'symbol', 't', 'timestamp', 'timestamps', 'url', 'v', 'volume']

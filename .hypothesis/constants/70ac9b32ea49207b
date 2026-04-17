@@ -1,4 +1,0 @@
-# file: C:\Users\blain\.openclaw\workspace\paper-trader\db\schema.py
-# hypothesis_version: 6.151.13
-
-[128, 'active', 'agent_memory', 'balance', 'daily_log', 'db/paper_trader.db', 'dynamic_strategies', 'long', 'moderate', 'open', 'pending', 'positions', 'quant_researcher', 'review_queue', 'trades']
