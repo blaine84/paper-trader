@@ -158,6 +158,15 @@ def run_pre_market():
     except Exception as e:
         log.error(f"Analyst error: {e}", exc_info=True)
 
+    # Slack morning report — non-blocking, failures never affect trading
+    try:
+        from utils.slack_notifier import SlackNotifier
+        notifier = SlackNotifier()
+        if notifier.is_enabled():
+            notifier.send_morning_report(engine)
+    except Exception as e:
+        log.error(f"Slack morning report error: {e}", exc_info=True)
+
 
 def run_analyst_refresh():
     """Analyst-only refresh — runs every 15 min, free via local LLM."""
@@ -298,6 +307,15 @@ def run_daily_review():
         log.info(f"Daily Review: {result.get('date', 'unknown')} — confidence: {result.get('completeness', {}).get('confidence', 'unknown')}")
     except Exception as e:
         log.error(f"Daily Review error: {e}", exc_info=True)
+
+    # Slack afternoon report — non-blocking, failures never affect trading
+    try:
+        from utils.slack_notifier import SlackNotifier
+        notifier = SlackNotifier()
+        if notifier.is_enabled():
+            notifier.send_afternoon_report(engine)
+    except Exception as e:
+        log.error(f"Slack afternoon report error: {e}", exc_info=True)
 
 
 def run_once():

@@ -21,3 +21,8 @@ logs/
 .DS_Store
 Thumbs.db
 .vscode/
+
+.kiro/*
+*.md
+
+.hypothesis*
