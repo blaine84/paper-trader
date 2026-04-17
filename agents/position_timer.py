@@ -231,6 +231,10 @@ def run(engine) -> dict:
 
         # Hard wall: 3:45 PM ET
         if past_hard_wall and is_intraday:
+            if td["target_price"] is not None:
+                log.info(f"⏰ HARD WALL SKIP: {td['symbol']} ({td['profile']}) has target_price "
+                         f"${td['target_price']:.2f} — deferring to price_monitor")
+                continue
             hard_wall_closes.append({"symbol": td["symbol"], "profile": td["profile"],
                                      "minutes_held": round(minutes_held), "setup_type": setup_type})
             _close_position(engine, trade, price,
@@ -280,11 +284,17 @@ def run(engine) -> dict:
 
         # ── GENERIC SETUP LOGIC ──
         if minutes_held > limits["force_close"]:
-            force_closes.append({"symbol": td["symbol"], "profile": td["profile"],
-                                 "minutes_held": round(minutes_held), "setup_type": setup_type})
-            _close_position(engine, trade, price,
-                            f"Time-based forced exit: {setup_type} held {round(minutes_held)} min (limit: {limits['force_close']})")
-            continue
+            if td["target_price"] is not None:
+                log.info(f"⏰ FORCE CLOSE SKIP: {td['symbol']} ({td['profile']}) has target_price "
+                         f"${td['target_price']:.2f} — deferring to price_monitor "
+                         f"({setup_type} held {round(minutes_held)} min)")
+                # Still allow alert generation below
+            else:
+                force_closes.append({"symbol": td["symbol"], "profile": td["profile"],
+                                     "minutes_held": round(minutes_held), "setup_type": setup_type})
+                _close_position(engine, trade, price,
+                                f"Time-based forced exit: {setup_type} held {round(minutes_held)} min (limit: {limits['force_close']})")
+                continue
 
         if minutes_held > limits["alert"]:
             if _escalate(td["id"], "alert"):
