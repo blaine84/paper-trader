@@ -14,6 +14,7 @@ from db.schema import AgentMemory, Position, Balance, Trade, get_session
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.case_library import get_relevant_cases, format_cases_for_prompt, get_win_rate_by_setup
 from agents.quant_researcher import build_strategy_context
+from agents.lesson_registry import check_track_record
 from core.similarity import find_similar_cases, compute_similarity_stats
 from core.edge_score import (
     compute_edge_score, check_hard_rejection, cap_position_size,
@@ -1298,6 +1299,7 @@ def execute_trade(db, decision: dict, profile_id: str):
             return False, "No position to close"
 
         close_qty = quantity if quantity and quantity < pos.quantity else pos.quantity
+        close_qty = abs(close_qty)  # Guard against negative qty from LLM decisions
         side = pos.side
 
         open_trade = (
@@ -1318,6 +1320,13 @@ def execute_trade(db, decision: dict, profile_id: str):
             open_trade.pnl = round(pnl, 2)
             open_trade.pnl_pct = round(pnl_pct, 2)
             open_trade.reason_exit = decision.get("rationale")
+
+            # Post-trade PnL sign consistency check
+            if pnl != 0 and ((pnl > 0) != (pnl_pct > 0)):
+                log.warning(
+                    "PnL sign mismatch for %s: pnl=%.2f, pnl_pct=%.2f — signs should be consistent",
+                    symbol, pnl, pnl_pct,
+                )
 
             # Queue for review
             from db.schema import ReviewQueue
@@ -1768,6 +1777,40 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
             continue
         if action == "HOLD":
             continue
+
+        # ── LessonRegistry pre-trade gate ──
+        signal = _build_signal_for_symbol(db, sym, decision)
+        verdict = check_track_record(
+            engine,
+            symbol=sym,
+            bias=signal.get("bias", ""),
+            setup_type=signal.get("setup_type", ""),
+        )
+
+        if verdict["verdict"] == "BLOCK":
+            log.warning(
+                "LESSON BLOCK: %s %s %s — avg_score=%.2f (n=%d). Trade blocked.",
+                sym, signal.get("bias"), signal.get("setup_type"),
+                verdict.get("avg_score_5") or verdict.get("avg_score_3") or 0,
+                verdict["sample_size"],
+            )
+            executed.append({
+                **decision, "executed": False,
+                "message": f"Blocked by LessonRegistry: {verdict['verdict']}",
+                "profile": profile_id, "source": "entry_logic",
+            })
+            continue
+
+        if verdict["verdict"] == "POOR_TRACK_RECORD":
+            original_qty = decision.get("quantity", 0)
+            decision["quantity"] = max(1, int(original_qty * verdict["size_multiplier"]))
+            log.info(
+                "LESSON WARNING: %s %s %s — avg_score=%.2f (n=%d). "
+                "Reducing qty %d → %d.",
+                sym, signal.get("bias"), signal.get("setup_type"),
+                verdict.get("avg_score_3") or 0, verdict["sample_size"],
+                original_qty, decision["quantity"],
+            )
 
         ok, msg = execute_trade(db, decision, profile_id)
         executed.append({
