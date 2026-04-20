@@ -103,6 +103,25 @@ def _close_position(engine, trade, price, reason):
     _alert_status.pop(trade.id, None)
 
 
+def _reclassify_to_swing(engine, trade_id, symbol, profile, old_setup, minutes_held):
+    """Reclassify an intraday trade to swing when it survives past its time limit with a target_price."""
+    db = get_session(engine)
+    try:
+        trade = db.query(Trade).filter_by(id=trade_id).first()
+        if trade:
+            trade.setup_type = "swing"
+            db.commit()
+            log.warning(
+                "⏰ SWING RECLASSIFY: %s (%s) %s → swing after %d min "
+                "(has target_price, deferring to price_monitor)",
+                symbol, profile, old_setup, minutes_held,
+            )
+    except Exception as e:
+        log.error("Swing reclassification failed for %s: %s", symbol, e)
+    finally:
+        db.close()
+
+
 def _calculate_r_achieved(trade, current_price):
     """Calculate how much R (risk units) the trade has achieved."""
     if not trade.stop_price or not trade.entry_price:
@@ -232,8 +251,9 @@ def run(engine) -> dict:
         # Hard wall: 3:45 PM ET
         if past_hard_wall and is_intraday:
             if td["target_price"] is not None:
-                log.info(f"⏰ HARD WALL SKIP: {td['symbol']} ({td['profile']}) has target_price "
-                         f"${td['target_price']:.2f} — deferring to price_monitor")
+                # Reclassify to swing — allow overnight hold with price_monitor tracking
+                _reclassify_to_swing(engine, td["id"], td["symbol"], td["profile"],
+                                     setup_type, round(minutes_held))
                 continue
             hard_wall_closes.append({"symbol": td["symbol"], "profile": td["profile"],
                                      "minutes_held": round(minutes_held), "setup_type": setup_type})
@@ -285,10 +305,10 @@ def run(engine) -> dict:
         # ── GENERIC SETUP LOGIC ──
         if minutes_held > limits["force_close"]:
             if td["target_price"] is not None:
-                log.info(f"⏰ FORCE CLOSE SKIP: {td['symbol']} ({td['profile']}) has target_price "
-                         f"${td['target_price']:.2f} — deferring to price_monitor "
-                         f"({setup_type} held {round(minutes_held)} min)")
-                # Still allow alert generation below
+                # Reclassify to swing — no longer subject to intraday limits
+                _reclassify_to_swing(engine, td["id"], td["symbol"], td["profile"],
+                                     setup_type, round(minutes_held))
+                continue
             else:
                 force_closes.append({"symbol": td["symbol"], "profile": td["profile"],
                                      "minutes_held": round(minutes_held), "setup_type": setup_type})

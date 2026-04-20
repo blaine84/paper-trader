@@ -26,6 +26,15 @@ from core.portfolio_risk import (
 
 log = logging.getLogger(__name__)
 
+# Max minutes after market open (9:30 AM ET) that each setup type may be entered.
+# Setup types NOT listed here have no entry-window restriction.
+ENTRY_WINDOW_LIMITS = {
+    "gap_and_go": 60,
+    "orb": 60,
+    "momentum_fade": 60,
+    "short_squeeze": 60,
+}
+
 
 SYSTEM_PROMPT_TEMPLATE = """You are a portfolio manager for paper day trading.
 Profile: {profile_name} {emoji}
@@ -1777,6 +1786,36 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
             continue
         if action == "HOLD":
             continue
+
+        # ── Entry timing gate ──
+        setup = decision.get("setup_type") or ""
+        if not setup:
+            signal_for_timing = _build_signal_for_symbol(db, sym, decision)
+            setup = signal_for_timing.get("setup_type", "")
+        max_minutes = ENTRY_WINDOW_LIMITS.get(setup)
+        if max_minutes is not None:
+            from pytz import timezone as _tz
+            et_tz = _tz("America/New_York")
+            now_et = datetime.now(et_tz)
+            market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_since_open = (now_et - market_open).total_seconds() / 60
+            if minutes_since_open > max_minutes:
+                log.info(
+                    "ENTRY TIMING GATE: %s %s blocked — %s entry window closed "
+                    "(%d min since open, max %d)",
+                    sym, setup, setup, int(minutes_since_open), max_minutes,
+                )
+                decision["action"] = "PASS"
+                decision["rationale"] = (
+                    f"Entry timing gate: {setup} window closed "
+                    f"({int(minutes_since_open)} min since open, max {max_minutes})"
+                )
+                executed.append({
+                    **decision, "executed": False,
+                    "message": f"Blocked by entry timing gate",
+                    "profile": profile_id, "source": "entry_logic",
+                })
+                continue
 
         # ── LessonRegistry pre-trade gate ──
         signal = _build_signal_for_symbol(db, sym, decision)
