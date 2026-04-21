@@ -5,6 +5,7 @@ Access at: http://localhost:5000
 """
 
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timedelta
@@ -14,10 +15,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
+log = logging.getLogger(__name__)
+
 from flask import Flask, jsonify, render_template, request
 from db.schema import init_db, get_session, Position, Balance, Trade, AgentMemory, DailyLog
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.finnhub_client import FinnhubClient
+from utils.catalyst_freshness import (
+    compute_catalyst_freshness,
+    get_breaking_news_for_symbols,
+    get_market_day_start,
+    build_freshness_label,
+    ET,
+)
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
@@ -140,6 +150,31 @@ def api_data():
     quotes = get_quotes(all_symbols)
     market_open = get_market_open()
 
+    # Compute now_et ONCE and thread it through all freshness calls
+    now_et = datetime.now(ET)
+    market_day_start = get_market_day_start(now_et)
+
+    # Breaking news — isolated from sentiment query
+    breaking_news_by_symbol = {}
+    try:
+        breaking_news_by_symbol = get_breaking_news_for_symbols(
+            db, all_symbols, market_day_start
+        )
+    except Exception as e:
+        log.error(f"Breaking news query failed: {e}")
+        breaking_news_by_symbol = {sym: [] for sym in all_symbols}
+
+    # Catalyst freshness — isolated
+    # Pass pre-fetched breaking_news to avoid redundant DB query
+    freshness_by_symbol = {}
+    try:
+        freshness_by_symbol = compute_catalyst_freshness(
+            db, all_symbols, now=now_et,
+            breaking_news_by_symbol=breaking_news_by_symbol,
+        )
+    except Exception as e:
+        log.error(f"Catalyst freshness computation failed: {e}")
+
     watchlist = []
     for sym in all_symbols:
         q = quotes.get(sym, {})
@@ -161,6 +196,9 @@ def api_data():
             "sentiment": sent.get("sentiment", "—"),
             "catalysts": sent.get("catalysts", []),
             "risks": sent.get("risks", []),
+            "breaking_news": breaking_news_by_symbol.get(sym, []),
+            "catalyst_freshness": freshness_by_symbol.get(sym, {}),
+            "freshness_label": build_freshness_label(sym, freshness_by_symbol.get(sym, {})),
         })
 
     # Market regime from quant researcher

@@ -8,7 +8,7 @@ import os
 import signal
 import logging
 import logging.handlers
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -452,6 +452,70 @@ def run_position_health():
         log.error(f"Position health error: {e}", exc_info=True)
 
 
+def run_price_spike_news_check():
+    """Every ~15 min — check for price spikes and fetch news for spiking symbols."""
+    from pytz import timezone
+    et = datetime.now(timezone("America/New_York"))
+    if et.weekday() >= 5:  # weekend
+        return
+    market_open = et.replace(hour=9, minute=30, second=0)
+    market_close = et.replace(hour=16, minute=0, second=0)
+    if not (market_open <= et <= market_close):
+        return
+
+    engine = get_engine()
+    from agents.price_monitor import get_batch_quotes, get_price_history
+    from utils.catalyst_freshness import PRICE_SPIKE_THRESHOLD_PCT, PRICE_SPIKE_WINDOW_MINUTES
+
+    quotes = get_batch_quotes(WATCHLIST)
+
+    spiking = []
+    for sym, price in quotes.items():
+        history = get_price_history(sym)
+        if len(history) < 2:
+            continue
+        # Find price from ~PRICE_SPIKE_WINDOW_MINUTES ago
+        cutoff = datetime.utcnow() - timedelta(minutes=PRICE_SPIKE_WINDOW_MINUTES)
+        old_prices = [(t, p) for t, p in history if t <= cutoff]
+        if not old_prices:
+            continue
+        old_price = old_prices[-1][1]
+        change_pct = abs((price - old_price) / old_price) * 100
+        if change_pct >= PRICE_SPIKE_THRESHOLD_PCT:
+            spiking.append(sym)
+            log.info(f"📰 Price spike detected: {sym} moved {change_pct:.1f}% in {PRICE_SPIKE_WINDOW_MINUTES}min — fetching news")
+
+    if spiking:
+        from agents.news_monitor import fetch_and_store_news
+        fetch_and_store_news(engine, spiking, source_tag="price_spike")
+
+
+def run_position_news_poll():
+    """Every ~30 min — fetch news for symbols with open positions."""
+    from pytz import timezone
+    et = datetime.now(timezone("America/New_York"))
+    if et.weekday() >= 5:  # weekend
+        return
+    market_open = et.replace(hour=9, minute=30, second=0)
+    market_close = et.replace(hour=16, minute=0, second=0)
+    if not (market_open <= et <= market_close):
+        return
+
+    engine = get_engine()
+    from db.schema import get_session, Position
+    db = get_session(engine)
+    positions = db.query(Position).all()
+    db.close()
+
+    held_symbols = list(set(p.symbol for p in positions))
+    if not held_symbols:
+        return
+
+    log.info(f"📰 Position news poll for: {', '.join(held_symbols)}")
+    from agents.news_monitor import fetch_and_store_news
+    fetch_and_store_news(engine, held_symbols, source_tag="position_poll")
+
+
 def run_position_timer():
     """Every 5 minutes — check position hold times and enforce exits."""
     engine = get_engine()
@@ -546,6 +610,24 @@ def main():
         run_position_timer,
         CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone="America/New_York"),
         id="position_timer",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Price-spike news check: every 15 min during market hours
+    scheduler.add_job(
+        run_price_spike_news_check,
+        CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/15", timezone="America/New_York"),
+        id="price_spike_news",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Position-based news poll: every 30 min during market hours
+    scheduler.add_job(
+        run_position_news_poll,
+        CronTrigger(day_of_week="mon-fri", hour="9-15", minute="0,30", timezone="America/New_York"),
+        id="position_news_poll",
         max_instances=1,
         coalesce=True,
     )

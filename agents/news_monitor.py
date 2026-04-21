@@ -38,6 +38,93 @@ If nothing material, return {"alerts": [], "market_update": "no significant chan
 """
 
 
+def fetch_and_store_news(engine, symbols: list, source_tag: str) -> dict:
+    """
+    Lightweight news fetch for a list of symbols.
+    Fetches raw news via Finnhub, stores in AgentMemory as breaking_news.
+    Does NOT run LLM analysis — the analyst interprets on its next run.
+
+    News is APPENDED to the current market day's alerts by querying existing
+    records and merging, rather than writing a new row that displaces prior data.
+
+    source_tag is required (no default) to force callers to be explicit about
+    the origin: "price_spike", "position_poll", or "scheduled".
+
+    Returns {symbol: [news_items]}.
+    """
+    from utils.catalyst_freshness import get_market_day_start, ET, MAX_ALERTS_PER_SYMBOL
+
+    fh = FinnhubClient()
+    db = get_session(engine)
+    results = {}
+    for sym in symbols:
+        try:
+            news = fh.get_news(sym, days=1)
+            results[sym] = news or []
+        except Exception as e:
+            log.error(f"News fetch failed for {sym} ({source_tag}): {e}")
+            results[sym] = []
+
+    # Build alerts in the same format as the existing news monitor
+    # MAX_ALERTS_PER_SYMBOL is configurable in catalyst_freshness.py
+    new_alerts = []
+    for sym, news_items in results.items():
+        for item in news_items[:MAX_ALERTS_PER_SYMBOL]:
+            new_alerts.append({
+                "symbol": sym,
+                "headline": item.get("headline", ""),
+                "impact": "unknown",  # no LLM classification
+                "urgency": "medium",
+                "summary": (item.get("summary", "") or "")[:200],
+                "source_tag": source_tag,
+            })
+
+    if new_alerts:
+        # Merge with existing alerts from today rather than clobbering.
+        # Query the most recent N records for the current market day and
+        # union their alerts with the new ones, deduplicating by headline.
+        now_et = datetime.now(ET)
+        market_day_start = get_market_day_start(now_et)
+        existing_alerts = []
+        existing_rows = (
+            db.query(AgentMemory)
+            .filter_by(agent="news_monitor", key="breaking_news")
+            .filter(AgentMemory.timestamp >= market_day_start)
+            .order_by(AgentMemory.timestamp.desc())
+            .limit(10)
+            .all()
+        )
+        seen_headlines = set()
+        for row in existing_rows:
+            try:
+                data = json.loads(row.value)
+                for alert in data.get("alerts", []):
+                    hl = alert.get("headline", "")
+                    if hl and hl not in seen_headlines:
+                        existing_alerts.append(alert)
+                        seen_headlines.add(hl)
+            except Exception:
+                pass
+
+        # Add new alerts, skipping duplicates
+        for alert in new_alerts:
+            hl = alert.get("headline", "")
+            if hl and hl not in seen_headlines:
+                existing_alerts.append(alert)
+                seen_headlines.add(hl)
+
+        db.add(AgentMemory(
+            agent="news_monitor",
+            symbol=None,
+            key="breaking_news",
+            value=json.dumps({"alerts": existing_alerts, "market_update": f"{source_tag} check"}),
+        ))
+        db.commit()
+
+    db.close()
+    return results
+
+
 def run(engine) -> dict:
     """Check for breaking news on watchlist symbols."""
     fh = FinnhubClient()

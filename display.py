@@ -29,6 +29,7 @@ from rich.columns import Columns
 
 from db.schema import init_db, get_session, Position, Balance, Trade
 from utils.finnhub_client import FinnhubClient
+from utils.catalyst_freshness import compute_catalyst_freshness, get_breaking_news_for_symbols, get_market_day_start, ET
 from agents.quant_researcher import build_strategy_context
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 
@@ -185,7 +186,13 @@ def build_prices_table(symbols: list[str], fh: FinnhubClient,
     return Panel(table, title="[bold cyan]📊 Watchlist[/bold cyan]", box=box.ROUNDED)
 
 
-def build_analysis_table(symbols: list[str], signals: dict, sentiment: dict) -> Panel:
+def build_analysis_table(symbols: list[str], signals: dict, sentiment: dict,
+                         freshness_data: dict = None, breaking_news_data: dict = None) -> Panel:
+    if freshness_data is None:
+        freshness_data = {}
+    if breaking_news_data is None:
+        breaking_news_data = {}
+
     table = Table(
         box=box.SIMPLE_HEAVY,
         header_style="bold cyan",
@@ -193,6 +200,7 @@ def build_analysis_table(symbols: list[str], signals: dict, sentiment: dict) -> 
         expand=True,
     )
     table.add_column("Symbol", style="bold", width=8)
+    table.add_column("Fresh", justify="center", width=7)
     table.add_column("Sentiment", justify="center", width=10)
     table.add_column("Catalysts", width=30)
     table.add_column("Invalidation", width=35)
@@ -202,6 +210,12 @@ def build_analysis_table(symbols: list[str], signals: dict, sentiment: dict) -> 
         sig = signals.get(sym, {})
         sent = sentiment.get(sym, {})
 
+        # Freshness indicator
+        freshness = freshness_data.get(sym, {})
+        state = freshness.get("freshness_state", "stale")
+        state_color = {"fresh": "green", "aging": "yellow", "stale": "red"}.get(state, "red")
+        fresh_str = f"[{state_color}]{state.upper()}[/{state_color}]"
+
         # Sentiment
         s = sent.get("sentiment", "—")
         s_color = {"bullish": "green", "bearish": "red", "neutral": "yellow"}.get(s, "dim")
@@ -209,6 +223,13 @@ def build_analysis_table(symbols: list[str], signals: dict, sentiment: dict) -> 
         # Catalysts (truncated)
         catalysts = sent.get("catalysts", [])
         cat_str = (" · ".join(catalysts))[:30] if catalysts else "—"
+
+        # Append breaking news headline if available
+        alerts = breaking_news_data.get(sym, [])
+        if alerts:
+            headline = alerts[0].get("headline", "")[:40]
+            if headline:
+                cat_str += f" | 📰 {headline}"
 
         # Invalidation
         invalidation = (sig.get("invalidation") or "—")[:35]
@@ -226,6 +247,7 @@ def build_analysis_table(symbols: list[str], signals: dict, sentiment: dict) -> 
 
         table.add_row(
             sym,
+            fresh_str,
             f"[{s_color}]{s}[/{s_color}]",
             cat_str,
             invalidation,
@@ -314,12 +336,35 @@ def render(symbols: list[str], scout_picks: list[str]) -> str:
     sentiment = get_researcher_sentiment(db, symbols)
     portfolio = get_portfolio_summary(db, fh)
 
+    # Compute freshness data and breaking news for the analysis table
+    now_et = datetime.now(ET)
+    market_day_start = get_market_day_start(now_et)
+
+    breaking_news_by_symbol = {}
+    try:
+        breaking_news_by_symbol = get_breaking_news_for_symbols(
+            db, symbols, market_day_start
+        )
+    except Exception:
+        breaking_news_by_symbol = {sym: [] for sym in symbols}
+
+    freshness_by_symbol = {}
+    try:
+        freshness_by_symbol = compute_catalyst_freshness(
+            db, symbols, now=now_et,
+            breaking_news_by_symbol=breaking_news_by_symbol,
+        )
+    except Exception:
+        pass
+
     from rich.console import Group
 
     return Group(
         build_header(market_open),
         build_prices_table(symbols, fh, signals, scout_picks),
-        build_analysis_table(symbols, signals, sentiment),
+        build_analysis_table(symbols, signals, sentiment,
+                             freshness_data=freshness_by_symbol,
+                             breaking_news_data=breaking_news_by_symbol),
         build_reasoning_panels(symbols, signals),
         Columns([
             build_portfolio_panel(portfolio),

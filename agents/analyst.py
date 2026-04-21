@@ -6,13 +6,22 @@ Writes signal recommendations to AgentMemory.
 """
 
 import json
-from datetime import datetime
+import logging
+from datetime import datetime, timezone as dt_tz
 from utils.finnhub_client import FinnhubClient
 from utils.technicals import compute_indicators
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, get_session
 from utils.case_library import get_relevant_cases, format_cases_for_prompt
 from agents.quant_researcher import build_strategy_context
+from utils.catalyst_freshness import (
+    compute_freshness_state,
+    get_breaking_news_for_symbols,
+    get_market_day_start,
+    ET,
+)
+
+log = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """You are a technical analyst for day trading.
@@ -125,9 +134,62 @@ def run(engine, symbols: list[str]) -> dict:
             relevant_cases = get_relevant_cases(engine, case_context, limit=3)
             cases_text = format_cases_for_prompt(relevant_cases)
 
+            # --- Catalyst freshness: query breaking news (isolated) ---
+            breaking_alerts = []
+            breaking_news_ts = None
+            try:
+                thread_db = get_session(engine)
+                now_et = datetime.now(ET)
+                mds = get_market_day_start(now_et)
+                bn = get_breaking_news_for_symbols(thread_db, [sym], mds)
+                breaking_alerts = bn.get(sym, [])
+                if breaking_alerts:
+                    breaking_news_ts = now_et
+                thread_db.close()
+            except Exception as e:
+                log.error(f"Analyst breaking news query failed for {sym}: {e}")
+
+            # Compute freshness state — use timezone-aware now (not datetime.utcnow())
+            researcher_ts = None
+            sent_rows = (
+                db.query(AgentMemory)
+                .filter_by(agent="researcher", key="sentiment", symbol=sym)
+                .order_by(AgentMemory.timestamp.desc())
+                .first()
+            )
+            if sent_rows and sent_rows.timestamp:
+                researcher_ts = sent_rows.timestamp
+                # Ensure timezone-aware
+                if researcher_ts.tzinfo is None:
+                    from pytz import utc as UTC
+                    researcher_ts = UTC.localize(researcher_ts)
+
+            now_aware = datetime.now(dt_tz.utc)
+            # Normalize breaking_news_ts to UTC for comparison
+            bn_ts_utc = None
+            if breaking_news_ts is not None:
+                bn_ts_utc = breaking_news_ts.astimezone(dt_tz.utc) if breaking_news_ts.tzinfo else None
+
+            freshness_state = compute_freshness_state(researcher_ts, bn_ts_utc, now_aware)
+
+            # Build freshness context block for the prompt
+            freshness_context = f"""
+CATALYST FRESHNESS:
+  Freshness state: {freshness_state}
+  Last researcher update: {researcher_ts or 'unknown'}
+  Last breaking news: {bn_ts_utc or 'none'}
+"""
+            if freshness_state == "stale":
+                freshness_context += "  ⚠️ WARNING: Catalyst data is STALE (>3 hours old). Reduce signal confidence accordingly.\n"
+            elif freshness_state == "aging":
+                freshness_context += "  ℹ️ NOTE: Catalyst data is AGING (1-3 hours old). May not reflect current conditions.\n"
+
+            if breaking_alerts:
+                freshness_context += f"\nBREAKING NEWS ALERTS:\n{json.dumps(breaking_alerts, indent=2)}\n"
+
             user_prompt = f"""
 Symbol: {sym}
-Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+Time: {datetime.now(dt_tz.utc).strftime('%Y-%m-%d %H:%M UTC')}
 
 VALID SETUP TYPES (use one of these):
 {', '.join(valid_setups)}
@@ -152,15 +214,14 @@ STRATEGY RECOMMENDATIONS (from Quant Researcher):
 
 RELEVANT PAST CASES:
 {cases_text}
-
+{freshness_context}
 Produce your trading signal JSON for {sym}.
 """
             raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
             signal = parse_json_response(raw)
             signals[sym] = signal
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Analyst error for {sym}: {e}")
+            log.error(f"Analyst error for {sym}: {e}")
             signals[sym] = {"signal": "HOLD", "strength": "weak", "confidence": "low", "setup_type": "error", "reasoning": str(e)}
 
     # Run all symbols in parallel

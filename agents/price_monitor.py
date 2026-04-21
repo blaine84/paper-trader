@@ -402,6 +402,18 @@ def check_entry_triggers(engine) -> list[dict]:
 
 # In-memory price history for change detection
 _price_history = {}  # {symbol: [(timestamp, price), ...]}
+
+
+def get_price_history(symbol: str) -> list[tuple]:
+    """Return the price history for a symbol as a list of (timestamp, price) tuples.
+
+    Returns an empty list if no history exists for the symbol.
+    This is the public API — callers should use this instead of accessing
+    _price_history directly.
+    """
+    return list(_price_history.get(symbol, []))
+
+
 ALERT_THRESHOLDS = {
     "rapid_move_pct": 1.5,       # alert if price moves >1.5% in 5 min
     "approach_level_pct": 0.3,   # alert if price is within 0.3% of a key level
