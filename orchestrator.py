@@ -45,8 +45,14 @@ WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AM
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL_MINUTES", 15))
 
 
+_engine = None
+
+
 def get_engine():
-    return init_db("db/paper_trader.db")
+    global _engine
+    if _engine is None:
+        _engine = init_db("db/paper_trader.db")
+    return _engine
 
 
 def ensure_initial_balance(engine):

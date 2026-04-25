@@ -14,15 +14,16 @@ learns from every trade, and improves over time through structured feedback loop
 5. [Risk Profiles](#risk-profiles)
 6. [The Case Library](#the-case-library)
 7. [Feedback Loops](#feedback-loops)
-8. [Daily Schedule](#daily-schedule)
-9. [Running the System](#running-the-system)
-10. [Inspect CLI](#inspect-cli)
-11. [Running on a Raspberry Pi](#running-on-a-raspberry-pi)
-12. [Watchlist](#watchlist)
-13. [Understanding the Scores](#understanding-the-scores)
-14. [Edge Score & Risk Engine](#edge-score--risk-engine)
-15. [Database](#database)
-16. [Troubleshooting](#troubleshooting)
+8. [Decision Logic Flow](#decision-logic-flow)
+9. [Daily Schedule](#daily-schedule)
+10. [Running the System](#running-the-system)
+11. [Inspect CLI](#inspect-cli)
+12. [Running on a Raspberry Pi](#running-on-a-raspberry-pi)
+13. [Watchlist](#watchlist)
+14. [Understanding the Scores](#understanding-the-scores)
+15. [Edge Score & Risk Engine](#edge-score--risk-engine)
+16. [Database](#database)
+17. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -83,7 +84,7 @@ Only PM decisions and the Meta Reviewer hit the cloud API. Everything else runs 
 
 ## How It Works
 
-The system runs 9 agents on a market-hours schedule. Each agent has a single job.
+The system runs 10 agents on a market-hours schedule. Each agent has a single job.
 No agent does another agent's job.
 
 ```
@@ -92,11 +93,16 @@ No agent does another agent's job.
 9:30 AM ──► Price Monitor (every 60s) ◄──────────────────────┘
             │                                                  │
             ├─ Stop/target hit? → close immediately            │
-            └─ Key level breach? → trigger PM                  │
+            ├─ Key level breach? → trigger PM                  │
+            └─ Price spike (≥2%)? → fetch news ──► AgentMemory │
+                                                               │
+            News Monitor (10/12/2 PM) ──► AgentMemory          │
+            Position News Poll (every 30 min) ──► AgentMemory  │
                                                                │
 9:30-12  ──► PM decisions every 15 min ◄───────────────────────┘
 12-4 PM  ──► PM decisions every 30 min
             Analyst refreshes every 15 min all day (free, local LLM)
+            Analyst reads breaking news + freshness state from AgentMemory
 
 4:15 PM ──► Reviewer (score trades, build cases)
         ──► Bookkeeper (daily log)
@@ -125,6 +131,17 @@ bullish / bearish / neutral, with key catalysts and risks.
 ### 📊 Analyst
 Runs technical analysis on every symbol. Computes RSI, MACD, EMA (9/21/50),
 Bollinger Bands, ATR, and VWAP. Produces a **signal** — not a trade recommendation.
+
+The Analyst is **freshness-aware**: before generating each signal, it queries
+AgentMemory for breaking news alerts and computes the catalyst freshness state.
+This context is injected into the LLM prompt:
+- **Stale** (>3 hours) → warning to reduce signal confidence
+- **Aging** (1–3 hours) → note that data may not reflect current conditions
+- **Fresh** (<1 hour) → no modifier
+- Breaking news alerts are included as structured JSON in the prompt
+
+If the breaking news query fails, the Analyst proceeds with researcher sentiment
+only — it never blocks on a failed news lookup.
 
 **Analyst output:**
 ```
@@ -214,6 +231,72 @@ Runs weekly after Sunday prep. Grades each agent (A–F), tracks trends
 (improving/stable/degrading), and writes specific recommendations that agents
 read as context. Also suggests code refactors and feature additions visible in
 the web dashboard's System Review tab.
+
+### 📡 News Monitor
+Runs at 10 AM, 12 PM, and 2 PM during market hours. Detects breaking catalysts
+via Finnhub and stores them in AgentMemory (`agent="news_monitor"`,
+`key="breaking_news"`). Uses LLM classification to assess impact and urgency.
+
+Two additional **event-driven news checks** supplement the scheduled runs:
+
+| Check | Frequency | Trigger |
+|---|---|---|
+| Price-Spike Check | Every 15 min | Any watchlist symbol moves ≥ 2% in 15 min |
+| Position News Poll | Every 30 min | Fetches news for all symbols with open positions |
+
+Both use `fetch_and_store_news()` which:
+- Fetches raw news via Finnhub (no LLM classification — impact set to "unknown")
+- Merges new alerts with existing market-day alerts (deduplicates by headline)
+- Caps at 3 alerts per symbol per fetch
+- Tags each alert with `source_tag` ("price_spike", "position_poll", or "scheduled")
+- Does NOT trigger full researcher reanalysis
+
+The Analyst and web dashboard read these alerts automatically on their next cycle.
+
+### Catalyst Freshness (`utils/catalyst_freshness.py`)
+
+A shared module that computes per-symbol freshness metadata. All consumers
+(web API, Analyst, terminal display) import from this single module.
+
+```
+Researcher (8:30 AM)  ──sentiment──▶  AgentMemory
+News Monitor (10/12/2 PM)  ──breaking_news──▶  AgentMemory
+Price-Spike Check (every 15 min)  ──breaking_news──▶  AgentMemory
+Position News Poll (every 30 min)  ──breaking_news──▶  AgentMemory
+                                          │
+                                          ▼
+                              utils/catalyst_freshness.py
+                              (freshness state, confidence,
+                               labels, market day boundary)
+                                          │
+                          ┌───────────────┼───────────────┐
+                          ▼               ▼               ▼
+                    web/app.py      agents/analyst.py   display.py
+                    (/api/data)     (LLM prompt)        (terminal)
+```
+
+**Freshness states** (based on age of most recent catalyst data):
+
+| State | Age | Color | Effect |
+|---|---|---|---|
+| `fresh` | < 60 min | 🟢 green | Full confidence |
+| `aging` | 60–180 min | 🟡 yellow | Analyst adds aging note to prompt |
+| `stale` | > 180 min | 🔴 red | Analyst warns to reduce confidence |
+
+**Confidence mapping** — decreases monotonically as freshness degrades:
+
+| Researcher Level | Fresh | Aging | Stale |
+|---|---|---|---|
+| high | 0.9 | 0.6 | 0.3 |
+| medium | 0.7 | 0.4 | 0.2 |
+| low | 0.4 | 0.2 | 0.0 |
+
+**Market day boundary**: 4:00 AM ET. Activity between midnight and 4 AM belongs
+to the previous market day.
+
+**Error isolation**: Each data source (breaking news, researcher sentiment,
+freshness computation) is wrapped in its own try/except. A failure in one never
+affects the others.
 
 ---
 
@@ -370,6 +453,14 @@ The full lifecycle of a trade from signal to exit:
    Analyst detects setup → outputs signal (LONG/SHORT/HOLD)
    with setup_type, setup_reasoning, key_levels, invalidation, strength, confidence
 
+   Catalyst freshness context injected into Analyst prompt:
+   ├─ Queries AgentMemory for breaking news alerts (isolated try/except)
+   ├─ Computes freshness_state (fresh/aging/stale) from most recent catalyst timestamp
+   ├─ Stale → warning appended: "reduce signal confidence"
+   ├─ Aging → note appended: "may not reflect current conditions"
+   ├─ Breaking alerts → included as BREAKING NEWS ALERTS JSON block
+   └─ If news query fails → proceeds with researcher sentiment only
+
 2. CONFIDENCE ADJUSTMENT (automatic, pre-trade)
    Query case library for setup_type + market_regime win rate:
    ├─ Win rate < 35% (5+ cases) → BLOCK trade entirely
@@ -499,8 +590,17 @@ The full lifecycle of a trade from signal to exit:
        Includes DRIFTING state label
        Flags deteriorating positions even if stops haven't hit
 
-   News Monitor (every 2 hours, local LLM):
+   News Monitor (scheduled: 10/12/2 PM, local LLM):
    └─ Checks for breaking catalysts that could affect open positions
+       Stores alerts in AgentMemory (agent="news_monitor", key="breaking_news")
+
+   Event-Driven News Checks (no LLM):
+   ├─ Price-Spike Check (every 15 min):
+   │    Compare current price to ~15 min ago for each watchlist symbol
+   │    If change ≥ 2% → fetch news via Finnhub → merge into AgentMemory
+   └─ Position News Poll (every 30 min):
+        Fetch news for all symbols with open positions → merge into AgentMemory
+   Both use fetch_and_store_news() — merges with existing alerts, deduplicates by headline
 
 10. EXIT
     Trade closed → P&L calculated → cash returned
@@ -602,13 +702,16 @@ All times Eastern (ET), Monday–Friday.
 | 8:30 AM | Scout → Researcher → Quant Researcher → Analyst |
 | 9:30 AM | Market opens, price monitor starts (every 60s), position timer starts (every 5 min) |
 | 9:30–12:00 | PM decisions every 15 min, Analyst refresh every 15 min |
-| 10:00, 12:00, 2:00 | News monitor checks for breaking catalysts |
+| Every 15 min | Price-spike news check (fetches news for symbols with ≥2% moves) |
+| Every 30 min | Position news poll (fetches news for symbols with open positions) |
+| 10:00, 12:00, 2:00 | News monitor checks for breaking catalysts (full LLM classification) |
 | 10:30–3:30 | Position health check every hour |
 | 10:00–4:00 | Reviewer queue processes pending reviews every 15 min |
 | 12:00–4:00 | PM decisions every 30 min, Analyst refresh every 15 min |
 | 3:45 PM | Hard wall: all intraday positions force-closed |
 | 4:00 PM | Market closes, price monitor stops |
 | 4:15 PM | Reviewer scores remaining trades, Bookkeeper saves daily log |
+| 4:30 PM | Daily Review journal generation |
 
 ---
 

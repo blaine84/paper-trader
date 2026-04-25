@@ -42,71 +42,17 @@ PM profiles have an `opposing_evidence_threshold` (conservative: moderate, moder
 
 ### Catalyst Freshness
 
-The system tracks how current each symbol's catalyst data is and surfaces that information across the web dashboard, analyst agent, and terminal display.
+The system tracks how current each symbol's catalyst data is. A shared module
+(`utils/catalyst_freshness.py`) computes per-symbol freshness state (fresh / aging / stale),
+confidence scores, and human-readable labels. This data flows to the web dashboard,
+analyst agent (injected into the LLM prompt), and terminal display.
 
-**The problem:** The Researcher runs once at 8:30 AM. The News Monitor catches breaking news at 10/12/2 PM. But the Analyst and the analysis tab only ever read the Researcher's pre-market sentiment — so catalysts appear stale all day, and breaking news is invisible.
+Two event-driven news checks supplement the scheduled News Monitor:
+- **Price-Spike Check** (every 15 min) — fetches news when a symbol moves ≥ 2%
+- **Position News Poll** (every 30 min) — fetches news for symbols with open positions
 
-**The solution:** A shared freshness module (`utils/catalyst_freshness.py`) computes per-symbol freshness metadata. All consumers import from this single module, so the logic is consistent everywhere.
-
-#### Data flow
-
-```
-Researcher (8:30 AM)  ──sentiment──▶  AgentMemory
-News Monitor (10/12/2 PM)  ──breaking_news──▶  AgentMemory
-Price-Spike Check (every 15 min)  ──breaking_news──▶  AgentMemory
-Position News Poll (every 30 min)  ──breaking_news──▶  AgentMemory
-                                          │
-                                          ▼
-                              utils/catalyst_freshness.py
-                              (compute freshness state,
-                               confidence, labels)
-                                          │
-                          ┌───────────────┼───────────────┐
-                          ▼               ▼               ▼
-                    web/app.py      agents/analyst.py   display.py
-                    (/api/data)     (LLM prompt)        (terminal)
-```
-
-#### Freshness states
-
-The freshness state is based on the age of the most recent catalyst data (whichever is newer — researcher sentiment or breaking news):
-
-| State | Age | Color | Meaning |
-|---|---|---|---|
-| `fresh` | < 60 min | 🟢 green | Catalyst data is current |
-| `aging` | 60–180 min | 🟡 yellow | Data may not reflect current conditions |
-| `stale` | > 180 min | 🔴 red | Data is outdated, confidence reduced |
-
-#### How agents interact with freshness
-
-- **Analyst** queries breaking news for each symbol before generating signals. The freshness state and any breaking alerts are injected into the LLM prompt. Stale data gets a warning; aging data gets a note. If the breaking news query fails, the Analyst proceeds with researcher sentiment only.
-- **Web API** (`/api/data`) returns three new fields per symbol: `breaking_news` (alert list), `catalyst_freshness` (metadata object), and `freshness_label` (human-readable string). Each data source is wrapped in its own try/except — a failure in breaking news doesn't affect sentiment, and vice versa.
-- **Terminal display** shows a color-coded "Fresh" column in the analysis table and appends the most recent breaking news headline (truncated to 40 chars) to the catalysts column.
-
-#### Event-driven news checks
-
-Two lightweight orchestrator jobs supplement the scheduled News Monitor:
-
-| Job | Trigger | What it does |
-|---|---|---|
-| Price-Spike Check | Every 15 min | Compares current price to price ~15 min ago. If any symbol moved ≥ 2%, fetches news for those symbols. |
-| Position News Poll | Every 30 min | Fetches news for all symbols with open positions. |
-
-Both jobs call `fetch_and_store_news()` which merges new alerts with existing market-day alerts (deduplicating by headline) and stores them in AgentMemory. They do not trigger full researcher reanalysis — the Analyst interprets the raw news on its next run.
-
-#### Confidence mapping
-
-Confidence is a function of the researcher's confidence level and the freshness state. It decreases monotonically as freshness degrades:
-
-| Researcher Level | Fresh | Aging | Stale |
-|---|---|---|---|
-| high | 0.9 | 0.6 | 0.3 |
-| medium | 0.7 | 0.4 | 0.2 |
-| low | 0.4 | 0.2 | 0.0 |
-
-#### Market day boundary
-
-The market day starts at 4:00 AM ET. Activity between midnight and 4 AM belongs to the previous market day. This matches the existing orchestrator timezone conventions.
+See the [User Guide](USER_GUIDE.md#catalyst-freshness-utilscatalyst_freshnesspy) for
+the full data flow diagram, freshness thresholds, confidence mapping, and error isolation details.
 
 ## Feedback Loop
 

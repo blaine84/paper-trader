@@ -134,7 +134,20 @@ class DailyLog(Base):
 
 
 def init_db(db_path: str = "db/paper_trader.db"):
-    engine = create_engine(f"sqlite:///{db_path}")
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"timeout": 30},  # wait up to 30s if DB is locked
+    )
+    # Enable WAL mode for better concurrent read/write performance
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
     # Import Case model so it registers with Base before create_all
     from models.case import Case  # noqa: F401
     Base.metadata.create_all(engine)
