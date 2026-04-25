@@ -173,6 +173,14 @@ def run_pre_market():
     except Exception as e:
         log.error(f"Slack morning report error: {e}", exc_info=True)
 
+    # Narrator morning briefing - non-blocking, failures never affect trading
+    try:
+        import agents.narrator as narrator
+        console.print("[bold cyan]📝 Narrator: morning briefing...[/bold cyan]")
+        narrator.run(engine, "morning_briefing")
+    except Exception as e:
+        log.error(f"Narrator morning briefing error: {e}", exc_info=True)
+
 
 def run_analyst_refresh():
     """Analyst-only refresh — runs every 15 min, free via local LLM."""
@@ -536,6 +544,22 @@ def run_position_timer():
         log.error(f"Position timer error: {e}", exc_info=True)
 
 
+def run_narrator(update_type: str):
+    """Generic narrator runner for cron-triggered update types."""
+    log.info(f"=== NARRATOR: {update_type} ===")
+    engine = get_engine()
+    try:
+        import agents.narrator as narrator
+        console.print(f"[bold cyan]📝 Narrator: {update_type}...[/bold cyan]")
+        result = narrator.run(engine, update_type)
+        if result.get("skipped"):
+            log.info(f"Narrator {update_type}: skipped (already exists)")
+        else:
+            log.info(f"Narrator {update_type}: generated")
+    except Exception as e:
+        log.error(f"Narrator {update_type} error: {e}", exc_info=True)
+
+
 def main():
     engine = get_engine()
     ensure_initial_balance(engine)
@@ -688,6 +712,48 @@ def main():
         run_weekly_prep,
         CronTrigger(day_of_week="sun", hour=17, minute=0, timezone="America/New_York"),
         id="weekly_prep",
+    )
+
+    # --- Narrator cron jobs ---
+
+    # Hourly recaps: 10 AM, 11 AM, 12 PM ET, Mon-Fri
+    scheduler.add_job(
+        lambda: run_narrator("hourly_recap"),
+        CronTrigger(day_of_week="mon-fri", hour="10,11,12", minute=0,
+                    timezone="America/New_York"),
+        id="narrator_hourly",
+    )
+
+    # Afternoon recap: 2 PM ET, Mon-Fri
+    scheduler.add_job(
+        lambda: run_narrator("afternoon_recap"),
+        CronTrigger(day_of_week="mon-fri", hour=14, minute=0,
+                    timezone="America/New_York"),
+        id="narrator_afternoon",
+    )
+
+    # Daily wrap: 4:15 PM ET, Mon-Thu
+    scheduler.add_job(
+        lambda: run_narrator("daily_wrap"),
+        CronTrigger(day_of_week="mon-thu", hour=16, minute=15,
+                    timezone="America/New_York"),
+        id="narrator_daily_wrap",
+    )
+
+    # Weekly wrap: 4:15 PM ET, Friday
+    scheduler.add_job(
+        lambda: run_narrator("weekly_wrap"),
+        CronTrigger(day_of_week="fri", hour=16, minute=15,
+                    timezone="America/New_York"),
+        id="narrator_weekly_wrap",
+    )
+
+    # Sunday prep: 5:15 PM ET, Sunday
+    scheduler.add_job(
+        lambda: run_narrator("sunday_prep"),
+        CronTrigger(day_of_week="sun", hour=17, minute=15,
+                    timezone="America/New_York"),
+        id="narrator_sunday_prep",
     )
 
     console.print(f"[bold green]🚀 Paper Trader started[/bold green]")

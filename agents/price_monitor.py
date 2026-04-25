@@ -522,6 +522,17 @@ def run(engine) -> dict:
     for a in momentum_alerts:
         if a["type"] == "rapid_move":
             log.warning(f"📊 RAPID MOVE: {a['symbol']} {a['direction']} {a['change_pct']}% in {a['window_minutes']}min (${a['price']})")
+            # Trigger narrator flash update for significant rapid moves
+            try:
+                import agents.narrator as narrator
+                narrator.run(engine, "flash_update", event_context={
+                    "trigger": "atr_spike",
+                    "symbol": a["symbol"],
+                    "details": f"{a['symbol']} moved {a['change_pct']}% {a['direction']} in {a['window_minutes']}min",
+                    "price": a["price"],
+                })
+            except Exception:
+                pass  # never block price monitoring
         elif a["type"] == "approaching_level":
             log.info(f"📊 APPROACHING: {a['symbol']} ${a['price']} within {a['distance_pct']}% of {a['level_name']}={a['level_value']}")
 

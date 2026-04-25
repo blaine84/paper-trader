@@ -735,6 +735,66 @@ def api_journal():
         db.close()
 
 
+@app.route("/narratives")
+def narratives_page():
+    return render_template("narratives.html")
+
+
+@app.route("/api/narratives")
+def api_narratives():
+    """Returns narrator entries from AgentMemory, paginated, reverse chronological."""
+    try:
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 20))
+    except (ValueError, TypeError):
+        page, per_page = 1, 20
+
+    if page < 1:
+        page = 1
+    if per_page < 1 or per_page > 100:
+        per_page = 20
+
+    offset = (page - 1) * per_page
+
+    db = get_session(engine)
+    try:
+        entries = (
+            db.query(AgentMemory)
+            .filter_by(agent="narrator")
+            .order_by(AgentMemory.timestamp.desc())
+            .offset(offset)
+            .limit(per_page)
+            .all()
+        )
+
+        total = db.query(AgentMemory).filter_by(agent="narrator").count()
+
+        result = []
+        for entry in entries:
+            try:
+                data = json.loads(entry.value)
+                result.append({
+                    "update_type": entry.key,
+                    "date": entry.symbol,
+                    "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+                    "narrative": data.get("narrative", ""),
+                    "generated_at": data.get("generated_at"),
+                })
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return jsonify({
+            "narratives": result,
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+        })
+    except Exception:
+        return jsonify({"narratives": [], "page": page, "per_page": per_page, "total": 0})
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     port = int(os.getenv("WEB_PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

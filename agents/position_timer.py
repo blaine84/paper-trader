@@ -102,6 +102,22 @@ def _close_position(engine, trade, price, reason):
     # Clear alert status
     _alert_status.pop(trade.id, None)
 
+    # Trigger narrator flash update for force exits
+    try:
+        import agents.narrator as narrator
+        pnl = round(price - trade.entry_price, 2) if trade.entry_price else None
+        if getattr(trade, "direction", None) == "SHORT" and pnl is not None:
+            pnl = -pnl
+        narrator.run(engine, "flash_update", event_context={
+            "trigger": "force_exit",
+            "symbol": trade.symbol,
+            "details": f"Force exit: {reason}",
+            "profile": trade.profile,
+            "pnl_impact": pnl,
+        })
+    except Exception:
+        pass  # never block position timer operations
+
 
 def _reclassify_to_swing(engine, trade_id, symbol, profile, old_setup, minutes_held):
     """Reclassify an intraday trade to swing when it survives past its time limit with a target_price."""

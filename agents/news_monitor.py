@@ -195,8 +195,32 @@ Flag any breaking catalysts that could affect today's trading.
             value=json.dumps(result),
         ))
         db.commit()
+
+        # Query held positions to detect catalyst shocks for narrator flash updates
+        from db.schema import Position
+        held_symbols = set()
+        try:
+            held_symbols = {p.symbol for p in db.query(Position).all()}
+        except Exception:
+            pass
+
         db.close()
+
         for alert in result["alerts"]:
             log.info(f"📰 BREAKING: {alert['symbol']} [{alert['impact']}] {alert['headline']}")
+
+            # Trigger narrator flash update for high-urgency breaking news on held positions
+            sym = alert.get("symbol", "")
+            headline = alert.get("headline", "")
+            if alert.get("urgency") == "high" and sym in held_symbols:
+                try:
+                    import agents.narrator as narrator
+                    narrator.run(engine, "flash_update", event_context={
+                        "trigger": "catalyst_shock",
+                        "symbol": sym,
+                        "details": f"Breaking: {headline}",
+                    })
+                except Exception:
+                    pass  # never block news monitoring
 
     return result

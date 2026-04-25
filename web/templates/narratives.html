@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Narratives — Paper Trader</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
+    header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header a { color: #58a6ff; text-decoration: none; font-size: 13px; }
+    header a:hover { text-decoration: underline; }
+    .meta { color: #8b949e; font-size: 12px; }
+    main { max-width: 800px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+    .section-title { font-size: 13px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+
+    /* Narrative cards */
+    .narrative-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px;
+      border-left: 3px solid #30363d;
+    }
+    .narrative-card .card-top {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .narrative-card .timestamp {
+      font-size: 12px;
+      color: #8b949e;
+    }
+    .narrative-card .prose {
+      font-size: 14px;
+      line-height: 1.7;
+      color: #e6edf3;
+    }
+
+    /* Update type badges */
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .narrative-morning .badge { background: #1a2a3a; color: #58a6ff; }
+    .narrative-morning { border-left-color: #58a6ff; }
+
+    .narrative-hourly .badge { background: #1a3a2a; color: #3fb950; }
+    .narrative-hourly { border-left-color: #3fb950; }
+
+    .narrative-afternoon .badge { background: #2a2a1a; color: #d29922; }
+    .narrative-afternoon { border-left-color: #d29922; }
+
+    .narrative-daily .badge { background: #2a1a3a; color: #bc8cff; }
+    .narrative-daily { border-left-color: #bc8cff; }
+
+    .narrative-weekly .badge { background: #3a1a2a; color: #f778ba; }
+    .narrative-weekly { border-left-color: #f778ba; }
+
+    .narrative-sunday .badge { background: #1a3a3a; color: #56d4dd; }
+    .narrative-sunday { border-left-color: #56d4dd; }
+
+    .narrative-flash .badge { background: #3a1a1a; color: #f85149; }
+    .narrative-flash { border-left-color: #f85149; background: #1a1215; }
+
+    /* Pagination */
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 16px 0;
+    }
+    .pagination button {
+      background: #21262d;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 6px 16px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .pagination button:hover:not(:disabled) { background: #30363d; }
+    .pagination button:disabled { opacity: 0.4; cursor: default; }
+    .pagination .page-info { font-size: 12px; color: #8b949e; }
+
+    /* Empty / loading states */
+    .empty-state {
+      text-align: center;
+      color: #8b949e;
+      padding: 48px 20px;
+      font-size: 14px;
+    }
+    .loading { text-align: center; color: #8b949e; padding: 48px 20px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div style="display:flex; align-items:center; gap:12px;">
+    <h1>📝 Desk Narratives</h1>
+  </div>
+  <a href="/">← Back to Dashboard</a>
+</header>
+
+<main>
+  <div id="narrativesFeed">
+    <div class="loading">Loading narratives…</div>
+  </div>
+  <div id="pagination" class="pagination" style="display:none;">
+    <button id="prevBtn" onclick="changePage(-1)" disabled>← Previous</button>
+    <span id="pageInfo" class="page-info"></span>
+    <button id="nextBtn" onclick="changePage(1)">Next →</button>
+  </div>
+</main>
+
+<script>
+  const PER_PAGE = 20;
+  let currentPage = 1;
+  let totalNarratives = 0;
+
+  const TYPE_DISPLAY = {
+    morning_briefing: 'Morning Briefing',
+    hourly_recap: 'Hourly Recap',
+    afternoon_recap: 'Afternoon Recap',
+    daily_wrap: 'Daily Wrap',
+    weekly_wrap: 'Weekly Wrap',
+    sunday_prep: 'Sunday Prep',
+    flash_update: '🚨 Desk Flash',
+  };
+
+  const TYPE_CSS_CLASS = {
+    morning_briefing: 'narrative-morning',
+    hourly_recap: 'narrative-hourly',
+    afternoon_recap: 'narrative-afternoon',
+    daily_wrap: 'narrative-daily',
+    weekly_wrap: 'narrative-weekly',
+    sunday_prep: 'narrative-sunday',
+    flash_update: 'narrative-flash',
+  };
+
+  function formatTimestamp(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts.endsWith('Z') ? ts : ts + 'Z');
+    return d.toLocaleString([], {
+      month: 'short', day: 'numeric', year: 'numeric',
+      hour: 'numeric', minute: '2-digit',
+    });
+  }
+
+  function renderNarrative(n) {
+    const cssClass = TYPE_CSS_CLASS[n.update_type] || '';
+    const displayType = TYPE_DISPLAY[n.update_type] || n.update_type;
+    const ts = formatTimestamp(n.timestamp || n.generated_at);
+
+    let prose = n.narrative || '';
+    if (n.update_type === 'flash_update' && prose && !prose.startsWith('🚨')) {
+      prose = '🚨 Desk Flash: ' + prose;
+    }
+
+    return `<div class="narrative-card ${cssClass}">
+      <div class="card-top">
+        <span class="badge">${displayType}</span>
+        <span class="timestamp">${ts}</span>
+      </div>
+      <div class="prose">${escapeHtml(prose)}</div>
+    </div>`;
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  async function loadNarratives() {
+    const feed = document.getElementById('narrativesFeed');
+    feed.innerHTML = '<div class="loading">Loading narratives…</div>';
+
+    try {
+      const res = await fetch(`/api/narratives?page=${currentPage}&per_page=${PER_PAGE}`);
+      const data = await res.json();
+
+      totalNarratives = data.total || 0;
+      const narratives = data.narratives || [];
+
+      if (!narratives.length) {
+        feed.innerHTML = '<div class="empty-state">No narratives yet. The desk narrator will post updates here during market hours.</div>';
+        document.getElementById('pagination').style.display = 'none';
+        return;
+      }
+
+      feed.innerHTML = narratives.map(renderNarrative).join('');
+
+      // Update pagination
+      const totalPages = Math.ceil(totalNarratives / PER_PAGE);
+      document.getElementById('pagination').style.display = 'flex';
+      document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${totalPages} (${totalNarratives} total)`;
+      document.getElementById('prevBtn').disabled = currentPage <= 1;
+      document.getElementById('nextBtn').disabled = currentPage >= totalPages;
+    } catch (e) {
+      feed.innerHTML = '<div class="empty-state">Failed to load narratives. Try refreshing the page.</div>';
+      console.error('Failed to load narratives:', e);
+    }
+  }
+
+  function changePage(delta) {
+    currentPage += delta;
+    if (currentPage < 1) currentPage = 1;
+    loadNarratives();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // Initial load
+  loadNarratives();
+</script>
+
+</body>
+</html>
