@@ -7,6 +7,7 @@ Access at: http://localhost:5000
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 
@@ -547,9 +548,8 @@ def api_performance():
 
 @app.route("/api/alerts")
 def api_alerts():
-    """Return the latest live alerts from the price monitor."""
+    """Return the latest live alerts from the price monitor, deduplicated per symbol."""
     db = get_session(engine)
-    # Get the most recent live_alerts entries (last 15 minutes worth)
     cutoff = datetime.utcnow() - timedelta(minutes=15)
     rows = (
         db.query(AgentMemory)
@@ -559,20 +559,57 @@ def api_alerts():
         .limit(5)
         .all()
     )
-    alerts = []
-    seen = set()  # deduplicate by symbol+type+detail
+
+    # Collect all alerts, keeping only the most recent per symbol+type
+    by_sym_type = {}  # (symbol, type) -> alert
     for row in rows:
         try:
             batch = json.loads(row.value)
             for a in batch:
-                key = f"{a.get('symbol')}:{a.get('type')}:{a.get('detail')}"
-                if key not in seen:
-                    seen.add(key)
-                    alerts.append(a)
+                key = (a.get("symbol"), a.get("type"))
+                if key not in by_sym_type:
+                    by_sym_type[key] = a
         except Exception:
             pass
+
+    # For approaching alerts, consolidate all levels into one alert per symbol
+    consolidated = []
+    approaching_by_sym = {}  # symbol -> list of level details
+    for (sym, atype), a in by_sym_type.items():
+        if atype == "approaching":
+            approaching_by_sym.setdefault(sym, []).append(a)
+        else:
+            consolidated.append(a)
+
+    for sym, alerts in approaching_by_sym.items():
+        # Pick the closest level as the primary, list others as context
+        alerts.sort(key=lambda x: x.get("detail", ""))
+        levels = []
+        for a in alerts:
+            detail = a.get("detail", "")
+            # Extract level name from "within X% of name=value"
+            m = re.search(r"of (\w+)=", detail)
+            if m:
+                levels.append(m.group(1))
+        primary = alerts[0]
+        level_summary = ", ".join(levels[:4])
+        if len(levels) > 4:
+            level_summary += f" +{len(levels)-4}"
+        consolidated.append({
+            "type": "approaching",
+            "symbol": sym,
+            "price": primary["price"],
+            "detail": f"near {level_summary}",
+            "timestamp": primary.get("timestamp"),
+        })
+
+    # Sort: rapid_move and stop first, then entry, then approaching
+    type_order = {"rapid_move": 0, "stop": 0, "thesis_invalidation": 0,
+                  "entry": 1, "breakdown": 1, "breakout": 1, "approaching": 2}
+    consolidated.sort(key=lambda a: type_order.get(a.get("type"), 3))
+
     db.close()
-    return jsonify(alerts)
+    return jsonify(consolidated)
 
 
 @app.route("/api/decisions")
