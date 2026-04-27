@@ -5,6 +5,7 @@ Uses APScheduler for intraday loops.
 """
 
 import os
+import json
 import signal
 import logging
 import logging.handlers
@@ -381,6 +382,53 @@ def run_price_monitor():
     try:
         import agents.price_monitor as price_monitor
         result = price_monitor.run(engine)
+
+        # Persist live alerts for the web UI
+        all_live_alerts = []
+        for t in result.get("entry_triggers", []):
+            all_live_alerts.append({
+                "type": t.get("type", "entry"),
+                "symbol": t.get("symbol"),
+                "price": t.get("price"),
+                "detail": f"{t.get('signal', '')} broke {t.get('level_name', '')}={t.get('level', '')}",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            })
+        for a in result.get("momentum_alerts", []):
+            if a["type"] == "rapid_move":
+                all_live_alerts.append({
+                    "type": "rapid_move",
+                    "symbol": a["symbol"],
+                    "price": a["price"],
+                    "detail": f"{a['direction']} {a['change_pct']}% in {a['window_minutes']}min",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                })
+            elif a["type"] == "approaching_level":
+                all_live_alerts.append({
+                    "type": "approaching",
+                    "symbol": a["symbol"],
+                    "price": a["price"],
+                    "detail": f"within {a['distance_pct']}% of {a['level_name']}={a['level_value']}",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                })
+        for t in result.get("stop_triggers", []):
+            all_live_alerts.append({
+                "type": t.get("type", "stop"),
+                "symbol": t.get("symbol"),
+                "price": t.get("price"),
+                "detail": f"{t['type']} at {t.get('level', '')} ({t.get('profile', '')})",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            })
+        if all_live_alerts:
+            from db.schema import get_session as _gs, AgentMemory
+            _db = _gs(engine)
+            _db.add(AgentMemory(
+                agent="price_monitor",
+                symbol=None,
+                key="live_alerts",
+                value=json.dumps(all_live_alerts),
+            ))
+            _db.commit()
+            _db.close()
 
         # Execute stop losses immediately
         for trigger in result.get("stop_triggers", []):

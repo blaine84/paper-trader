@@ -85,6 +85,22 @@
     /* Decision log day grouping */
     .day-group { margin-bottom: 16px; }
     .day-header { font-size: 13px; font-weight: 600; color: #8b949e; padding: 8px 12px; border-bottom: 1px solid #30363d; margin-bottom: 4px; }
+
+    /* Live alerts */
+    .alerts-bar { padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid #30363d; }
+    .alert-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; line-height: 1.4; }
+    .alert-chip .alert-sym { color: #e6edf3; }
+    .alert-chip .alert-detail { color: #8b949e; font-weight: 400; }
+    .alert-chip .alert-price { color: #8b949e; }
+    .alert-chip.alert-rapid { background: #3a1a1a; border: 1px solid #f8514966; }
+    .alert-chip.alert-rapid .alert-sym { color: #f85149; }
+    .alert-chip.alert-approaching { background: #2a2a1a; border: 1px solid #d2992266; }
+    .alert-chip.alert-approaching .alert-sym { color: #d29922; }
+    .alert-chip.alert-entry { background: #1a2a3a; border: 1px solid #58a6ff66; }
+    .alert-chip.alert-entry .alert-sym { color: #58a6ff; }
+    .alert-chip.alert-stop { background: #3a1a1a; border: 1px solid #f8514966; }
+    .alert-chip.alert-stop .alert-sym { color: #f85149; }
+    .alerts-header { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 12px 0; }
   </style>
 </head>
 <body>
@@ -130,6 +146,7 @@
 
     <!-- Watchlist -->
     <div id="tab-watchlist" class="tab-content active">
+      <div id="liveAlerts"></div>
       <table>
         <thead><tr>
           <th>Symbol</th><th class="right">Price</th><th class="right">Change</th>
@@ -311,7 +328,15 @@
       renderAnalysis(data.watchlist);
       updateHeader(data.market_open, data.timestamp, data.regime);
       if (activeTab === 'positions') loadPositions();
+      loadAlerts();
     } catch(e) { console.error(e); }
+  }
+
+  async function loadAlerts() {
+    try {
+      const res = await fetch('/api/alerts');
+      renderAlerts(await res.json());
+    } catch(e) {}
   }
 
   async function loadPositions() {
@@ -387,6 +412,44 @@
         </tr>
         ${hasR ? `<tr id="reasoning-${w.symbol}"><td colspan="9"><div class="reasoning ${exp ? 'visible' : ''}">${w.setup_reasoning ? `<strong>Setup:</strong> ${w.setup_reasoning}<br><br>` : ''}${w.reasoning || ''}</div></td></tr>` : ''}`;
     }).join('');
+  }
+
+  function renderAlerts(alerts) {
+    const el = document.getElementById('liveAlerts');
+    if (!alerts || !alerts.length) {
+      el.innerHTML = '';
+      return;
+    }
+    const iconMap = {
+      rapid_move: '🔴',
+      approaching: '🟡',
+      entry: '🔵',
+      breakdown: '🔵',
+      breakout: '🔵',
+      stop: '🔴',
+      thesis_invalidation: '🔴',
+    };
+    const classMap = {
+      rapid_move: 'alert-rapid',
+      approaching: 'alert-approaching',
+      entry: 'alert-entry',
+      breakdown: 'alert-entry',
+      breakout: 'alert-entry',
+      stop: 'alert-stop',
+      thesis_invalidation: 'alert-stop',
+    };
+    const chips = alerts.map(a => {
+      const icon = iconMap[a.type] || '⚡';
+      const cls = classMap[a.type] || 'alert-entry';
+      const time = a.timestamp ? new Date(a.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
+      return `<span class="alert-chip ${cls}">
+        ${icon} <span class="alert-sym">${a.symbol}</span>
+        <span class="alert-price">$${a.price}</span>
+        <span class="alert-detail">${a.detail}</span>
+        <span class="alert-detail">${time}</span>
+      </span>`;
+    }).join('');
+    el.innerHTML = `<div class="alerts-header">⚡ Live Alerts</div><div class="alerts-bar">${chips}</div>`;
   }
 
   function renderAnalysis(watchlist) {

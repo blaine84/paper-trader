@@ -545,6 +545,36 @@ def api_performance():
     })
 
 
+@app.route("/api/alerts")
+def api_alerts():
+    """Return the latest live alerts from the price monitor."""
+    db = get_session(engine)
+    # Get the most recent live_alerts entries (last 15 minutes worth)
+    cutoff = datetime.utcnow() - timedelta(minutes=15)
+    rows = (
+        db.query(AgentMemory)
+        .filter_by(agent="price_monitor", key="live_alerts")
+        .filter(AgentMemory.timestamp >= cutoff)
+        .order_by(AgentMemory.timestamp.desc())
+        .limit(5)
+        .all()
+    )
+    alerts = []
+    seen = set()  # deduplicate by symbol+type+detail
+    for row in rows:
+        try:
+            batch = json.loads(row.value)
+            for a in batch:
+                key = f"{a.get('symbol')}:{a.get('type')}:{a.get('detail')}"
+                if key not in seen:
+                    seen.add(key)
+                    alerts.append(a)
+        except Exception:
+            pass
+    db.close()
+    return jsonify(alerts)
+
+
 @app.route("/api/decisions")
 def api_decisions():
     db = get_session(engine)
