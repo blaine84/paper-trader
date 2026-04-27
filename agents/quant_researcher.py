@@ -139,7 +139,7 @@ def build_strategy_context(engine, market_regime: str = None) -> str:
         rec = s.get("recommendation", "?")
         rec_color_char = "✅" if rec == "lean_into" else "⚠️"
         lines.append(
-            f"{rec_color_char} {s['strategy_name']} "
+            f"{rec_color_char} {s.get('strategy_name') or s.get('name', '?')} "
             f"(fit: {s.get('fit_score', '?')}/10, "
             f"internal: {int((s.get('internal_win_rate') or 0)*100)}% "
             f"over {s.get('internal_cases', 0)} cases)"

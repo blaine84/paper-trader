@@ -69,6 +69,12 @@ All config lives in `.env`. Copy `.env.example` to get started.
 | `STARTING_BALANCE` | `100000` | Paper balance per profile (×3) |
 | `WATCHLIST` | `SPY,QQQ,IWM,TSLA,NVDA,AMD` | Core tickers, comma-separated |
 | `LOOP_INTERVAL_MINUTES` | `15` | How often intraday loop runs |
+| `CEO_SLACK_BOT_TOKEN` | — | Slack bot token (optional) |
+| `CEO_SLACK_CHANNEL_ID` | — | Slack channel ID (optional) |
+| `BLOGGER_BLOG_ID` | — | Google Blogger blog ID (optional, for narrator) |
+| `GOOGLE_CLIENT_ID` | — | OAuth2 client ID (optional, for narrator) |
+| `GOOGLE_CLIENT_SECRET` | — | OAuth2 client secret (optional, for narrator) |
+| `GOOGLE_REFRESH_TOKEN` | — | OAuth2 refresh token (optional, for narrator) |
 
 ### LLM Tiers
 
@@ -107,8 +113,14 @@ No agent does another agent's job.
 4:15 PM ──► Reviewer (score trades, build cases)
         ──► Bookkeeper (daily log)
 
+4:15 PM ──► Narrator: Daily Wrap (Mon-Thu) or Weekly Wrap (Fri)
+            Narrator: Morning briefing, hourly/afternoon recaps, flash updates
+            throughout the day — read-only, never modifies trading state
+            Delivers to AgentMemory + Blogger (optional) + /narratives page
+
 Sunday  ──► Weekly Prep
         ──► Meta Reviewer (grades agents, suggests improvements)
+        ──► Narrator: Sunday Prep (5:15 PM)
 ```
 
 All three Portfolio Manager profiles run in **parallel** with **isolated portfolios**.
@@ -252,6 +264,50 @@ Both use `fetch_and_store_news()` which:
 - Does NOT trigger full researcher reanalysis
 
 The Analyst and web dashboard read these alerts automatically on their next cycle.
+
+### 📝 Desk Narrator
+A read-only agent that generates short, punchy narrative updates throughout the
+trading day. The tone is Bloomberg terminal desk commentary — confident, direct,
+slightly informal, like a senior trader briefing the desk.
+
+**Seven update types** (six scheduled, one event-driven):
+
+| Update Type | Trigger | Scope |
+|---|---|---|
+| Morning Briefing | End of pre-market | Full desk state: signals, regime, stances, watchlist |
+| Hourly Recap | 10, 11, 12 PM ET | Trades since last update, P&L changes, signal shifts |
+| Afternoon Recap | 2 PM ET | Hourly scope + midday aggregate P&L summary |
+| Daily Wrap | 4:15 PM Mon–Thu | Full day P&L, all trades, reviewer scores, lessons |
+| Weekly Wrap | 4:15 PM Friday | Week P&L, best/worst trades, strategy performance |
+| Sunday Prep | 5:15 PM Sunday | Weekly prep briefing, stances, strategy recommendation |
+| 🚨 Flash Update | Event-driven | Immediate alert for ATR spikes, force exits, catalyst shocks |
+
+**Delivery destinations:**
+1. **AgentMemory** — stored for other agents and the web dashboard to read
+2. **Google Blogger** — public/archival record (optional, requires OAuth2 credentials)
+3. **Web dashboard** — timeline feed at `/narratives`
+
+**Key features:**
+- **Story memory** — tracks the day's evolving thesis across updates, turning
+  disconnected snapshots into a serialized narrative
+- **Confidence regime** — narrates "market weather" (edge quality, tape noise,
+  signal disagreement, catalyst freshness) and flags when P&L diverges from
+  signal quality
+- **Deduplication** — prevents duplicate narratives if a cron job fires twice
+- **Flash rate limiting** — max 1 flash update per symbol per 15 minutes
+- **Read-only isolation** — only SELECTs from trading tables, never modifies
+  trading state
+
+All LLM calls use `tier="medium"` (local Ollama). Blogger publishing is optional
+and gracefully disabled when env vars are missing.
+
+**Blogger setup** (optional):
+1. Create a project at [Google Cloud Console](https://console.cloud.google.com)
+2. Enable the Blogger API v3
+3. Create OAuth2 credentials (Desktop app type)
+4. Generate a refresh token using the OAuth2 playground
+5. Add `BLOGGER_BLOG_ID`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+   `GOOGLE_REFRESH_TOKEN` to `.env`
 
 ### Catalyst Freshness (`utils/catalyst_freshness.py`)
 
@@ -699,19 +755,26 @@ All times Eastern (ET), Monday–Friday.
 | Time | Event |
 |---|---|
 | **Sunday 5:00 PM** | Weekly prep + Meta Reviewer (grades agents, suggests improvements) |
+| **Sunday 5:15 PM** | 📝 Narrator: Sunday prep narrative |
 | 8:30 AM | Scout → Researcher → Quant Researcher → Analyst |
+| After pre-market | 📝 Narrator: Morning briefing |
 | 9:30 AM | Market opens, price monitor starts (every 60s), position timer starts (every 5 min) |
 | 9:30–12:00 | PM decisions every 15 min, Analyst refresh every 15 min |
 | Every 15 min | Price-spike news check (fetches news for symbols with ≥2% moves) |
 | Every 30 min | Position news poll (fetches news for symbols with open positions) |
 | 10:00, 12:00, 2:00 | News monitor checks for breaking catalysts (full LLM classification) |
+| 10:00, 11:00, 12:00 | 📝 Narrator: Hourly recaps |
 | 10:30–3:30 | Position health check every hour |
 | 10:00–4:00 | Reviewer queue processes pending reviews every 15 min |
 | 12:00–4:00 | PM decisions every 30 min, Analyst refresh every 15 min |
+| 2:00 PM | 📝 Narrator: Afternoon recap (includes midday P&L summary) |
 | 3:45 PM | Hard wall: all intraday positions force-closed |
 | 4:00 PM | Market closes, price monitor stops |
+| 4:15 PM Mon–Thu | 📝 Narrator: Daily wrap |
+| 4:15 PM Friday | 📝 Narrator: Weekly wrap (replaces daily wrap) |
 | 4:15 PM | Reviewer scores remaining trades, Bookkeeper saves daily log |
 | 4:30 PM | Daily Review journal generation |
+| Event-driven | 📝 Narrator: 🚨 Flash updates (ATR spikes, force exits, catalyst shocks) |
 
 ---
 
@@ -743,6 +806,10 @@ python web/app.py
 ```
 Opens a dashboard at `http://localhost:5000` (or `http://<pi-ip>:5000` from another machine).
 Shows live positions with unrealized P&L, watchlist signals, performance analytics, agent feedback, and case library.
+
+The **Narratives** page (`/narratives`) shows a timeline feed of all desk commentary
+updates — morning briefings, hourly recaps, daily wraps, flash alerts, and more.
+Accessible from the "📝 Narratives" link in the main dashboard header.
 
 ### Backtester
 ```bash

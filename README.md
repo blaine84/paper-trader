@@ -12,6 +12,7 @@ A multi-agent paper trading system for day trading SPY, QQQ, IWM, TSLA, NVDA, AM
 | 🧠 Portfolio Manager | Trade decisions, position sizing, thesis-anchored exits |
 | 📋 Bookkeeper | Tracks positions, P&L, stop losses, daily summaries |
 | 🔍 Reviewer | Scores closed trades, extracts lessons, feeds back |
+| 📝 Narrator | Bloomberg-style desk commentary throughout the day (read-only) |
 | 🎯 Orchestrator | Runs the market-hours loop via APScheduler |
 
 ### Core Modules (Tier 1)
@@ -97,6 +98,15 @@ python orchestrator.py once
 - **4:15 PM** — EOD: Reviewer scores, daily log saved
 - **4:30 PM** — Daily Review journal generation
 
+### Desk Narrator Schedule
+- **After pre-market** — Morning briefing (triggered by `run_pre_market()`)
+- **10, 11, 12 PM** — Hourly recaps
+- **2 PM** — Afternoon recap with midday P&L summary
+- **4:15 PM Mon–Thu** — Daily wrap
+- **4:15 PM Friday** — Weekly wrap (replaces daily wrap)
+- **5:15 PM Sunday** — Sunday prep narrative
+- **Event-driven** — 🚨 Flash updates on ATR spikes, force exits, catalyst shocks
+
 ## Database
 
 SQLite at `db/paper_trader.db`
@@ -125,6 +135,12 @@ Tables:
 | STARTING_BALANCE | 100000 | Paper trading balance |
 | WATCHLIST | SPY,QQQ,IWM,TSLA,NVDA,AMD | Comma-separated tickers |
 | LOOP_INTERVAL_MINUTES | 15 | Intraday loop frequency |
+| CEO_SLACK_BOT_TOKEN | — | Slack bot token (optional) |
+| CEO_SLACK_CHANNEL_ID | — | Slack channel ID (optional) |
+| BLOGGER_BLOG_ID | — | Google Blogger blog ID (optional, for narrator) |
+| GOOGLE_CLIENT_ID | — | OAuth2 client ID (optional, for narrator) |
+| GOOGLE_CLIENT_SECRET | — | OAuth2 client secret (optional, for narrator) |
+| GOOGLE_REFRESH_TOKEN | — | OAuth2 refresh token (optional, for narrator) |
 
 ## Tips
 
