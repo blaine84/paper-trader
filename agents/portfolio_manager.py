@@ -1311,18 +1311,30 @@ def execute_trade(db, decision: dict, profile_id: str):
         close_qty = abs(close_qty)  # Guard against negative qty from LLM decisions
         side = pos.side
 
-        open_trade = (
+        # Find ALL open trades for this symbol/profile (handles averaged-in positions)
+        open_trades = (
             db.query(Trade)
             .filter_by(symbol=symbol, status="open", profile=profile_id)
             .order_by(Trade.entry_time)
-            .first()
+            .all()
         )
-        if open_trade:
+
+        pnl_total = 0.0
+        remaining_to_close = close_qty
+        first_trade = open_trades[0] if open_trades else None
+
+        for open_trade in open_trades:
+            if remaining_to_close <= 0:
+                break
+            trade_close_qty = min(open_trade.quantity, remaining_to_close)
+            remaining_to_close -= trade_close_qty
+
             if side == "long":
-                pnl = (price - open_trade.entry_price) * close_qty
+                pnl = (price - open_trade.entry_price) * trade_close_qty
             else:  # short: profit when price falls
-                pnl = (open_trade.entry_price - price) * close_qty
-            pnl_pct = pnl / (open_trade.entry_price * close_qty) * 100
+                pnl = (open_trade.entry_price - price) * trade_close_qty
+            pnl_pct = pnl / (open_trade.entry_price * trade_close_qty) * 100
+
             open_trade.exit_price = price
             open_trade.exit_time = datetime.utcnow()
             open_trade.status = "closed"
@@ -1341,6 +1353,8 @@ def execute_trade(db, decision: dict, profile_id: str):
             from db.schema import ReviewQueue
             db.add(ReviewQueue(trade_id=open_trade.id))
 
+            pnl_total += pnl
+
         if close_qty >= pos.quantity:
             db.delete(pos)
         else:
@@ -1351,8 +1365,8 @@ def execute_trade(db, decision: dict, profile_id: str):
             cash_delta = close_qty * price
         else:
             # Return original margin + profit (or minus loss)
-            margin_back = close_qty * open_trade.entry_price if open_trade else close_qty * price
-            profit = (open_trade.entry_price - price) * close_qty if open_trade else 0
+            margin_back = close_qty * (first_trade.entry_price if first_trade else price)
+            profit = (first_trade.entry_price - price) * close_qty if first_trade else 0
             cash_delta = margin_back + profit
 
         db.add(Balance(cash=cash + cash_delta, profile=profile_id))

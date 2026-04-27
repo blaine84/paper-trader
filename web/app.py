@@ -279,6 +279,21 @@ def api_positions():
 def api_trades():
     db = get_session(engine)
     import yfinance as yf
+
+    # Reconcile orphaned trades: mark open trades as closed if no matching position exists
+    open_trades_all = db.query(Trade).filter_by(status="open").all()
+    for ot in open_trades_all:
+        side = "long" if ot.direction == "LONG" else "short"
+        matching_pos = db.query(Position).filter_by(
+            symbol=ot.symbol, profile=ot.profile, side=side
+        ).first()
+        if not matching_pos:
+            ot.status = "closed"
+            ot.exit_time = ot.exit_time or datetime.utcnow()
+            ot.reason_exit = (ot.reason_exit or "") + " [auto-reconciled: no matching position]"
+            log.warning("Reconciled orphan trade #%d (%s %s)", ot.id, ot.symbol, ot.profile)
+    db.commit()
+
     cutoff = datetime.utcnow() - timedelta(days=30)
     trades = (
         db.query(Trade)

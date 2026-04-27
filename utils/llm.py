@@ -161,6 +161,17 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
             raise
 
 
+_JSON_REPAIR_PROMPT = """You are a JSON extraction assistant. The following text is an LLM response that should have been JSON but came back as prose. Extract the trading decisions from it and return ONLY valid JSON.
+
+If the text recommends one or more trades, return:
+{"decisions": [{"symbol": "...", "action": "BUY|SHORT|CLOSE", "quantity": N, "price": N.NN, "stop_loss": N.NN, "target": N.NN, "rationale": "..."}], "portfolio_notes": "..."}
+
+If the text recommends no trades / holding / waiting, return:
+{"decisions": [], "portfolio_notes": "summary of why no trades"}
+
+Respond with ONLY the JSON object. No markdown, no explanation."""
+
+
 def parse_json_response(text: str) -> dict:
     """Safely parse JSON from LLM output, even with markdown fences or trailing text."""
     if not text or not text.strip():
@@ -182,8 +193,52 @@ def parse_json_response(text: str) -> dict:
                 if depth == 0:
                     end = i + 1
                     break
-        text = text[start:end]
+        candidate = text[start:end]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass  # fall through to repair below
+
+    # LLM returned prose instead of JSON — try a repair call
+    log.warning("LLM returned prose instead of JSON, attempting repair extraction")
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse LLM JSON response: {e}\nRaw: {text[:500]}")
+        repair_raw = call_llm(
+            _JSON_REPAIR_PROMPT,
+            f"Extract JSON from this response:\n\n{text[:2000]}",
+            json_mode=True,
+            tier="low",
+        )
+        repair_text = repair_raw.strip()
+        if repair_text.startswith("```"):
+            repair_lines = repair_text.split("\n")
+            repair_text = "\n".join(repair_lines[1:-1]).strip()
+        if "{" in repair_text:
+            rs = repair_text.index("{")
+            rd = 0
+            re_ = rs
+            for i in range(rs, len(repair_text)):
+                if repair_text[i] == "{":
+                    rd += 1
+                elif repair_text[i] == "}":
+                    rd -= 1
+                    if rd == 0:
+                        re_ = i + 1
+                        break
+            result = json.loads(repair_text[rs:re_])
+            log.info("JSON repair succeeded")
+            return result
+    except Exception as repair_err:
+        log.warning("JSON repair call failed: %s", repair_err)
+
+    # Last resort: detect "no action" intent from the prose
+    lower = text[:500].lower()
+    no_action_phrases = [
+        "no trades", "no trade", "no action", "recommend holding",
+        "pass on", "stand aside", "stay flat", "no new", "wait for",
+        "not recommend", "do not recommend", "skip", "no opportunities",
+    ]
+    if any(phrase in lower for phrase in no_action_phrases):
+        log.warning("Detected no-action intent in prose, returning empty decisions")
+        return {"decisions": [], "portfolio_notes": text[:300]}
+
+    raise ValueError(f"Failed to parse LLM JSON response: {text[:500]}")
