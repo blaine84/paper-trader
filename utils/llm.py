@@ -58,16 +58,27 @@ def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier
         provider = os.getenv("LLM_PROVIDER", "openai").lower()
         model = None
 
-    if provider == "openai":
-        return _call_openai(system_prompt, user_prompt, json_mode, model)
-    elif provider == "anthropic":
-        return _call_anthropic(system_prompt, user_prompt, model)
-    elif provider == "mistral":
-        return _call_mistral(system_prompt, user_prompt, json_mode, model)
-    elif provider == "ollama":
-        return _call_ollama(system_prompt, user_prompt, model)
-    else:
+    dispatch = {
+        "openai": lambda: _call_openai(system_prompt, user_prompt, json_mode, model),
+        "anthropic": lambda: _call_anthropic(system_prompt, user_prompt, model),
+        "mistral": lambda: _call_mistral(system_prompt, user_prompt, json_mode, model),
+        "ollama": lambda: _call_ollama(system_prompt, user_prompt, model),
+    }
+    if provider not in dispatch:
         raise ValueError(f"Unknown LLM provider: {provider}")
+
+    fn = dispatch[provider]
+
+    # Retry once on empty response (local models sometimes return nothing on overload)
+    for attempt in range(2):
+        result = fn()
+        if result and result.strip():
+            return result
+        if attempt == 0:
+            log.warning("LLM returned empty response (provider=%s, tier=%s), retrying once", provider, tier)
+            time.sleep(2)
+
+    return result or ""
 
 
 def _call_openai(system_prompt: str, user_prompt: str, json_mode: bool, model: str = None) -> str:
