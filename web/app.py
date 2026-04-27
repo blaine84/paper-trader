@@ -231,6 +231,20 @@ def api_data():
 def api_positions():
     db = get_session(engine)
     fh = FinnhubClient()
+
+    # Reconcile orphaned positions: remove positions with no matching open trade
+    all_positions = db.query(Position).all()
+    for p in all_positions:
+        has_open_trade = (
+            db.query(Trade)
+            .filter_by(symbol=p.symbol, profile=p.profile, status="open")
+            .first()
+        )
+        if not has_open_trade:
+            log.warning("Reconciled orphan position: %s %s (%s)", p.symbol, p.side, p.profile)
+            db.delete(p)
+    db.commit()
+
     result = []
     for profile_id in ACTIVE_PROFILES:
         positions = db.query(Position).filter_by(profile=profile_id).all()
