@@ -146,24 +146,66 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
     timeout = int(os.getenv("OLLAMA_TIMEOUT", 600))
 
+    json_instruction = "\n\nYou MUST respond with valid JSON only. No markdown, no explanation, no preamble."
+    system_content = system_prompt + json_instruction
+
+    # Prompt-size telemetry: useful for diagnosing local model timeouts/context bloat.
+    # Approx token estimate is intentionally rough and cheap: ~4 chars/token.
+    system_chars = len(system_content)
+    user_chars = len(user_prompt)
+    total_chars = system_chars + user_chars
+    approx_tokens = max(1, total_chars // 4)
+
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": system_prompt + "\n\nYou MUST respond with valid JSON only. No markdown, no explanation, no preamble."},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
         "format": "json",
     }
 
+    log.info(
+        "Ollama request starting: model=%s base_url=%s timeout=%ss prompt_chars=%s "
+        "system_chars=%s user_chars=%s approx_tokens=%s",
+        model,
+        base_url,
+        timeout,
+        total_chars,
+        system_chars,
+        user_chars,
+        approx_tokens,
+    )
+    started = time.monotonic()
+
     try:
         resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
+        elapsed = time.monotonic() - started
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        content = resp.json()["message"]["content"]
+        log.info(
+            "Ollama request completed: model=%s elapsed=%.1fs response_chars=%s",
+            model,
+            elapsed,
+            len(content or ""),
+        )
+        return content
     except Exception as e:
+        elapsed = time.monotonic() - started
         fallback_model = os.getenv("OLLAMA_FALLBACK_MODEL", "claude-haiku-4-5")
         fallback_provider = os.getenv("OLLAMA_FALLBACK_PROVIDER", "anthropic")
-        log.warning(f"Ollama failed ({e}), falling back to {fallback_provider}/{fallback_model}")
+        log.warning(
+            "Ollama failed after %.1fs: model=%s prompt_chars=%s approx_tokens=%s error=%s; "
+            "falling back to %s/%s",
+            elapsed,
+            model,
+            total_chars,
+            approx_tokens,
+            e,
+            fallback_provider,
+            fallback_model,
+        )
         if fallback_provider == "anthropic":
             return _call_anthropic(system_prompt, user_prompt, fallback_model)
         elif fallback_provider == "openai":
