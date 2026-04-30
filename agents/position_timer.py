@@ -22,6 +22,7 @@ from datetime import datetime
 from pytz import timezone
 
 from db.schema import Trade, Position, AgentMemory, get_session
+from utils.trade_events import log_trade_event
 from utils.finnhub_client import FinnhubClient
 
 log = logging.getLogger(__name__)
@@ -302,6 +303,17 @@ def run(engine) -> dict:
                 if _escalate(td["id"], "revalidating"):
                     log.info(f"⏰ REVALIDATING: {td['symbol']} ({td['profile']}) at {round(minutes_held)} min")
                     valid = _revalidate_momentum_fade(engine, trade, price)
+                    event_db = get_session(engine)
+                    try:
+                        log_trade_event(
+                            event_db, "thesis_revalidated", trade_id=td["id"], agent="position_timer",
+                            symbol=td["symbol"], profile=td["profile"], price=price,
+                            message="Momentum fade thesis revalidation " + ("passed" if valid else "failed"),
+                            payload={"minutes_held": round(minutes_held), "valid": valid, "setup_type": setup_type},
+                        )
+                        event_db.commit()
+                    finally:
+                        event_db.close()
                     revalidations.append({"symbol": td["symbol"], "profile": td["profile"],
                                           "minutes_held": round(minutes_held), "valid": valid})
                     if not valid:

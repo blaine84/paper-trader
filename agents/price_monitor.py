@@ -14,6 +14,7 @@ import logging
 import yfinance as yf
 from datetime import datetime
 from db.schema import Trade, Position, AgentMemory, get_session
+from utils.trade_events import log_trade_event
 
 log = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ def check_stops_and_targets(engine) -> list[dict]:
                 else:
                     hit = price >= (trade.stop_price + buffer)
                 if hit:
-                    triggers.append({
+                    trigger = {
                         "type": "stop_loss",
                         "symbol": trade.symbol,
                         "profile": trade.profile,
@@ -91,7 +92,14 @@ def check_stops_and_targets(engine) -> list[dict]:
                         "level": trade.stop_price,
                         "side": side,
                         "trade_id": trade.id,
-                    })
+                    }
+                    triggers.append(trigger)
+                    log_trade_event(
+                        db, "stop_triggered", trade_id=trade.id, agent="price_monitor",
+                        symbol=trade.symbol, profile=trade.profile, price=price,
+                        message=f"Stop triggered at {price} vs level {trade.stop_price}",
+                        payload=trigger,
+                    )
 
         # Target check — verify target is on the correct side before triggering
         if trade.target_price:
@@ -108,7 +116,7 @@ def check_stops_and_targets(engine) -> list[dict]:
                 hit = (side == "long" and price >= trade.target_price) or \
                       (side == "short" and price <= trade.target_price)
                 if hit:
-                    triggers.append({
+                    trigger = {
                         "type": "target_hit",
                         "symbol": trade.symbol,
                         "profile": trade.profile,
@@ -116,7 +124,14 @@ def check_stops_and_targets(engine) -> list[dict]:
                         "level": trade.target_price,
                         "side": side,
                         "trade_id": trade.id,
-                    })
+                    }
+                    triggers.append(trigger)
+                    log_trade_event(
+                        db, "target_triggered", trade_id=trade.id, agent="price_monitor",
+                        symbol=trade.symbol, profile=trade.profile, price=price,
+                        message=f"Target triggered at {price} vs level {trade.target_price}",
+                        payload=trigger,
+                    )
 
         # Thesis invalidator evaluation — check structured invalidation conditions
         if getattr(trade, "invalidators", None):
@@ -133,6 +148,13 @@ def check_stops_and_targets(engine) -> list[dict]:
                     "timestamp": now.isoformat() + "Z",
                 }
                 triggers.append(trigger)
+                log_trade_event(
+                    db, "thesis_invalidated", trade_id=trade.id, agent="price_monitor",
+                    symbol=trade.symbol, profile=trade.profile, price=price,
+                    message=f"Thesis invalidator breached: {inv.get('type')}@{inv.get('reference')}",
+                    payload=trigger,
+                    timestamp=now,
+                )
                 # Store in AgentMemory for PM to read during Reversal/Close Review
                 db.add(AgentMemory(
                     agent="price_monitor",
@@ -148,6 +170,9 @@ def check_stops_and_targets(engine) -> list[dict]:
                 )
             if breached:
                 db.commit()
+
+    if triggers:
+        db.commit()
 
     # Run profit management on all open trades
     from agents.profit_manager import run as run_profit

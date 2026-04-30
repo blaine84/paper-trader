@@ -14,6 +14,7 @@ import json
 import logging
 from datetime import datetime
 from db.schema import Trade, Position, Balance, AgentMemory, get_session
+from utils.trade_events import log_trade_event
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +90,18 @@ def _partial_close(engine, trade, quantity_pct, price, reason):
             cash_back = close_qty * trade.entry_price + pnl
         db.add(Balance(cash=bal.cash + cash_back, profile=trade.profile))
 
+    log_trade_event(
+        db, "partial_profit", trade_id=trade.id, agent=f"profit_manager",
+        symbol=trade.symbol, profile=trade.profile, price=price,
+        message=reason,
+        payload={
+            "closed_qty": close_qty,
+            "remaining_qty": max(0, pos.quantity) if pos else 0,
+            "pnl": round(pnl, 2),
+            "quantity_pct": quantity_pct,
+        },
+    )
+
     # Log the partial as an agent memory note
     db.add(AgentMemory(
         agent=f"pm_{trade.profile}",
@@ -118,6 +131,12 @@ def _move_stop(engine, trade_id, new_stop, reason):
     if trade:
         old_stop = trade.stop_price
         trade.stop_price = new_stop
+        log_trade_event(
+            db, "stop_set", trade_id=trade.id, agent="profit_manager",
+            symbol=trade.symbol, profile=trade.profile, price=new_stop,
+            message=reason,
+            payload={"old_stop": old_stop, "new_stop": new_stop},
+        )
         db.commit()
         log.info(f"🔒 STOP MOVED: {trade.symbol} ({trade.profile}) "
                  f"${old_stop} → ${new_stop:.2f} — {reason}")

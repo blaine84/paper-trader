@@ -11,6 +11,7 @@ from datetime import datetime
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, Position, Balance, Trade, get_session
+from utils.trade_events import log_trade_event
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.case_library import get_relevant_cases, format_cases_for_prompt, get_win_rate_by_setup
 from agents.quant_researcher import build_strategy_context
@@ -1024,6 +1025,24 @@ def execute_trade(db, decision: dict, profile_id: str):
                 stop = round(price * 1.015, 2)
             _log.warning(f"No ATR or key level for {symbol}, using 1.5% fallback: {stop}")
 
+    if action in ("BUY", "SHORT", "CLOSE"):
+        log_trade_event(
+            db,
+            "entry_requested" if action in ("BUY", "SHORT") else "exit_requested",
+            agent=f"pm_{profile_id}",
+            symbol=symbol,
+            profile=profile_id,
+            price=price,
+            message=decision.get("rationale"),
+            payload={
+                "action": action,
+                "quantity": quantity,
+                "stop": stop,
+                "target": target,
+                "decision": decision,
+            },
+        )
+
     starting = PM_PROFILES[profile_id]["starting_balance"]
     bal = (
         db.query(Balance)
@@ -1246,7 +1265,7 @@ def execute_trade(db, decision: dict, profile_id: str):
             )
             db.add(pos)
 
-        db.add(Trade(
+        trade = Trade(
             symbol=symbol, direction="LONG", quantity=quantity,
             entry_price=price, reason_entry=decision.get("rationale"),
             stop_price=stop,
@@ -1259,7 +1278,14 @@ def execute_trade(db, decision: dict, profile_id: str):
             thesis=_entry_contract.get("thesis"),
             setup_type=_entry_contract.get("setup_type"),
             invalidators=json.dumps(_entry_contract["invalidators"]) if _entry_contract.get("invalidators") else None,
-        ))
+        )
+        db.add(trade)
+        db.flush()
+        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload={"action": action, "quantity": quantity, "side": "long", "edge": _edge_data})
+        if stop:
+            log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
+        if target:
+            log_trade_event(db, "target_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(target), message="Initial target set", payload={"target_price": target})
         db.add(Balance(cash=cash - cost, profile=profile_id))
 
     elif action == "SHORT":
@@ -1282,7 +1308,7 @@ def execute_trade(db, decision: dict, profile_id: str):
             )
             db.add(pos)
 
-        db.add(Trade(
+        trade = Trade(
             symbol=symbol, direction="SHORT", quantity=quantity,
             entry_price=price, reason_entry=decision.get("rationale"),
             stop_price=stop,
@@ -1295,7 +1321,14 @@ def execute_trade(db, decision: dict, profile_id: str):
             thesis=_entry_contract.get("thesis"),
             setup_type=_entry_contract.get("setup_type"),
             invalidators=json.dumps(_entry_contract["invalidators"]) if _entry_contract.get("invalidators") else None,
-        ))
+        )
+        db.add(trade)
+        db.flush()
+        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload={"action": action, "quantity": quantity, "side": "short", "edge": _edge_data})
+        if stop:
+            log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
+        if target:
+            log_trade_event(db, "target_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(target), message="Initial target set", payload={"target_price": target})
         # Deduct margin from cash (returned + P&L on close)
         db.add(Balance(cash=cash - margin_required, profile=profile_id))
 
@@ -1348,6 +1381,12 @@ def execute_trade(db, decision: dict, profile_id: str):
                     "PnL sign mismatch for %s: pnl=%.2f, pnl_pct=%.2f — signs should be consistent",
                     symbol, pnl, pnl_pct,
                 )
+
+            log_trade_event(
+                db, "exit_filled", trade_id=open_trade.id, agent=f"pm_{profile_id}",
+                symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"),
+                payload={"quantity": trade_close_qty, "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2), "side": side},
+            )
 
             # Queue for review
             from db.schema import ReviewQueue
