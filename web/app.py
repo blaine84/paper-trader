@@ -29,6 +29,7 @@ from utils.catalyst_freshness import (
     build_freshness_label,
     ET,
 )
+from feedback_loop.analyst_feedback import get_quality_metrics
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
@@ -440,6 +441,7 @@ def api_feedback():
             except Exception:
                 pass
     result["stances"] = stances
+    result["analyst_quality"] = get_quality_metrics(engine)
 
     db.close()
     return jsonify(result)

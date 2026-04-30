@@ -5,11 +5,13 @@ No prose summaries — only typed, queryable records.
 """
 
 import json
+import logging
 from datetime import datetime
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
 from utils.case_library import store_case, get_win_rate_by_setup, format_cases_for_prompt
 from db.schema import Trade, AgentMemory, get_session
+from feedback_loop.analyst_feedback import queue_reviewer_flags
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -209,6 +211,12 @@ Extract structured cases for each trade. Return the JSON.
 
     for case_data in result.get("cases", []):
         store_case(engine, case_data)
+
+    try:
+        queue_reviewer_flags(engine, result.get("cases", []))
+    except Exception as exc:
+        log = logging.getLogger(__name__)
+        log.warning("Analyst feedback queueing failed: %s", exc)
 
     # Route feedback — reopen session
     db = get_session(engine)

@@ -93,6 +93,45 @@ class ReviewQueue(Base):
     reviewed_at = Column(DateTime, nullable=True)
 
 
+class AnalystFeedbackQueue(Base):
+    """Reviewer-raised quality flags that require an analyst response."""
+    __tablename__ = "analyst_feedback_queue"
+
+    id = Column(Integer, primary_key=True)
+    trade_id = Column(Integer, nullable=True)
+    symbol = Column(String(10), nullable=False)
+    setup_type = Column(String(64), nullable=True)
+    date = Column(String(10), nullable=False)  # YYYY-MM-DD case date
+    flag_type = Column(String(64), nullable=False)
+    severity = Column(String(16), nullable=False)  # low | medium | high | critical
+    recommendation = Column(Text, nullable=False)
+    reviewer_context = Column(Text, nullable=True)  # JSON payload from reviewer case
+    status = Column(String(16), default="pending")  # pending | responded | overdue
+    created_at = Column(DateTime, default=datetime.utcnow)
+    due_at = Column(DateTime, nullable=False)
+    responded_at = Column(DateTime, nullable=True)
+    analyst_response = Column(String(16), nullable=True)  # accept | reject | modify
+    analyst_response_note = Column(Text, nullable=True)
+    analyst_supporting_data = Column(Text, nullable=True)  # JSON array or object
+    no_data_reject = Column(Boolean, default=False)
+
+
+class AnalystMitigation(Base):
+    """Active conservative throttles applied to analyst setup classifications."""
+    __tablename__ = "analyst_mitigations"
+
+    id = Column(Integer, primary_key=True)
+    setup_type = Column(String(64), nullable=False, unique=True)
+    level = Column(Integer, default=0)
+    deployment_multiplier = Column(Float, default=1.0)
+    signal_threshold_bump = Column(Float, default=0.0)
+    active = Column(Boolean, default=False)
+    reason = Column(Text, nullable=True)
+    applied_at = Column(DateTime, nullable=True)
+    last_triggered_at = Column(DateTime, nullable=True)
+    reset_at = Column(DateTime, nullable=True)
+
+
 class DynamicStrategy(Base):
     """Agent-proposed strategies that supplement the hardcoded strategy library."""
     __tablename__ = "dynamic_strategies"

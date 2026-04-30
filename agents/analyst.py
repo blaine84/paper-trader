@@ -20,6 +20,12 @@ from utils.catalyst_freshness import (
     get_market_day_start,
     ET,
 )
+from feedback_loop.analyst_feedback import (
+    apply_signal_mitigation,
+    build_feedback_prompt_context,
+    get_active_mitigations,
+    process_pending_feedback,
+)
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +83,11 @@ def run(engine, symbols: list[str]) -> dict:
     fh = FinnhubClient()
     db = get_session(engine)
 
+    try:
+        process_pending_feedback(engine)
+    except Exception as exc:
+        log.warning("Analyst feedback processing failed: %s", exc)
+
     # Pull latest researcher sentiment from memory
     recent_sentiment = {}
     sentiments = (
@@ -111,6 +122,8 @@ def run(engine, symbols: list[str]) -> dict:
 
     # Strategy context from Quant Researcher
     strategy_context = build_strategy_context(engine)
+    feedback_context = build_feedback_prompt_context(engine)
+    active_mitigations = get_active_mitigations(engine)
 
     # Get all valid setup types (hardcoded + dynamic)
     from utils.strategy_store import get_all_setup_types
@@ -214,11 +227,15 @@ STRATEGY RECOMMENDATIONS (from Quant Researcher):
 
 RELEVANT PAST CASES:
 {cases_text}
+
+ANALYST FEEDBACK LOOP:
+{feedback_context}
 {freshness_context}
 Produce your trading signal JSON for {sym}.
 """
             raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
             signal = parse_json_response(raw)
+            signal = apply_signal_mitigation(signal, active_mitigations)
             signals[sym] = signal
         except Exception as e:
             log.error(f"Analyst error for {sym}: {e}")

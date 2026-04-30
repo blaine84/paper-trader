@@ -628,6 +628,25 @@
   function renderFeedback(data) {
     let html = '';
 
+    if (data.analyst_quality) {
+      const q = data.analyst_quality;
+      const mitigations = (q.active_mitigations || []).map(m =>
+        `<span class="level-tag">${m.setup_type}: L${m.level} · ${(m.deployment_multiplier * 100).toFixed(0)}% deploy · +${m.signal_threshold_bump.toFixed(1)} threshold</span>`
+      ).join(' ');
+      html += `<div class="feedback-box">
+        <strong>Analyst Quality Metrics</strong><br>
+        <div class="stat-grid" style="padding:12px 0 0">
+          <div class="stat-box"><div class="stat-label">Flags Received</div><div class="stat-value">${q.flags_received || 0}</div></div>
+          <div class="stat-box"><div class="stat-label">Flags Accepted</div><div class="stat-value">${q.flags_accepted || 0}</div></div>
+          <div class="stat-box"><div class="stat-label">Avg Response Time</div><div class="stat-value">${q.avg_response_time != null ? q.avg_response_time + 'h' : '—'}</div></div>
+          <div class="stat-box"><div class="stat-label">Response Rate</div><div class="stat-value">${((q.response_rate || 0) * 100).toFixed(0)}%</div></div>
+          <div class="stat-box"><div class="stat-label">Acceptance Rate</div><div class="stat-value">${((q.acceptance_rate || 0) * 100).toFixed(0)}%</div></div>
+          <div class="stat-box"><div class="stat-label">Mitigation Level</div><div class="stat-value">${q.current_mitigation_level || 0}</div></div>
+        </div>
+        ${mitigations ? `<div style="margin-top:10px"><span class="dim">Active mitigations:</span><br><div class="levels" style="margin-top:6px">${mitigations}</div></div>` : '<div class="dim" style="margin-top:10px">No active analyst mitigations.</div>'}
+      </div>`;
+    }
+
     if (data.regime) {
       html += `<div class="feedback-box">
         <strong>Market Regime</strong><br>
