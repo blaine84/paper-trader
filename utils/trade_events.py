@@ -1,16 +1,46 @@
 """Helpers for recording normalized trade lifecycle events."""
 
 import json
+import logging
 from datetime import datetime
 from typing import Any
 
 from db.schema import TradeEvent
+
+log = logging.getLogger(__name__)
 
 
 def _json_default(value: Any):
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def _coerce_optional_float(value: Any, field_name: str, event_type: str, symbol: str | None):
+    """Return a float for valid numeric values, otherwise None.
+
+    LLM repair can occasionally leave placeholders like ``N.NN`` or strings
+    with currency formatting. TradeEvent.price is nullable, so dropping a bad
+    event price is safer than letting autoflush abort the trading cycle.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            cleaned = value.strip().replace("$", "").replace(",", "")
+            if not cleaned or cleaned.upper() in {"N/A", "NA", "NONE", "NULL", "N.NN"}:
+                raise ValueError("placeholder/non-numeric price")
+            value = cleaned
+        return float(value)
+    except (TypeError, ValueError):
+        log.warning(
+            "Dropping invalid %s for trade event %s%s: %r",
+            field_name,
+            event_type,
+            f" ({symbol})" if symbol else "",
+            value,
+        )
+        return None
 
 
 def log_trade_event(
@@ -39,6 +69,8 @@ def log_trade_event(
     else:
         payload_json = json.dumps(payload, default=_json_default)
 
+    safe_price = _coerce_optional_float(price, "price", event_type, symbol)
+
     event = TradeEvent(
         trade_id=trade_id,
         timestamp=timestamp or datetime.utcnow(),
@@ -46,7 +78,7 @@ def log_trade_event(
         agent=agent,
         symbol=symbol,
         profile=profile,
-        price=price,
+        price=safe_price,
         message=message,
         payload_json=payload_json,
     )
