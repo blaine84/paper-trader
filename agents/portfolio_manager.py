@@ -27,6 +27,22 @@ from core.portfolio_risk import (
 
 log = logging.getLogger(__name__)
 
+
+def _coerce_price(value, field_name: str, symbol: str) -> float | None:
+    """Normalize LLM/database price values before persisting or %.2f logging."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace("$", "").replace(",", "")
+        return float(value)
+    except (TypeError, ValueError):
+        log.warning(
+            "Ignoring invalid %s for %s from maintenance review: %r",
+            field_name, symbol, value,
+        )
+        return None
+
 # Max minutes after market open (9:30 AM ET) that each setup type may be entered.
 # Setup types NOT listed here have no entry-window restriction.
 ENTRY_WINDOW_LIMITS = {
@@ -1641,18 +1657,24 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
             # Apply maintenance actions
             action = review_result.get("action", "hold")
             if action == "tighten_stop" and review_result.get("new_stop"):
-                open_trade.stop_price = review_result["new_stop"]
+                new_stop = _coerce_price(review_result.get("new_stop"), "new_stop", symbol)
+                if new_stop is None:
+                    continue
+                open_trade.stop_price = new_stop
                 db.commit()
                 log.info(
                     "Maintenance Review tighten_stop for %s: new stop=%.2f",
-                    symbol, review_result["new_stop"],
+                    symbol, new_stop,
                 )
             elif action == "raise_target" and review_result.get("new_target"):
-                open_trade.target_price = review_result["new_target"]
+                new_target = _coerce_price(review_result.get("new_target"), "new_target", symbol)
+                if new_target is None:
+                    continue
+                open_trade.target_price = new_target
                 db.commit()
                 log.info(
                     "Maintenance Review raise_target for %s: new target=%.2f",
-                    symbol, review_result["new_target"],
+                    symbol, new_target,
                 )
             elif action == "trim_partial" and review_result.get("trim_pct"):
                 trim_qty = max(1, int(pos.quantity * review_result["trim_pct"] / 100))

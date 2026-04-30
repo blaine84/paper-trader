@@ -109,18 +109,36 @@ class FinnhubClient:
                              progress=False, auto_adjust=True)
             if df.empty:
                 return {}
-            # flatten multi-level columns from newer yfinance versions
-            if isinstance(df.columns, __import__('pandas').MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+
+            import pandas as pd
+
+            # Newer yfinance versions can return a MultiIndex even for a
+            # single ticker, e.g. ("Open", "SPY"). Select the requested
+            # ticker level first, then normalize to flat OHLCV columns.
+            if isinstance(df.columns, pd.MultiIndex):
+                ticker_level = df.columns.names.index("Ticker") if "Ticker" in df.columns.names else -1
+                if symbol in df.columns.get_level_values(ticker_level):
+                    df = df.xs(symbol, axis=1, level=ticker_level, drop_level=True)
+                else:
+                    df.columns = df.columns.get_level_values(0)
+
+            def series_values(column: str) -> list:
+                values = df[column]
+                # Defensive fallback: duplicated/tuple columns can make pandas
+                # return a DataFrame here; candles need a one-dimensional list.
+                if isinstance(values, pd.DataFrame):
+                    values = values.iloc[:, 0]
+                return values.tolist()
+
             return {
                 "symbol": symbol,
                 "resolution": resolution,
                 "timestamps": [int(t.timestamp()) for t in df.index],
-                "open": df["Open"].tolist(),
-                "high": df["High"].tolist(),
-                "low": df["Low"].tolist(),
-                "close": df["Close"].tolist(),
-                "volume": df["Volume"].tolist(),
+                "open": series_values("Open"),
+                "high": series_values("High"),
+                "low": series_values("Low"),
+                "close": series_values("Close"),
+                "volume": series_values("Volume"),
             }
         except Exception as e:
             log.warning(f"yfinance fallback failed for {symbol}: {e}")
