@@ -41,7 +41,7 @@ def _with_retry(fn):
                 raise
 
 
-def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier: str = "high") -> str:
+def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier: str = "high", purpose: str = None) -> str:
     """
     Call the LLM.
     tier="high"   — LLM_PROVIDER/LLM_MODEL (Sonnet for critical decisions)
@@ -62,7 +62,7 @@ def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier
         "openai": lambda: _call_openai(system_prompt, user_prompt, json_mode, model),
         "anthropic": lambda: _call_anthropic(system_prompt, user_prompt, model),
         "mistral": lambda: _call_mistral(system_prompt, user_prompt, json_mode, model),
-        "ollama": lambda: _call_ollama(system_prompt, user_prompt, model),
+        "ollama": lambda: _call_ollama(system_prompt, user_prompt, model, purpose=purpose or "unlabeled"),
     }
     if provider not in dispatch:
         raise ValueError(f"Unknown LLM provider: {provider}")
@@ -140,7 +140,7 @@ def _call_mistral(system_prompt: str, user_prompt: str, json_mode: bool, model: 
     return _with_retry(lambda: client.chat.complete(**kwargs).choices[0].message.content)
 
 
-def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str:
+def _call_ollama(system_prompt: str, user_prompt: str, model: str = None, purpose: str = "unlabeled") -> str:
     import requests
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
@@ -167,8 +167,9 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
     }
 
     log.info(
-        "Ollama request starting: model=%s base_url=%s timeout=%ss prompt_chars=%s "
+        "Ollama request starting: purpose=%s model=%s base_url=%s timeout=%ss prompt_chars=%s "
         "system_chars=%s user_chars=%s approx_tokens=%s",
+        purpose,
         model,
         base_url,
         timeout,
@@ -177,6 +178,17 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
         user_chars,
         approx_tokens,
     )
+    chunk_threshold = int(os.getenv("OLLAMA_CHUNK_WARN_TOKENS", "8000"))
+    if approx_tokens > chunk_threshold:
+        log.warning(
+            "Ollama oversized prompt: purpose=%s model=%s approx_tokens=%s prompt_chars=%s "
+            "threshold=%s — chunking candidate",
+            purpose,
+            model,
+            approx_tokens,
+            total_chars,
+            chunk_threshold,
+        )
     started = time.monotonic()
 
     try:
@@ -185,7 +197,8 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
         resp.raise_for_status()
         content = resp.json()["message"]["content"]
         log.info(
-            "Ollama request completed: model=%s elapsed=%.1fs response_chars=%s",
+            "Ollama request completed: purpose=%s model=%s elapsed=%.1fs response_chars=%s",
+            purpose,
             model,
             elapsed,
             len(content or ""),
@@ -196,9 +209,10 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None) -> str
         fallback_model = os.getenv("OLLAMA_FALLBACK_MODEL", "claude-haiku-4-5")
         fallback_provider = os.getenv("OLLAMA_FALLBACK_PROVIDER", "anthropic")
         log.warning(
-            "Ollama failed after %.1fs: model=%s prompt_chars=%s approx_tokens=%s error=%s; "
+            "Ollama failed after %.1fs: purpose=%s model=%s prompt_chars=%s approx_tokens=%s error=%s; "
             "falling back to %s/%s",
             elapsed,
+            purpose,
             model,
             total_chars,
             approx_tokens,
@@ -260,6 +274,7 @@ def parse_json_response(text: str) -> dict:
             f"Extract JSON from this response:\n\n{text[:2000]}",
             json_mode=True,
             tier="low",
+            purpose="json_repair",
         )
         repair_text = repair_raw.strip()
         if repair_text.startswith("```"):

@@ -475,7 +475,7 @@ def run_maintenance_review(position_data: dict, profile: dict, tier: str = "high
     }
 
     try:
-        raw = call_llm(system_prompt, prompt, json_mode=True, tier=tier)
+        raw = call_llm(system_prompt, prompt, json_mode=True, tier=tier, purpose=f"pm_maintenance:{profile.get('name', 'unknown')}:{symbol}")
         result = parse_json_response(raw)
     except Exception as exc:
         log.error("Maintenance Review LLM call failed for %s: %s", symbol, exc)
@@ -623,7 +623,7 @@ def run_reversal_close_review(position_data: dict, trigger_info: dict, profile: 
     }
 
     try:
-        raw = call_llm(system_prompt, prompt, json_mode=True, tier=tier)
+        raw = call_llm(system_prompt, prompt, json_mode=True, tier=tier, purpose=f"pm_reversal:{profile.get('name', 'unknown')}:{symbol}")
         result = parse_json_response(raw)
     except Exception as exc:
         log.error("Reversal/Close Review LLM call failed for %s: %s", symbol, exc)
@@ -2006,7 +2006,7 @@ Make your trading decisions for this cycle.
 NOTE: Open positions are managed by the two-tier review system. Only consider NEW entries here.
 """
 
-    raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier)
+    raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier, purpose=f"pm_entry:{profile_id}")
     result = parse_json_response(raw)
 
     # Apply behavioral parameters to decisions

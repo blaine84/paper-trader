@@ -1000,7 +1000,7 @@ def generate_narrative(deterministic_summary: dict, tier: str = "medium") -> dic
     # --- Phase 1: Diagnostic ---
     diagnostic = {}
     try:
-        raw = call_llm(_DIAGNOSTIC_PROMPT, user_prompt, tier=tier)
+        raw = call_llm(_DIAGNOSTIC_PROMPT, user_prompt, tier=tier, purpose="daily_review:diagnostic")
         diagnostic = parse_json_response(raw)
         logger.info("Daily review phase 1 (diagnostic) complete")
     except Exception as e:
@@ -1009,7 +1009,7 @@ def generate_narrative(deterministic_summary: dict, tier: str = "medium") -> dic
     # --- Phase 2: Analysis ---
     analysis = {}
     try:
-        raw = call_llm(_ANALYSIS_PROMPT, user_prompt, tier=tier)
+        raw = call_llm(_ANALYSIS_PROMPT, user_prompt, tier=tier, purpose="daily_review:analysis")
         analysis = parse_json_response(raw)
         logger.info("Daily review phase 2 (analysis) complete")
     except Exception as e:

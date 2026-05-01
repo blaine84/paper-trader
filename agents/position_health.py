@@ -127,7 +127,7 @@ Assess the health of each position. Flag any that are deteriorating.
 """
 
     try:
-        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
+        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose="position_health")
         result = parse_json_response(raw)
     except Exception as e:
         log.error(f"Position health LLM error: {e}")

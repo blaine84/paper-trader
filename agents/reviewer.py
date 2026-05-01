@@ -197,7 +197,7 @@ RECENT CASE LIBRARY EXAMPLES (for reference):
 Extract structured cases for each trade. Return the JSON.
 """
 
-    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True)
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, purpose="reviewer_trade")
     result = parse_json_response(raw)
 
     # Store cases in the case library
@@ -472,7 +472,7 @@ Extract structured cases.
 """
 
     try:
-        raw = call_llm(system, user, json_mode=True)
+        raw = call_llm(system, user, json_mode=True, purpose="reviewer_daily_feedback")
         result = parse_json_response(raw)
 
         for case_data in result.get("cases", []):

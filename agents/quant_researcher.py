@@ -307,7 +307,7 @@ Only propose strategies backed by at least 3 similar cases with >50% win rate.
 If no new strategies are warranted, return "proposed_strategies": [].
 """
 
-    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose="quant_researcher")
     result = parse_json_response(raw)
     result["timestamp"] = datetime.utcnow().isoformat()
 

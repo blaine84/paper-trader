@@ -194,7 +194,7 @@ Respond in JSON:
     try:
         raw = call_llm(
             "You are a trade thesis validator. Be strict — if in doubt, say invalid.",
-            prompt, json_mode=True, tier="medium"
+            prompt, json_mode=True, tier="medium", purpose=f"position_timer_revalidation:{trade.symbol}"
         )
         result = parse_json_response(raw)
         valid = result.get("valid", False)

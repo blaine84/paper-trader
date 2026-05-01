@@ -154,7 +154,7 @@ Use the case library to bias toward setup types with proven win rates.
 Find the best 1-3 additional stocks worth day trading today.
 """
 
-    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low")
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low", purpose="scout_daily")
     result = parse_json_response(raw)
 
     picks = result.get("picks", [])

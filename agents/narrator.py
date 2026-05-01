@@ -127,7 +127,7 @@ def run(engine, update_type: str, event_context: dict = None) -> dict:
     try:
         system_prompt = build_system_prompt(update_type)
         user_prompt = build_user_prompt(update_type, context)
-        narrative = call_llm(system_prompt, user_prompt, tier="medium")
+        narrative = call_llm(system_prompt, user_prompt, tier="medium", purpose=f"narrator:{update_type}")
     except Exception as e:
         logger.error(f"LLM generation failed for {update_type}: {e}", exc_info=True)
         narrative = ""

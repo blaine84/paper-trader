@@ -375,7 +375,7 @@ def check_llm_connectivity():
 
     # High tier
     try:
-        result = call_llm("You are a test.", probe, tier="high")
+        result = call_llm("You are a test.", probe, tier="high", purpose="startup_probe:high")
         console.print(f"   [green]✓ LLM high tier OK[/green] ({os.getenv('LLM_PROVIDER')} / {os.getenv('LLM_MODEL')})")
     except Exception as e:
         console.print(f"   [red]✗ LLM high tier FAILED: {e}[/red]")
@@ -384,7 +384,7 @@ def check_llm_connectivity():
     # Low tier (only if configured separately)
     if os.getenv("LLM_LOW_PROVIDER"):
         try:
-            result = call_llm("You are a test.", probe, tier="low")
+            result = call_llm("You are a test.", probe, tier="low", purpose="startup_probe:low")
             console.print(f"   [green]✓ LLM low tier OK[/green] ({os.getenv('LLM_LOW_PROVIDER')} / {os.getenv('LLM_LOW_MODEL')})")
         except Exception as e:
             console.print(f"   [yellow]⚠ LLM low tier FAILED: {e} (will use fallback)[/yellow]")

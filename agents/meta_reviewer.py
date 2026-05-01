@@ -254,7 +254,7 @@ Identify what's working, what's degrading, and what needs to change.
 Suggest specific code refactors and feature additions that would improve the system.
 """
 
-    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True)
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, purpose="meta_reviewer")
     result = parse_json_response(raw)
     result["generated_at"] = datetime.utcnow().isoformat()
 

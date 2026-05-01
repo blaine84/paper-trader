@@ -119,7 +119,7 @@ RECENT SELECTION FEEDBACK:
 Build the weekly watchlist and thesis for each symbol.
 """
 
-    raw = call_llm(SCOUT_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low")
+    raw = call_llm(SCOUT_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low", purpose="weekly_prep:scout")
     return parse_json_response(raw)
 
 
@@ -166,7 +166,7 @@ M&A / CORPORATE:
 
 Write the weekly briefing.
 """
-    raw = call_llm(RESEARCHER_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low")
+    raw = call_llm(RESEARCHER_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low", purpose="weekly_prep:researcher")
     return parse_json_response(raw)
 
 
@@ -277,7 +277,7 @@ CASE LIBRARY SAMPLE (last 20):
 
 Produce the weekly retrospective.
 """
-    raw = call_llm(REVIEWER_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low")
+    raw = call_llm(REVIEWER_WEEKLY_PROMPT, user_prompt, json_mode=True, tier="low", purpose="weekly_prep:reviewer")
     return parse_json_response(raw)
 
 
@@ -334,7 +334,7 @@ YOUR RECENT EXECUTION FEEDBACK:
 
 Set your stance for the coming week.
 """
-        raw = call_llm(PM_STANCE_PROMPT, user_prompt, json_mode=True)
+        raw = call_llm(PM_STANCE_PROMPT, user_prompt, json_mode=True, purpose=f"weekly_prep:pm_stance:{profile_id}")
         stance = parse_json_response(raw)
         stance["profile"] = profile_id
         stances[profile_id] = stance
