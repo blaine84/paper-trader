@@ -94,7 +94,7 @@ The system runs 10 agents on a market-hours schedule. Each agent has a single jo
 No agent does another agent's job.
 
 ```
-8:30 AM ──► Scout ──► Researcher ──► Quant Researcher ──► Analyst
+8:30 AM ──► Scout ──► Researcher ──► Quant Researcher ──► Pipeline Eval ──► Analyst
                                                               │
 9:30 AM ──► Price Monitor (every 60s) ◄──────────────────────┘
             │                                                  │
@@ -222,8 +222,28 @@ right agents. Scores are split — see [Understanding the Scores](#understanding
 Evaluates which strategies have edge in current market conditions. Cross-references
 the strategy library against the case library and backtest results. Runs the
 backtester automatically every 3 days. Can propose new dynamic strategies based
-on patterns in the case data — strategies that underperform after 10+ trades are
-automatically retired.
+on patterns in the case data.
+
+**Strategy Lifecycle Pipeline** — proposed strategies no longer go straight to
+active trading. Instead they enter a staged deployment pipeline:
+
+```
+propose_strategy() → Backtest → Paper Trade (7d) → Live 50% (7d) → Live 100%
+```
+
+| Stage | Gate Criteria | On Failure |
+|---|---|---|
+| Backtest | ≥50 trades AND win_rate > 55% | → `backtest_failed` + escalation |
+| Paper Trade | 7 days AND win_rate > 55% | → `backtest_failed` + escalation |
+| Live 50% | 7 days AND win_rate > 55% | → `backtest_failed` + escalation |
+| Live 100% | Terminal stage | Retirement via `update_strategy_stats()` if win_rate < 35% |
+
+The pipeline evaluation runs automatically during the pre-market orchestrator
+cycle. Failed strategies generate an AgentMemory escalation record so the Quant
+Researcher can investigate and iterate.
+
+Key modules: `strategy_backtester.py` (backtest execution), `deployment_pipeline.py`
+(gate evaluation and stage transitions).
 
 ### ⚡ Price Monitor
 Runs every 60 seconds during market hours using yfinance (free, no rate limit).
@@ -484,7 +504,12 @@ Meta Reviewer (weekly)
 Quant Researcher
   ├── proposes new strategies from case patterns
   ├── tracks dynamic strategy win rates
-  └── retires strategies that underperform
+  ├── retires strategies that underperform
+  └── strategy lifecycle pipeline:
+        propose → backtest → paper_trade (7d) → live_50 (7d) → live_100
+        Each gate: win_rate > 55%. Failures → backtest_failed + escalation.
+        Pipeline evaluation runs in pre-market orchestrator cycle.
+        Modules: strategy_backtester.py, deployment_pipeline.py
 ```
 
 **Selection score** — was the setup correctly identified? Did the Analyst's read
@@ -672,6 +697,7 @@ The full lifecycle of a trade from signal to exit:
 12. LEARNING (weekly)
     Meta Reviewer grades all agents A–F
     Quant Researcher proposes/retires dynamic strategies
+    Strategy pipeline evaluates stages (backtest → paper → live 50% → live 100%)
     Backtester validates strategy edge on historical data
     All feedback written to agent_memory → agents read next cycle
 ```
@@ -756,7 +782,7 @@ All times Eastern (ET), Monday–Friday.
 |---|---|
 | **Sunday 5:00 PM** | Weekly prep + Meta Reviewer (grades agents, suggests improvements) |
 | **Sunday 5:15 PM** | 📝 Narrator: Sunday prep narrative |
-| 8:30 AM | Scout → Researcher → Quant Researcher → Analyst |
+| 8:30 AM | Scout → Researcher → Quant Researcher → Pipeline Evaluation → Analyst |
 | After pre-market | 📝 Narrator: Morning briefing |
 | 9:30 AM | Market opens, price monitor starts (every 60s), position timer starts (every 5 min) |
 | 9:30–12:00 | PM decisions every 15 min, Analyst refresh every 15 min |
@@ -820,6 +846,11 @@ python backtest.py --strategy gap_and_go   # single strategy
 python backtest.py --export results.csv    # export to CSV
 ```
 Rule-based backtest using the same technical indicators as the Analyst. The Quant Researcher also runs this automatically every 3 days and feeds results into its strategy recommendations.
+
+The `StrategyBacktester` class (`strategy_backtester.py`) extends this for dynamic
+strategies — it evaluates a strategy's `ideal_conditions` against historical candles,
+simulates ATR-based trades, and produces a structured `BacktestReport` with trade log
+and summary statistics. This is the first gate in the strategy lifecycle pipeline.
 
 ### On-demand signal refresh (Linux/Pi only)
 ```bash
@@ -1083,7 +1114,7 @@ SQLite at `db/paper_trader.db`. Back it up periodically.
 | `agent_memory` | Shared notes between agents (signals, feedback, meta reviews) |
 | `daily_log` | End-of-day summaries |
 | `cases` | The case library — structured trade lessons |
-| `dynamic_strategies` | Agent-proposed strategies with win rate tracking |
+| `dynamic_strategies` | Agent-proposed strategies with pipeline lifecycle tracking (status, pipeline_stage, stage dates, failure metadata) |
 | `review_queue` | Trades pending review (auto-queued on close) |
 
 ### Quick backup

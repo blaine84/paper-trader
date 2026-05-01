@@ -13,6 +13,7 @@ A multi-agent paper trading system for day trading SPY, QQQ, IWM, TSLA, NVDA, AM
 | 📋 Bookkeeper | Tracks positions, P&L, stop losses, daily summaries |
 | 🔍 Reviewer | Scores closed trades, extracts lessons, feeds back |
 | 📝 Narrator | Bloomberg-style desk commentary throughout the day (read-only) |
+| 🔬 Quant Researcher | Proposes dynamic strategies, runs backtester, retires underperformers |
 | 🎯 Orchestrator | Runs the market-hours loop via APScheduler |
 
 ### Core Modules (Tier 1)
@@ -55,6 +56,28 @@ Two event-driven news checks supplement the scheduled News Monitor:
 See the [User Guide](USER_GUIDE.md#catalyst-freshness-utilscatalyst_freshnesspy) for
 the full data flow diagram, freshness thresholds, confidence mapping, and error isolation details.
 
+### Strategy Lifecycle Pipeline
+
+Dynamic strategies proposed by the Quant Researcher go through a staged deployment
+pipeline before reaching live trading:
+
+```
+propose_strategy() → Backtest → Paper Trade (7d) → Live 50% (7d) → Live 100%
+```
+
+Each gate requires win_rate > 55% to advance. Failures revert to `backtest_failed`
+and the Quant Researcher is notified for iteration. The pipeline runs automatically
+during the pre-market orchestrator cycle.
+
+| Stage | Status | Position Size | Gate |
+|---|---|---|---|
+| Backtest | `backtest` | — | ≥50 trades, >55% win rate |
+| Paper Trade | `paper_trade` | — | 7 days, >55% win rate |
+| Live 50% | `live_50` | 0.5× | 7 days, >55% win rate |
+| Live 100% | `live_100` | 1.0× | Terminal stage |
+
+Key modules: `strategy_backtester.py`, `deployment_pipeline.py`
+
 ## Feedback Loop
 
 Reviewer → lessons/feedback → AgentMemory DB → Analyst + PM read before deciding
@@ -90,7 +113,7 @@ python orchestrator.py once
 ```
 
 ## Schedule (ET)
-- **8:30 AM** — Pre-market: Scout scans, Researcher + Analyst prep
+- **8:30 AM** — Pre-market: Scout scans, Researcher + Analyst prep, Pipeline evaluation
 - **9:30–4:00 PM** — Intraday: every 15 min (configurable)
 - **Every 15 min** — Price-spike news check (fetches news for symbols with unusual moves)
 - **Every 30 min** — Position news poll (fetches news for symbols with open positions)
@@ -116,6 +139,7 @@ Tables:
 - `positions` — current open positions
 - `balance` — cash balance history
 - `agent_memory` — shared notes between agents (signals, lessons, feedback)
+- `dynamic_strategies` — agent-proposed strategies with pipeline lifecycle tracking
 - `daily_log` — end-of-day summaries
 
 ## Config (.env)
