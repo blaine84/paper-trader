@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timedelta
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
-from db.schema import AgentMemory, Position, Balance, Trade, get_session
+from db.schema import AgentMemory, Position, Balance, Trade, DynamicStrategy, get_session
 from utils.trade_events import log_trade_event
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.case_library import get_relevant_cases, format_cases_for_prompt, get_win_rate_by_setup
@@ -1076,6 +1076,33 @@ def detect_drifting(db, trade) -> bool:
     return latest_signal is None
 
 
+def get_strategy_position_multiplier(engine, strategy_key: str) -> float:
+    """Return position size multiplier based on pipeline stage.
+
+    Queries the DynamicStrategy table for the given key.  Hardcoded strategies
+    (not present in the table) always get a 1.0 multiplier.
+
+    Returns:
+        0.5 for live_50 strategies
+        1.0 for live_100 strategies (and hardcoded)
+        0.0 for strategies not yet in live stages (should not be called)
+    """
+    db = get_session(engine)
+    try:
+        strategy = db.query(DynamicStrategy).filter_by(key=strategy_key).first()
+        if strategy is None:
+            # Not a dynamic strategy — treat as hardcoded → full allocation
+            return 1.0
+        if strategy.status == "live_50":
+            return 0.5
+        if strategy.status == "live_100":
+            return 1.0
+        # Strategy exists but is not in a live stage
+        return 0.0
+    finally:
+        db.close()
+
+
 def execute_trade(db, decision: dict, profile_id: str):
     """
     Apply a trade decision to the paper portfolio.
@@ -1300,6 +1327,34 @@ def execute_trade(db, decision: dict, profile_id: str):
         scaled_size = max(1, int(quantity * edge))
         quantity = int(cap_position_size(scaled_size, base_quantity))
         decision["quantity"] = quantity
+
+        # --- 5b. Apply pipeline stage position multiplier ---
+        try:
+            strategy_key = (
+                decision.get("strategy_key")
+                or decision.get("setup_type")
+                or decision.get("setup")
+                or signal_for_symbol.get("setup_type")
+                or ""
+            )
+            if strategy_key:
+                multiplier = get_strategy_position_multiplier(db.bind, strategy_key)
+                if multiplier < 1.0 and multiplier > 0:
+                    pre_mult_qty = quantity
+                    quantity = max(1, int(quantity * multiplier))
+                    decision["quantity"] = quantity
+                    log.info(
+                        "Pipeline multiplier applied for %s: %.1f × %d → %d",
+                        strategy_key, multiplier, pre_mult_qty, quantity,
+                    )
+                elif multiplier == 0.0:
+                    log.warning(
+                        "Strategy %s not in a live stage (multiplier=0.0), rejecting trade",
+                        strategy_key,
+                    )
+                    return False, f"Strategy {strategy_key} not in a live pipeline stage"
+        except Exception as exc:
+            log.warning("Pipeline multiplier lookup error (proceeding without scaling): %s", exc)
 
         # --- 6. Adaptive risk throttling (fail-open) ---
         try:

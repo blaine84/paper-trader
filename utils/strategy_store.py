@@ -10,16 +10,22 @@ from models.strategies import STRATEGIES, SETUP_TYPE_MAP
 
 
 def get_all_strategies(engine) -> dict:
-    """Return merged dict of hardcoded + active dynamic strategies."""
+    """Return merged dict of hardcoded + live dynamic strategies.
+
+    Hardcoded strategies are always included with source="hardcoded".
+    Dynamic strategies are included only when status is 'live_50' or 'live_100'.
+    """
     all_strats = {}
 
-    # Hardcoded
+    # Hardcoded — always included, unchanged
     for key, strat in STRATEGIES.items():
         all_strats[key] = {**strat, "source": "hardcoded"}
 
-    # Dynamic (active only)
+    # Dynamic — only live_50 and live_100 strategies
     db = get_session(engine)
-    dynamic = db.query(DynamicStrategy).filter_by(status="active").all()
+    dynamic = db.query(DynamicStrategy).filter(
+        DynamicStrategy.status.in_(["live_50", "live_100"])
+    ).all()
     for d in dynamic:
         all_strats[d.key] = {
             "name": d.name,
@@ -33,9 +39,35 @@ def get_all_strategies(engine) -> dict:
             "total_trades": d.total_trades,
             "source": "dynamic",
             "status": d.status,
+            "pipeline_stage": d.pipeline_stage,
         }
     db.close()
     return all_strats
+
+
+def get_pipeline_strategies(engine, stage: str = None) -> list[DynamicStrategy]:
+    """Query DynamicStrategy records by pipeline stage for evaluation.
+
+    Args:
+        engine: SQLAlchemy engine instance.
+        stage: Pipeline stage to filter by (backtest, paper_trade, live_50, live_100).
+               If None, returns all strategies in any pipeline stage.
+
+    Returns:
+        List of DynamicStrategy records matching the stage filter.
+    """
+    pipeline_stages = ["backtest", "paper_trade", "live_50", "live_100"]
+    db = get_session(engine)
+    if stage is not None:
+        strategies = db.query(DynamicStrategy).filter(
+            DynamicStrategy.status == stage
+        ).all()
+    else:
+        strategies = db.query(DynamicStrategy).filter(
+            DynamicStrategy.status.in_(pipeline_stages)
+        ).all()
+    db.close()
+    return strategies
 
 
 def get_all_setup_types(engine) -> list[str]:
@@ -61,9 +93,12 @@ def propose_strategy(engine, strategy_data: dict) -> DynamicStrategy:
     if existing:
         # Update if retired, skip if active
         if existing.status == "retired":
-            existing.status = "probation"
+            existing.status = "backtest"
+            existing.pipeline_stage = "backtest"
             existing.retired_at = None
             existing.retire_reason = None
+            existing.failure_stage = None
+            existing.failure_reason = None
             existing.description = strategy_data.get("description", existing.description)
             db.commit()
             db.close()
@@ -81,7 +116,8 @@ def propose_strategy(engine, strategy_data: dict) -> DynamicStrategy:
         failure_conditions=json.dumps(strategy_data.get("failure_conditions", [])),
         execution_notes=json.dumps(strategy_data.get("execution_notes", [])),
         proposed_by=strategy_data.get("proposed_by", "quant_researcher"),
-        status="active",
+        status="backtest",
+        pipeline_stage="backtest",
     )
     db.add(strat)
     db.commit()
@@ -100,7 +136,7 @@ def update_strategy_stats(engine):
 
     db = get_session(engine)
     dynamic = db.query(DynamicStrategy).filter(
-        DynamicStrategy.status.in_(["active", "probation"])
+        DynamicStrategy.status.in_(["active", "probation", "backtest", "paper_trade", "live_50", "live_100"])
     ).all()
 
     for strat in dynamic:
@@ -117,11 +153,15 @@ def update_strategy_stats(engine):
         strat.win_rate = round(wins / total * 100, 1) if total else None
         strat.avg_pnl_pct = round(avg_pnl, 2)
 
-        # Retire if enough data and consistently losing
+        # Retire if enough data and consistently losing.
+        # Only retire strategies that have reached live stages (live_50 or live_100)
+        # or legacy statuses (active, probation). Strategies still in early pipeline
+        # stages (backtest, paper_trade) are managed by the deployment pipeline.
         if total >= 10 and strat.win_rate < 35 and avg_pnl < 0:
-            strat.status = "retired"
-            strat.retired_at = datetime.utcnow()
-            strat.retire_reason = f"Win rate {strat.win_rate}% with avg P&L {avg_pnl:.2f}% over {total} trades"
+            if strat.status in ("active", "probation", "live_50", "live_100"):
+                strat.status = "retired"
+                strat.retired_at = datetime.utcnow()
+                strat.retire_reason = f"Win rate {strat.win_rate}% with avg P&L {avg_pnl:.2f}% over {total} trades"
 
     db.commit()
     db.close()

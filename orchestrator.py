@@ -157,6 +157,17 @@ def run_pre_market():
     except Exception as e:
         log.error(f"Quant Researcher error: {e}", exc_info=True)
 
+    # Pipeline evaluation — evaluate all dynamic strategies in pipeline stages
+    try:
+        console.print("[bold magenta]🔄 Pipeline: evaluating strategy stages...[/bold magenta]")
+        pipeline_results = run_pipeline_evaluation()
+        for r in pipeline_results:
+            log.info(f"Pipeline: {r['strategy_key']} @ {r['stage']} → {r['decision']} ({r['reason']})")
+        if not pipeline_results:
+            log.info("Pipeline: no strategies in pipeline stages")
+    except Exception as e:
+        log.error(f"Pipeline evaluation error: {e}", exc_info=True)
+
     # Analyst
     try:
         console.print("[bold blue]📊 Analyst running...[/bold blue]")
@@ -182,6 +193,73 @@ def run_pre_market():
         narrator.run(engine, "morning_briefing")
     except Exception as e:
         log.error(f"Narrator morning briefing error: {e}", exc_info=True)
+
+
+def run_pipeline_evaluation():
+    """Pre-market: evaluate all strategies in pipeline stages.
+
+    1. Trigger backtests for new proposals (status=backtest, no report yet).
+    2. Run the full pipeline evaluation for all strategies in pipeline stages.
+    """
+    from deployment_pipeline import (
+        run_pipeline_evaluation as evaluate,
+        evaluate_backtest_gate,
+        apply_gate_result,
+    )
+    from strategy_backtester import StrategyBacktester
+    from db.schema import get_session, DynamicStrategy
+
+    engine = get_engine()
+
+    # --- Phase 1: trigger backtests for pending proposals ---
+    db = get_session(engine)
+    try:
+        pending = (
+            db.query(DynamicStrategy)
+            .filter(
+                DynamicStrategy.status == "backtest",
+                (DynamicStrategy.backtest_report_id == None) | (DynamicStrategy.backtest_report_id == ""),  # noqa: E711
+            )
+            .all()
+        )
+        # Detach so we can close the session before long-running backtests
+        for s in pending:
+            db.expunge(s)
+    finally:
+        db.close()
+
+    for strategy in pending:
+        try:
+            log.info(f"Pipeline: triggering backtest for '{strategy.key}'")
+            backtester = StrategyBacktester(engine)
+            report = backtester.run(strategy)
+
+            # Update the strategy's backtest_report_id
+            memory_key = f"backtest_report_{strategy.key}"
+            db = get_session(engine)
+            try:
+                strat = db.query(DynamicStrategy).filter_by(id=strategy.id).first()
+                if strat:
+                    strat.backtest_report_id = memory_key
+                    db.commit()
+            finally:
+                db.close()
+
+            # Evaluate the backtest gate and apply the result
+            gate_result = evaluate_backtest_gate(report)
+            apply_gate_result(engine, strategy, gate_result)
+
+            log.info(
+                f"Pipeline: backtest for '{strategy.key}' → {gate_result.decision} ({gate_result.reason})"
+            )
+        except Exception as e:
+            log.error(f"Pipeline: backtest failed for '{strategy.key}': {e}", exc_info=True)
+
+    # --- Phase 2: evaluate all strategies in pipeline stages ---
+    results = evaluate(engine)
+    for r in results:
+        log.info(f"Pipeline: {r['strategy_key']} @ {r['stage']} → {r['decision']} ({r['reason']})")
+    return results
 
 
 def run_analyst_refresh():

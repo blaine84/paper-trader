@@ -153,16 +153,31 @@ def build_strategy_context(engine, market_regime: str = None) -> str:
     if avoid:
         lines.append(f"\nAvoid today: {', '.join(avoid)}")
 
-    # Include active dynamic strategies
-    from utils.strategy_store import get_all_strategies
+    # Include dynamic strategies across all pipeline stages
+    from utils.strategy_store import get_all_strategies, get_pipeline_strategies
     all_strats = get_all_strategies(engine)
-    dynamic = [k for k, v in all_strats.items() if v.get("source") == "dynamic"]
-    if dynamic:
-        lines.append("\nAgent-proposed strategies (active):")
-        for key in dynamic:
+    live_dynamic = [k for k, v in all_strats.items() if v.get("source") == "dynamic"]
+    if live_dynamic:
+        lines.append("\nAgent-proposed strategies (live):")
+        for key in live_dynamic:
             s = all_strats[key]
+            stage = s.get("pipeline_stage", s.get("status", "?"))
             wr = f"{s['win_rate_documented']:.0f}%" if s.get('win_rate_documented') else "new"
-            lines.append(f"  📌 {s['name']} ({key}) — {s['description'][:80]} [{wr}, {s.get('total_trades', 0)} trades]")
+            lines.append(f"  📌 {s['name']} ({key}) — stage: {stage} [{wr}, {s.get('total_trades', 0)} trades]")
+
+    # Show strategies still in pipeline (backtest, paper_trade) for full visibility
+    pipeline_strats = get_pipeline_strategies(engine)
+    in_pipeline = [s for s in pipeline_strats if s.status in ("backtest", "paper_trade")]
+    if in_pipeline:
+        stage_labels = {
+            "backtest": "🔬 backtesting",
+            "paper_trade": "📝 paper trading",
+        }
+        lines.append("\nAgent-proposed strategies (in pipeline):")
+        for s in in_pipeline:
+            label = stage_labels.get(s.status, s.status)
+            wr = f"{s.win_rate:.0f}%" if s.win_rate else "pending"
+            lines.append(f"  {label} {s.name} ({s.key}) — {(s.description or '')[:80]} [{wr}, {s.total_trades or 0} trades]")
 
     return "\n".join(lines)
 

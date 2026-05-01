@@ -163,7 +163,7 @@ class DynamicStrategy(Base):
     failure_conditions = Column(Text)            # JSON
     execution_notes = Column(Text)               # JSON
     proposed_by = Column(String(32), default="quant_researcher")
-    status = Column(String(16), default="active")  # active | retired | probation
+    status = Column(String(16), default="active")  # active | retired | probation | backtest | paper_trade | live_50 | live_100 | backtest_failed
     total_trades = Column(Integer, default=0)
     wins = Column(Integer, default=0)
     win_rate = Column(Float, nullable=True)
@@ -171,6 +171,14 @@ class DynamicStrategy(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     retired_at = Column(DateTime, nullable=True)
     retire_reason = Column(Text, nullable=True)
+    # Pipeline tracking columns
+    pipeline_stage = Column(String(16), nullable=True)        # backtest | paper_trade | live_50 | live_100
+    backtest_report_id = Column(String(128), nullable=True)   # AgentMemory key reference
+    paper_trade_start_date = Column(DateTime, nullable=True)
+    live_50_start_date = Column(DateTime, nullable=True)
+    live_100_start_date = Column(DateTime, nullable=True)
+    failure_stage = Column(String(16), nullable=True)         # which stage caused failure
+    failure_reason = Column(Text, nullable=True)              # human-readable reason
 
 
 class DailyLog(Base):
