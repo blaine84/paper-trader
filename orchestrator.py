@@ -28,6 +28,7 @@ import agents.scout as scout
 import agents.weekly_prep as weekly_prep
 import agents.quant_researcher as quant_researcher
 import agents.daily_review as daily_review
+import agents.ceo as ceo
 
 console = Console()
 logging.basicConfig(
@@ -331,6 +332,30 @@ def run_daily_review():
             notifier.send_afternoon_report(engine)
     except Exception as e:
         log.error(f"Slack afternoon report error: {e}", exc_info=True)
+
+
+def run_ceo_daily():
+    """4:45 PM ET — CEO daily operating memo."""
+    log.info("=== CEO DAILY MEMO ===")
+    engine = get_engine()
+    try:
+        console.print("[bold magenta]🧭 CEO: daily operating memo...[/bold magenta]")
+        memo = ceo.run(engine, period="daily")
+        log.info(f"CEO daily: constraint={memo.get('biggest_constraint', '')[:200]}")
+    except Exception as e:
+        log.error(f"CEO daily memo error: {e}", exc_info=True)
+
+
+def run_ceo_weekly():
+    """Friday 4:50 PM ET — CEO weekly strategy memo."""
+    log.info("=== CEO WEEKLY STRATEGY MEMO ===")
+    engine = get_engine()
+    try:
+        console.print("[bold magenta]🧭 CEO: weekly strategy memo...[/bold magenta]")
+        memo = ceo.run(engine, period="weekly")
+        log.info(f"CEO weekly: constraint={memo.get('biggest_constraint', '')[:200]}")
+    except Exception as e:
+        log.error(f"CEO weekly memo error: {e}", exc_info=True)
 
 
 def run_once():
@@ -755,6 +780,24 @@ def main():
         id="daily_review",
     )
 
+    # CEO daily memo: 4:45 PM ET, Mon-Thu. Friday gets the deeper weekly memo.
+    scheduler.add_job(
+        run_ceo_daily,
+        CronTrigger(day_of_week="mon-thu", hour=16, minute=45, timezone="America/New_York"),
+        id="ceo_daily",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # CEO weekly strategy memo: Friday after close and daily review.
+    scheduler.add_job(
+        run_ceo_weekly,
+        CronTrigger(day_of_week="fri", hour=16, minute=50, timezone="America/New_York"),
+        id="ceo_weekly",
+        max_instances=1,
+        coalesce=True,
+    )
+
     # Sunday weekly prep: 5:00 PM ET
     scheduler.add_job(
         run_weekly_prep,
@@ -844,5 +887,15 @@ if __name__ == "__main__":
         engine = get_engine()
         ensure_initial_balance(engine)
         run_weekly_prep()
+    elif len(sys.argv) > 1 and sys.argv[1] == "ceo-daily":
+        engine = get_engine()
+        ensure_initial_balance(engine)
+        check_schema(engine)
+        run_ceo_daily()
+    elif len(sys.argv) > 1 and sys.argv[1] == "ceo-weekly":
+        engine = get_engine()
+        ensure_initial_balance(engine)
+        check_schema(engine)
+        run_ceo_weekly()
     else:
         main()

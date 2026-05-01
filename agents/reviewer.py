@@ -12,6 +12,7 @@ from utils.llm import call_llm, parse_json_response
 from utils.case_library import store_case, get_win_rate_by_setup, format_cases_for_prompt
 from db.schema import Trade, AgentMemory, get_session
 from feedback_loop.analyst_feedback import queue_reviewer_flags
+from utils.trade_events import log_trade_event
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -206,6 +207,18 @@ Extract structured cases for each trade. Return the JSON.
         if trade:
             trade.review_score = case_data.get("review_score")
             trade.review_notes = case_data.get("lesson")
+            log_trade_event(
+                db, "review_completed", trade_id=trade.id, agent="reviewer",
+                symbol=trade.symbol, profile=trade.profile, price=trade.exit_price,
+                message=case_data.get("lesson"),
+                payload={
+                    "review_score": case_data.get("review_score"),
+                    "selection_score": case_data.get("selection_score"),
+                    "execution_score": case_data.get("execution_score"),
+                    "setup_type": case_data.get("setup_type"),
+                    "outcome": case_data.get("outcome"),
+                },
+            )
     db.commit()
     db.close()
 

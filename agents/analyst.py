@@ -12,6 +12,7 @@ from utils.finnhub_client import FinnhubClient
 from utils.technicals import compute_indicators
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, get_session
+from utils.trade_events import log_trade_event
 from utils.case_library import get_relevant_cases, format_cases_for_prompt
 from agents.quant_researcher import build_strategy_context
 from utils.catalyst_freshness import (
@@ -257,6 +258,12 @@ Produce your trading signal JSON for {sym}.
             key="signal",
             value=json.dumps(signal),
         ))
+        log_trade_event(
+            db2, "signal_seen", agent="analyst", symbol=sym,
+            price=signal.get("entry") or signal.get("entry_price"),
+            message=signal.get("reasoning"),
+            payload=signal,
+        )
     db2.commit()
     db2.close()
     return signals

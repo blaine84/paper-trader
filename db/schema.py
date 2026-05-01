@@ -45,6 +45,23 @@ class Trade(Base):
     invalidators = Column(Text, nullable=True)               # JSON array of invalidator objects
 
 
+
+class TradeEvent(Base):
+    """Normalized audit log for trade lifecycle decisions and outcomes."""
+    __tablename__ = "trade_events"
+
+    id = Column(Integer, primary_key=True)
+    trade_id = Column(Integer, ForeignKey("trades.id"), nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    event_type = Column(String(64), nullable=False)
+    agent = Column(String(64), nullable=True)
+    symbol = Column(String(10), nullable=True)
+    profile = Column(String(16), nullable=True)
+    price = Column(Float, nullable=True)
+    message = Column(Text, nullable=True)
+    payload_json = Column(Text, nullable=True)
+
+
 class Position(Base):
     """Current open positions (long or short)."""
     __tablename__ = "positions"
