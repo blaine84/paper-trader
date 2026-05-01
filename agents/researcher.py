@@ -24,6 +24,7 @@ For each symbol, assess:
 Respond in JSON format:
 {
   "market_context": "brief overall market narrative",
+  "market_regime": "risk_on|risk_off|mixed|unknown",
   "symbols": {
     "SPY": {
       "sentiment": "bullish|bearish|neutral",
@@ -70,6 +71,7 @@ Analyze the above and return your research JSON.
     raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low")
     result = parse_json_response(raw)
     result["market_context"] = result.get("market_context", "")
+    result["market_regime"] = result.get("market_regime", "unknown")
     for sym, data in result.get("symbols", {}).items():
         mem = AgentMemory(
             agent="researcher",
