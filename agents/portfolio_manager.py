@@ -92,6 +92,27 @@ def _extract_minutes(value) -> int | None:
     return None
 
 
+
+
+def _format_execution_audit(executed: list[dict]) -> str:
+    """Human-readable post-validation execution summary for PM notes."""
+    if not executed:
+        return "Execution audit: no executable decisions submitted."
+
+    lines = ["Execution audit:"]
+    for d in executed:
+        action = str(d.get("action") or "?").upper()
+        symbol = d.get("symbol") or "?"
+        qty = d.get("quantity") or 0
+        price = d.get("price") or d.get("entry_price") or 0
+        status = "EXECUTED" if d.get("executed") else "REJECTED"
+        msg = d.get("message") or ""
+        line = f"- {status}: {action} {qty} {symbol} @ ${float(price or 0):.2f}"
+        if msg:
+            line += f" — {msg}"
+        lines.append(line)
+    return "\n".join(lines)
+
 def _is_fast_intraday_trade(decision: dict, signal: dict) -> bool:
     """Return True when the trade is clearly intraday and intended under ~60 minutes."""
     setup_type = (
@@ -2086,20 +2107,26 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
             "profile": profile_id, "source": "entry_logic",
         })
 
-    # Save PM notes
+    # Save PM notes with a post-validation execution audit.  The LLM's
+    # portfolio_notes are written before validation/edge gates finish, so the
+    # audit prevents the dashboard from implying rejected ideas became trades.
     notes = result.get("portfolio_notes", "")
-    if notes:
+    if notes or executed:
+        audit = _format_execution_audit(executed)
+        stored_notes = f"{notes}\n\n{audit}" if notes else audit
         mem = AgentMemory(
             agent=f"pm_{profile_id}",
             symbol=None,
             key="notes",
-            value=notes,
+            value=stored_notes,
         )
         db.add(mem)
         db.commit()
+    else:
+        stored_notes = notes
 
     db.close()
-    return {"decisions": executed, "portfolio_notes": notes, "profile": profile_id}
+    return {"decisions": executed, "portfolio_notes": stored_notes, "profile": profile_id}
 
 
 def run(engine, symbols: list[str]) -> dict:
