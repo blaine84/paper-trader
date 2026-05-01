@@ -187,7 +187,7 @@ Extract behavioral parameter adjustments from this feedback.
 """
 
     try:
-        raw = call_llm(PARAM_EXTRACTION_PROMPT, prompt, json_mode=True, tier="medium")
+        raw = call_llm(PARAM_EXTRACTION_PROMPT, prompt, json_mode=True, tier="medium", purpose="behavioral_params_extract")
         params = parse_json_response(raw)
         # Validate types
         params["entry_offset_pct"] = float(params.get("entry_offset_pct", 0))

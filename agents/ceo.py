@@ -80,7 +80,7 @@ def run(engine, period: str = "daily", send_slack: bool | None = None) -> dict[s
     context = build_context(engine, period)
     prompt = build_prompt(context)
 
-    raw = call_llm(CEO_SYSTEM_PROMPT, prompt, json_mode=True, tier=os.getenv("CEO_LLM_TIER", "high"))
+    raw = call_llm(CEO_SYSTEM_PROMPT, prompt, json_mode=True, tier=os.getenv("CEO_LLM_TIER", "high"), purpose=f"ceo:{period}")
     memo = parse_json_response(raw)
     memo = normalize_memo(memo, period)
     memo["generated_at"] = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")

@@ -621,7 +621,7 @@ Is this alert actionable? Should the PM be notified?
 """
 
     try:
-        raw = call_llm(FILTER_PROMPT, user_prompt, json_mode=True, tier="low")
+        raw = call_llm(FILTER_PROMPT, user_prompt, json_mode=True, tier="low", purpose="price_monitor_filter")
         result = parse_json_response(raw)
         if result.get("actionable"):
             _alert_cooldowns[sym] = now

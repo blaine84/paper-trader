@@ -322,9 +322,33 @@ Only propose strategies backed by at least 3 similar cases with >50% win rate.
 If no new strategies are warranted, return "proposed_strategies": [].
 """
 
-    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose="quant_researcher")
     result = parse_json_response(raw)
     result["timestamp"] = datetime.utcnow().isoformat()
+
+    inferred_regime = (
+        market_regime
+        or result.get("market_regime")
+        or result.get("regime")
+        or "unknown"
+    )
+    result.setdefault("market_regime", inferred_regime)
+
+    # Some models return a looser schema (for example top_strategies). Normalize
+    # it so downstream reports and agents do not silently show unavailable data.
+    if "strategies" not in result and isinstance(result.get("top_strategies"), list):
+        result["strategies"] = [
+            {
+                "strategy_key": s.get("strategy_key") or s.get("name", "").lower().replace(" ", "_"),
+                "strategy_name": s.get("strategy_name") or s.get("name"),
+                "fit_score": s.get("fit_score"),
+                "recommendation": s.get("recommendation") or "use_with_caution",
+                "analyst_guidance": s.get("description"),
+                "pm_guidance": s.get("required_confirmation"),
+            }
+            for s in result["top_strategies"]
+            if isinstance(s, dict)
+        ]
 
     # Persist to agent memory
     db = get_session(engine)
@@ -333,6 +357,12 @@ If no new strategies are warranted, return "proposed_strategies": [].
         symbol=None,
         key="strategy_recommendations",
         value=json.dumps(result),
+    ))
+    db.add(AgentMemory(
+        agent="quant_researcher",
+        symbol=None,
+        key="regime",
+        value=json.dumps({"regime": inferred_regime, "source": "quant_researcher"}),
     ))
     db.commit()
     db.close()

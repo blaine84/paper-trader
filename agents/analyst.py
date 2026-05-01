@@ -234,7 +234,7 @@ ANALYST FEEDBACK LOOP:
 {freshness_context}
 Produce your trading signal JSON for {sym}.
 """
-            raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium")
+            raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose=f"analyst_signal:{symbol}")
             signal = parse_json_response(raw)
             signal = apply_signal_mitigation(signal, active_mitigations)
             signals[sym] = signal

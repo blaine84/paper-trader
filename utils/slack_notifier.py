@@ -37,6 +37,73 @@ def truncate_text(text: str, max_len: int = 2000) -> str:
     return text[: max_len - 1] + "…"
 
 
+
+
+def _extract_regime_from_strategy_data(data) -> str | None:
+    """Best-effort regime extraction from quant researcher output."""
+    if not isinstance(data, dict):
+        return None
+
+    for key in ("regime", "market_regime"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    text = " ".join(
+        str(data.get(key, ""))
+        for key in ("market_conditions_summary", "regime_note", "analysis_summary")
+    ).lower()
+
+    for regime in ("risk_on", "risk_off"):
+        if regime in text:
+            return regime
+    if "risk-on" in text:
+        return "risk_on"
+    if "risk-off" in text:
+        return "risk_off"
+    if "mixed" in text:
+        return "mixed"
+    if "unknown" in text or "undefined" in text:
+        return "unknown"
+    return None
+
+
+def _summarize_strategy_recommendations(data):
+    """Normalize quant researcher strategy output for the morning report."""
+    if not isinstance(data, dict):
+        return "Data unavailable", "Data unavailable"
+
+    recommended = data.get("recommended_strategies")
+    if not recommended:
+        strategies = data.get("strategies")
+        if isinstance(strategies, list):
+            recommended = [
+                s.get("strategy_name") or s.get("name") or s.get("strategy_key")
+                for s in strategies
+                if isinstance(s, dict) and s.get("recommendation") in {"lean_into", "use_with_caution"}
+            ]
+        else:
+            recommended = strategies
+
+    if not recommended and isinstance(data.get("top_strategies"), list):
+        recommended = [
+            s.get("strategy_name") or s.get("name") or s.get("strategy_key")
+            for s in data["top_strategies"]
+            if isinstance(s, dict)
+        ]
+
+    avoid = data.get("strategies_to_avoid")
+    if not avoid:
+        strategies = data.get("strategies")
+        if isinstance(strategies, list):
+            avoid = [
+                s.get("strategy_name") or s.get("name") or s.get("strategy_key")
+                for s in strategies
+                if isinstance(s, dict) and s.get("recommendation") == "avoid"
+            ]
+
+    return recommended or "Data unavailable", avoid or "Data unavailable"
+
 def _section(mrkdwn_text: str) -> dict:
     """Return a Slack Block Kit section block with truncated mrkdwn text."""
     return {
@@ -361,7 +428,7 @@ def assemble_morning_data(engine) -> dict:
         return result
 
     try:
-        # --- Market regime ---
+        # --- Market regime + strategy recommendation ---
         try:
             regime_mem = (
                 db.query(AgentMemory)
@@ -373,7 +440,7 @@ def assemble_morning_data(engine) -> dict:
                 try:
                     parsed = json.loads(regime_mem.value)
                     if isinstance(parsed, dict):
-                        result["regime"] = parsed.get("regime", parsed.get("market_regime", str(parsed)))
+                        result["regime"] = parsed.get("regime", parsed.get("market_regime", "Data unavailable"))
                     else:
                         result["regime"] = str(parsed) if parsed else "Data unavailable"
                 except json.JSONDecodeError:
@@ -382,27 +449,28 @@ def assemble_morning_data(engine) -> dict:
         except Exception as exc:
             logger.error("Error querying regime: %s", exc)
 
-        # --- Strategy recommendation ---
         try:
             strat_mem = (
                 db.query(AgentMemory)
-                .filter_by(agent="quant_researcher", key="strategy_recommendation")
+                .filter(AgentMemory.agent == "quant_researcher")
+                .filter(AgentMemory.key.in_(["strategy_recommendations", "strategy_recommendation"]))
                 .order_by(AgentMemory.timestamp.desc())
                 .first()
             )
             if strat_mem:
                 try:
                     parsed = json.loads(strat_mem.value)
-                    recommended = parsed.get("recommended_strategies", parsed.get("strategies", "Data unavailable"))
-                    avoid = parsed.get("strategies_to_avoid", "Data unavailable")
+                    if result["regime"] == "Data unavailable":
+                        result["regime"] = _extract_regime_from_strategy_data(parsed) or "Data unavailable"
+                    recommended, avoid = _summarize_strategy_recommendations(parsed)
                     result["strategies"] = {
-                        "recommended": recommended if recommended else "Data unavailable",
-                        "avoid": avoid if avoid else "Data unavailable",
+                        "recommended": recommended,
+                        "avoid": avoid,
                     }
                 except json.JSONDecodeError:
-                    logger.warning("Failed to parse strategy_recommendation JSON")
+                    logger.warning("Failed to parse strategy recommendation JSON")
         except Exception as exc:
-            logger.error("Error querying strategy_recommendation: %s", exc)
+            logger.error("Error querying strategy recommendation: %s", exc)
 
         # --- Scout picks ---
         try:

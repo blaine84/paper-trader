@@ -179,7 +179,7 @@ Flag any breaking catalysts that could affect today's trading.
 """
 
     try:
-        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low")
+        raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low", purpose="news_monitor")
         result = parse_json_response(raw)
     except Exception as e:
         log.error(f"News monitor LLM error: {e}")

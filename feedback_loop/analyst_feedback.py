@@ -150,7 +150,7 @@ def process_pending_feedback(engine) -> dict:
     )
 
     try:
-        raw = call_llm(ANALYST_RESPONSE_PROMPT, user_prompt, json_mode=True, tier="low")
+        raw = call_llm(ANALYST_RESPONSE_PROMPT, user_prompt, json_mode=True, tier="low", purpose="analyst_feedback_response")
         parsed = parse_json_response(raw)
         responses = parsed.get("responses", [])
     except Exception as exc:
