@@ -672,3 +672,104 @@ def test_entry_contract_fallback_to_stop_price_default():
     assert invalidators[0]["type"] == "price_below_level"
 
     db.close()
+
+# ---------------------------------------------------------------------------
+# 10. test_high_winrate_fast_intraday_stop_buffer_is_enforced
+# ---------------------------------------------------------------------------
+
+def test_high_winrate_fast_intraday_stop_buffer_is_enforced():
+    """
+    A setup with >60% historical WR and sub-60-minute intraday horizon must
+    persist a stop at least 1.5% from entry, even if the PM proposed tighter.
+    """
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=100_000.0)
+
+    signal = _strong_signal("AMD")
+    signal["timeframe"] = "5-15 min"
+    _seed_analyst_signal(db, "AMD", signal)
+
+    decision = _base_decision(
+        symbol="AMD", quantity=50, price=100.0,
+        stop=99.25, target=104.0,
+    )
+    decision["timeframe"] = "5-15 min"
+
+    high_wr_conf = {
+        "modifier": 1.0, "block": False, "reason": "ok",
+        "win_rate": 0.72, "total_cases": 20,
+    }
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=high_wr_conf),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+    ):
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is True, f"Trade should have succeeded: {msg}"
+    trade = db.query(Trade).filter_by(symbol="AMD", profile=profile_id).first()
+    assert trade is not None
+    assert trade.stop_price == 98.5
+    assert decision["stop_loss"] == 98.5
+
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 11. test_high_momentum_asset_cooldown_blocks_cascading_reentry
+# ---------------------------------------------------------------------------
+
+def test_high_momentum_asset_cooldown_blocks_cascading_reentry():
+    """
+    A fresh AMD stop/loss in any profile should block another profile from
+    immediately re-entering and creating cascading correlated exits.
+    """
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=100_000.0)
+    _seed_analyst_signal(db, "AMD", _strong_signal("AMD"))
+
+    now = datetime.utcnow()
+    db.add(Trade(
+        symbol="AMD",
+        direction="LONG",
+        quantity=25,
+        entry_price=100.0,
+        exit_price=98.5,
+        entry_time=now - timedelta(minutes=20),
+        exit_time=now - timedelta(minutes=5),
+        status="closed",
+        pnl=-37.5,
+        pnl_pct=-1.5,
+        profile="moderate",
+        reason_exit="Stop loss hit",
+    ))
+    db.commit()
+
+    decision = _base_decision(symbol="AMD", quantity=50, price=100.0,
+                              stop=98.0, target=105.0)
+    high_wr_conf = {
+        "modifier": 1.0, "block": False, "reason": "ok",
+        "win_rate": 0.72, "total_cases": 20,
+    }
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=high_wr_conf),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+    ):
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is False
+    assert "cooldown active for AMD".lower() in msg.lower()
+    assert db.query(Trade).filter_by(symbol="AMD", profile=profile_id, status="open").first() is None
+
+    db.close()

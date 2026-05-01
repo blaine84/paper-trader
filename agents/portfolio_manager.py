@@ -7,7 +7,7 @@ Scout provides symbols only — all entry/exit decisions are made here.
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, Position, Balance, Trade, get_session
@@ -51,6 +51,145 @@ ENTRY_WINDOW_LIMITS = {
     "momentum_fade": 60,
     "short_squeeze": 60,
 }
+
+# Hard guardrails from 2026-04-30 AMD review. High-WR, fast intraday
+# setups need enough breathing room; otherwise execution noise negates the edge.
+HIGH_WR_STOP_BUFFER_THRESHOLD = 0.60
+MIN_HIGH_WR_INTRADAY_STOP_BUFFER_PCT = 0.015
+HIGH_MOMENTUM_ASSETS = {"AMD", "NVDA", "TSLA"}
+HIGH_MOMENTUM_COOLDOWN_MINUTES = 30
+_FAST_INTRADAY_SETUPS = {
+    "gap_and_go",
+    "vwap_reclaim",
+    "orb",
+    "momentum_fade",
+    "trend_pullback",
+    "news_catalyst",
+    "short_squeeze",
+}
+
+
+def _extract_minutes(value) -> int | None:
+    """Best-effort conversion of timeframe/horizon fields into minutes."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = str(value).lower()
+    if any(token in text for token in ("swing", "overnight", "multi-day", "multiday")):
+        return None
+
+    import re
+    minute_values = [int(n) for n in re.findall(r"(\d+)\s*(?:m|min|mins|minute|minutes)\b", text)]
+    if minute_values:
+        return max(minute_values)
+
+    hour_values = [int(n) * 60 for n in re.findall(r"(\d+)\s*(?:h|hr|hrs|hour|hours)\b", text)]
+    if hour_values:
+        return max(hour_values)
+
+    return None
+
+
+def _is_fast_intraday_trade(decision: dict, signal: dict) -> bool:
+    """Return True when the trade is clearly intraday and intended under ~60 minutes."""
+    setup_type = (
+        decision.get("setup_type") or decision.get("setup")
+        or signal.get("setup_type") or signal.get("setup") or ""
+    )
+    setup_type = str(setup_type).lower()
+
+    for key in (
+        "holding_minutes", "expected_holding_minutes", "max_holding_minutes",
+        "time_horizon_minutes", "duration_minutes",
+    ):
+        minutes = _extract_minutes(decision.get(key) or signal.get(key))
+        if minutes is not None:
+            return minutes <= 60
+
+    timeframe = (
+        decision.get("timeframe") or decision.get("time_horizon") or decision.get("duration")
+        or signal.get("timeframe") or signal.get("time_horizon") or signal.get("duration")
+    )
+    minutes = _extract_minutes(timeframe)
+    if minutes is not None:
+        return minutes <= 60
+
+    text = str(timeframe or "").lower()
+    if "intraday" in text and not any(token in text for token in ("multi-day", "multiday", "swing")):
+        return True
+
+    return setup_type in _FAST_INTRADAY_SETUPS
+
+
+def _apply_high_wr_stop_buffer(
+    action: str,
+    price: float,
+    stop: float | None,
+    decision: dict,
+    signal: dict,
+    case_stats: dict,
+) -> float | None:
+    """Widen too-tight stops for high-win-rate, fast intraday setups."""
+    if action not in ("BUY", "SHORT") or not price or not stop:
+        return stop
+
+    win_rate = float(case_stats.get("win_rate") or 0.0)
+    if win_rate <= HIGH_WR_STOP_BUFFER_THRESHOLD:
+        return stop
+    if not _is_fast_intraday_trade(decision, signal):
+        return stop
+
+    min_distance = price * MIN_HIGH_WR_INTRADAY_STOP_BUFFER_PCT
+    if action == "BUY":
+        min_stop = round(price - min_distance, 2)
+        if stop > min_stop:
+            log.warning(
+                "Stop buffer enforced for %s: high-WR setup %.0f%% requires >=%.1f%% breathing room; %.2f → %.2f",
+                decision.get("symbol", "?"), win_rate * 100,
+                MIN_HIGH_WR_INTRADAY_STOP_BUFFER_PCT * 100, stop, min_stop,
+            )
+            return min_stop
+    else:
+        min_stop = round(price + min_distance, 2)
+        if stop < min_stop:
+            log.warning(
+                "Stop buffer enforced for %s: high-WR setup %.0f%% requires >=%.1f%% breathing room; %.2f → %.2f",
+                decision.get("symbol", "?"), win_rate * 100,
+                MIN_HIGH_WR_INTRADAY_STOP_BUFFER_PCT * 100, stop, min_stop,
+            )
+            return min_stop
+
+    return stop
+
+
+def _high_momentum_cooldown_message(db, symbol: str) -> str | None:
+    """Block fresh entries shortly after a stop/loss on volatile names across profiles."""
+    symbol = (symbol or "").upper()
+    if symbol not in HIGH_MOMENTUM_ASSETS:
+        return None
+
+    cutoff = datetime.utcnow() - timedelta(minutes=HIGH_MOMENTUM_COOLDOWN_MINUTES)
+    recent = (
+        db.query(Trade)
+        .filter_by(symbol=symbol, status="closed")
+        .filter(Trade.exit_time >= cutoff)
+        .order_by(Trade.exit_time.desc())
+        .first()
+    )
+    if not recent:
+        return None
+
+    reason = (recent.reason_exit or "").lower()
+    stopped_or_loss = "stop" in reason or (recent.pnl is not None and recent.pnl < 0)
+    if not stopped_or_loss:
+        return None
+
+    return (
+        f"Cooldown active for {symbol}: recent stop/loss in {recent.profile} profile "
+        f"within {HIGH_MOMENTUM_COOLDOWN_MINUTES} minutes — blocking cascading re-entry"
+    )
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are a portfolio manager for paper day trading.
@@ -1093,6 +1232,21 @@ def execute_trade(db, decision: dict, profile_id: str):
         setup_type = decision.get("setup_type") or decision.get("setup") or signal_for_symbol.get("setup_type") or ""
         regime = decision.get("market_regime") or decision.get("regime") or signal_for_symbol.get("market_regime")
         case_stats = _build_case_stats(db, setup_type, regime)
+
+        # High-WR fast intraday setups need mandatory breathing room. Enforce
+        # before edge/validation so the persisted stop and Entry Contract agree.
+        adjusted_stop = _apply_high_wr_stop_buffer(
+            action, price, stop, decision, signal_for_symbol, case_stats
+        )
+        if adjusted_stop != stop:
+            stop = adjusted_stop
+            decision["stop"] = stop
+            decision["stop_loss"] = stop
+
+        cooldown_msg = _high_momentum_cooldown_message(db, symbol)
+        if cooldown_msg:
+            log.warning(cooldown_msg)
+            return False, cooldown_msg
 
         # --- 3. Hard rejection check (fail-closed) ---
         try:
