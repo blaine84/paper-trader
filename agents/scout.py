@@ -11,6 +11,7 @@ import json
 from datetime import datetime, timedelta
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
+from utils.symbol_class import classify_symbol
 from db.schema import AgentMemory, get_session
 from utils.case_library import query_cases, get_win_rate_by_setup, format_cases_for_prompt, get_selection_feedback
 
@@ -158,6 +159,11 @@ Find the best 1-3 additional stocks worth day trading today.
     result = parse_json_response(raw)
 
     picks = result.get("picks", [])
+
+    # Attach deterministic symbol_class to each pick (Req 2.1, 3.3)
+    for pick in picks:
+        pick["symbol_class"] = classify_symbol(pick["symbol"])
+
     symbols = [p["symbol"] for p in picks]
 
     # Save picks to agent memory

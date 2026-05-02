@@ -27,6 +27,7 @@ from feedback_loop.analyst_feedback import (
     get_active_mitigations,
     process_pending_feedback,
 )
+from utils.symbol_class import classify_symbol, validate_setup_for_symbol
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +76,8 @@ Respond in JSON:
     "bb_position": "upper|middle|lower|outside_upper|outside_lower"
   }
 }
+
+gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
 
 HOLD is a valid and useful signal. Output it whenever the setup is ambiguous or low quality.
 """
@@ -237,6 +240,8 @@ Produce your trading signal JSON for {sym}.
             raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose=f"analyst_signal:{symbol}")
             signal = parse_json_response(raw)
             signal = apply_signal_mitigation(signal, active_mitigations)
+            validation_result = validate_setup_for_symbol(sym, signal.get("setup_type"))
+            signal.update(validation_result)
             signals[sym] = signal
         except Exception as e:
             log.error(f"Analyst error for {sym}: {e}")
@@ -248,6 +253,31 @@ Produce your trading signal JSON for {sym}.
         futures = {executor.submit(_analyze_symbol, sym): sym for sym in symbols}
         for f in as_completed(futures):
             pass  # results stored in signals dict
+
+    # Drift warning: detect if LLM is over-assigning gap_and_go to non-stock symbols
+    raw_gap_and_go = 0
+    reclassified_gap_and_go = 0
+    for sig in signals.values():
+        # A signal counts as "raw gap_and_go" if its current setup_type is gap_and_go
+        # OR if it was reclassified FROM gap_and_go (original_setup_type == "gap_and_go")
+        is_current_gap = sig.get("setup_type") == "gap_and_go"
+        is_reclassified_from_gap = (
+            sig.get("setup_reclassified") is True
+            and sig.get("original_setup_type") == "gap_and_go"
+        )
+        if is_current_gap or is_reclassified_from_gap:
+            raw_gap_and_go += 1
+        if is_reclassified_from_gap:
+            reclassified_gap_and_go += 1
+
+    if raw_gap_and_go >= 10 and (reclassified_gap_and_go / raw_gap_and_go) > 0.10:
+        log.warning(
+            "Signal drift detected: %d/%d raw gap_and_go signals were reclassified (%.1f%%). "
+            "LLM may be over-assigning gap_and_go to non-stock symbols.",
+            reclassified_gap_and_go,
+            raw_gap_and_go,
+            (reclassified_gap_and_go / raw_gap_and_go) * 100,
+        )
 
     # Save all signals to memory
     db2 = get_session(engine)
