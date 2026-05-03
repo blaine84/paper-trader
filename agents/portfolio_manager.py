@@ -13,8 +13,9 @@ from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, Position, Balance, Trade, DynamicStrategy, get_session
 from utils.trade_events import log_trade_event
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
-from utils.case_library import get_relevant_cases, format_cases_for_prompt, get_win_rate_by_setup
-from agents.quant_researcher import build_strategy_context
+from utils.case_library import get_relevant_cases, get_win_rate_by_setup
+from utils.prompt_compaction import format_cases_digest_for_pm, compact_signal_for_pm
+from agents.quant_researcher import build_pm_strategy_context
 from agents.lesson_registry import check_track_record
 from core.similarity import find_similar_cases, compute_similarity_stats
 from core.edge_score import (
@@ -1987,11 +1988,20 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
         "bias": "long",
     }
     relevant_cases = get_relevant_cases(engine, case_context, limit=5)
-    cases_text = format_cases_for_prompt(relevant_cases)
-    strategy_context = build_strategy_context(engine)
+    cases_text = format_cases_digest_for_pm(relevant_cases)
+    strategy_context = build_pm_strategy_context(engine)
 
     # Win rates by setup type — PM uses this to adjust sizing
     win_rates = get_win_rate_by_setup(engine)
+
+    # Filter signals to only symbols without open positions (entry candidates)
+    entry_signals = {sym: sig for sym, sig in signals.items() if sym not in held_symbols}
+
+    # Filter win rates to only include setup types matching entry candidates' signals
+    entry_setup_types = {sig.get("setup_type") for sig in entry_signals.values() if sig.get("setup_type")}
+    if entry_setup_types:
+        win_rates = [wr for wr in win_rates if wr.get("setup_type") in entry_setup_types]
+
     if win_rates:
         win_rate_lines = ["Setup type win rates from case library:"]
         for r in sorted(win_rates, key=lambda x: x["win_rate"], reverse=True):
@@ -2017,11 +2027,11 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     from utils.behavioral_params import get_behavioral_params
     behav_params = get_behavioral_params(engine, profile_id)
 
-    # Filter signals to only symbols without open positions (entry candidates)
-    entry_signals = {sym: sig for sym, sig in signals.items() if sym not in held_symbols}
-
     # Refresh portfolio snapshot (may have changed from review-phase closes)
     portfolio = get_portfolio_for_profile(db, fh, profile_id)
+
+    # Build compact signal text for entry candidates
+    compact_signals_text = "\n".join(compact_signal_for_pm(sym, sig) for sym, sig in entry_signals.items())
 
     user_prompt = f"""
 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
@@ -2031,7 +2041,7 @@ CURRENT PORTFOLIO:
 {json.dumps(portfolio, indent=2)}
 
 ANALYST SIGNALS:
-{json.dumps(entry_signals, indent=2)}
+{compact_signals_text if compact_signals_text else "No entry signals"}
 
 EXECUTION FEEDBACK (your profile only):
 {feedback_text}{weekly_stance_text}

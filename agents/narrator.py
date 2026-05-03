@@ -14,6 +14,10 @@ from db.schema import (
 from models.case import Case
 from utils.llm import call_llm
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
+from utils.prompt_compaction import (
+    compact_case_trends_for_narrator,
+    compact_daily_log_for_narrator,
+)
 
 logger = logging.getLogger("narrator")
 
@@ -430,7 +434,7 @@ WORST TRADES OF THE WEEK:
 {json.dumps(ctx.get('worst_trades', []), indent=2)}
 
 CASE LIBRARY TRENDS:
-{json.dumps(ctx.get('case_trends', []), indent=2)}
+{ctx.get('case_trends', 'No case trends.')}
 
 STRATEGY PERFORMANCE:
 {json.dumps(ctx.get('strategy_performance', {}), indent=2)}
@@ -439,7 +443,7 @@ AGENT GRADES (META REVIEWER):
 {json.dumps(ctx.get('agent_grades', {}), indent=2)}
 
 DAILY LOGS FOR THE WEEK:
-{json.dumps(ctx.get('daily_logs', []), indent=2)}
+{chr(10).join(ctx.get('daily_logs', [])) if ctx.get('daily_logs') else 'No daily logs.'}
 
 STORY ARC:
 {json.dumps(ctx.get('story_arc', {}), indent=2)}
@@ -1117,7 +1121,7 @@ def _assemble_recap_base(engine) -> dict:
         logger.error(f"Recap: positions query failed: {e}")
         ctx["position_pnl_changes"] = []
 
-    # --- 3. Analyst signals for signal changes ---
+    # --- 3. Analyst signals for signal changes (compacted) ---
     try:
         db = get_session(engine)
         try:
@@ -1132,7 +1136,13 @@ def _assemble_recap_base(engine) -> dict:
                 sym = row.symbol
                 if sym and sym not in signals:
                     try:
-                        signals[sym] = json.loads(row.value)
+                        full_sig = json.loads(row.value)
+                        # Compact: keep only direction, strength, key_level
+                        signals[sym] = {
+                            "signal": full_sig.get("signal"),
+                            "strength": full_sig.get("strength"),
+                            "key_level": full_sig.get("key_level"),
+                        }
                     except (json.JSONDecodeError, TypeError):
                         signals[sym] = {"raw": row.value}
             ctx["signal_changes"] = signals
@@ -1166,7 +1176,7 @@ def _assemble_recap_base(engine) -> dict:
         logger.error(f"Recap: breaking news query failed: {e}")
         ctx["breaking_news"] = []
 
-    # --- 5. Catalyst freshness for held positions ---
+    # --- 5. Catalyst freshness for held positions (stale/degrading only) ---
     try:
         db = get_session(engine)
         try:
@@ -1176,7 +1186,11 @@ def _assemble_recap_base(engine) -> dict:
                 try:
                     from utils.catalyst_freshness import compute_catalyst_freshness
                     freshness = compute_catalyst_freshness(db, held_symbols)
-                    ctx["catalyst_freshness"] = freshness
+                    # Filter to only stale/degrading positions
+                    ctx["catalyst_freshness"] = {
+                        sym: data for sym, data in freshness.items()
+                        if data.get("freshness_state") in ("stale", "degrading")
+                    }
                 except Exception as e:
                     logger.error(f"Recap: catalyst freshness computation failed: {e}")
                     ctx["catalyst_freshness"] = {}
@@ -1312,6 +1326,13 @@ def assemble_afternoon_recap(engine) -> dict:
     except Exception as e:
         logger.error(f"Afternoon recap: equity change query failed: {e}")
         ctx["equity_change"] = {}
+
+    # --- Strip individual trade pnl/pnl_pct when aggregate P&L is present ---
+    if ctx.get("recent_trades") and ctx.get("aggregate_pnl"):
+        ctx["recent_trades"] = [
+            {k: v for k, v in trade.items() if k not in ("pnl", "pnl_pct")}
+            for trade in ctx["recent_trades"]
+        ]
 
     return ctx
 
@@ -1651,7 +1672,7 @@ def assemble_weekly_wrap(engine) -> dict:
                 .all()
             )
             ctx["daily_logs"] = [
-                {
+                compact_daily_log_for_narrator({
                     "date": log_entry.date,
                     "starting_equity": log_entry.starting_equity,
                     "ending_equity": log_entry.ending_equity,
@@ -1661,7 +1682,7 @@ def assemble_weekly_wrap(engine) -> dict:
                     "daily_pnl": log_entry.daily_pnl,
                     "daily_pnl_pct": log_entry.daily_pnl_pct,
                     "notes": log_entry.notes,
-                }
+                })
                 for log_entry in logs
             ]
         finally:
@@ -1682,7 +1703,7 @@ def assemble_weekly_wrap(engine) -> dict:
                 )
                 .all()
             )
-            ctx["case_trends"] = [
+            ctx["case_trends"] = compact_case_trends_for_narrator([
                 {
                     "symbol": c.symbol,
                     "date": c.date,
@@ -1696,12 +1717,12 @@ def assemble_weekly_wrap(engine) -> dict:
                     "execution_score": c.execution_score,
                 }
                 for c in cases
-            ]
+            ])
         finally:
             db.close()
     except Exception as e:
         logger.error(f"Weekly wrap: Case trends query failed: {e}")
-        ctx["case_trends"] = []
+        ctx["case_trends"] = "No case trends this week."
 
     # --- 4. DynamicStrategy performance (win rates, retirements this week) ---
     try:
@@ -1720,6 +1741,7 @@ def assemble_weekly_wrap(engine) -> dict:
                     "retire_reason": s.retire_reason,
                 }
                 for s in strategies
+                if (s.total_trades or 0) > 0
             }
         finally:
             db.close()

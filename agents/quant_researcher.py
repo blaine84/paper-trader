@@ -182,6 +182,88 @@ def build_strategy_context(engine, market_regime: str = None) -> str:
     return "\n".join(lines)
 
 
+def build_pm_strategy_context(engine, market_regime: str = None) -> str:
+    """
+    Build a filtered strategy context block for PM entry prompts.
+
+    Similar to build_strategy_context() but excludes backtest/paper_trade
+    pipeline-stage strategies that are not actionable for PM entry decisions.
+    Only includes:
+    - Strategies with recommendation "lean_into" or "use_with_caution"
+    - Dynamic strategies that are live (source="dynamic", pipeline_stage in live stages)
+
+    Does NOT modify build_strategy_context() — that function remains unchanged
+    for all other callers (narrator morning_briefing, quant_researcher, etc.).
+    """
+    db = get_session(engine)
+
+    # Get latest quant researcher output
+    mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="quant_researcher", key="strategy_recommendations")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    db.close()
+
+    if not mem:
+        return "No strategy recommendations available yet."
+
+    data = json.loads(mem.value)
+
+    # Only use if from today or this week
+    ts = data.get("timestamp", "")
+    if ts < (datetime.utcnow() - timedelta(days=1)).isoformat():
+        return "Strategy recommendations are stale — run quant_researcher again."
+
+    lines = [f"Market conditions: {data.get('market_conditions_summary', '')}"]
+    lines.append(f"Primary strategy today: {data.get('primary_strategy', '?')}")
+    lines.append(f"Regime note: {data.get('regime_note', '')}")
+    lines.append("")
+
+    for s in data.get("strategies", []):
+        if s.get("recommendation") == "avoid":
+            continue
+        rec = s.get("recommendation", "?")
+        rec_color_char = "✅" if rec == "lean_into" else "⚠️"
+        lines.append(
+            f"{rec_color_char} {s.get('strategy_name') or s.get('name', '?')} "
+            f"(fit: {s.get('fit_score', '?')}/10, "
+            f"internal: {int((s.get('internal_win_rate') or 0)*100)}% "
+            f"over {s.get('internal_cases', 0)} cases)"
+        )
+        if s.get("analyst_guidance"):
+            lines.append(f"   → Analyst: {s['analyst_guidance']}")
+        if s.get("pm_guidance"):
+            lines.append(f"   → PM: {s['pm_guidance']}")
+
+    avoid = data.get("strategies_to_avoid", [])
+    if avoid:
+        lines.append(f"\nAvoid today: {', '.join(avoid)}")
+
+    # Include only live dynamic strategies — exclude backtest/paper_trade pipeline stages
+    from utils.strategy_store import get_all_strategies
+    all_strats = get_all_strategies(engine)
+    live_dynamic = [
+        k for k, v in all_strats.items()
+        if v.get("source") == "dynamic"
+        and v.get("pipeline_stage") not in ("backtest", "paper_trade")
+    ]
+    if live_dynamic:
+        lines.append("\nAgent-proposed strategies (live):")
+        for key in live_dynamic:
+            s = all_strats[key]
+            stage = s.get("pipeline_stage", s.get("status", "?"))
+            wr = f"{s['win_rate_documented']:.0f}%" if s.get('win_rate_documented') else "new"
+            lines.append(f"  📌 {s['name']} ({key}) — stage: {stage} [{wr}, {s.get('total_trades', 0)} trades]")
+
+    # NOTE: Deliberately omits the "Agent-proposed strategies (in pipeline)" section
+    # that shows backtest/paper_trade stage strategies. Those are not actionable
+    # for PM entry decisions.
+
+    return "\n".join(lines)
+
+
 def run(engine, market_regime: str = None, context: dict = None) -> dict:
     """
     Run the Quant Researcher.
