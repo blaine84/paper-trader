@@ -141,7 +141,7 @@ def index():
 @app.route("/api/data")
 def api_data():
     db = get_session(engine)
-    core = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD").split(",")]
+    core = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD").split(",")]
     scout_picks = get_scout_picks(db)
     scout_symbols = [p["symbol"] for p in scout_picks]
     all_symbols = core + [s for s in scout_symbols if s not in core]

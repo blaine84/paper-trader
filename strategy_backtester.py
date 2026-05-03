@@ -418,7 +418,7 @@ class StrategyBacktester:
             symbols = [
                 s.strip()
                 for s in os.getenv(
-                    "WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD"
+                    "WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD"
                 ).split(",")
             ]
 

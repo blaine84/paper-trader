@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_SYMBOLS = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD").split(",")]
+DEFAULT_SYMBOLS = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD").split(",")]
 DEFAULT_DAYS = 365
 RISK_REWARD = 2.0       # target = entry + (entry - stop) * RR
 STOP_ATR_MULT = 1.5     # stop = entry - ATR * multiplier

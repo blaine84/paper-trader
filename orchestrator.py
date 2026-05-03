@@ -43,7 +43,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD").split(",")]
+WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD").split(",")]
+SCOUT_CANDIDATES = [s.strip() for s in os.getenv("SCOUT_CANDIDATES", "AAPL,MSFT,META,AMZN,GOOGL,AVGO,SMCI,PLTR,COIN,MSTR,ARM,MU,INTC,NFLX").split(",")]
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL_MINUTES", 15))
 
 
@@ -127,7 +128,7 @@ def run_pre_market():
     scout_symbols = []
     try:
         console.print("[bold cyan]🔭 Scout scanning for movers...[/bold cyan]")
-        scout_result = scout.run(engine, WATCHLIST)
+        scout_result = scout.run(engine, WATCHLIST, scout_candidates=SCOUT_CANDIDATES)
         scout_symbols = scout_result.get("symbols", [])
         if scout_symbols:
             log.info(f"Scout picks: {', '.join(scout_symbols)} (tone: {scout_result.get('market_tone')})")

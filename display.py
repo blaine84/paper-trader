@@ -388,7 +388,7 @@ def main():
     parser.add_argument("--symbols", type=str, help="Override watchlist (comma-separated)")
     args = parser.parse_args()
 
-    core = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD").split(",")]
+    core = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD").split(",")]
     if args.symbols:
         core = [s.strip() for s in args.symbols.split(",")]
 

@@ -55,25 +55,18 @@ Do NOT duplicate symbols already in the core watchlist.
 """
 
 
-def get_market_movers(fh: FinnhubClient) -> dict:
+def get_market_movers(fh: FinnhubClient, scout_candidates: list[str] | None = None) -> dict:
     """
     Finnhub doesn't have a direct movers endpoint on free tier,
     so we approximate using stock symbols from major indices
     and check their quotes for big movers.
     """
-    # Sample a broad set of liquid names to screen
-    candidates = [
-        "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NFLX", "BABA",
-        "BA", "DIS", "JPM", "GS", "MS", "WFC", "BAC",
-        "XOM", "CVX", "OXY", "SLB",
-        "UBER", "LYFT", "SNAP", "PINS", "RBLX",
-        "PLTR", "COIN", "HOOD", "SOFI",
-        "MRNA", "PFE", "JNJ", "ABBV",
-        "F", "GM", "RIVN", "LCID",
-        "X", "CLF", "FCX",
-        "SQ", "PYPL", "SHOP",
-        "CRWD", "PANW", "ZS", "OKTA",
-        "SNOW", "DDOG", "MDB", "NET",
+    # Use provided candidate pool or fall back to default
+    candidates = scout_candidates or [
+        s.strip() for s in os.getenv(
+            "SCOUT_CANDIDATES",
+            "AAPL,MSFT,META,AMZN,GOOGL,AVGO,SMCI,PLTR,COIN,MSTR,ARM,MU,INTC,NFLX"
+        ).split(",")
     ]
 
     movers = []
@@ -90,12 +83,12 @@ def get_market_movers(fh: FinnhubClient) -> dict:
     return movers[:15]  # top 15 movers
 
 
-def run(engine, core_watchlist: list[str]) -> dict:
+def run(engine, core_watchlist: list[str], scout_candidates: list[str] | None = None) -> dict:
     fh = FinnhubClient()
     db = get_session(engine)
 
     # Get market movers
-    movers = get_market_movers(fh)
+    movers = get_market_movers(fh, scout_candidates=scout_candidates)
 
     # Get market news for context
     market_news = fh.get_market_news("general")
