@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "overlap_diagnostic.schema.json",
+  "title": "Overlap Diagnostic Output",
+  "description": "JSON Schema for validating LLM diagnostic output from the same-symbol overlap diagnostic runner.",
+  "type": "object",
+  "required": [
+    "diagnostic_schema_version",
+    "run_type",
+    "verdict",
+    "severity",
+    "summary",
+    "findings",
+    "recommended_policy"
+  ],
+  "properties": {
+    "diagnostic_schema_version": {
+      "const": "1.0"
+    },
+    "run_type": {
+      "const": "same_symbol_overlap_diagnostic"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "no_overlap_detected",
+        "overlap_detected",
+        "insufficient_evidence",
+        "invalid_input"
+      ]
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "candidate_id",
+          "symbol",
+          "direction",
+          "profiles",
+          "trade_ids",
+          "impact",
+          "combined_pnl",
+          "evidence",
+          "confidence"
+        ],
+        "properties": {
+          "candidate_id": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string"
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "trade_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "impact": {
+            "type": "string",
+            "enum": [
+              "harmful",
+              "neutral",
+              "beneficial",
+              "unclear"
+            ]
+          },
+          "combined_pnl": {
+            "type": "number"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        }
+      }
+    },
+    "recommended_policy": {
+      "type": "object",
+      "required": [
+        "policy_type",
+        "applies_to_candidate_ids",
+        "title",
+        "recommendation",
+        "requires_human_approval"
+      ],
+      "properties": {
+        "policy_type": {
+          "type": "string",
+          "enum": [
+            "cooldown",
+            "max_concurrent_profiles",
+            "throttle_size",
+            "no_change",
+            "human_review_only"
+          ]
+        },
+        "applies_to_candidate_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "title": {
+          "type": "string"
+        },
+        "recommendation": {
+          "type": "string"
+        },
+        "requires_human_approval": {
+          "const": true
+        }
+      }
+    }
+  }
+}

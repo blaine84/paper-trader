@@ -1,0 +1,17 @@
+{
+  "snapshot_schema_version": "1.0",
+  "snapshot_time": "2026-05-03T17:00:00-04:00",
+  "scope": {
+    "days": 5,
+    "tables": ["trades", "trade_events", "dynamic_strategies"],
+    "diagnostic": "same_symbol_overlap"
+  },
+  "dynamic_strategies": [
+    {
+      "id": 4,
+      "name": "Risk-Off Mega-Cap Momentum Fade",
+      "status": "active",
+      "pipeline_stage": null
+    }
+  ]
+}

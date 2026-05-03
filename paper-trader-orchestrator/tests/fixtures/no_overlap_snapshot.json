@@ -1,0 +1,105 @@
+{
+  "snapshot_schema_version": "1.0",
+  "snapshot_time": "2026-05-03T17:00:00-04:00",
+  "scope": {
+    "days": 5,
+    "tables": ["trades", "trade_events", "dynamic_strategies"],
+    "diagnostic": "same_symbol_overlap"
+  },
+  "trades": [
+    {
+      "id": 270,
+      "symbol": "AAPL",
+      "profile": "moderate",
+      "direction": "LONG",
+      "setup_type": "technical_breakout",
+      "entry_time": "2026-05-01 10:05:30",
+      "exit_time": "2026-05-01 11:45:00",
+      "status": "closed",
+      "entry_price": 189.50,
+      "exit_price": 191.20,
+      "pnl": 42.50,
+      "pnl_pct": 0.90,
+      "reason_exit": "Price monitor: target_hit at 191.20"
+    },
+    {
+      "id": 271,
+      "symbol": "MSFT",
+      "profile": "aggressive",
+      "direction": "LONG",
+      "setup_type": "momentum_continuation",
+      "entry_time": "2026-05-01 13:30:00",
+      "exit_time": "2026-05-01 14:50:22",
+      "status": "closed",
+      "entry_price": 420.00,
+      "exit_price": 423.75,
+      "pnl": 93.75,
+      "pnl_pct": 0.89,
+      "reason_exit": "Price monitor: target_hit at 423.75"
+    },
+    {
+      "id": 272,
+      "symbol": "NVDA",
+      "profile": "conservative",
+      "direction": "LONG",
+      "setup_type": "technical_breakout",
+      "entry_time": "2026-05-02 09:35:10",
+      "exit_time": "2026-05-02 10:20:45",
+      "status": "closed",
+      "entry_price": 950.00,
+      "exit_price": 955.30,
+      "pnl": 26.50,
+      "pnl_pct": 0.56,
+      "reason_exit": "Price monitor: target_hit at 955.30"
+    }
+  ],
+  "trade_events": {
+    "included_event_types": [
+      "entry_requested",
+      "entry_filled",
+      "stop_loss",
+      "target_hit",
+      "overlap_rejected"
+    ],
+    "rows": [
+      {
+        "id": 730,
+        "trade_id": 270,
+        "timestamp": "2026-05-01 10:05:25",
+        "event_type": "entry_requested",
+        "agent": "pm_moderate",
+        "symbol": "AAPL",
+        "profile": "moderate",
+        "message": "entry requested for AAPL LONG technical_breakout"
+      },
+      {
+        "id": 731,
+        "trade_id": 270,
+        "timestamp": "2026-05-01 10:05:30",
+        "event_type": "entry_filled",
+        "agent": "pm_moderate",
+        "symbol": "AAPL",
+        "profile": "moderate",
+        "message": "entry filled at 189.50"
+      },
+      {
+        "id": 732,
+        "trade_id": 271,
+        "timestamp": "2026-05-01 13:30:00",
+        "event_type": "entry_filled",
+        "agent": "pm_aggressive",
+        "symbol": "MSFT",
+        "profile": "aggressive",
+        "message": "entry filled at 420.00"
+      }
+    ]
+  },
+  "dynamic_strategies": [
+    {
+      "id": 4,
+      "name": "Risk-Off Mega-Cap Momentum Fade",
+      "status": "active",
+      "pipeline_stage": null
+    }
+  ]
+}

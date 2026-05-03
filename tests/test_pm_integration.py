@@ -708,7 +708,11 @@ def test_high_winrate_fast_intraday_stop_buffer_is_enforced():
         patch(_ADJUST_CONFIDENCE, return_value=high_wr_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 100.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is True, f"Trade should have succeeded: {msg}"

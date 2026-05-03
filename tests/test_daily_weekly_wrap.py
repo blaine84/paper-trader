@@ -257,7 +257,7 @@ class TestAssembleWeeklyWrap:
         assert result["best_trades"] == []
         assert result["worst_trades"] == []
         assert result["daily_logs"] == []
-        assert result["case_trends"] == []
+        assert result["case_trends"] == "No case trends this week."
         assert result["strategy_performance"] == {}
         assert result["agent_grades"] == {}
 
@@ -353,8 +353,9 @@ class TestAssembleWeeklyWrap:
         db.close()
 
         result = assemble_weekly_wrap(engine)
-        assert len(result["case_trends"]) == 1
-        assert result["case_trends"][0]["setup_type"] == "gap_and_go"
+        # case_trends is now a compacted string from compact_case_trends_for_narrator
+        assert isinstance(result["case_trends"], str)
+        assert "gap_and_go" in result["case_trends"]
 
     def test_strategy_performance(self, engine):
         """Req 6.3: DynamicStrategy performance included."""

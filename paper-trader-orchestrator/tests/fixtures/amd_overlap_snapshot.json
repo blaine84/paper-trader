@@ -1,0 +1,136 @@
+{
+  "snapshot_schema_version": "1.0",
+  "snapshot_time": "2026-05-03T17:00:00-04:00",
+  "scope": {
+    "days": 5,
+    "tables": ["trades", "trade_events", "dynamic_strategies"],
+    "diagnostic": "same_symbol_overlap"
+  },
+  "trades": [
+    {
+      "id": 259,
+      "symbol": "AMD",
+      "profile": "moderate",
+      "direction": "LONG",
+      "setup_type": "technical_breakout",
+      "entry_time": "2026-05-01 13:20:50",
+      "exit_time": "2026-05-01 14:30:13",
+      "status": "closed",
+      "entry_price": 353.0,
+      "exit_price": 352.01,
+      "pnl": -91.76,
+      "pnl_pct": -0.70,
+      "reason_exit": "Price monitor: stop_loss at 352.01"
+    },
+    {
+      "id": 260,
+      "symbol": "AMD",
+      "profile": "aggressive",
+      "direction": "LONG",
+      "setup_type": "technical_breakout",
+      "entry_time": "2026-05-01 14:20:10",
+      "exit_time": "2026-05-01 15:10:45",
+      "status": "closed",
+      "entry_price": 352.50,
+      "exit_price": 348.90,
+      "pnl": -309.96,
+      "pnl_pct": -1.02,
+      "reason_exit": "Price monitor: stop_loss at 348.90"
+    }
+  ],
+  "trade_events": {
+    "included_event_types": [
+      "entry_requested",
+      "entry_filled",
+      "stop_loss",
+      "target_hit",
+      "overlap_rejected"
+    ],
+    "rows": [
+      {
+        "id": 720,
+        "trade_id": 259,
+        "timestamp": "2026-05-01 13:20:45",
+        "event_type": "entry_requested",
+        "agent": "pm_moderate",
+        "symbol": "AMD",
+        "profile": "moderate",
+        "message": "entry requested for AMD LONG technical_breakout"
+      },
+      {
+        "id": 721,
+        "trade_id": 259,
+        "timestamp": "2026-05-01 13:20:50",
+        "event_type": "entry_filled",
+        "agent": "pm_moderate",
+        "symbol": "AMD",
+        "profile": "moderate",
+        "message": "entry filled at 353.00"
+      },
+      {
+        "id": 722,
+        "trade_id": 260,
+        "timestamp": "2026-05-01 14:20:05",
+        "event_type": "entry_requested",
+        "agent": "pm_aggressive",
+        "symbol": "AMD",
+        "profile": "aggressive",
+        "message": "entry requested for AMD LONG technical_breakout"
+      },
+      {
+        "id": 723,
+        "trade_id": 260,
+        "timestamp": "2026-05-01 14:20:10",
+        "event_type": "entry_filled",
+        "agent": "pm_aggressive",
+        "symbol": "AMD",
+        "profile": "aggressive",
+        "message": "entry filled at 352.50"
+      },
+      {
+        "id": 724,
+        "trade_id": null,
+        "timestamp": "2026-05-01 19:55:20",
+        "event_type": "entry_requested",
+        "agent": "pm_conservative",
+        "symbol": "AMD",
+        "profile": "conservative",
+        "message": "entry requested"
+      },
+      {
+        "id": 725,
+        "trade_id": 259,
+        "timestamp": "2026-05-01 14:30:13",
+        "event_type": "stop_loss",
+        "agent": "pm_moderate",
+        "symbol": "AMD",
+        "profile": "moderate",
+        "message": "stop_loss triggered at 352.01"
+      },
+      {
+        "id": 726,
+        "trade_id": 260,
+        "timestamp": "2026-05-01 15:10:45",
+        "event_type": "stop_loss",
+        "agent": "pm_aggressive",
+        "symbol": "AMD",
+        "profile": "aggressive",
+        "message": "stop_loss triggered at 348.90"
+      }
+    ]
+  },
+  "dynamic_strategies": [
+    {
+      "id": 4,
+      "name": "Risk-Off Mega-Cap Momentum Fade",
+      "status": "active",
+      "pipeline_stage": null
+    },
+    {
+      "id": 7,
+      "name": "Breakout Scalp Intraday",
+      "status": "active",
+      "pipeline_stage": "live"
+    }
+  ]
+}

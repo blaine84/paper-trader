@@ -1,0 +1,27 @@
+{
+  "diagnostic_schema_version": "1.0",
+  "run_type": "same_symbol_overlap_diagnostic",
+  "severity": "extreme",
+  "summary": "AMD overlap detected.",
+  "findings": [
+    {
+      "candidate_id": "overlap_001",
+      "symbol": "AMD",
+      "direction": "LONG",
+      "profiles": ["moderate", "aggressive"],
+      "trade_ids": [259, 260],
+      "combined_pnl": -401.72,
+      "evidence": [
+        "trade_id=259 AMD moderate LONG technical_breakout pnl=-91.76 reason_exit=stop_loss",
+        "trade_id=260 AMD aggressive LONG technical_breakout pnl=-309.96 reason_exit=stop_loss"
+      ]
+    }
+  ],
+  "recommended_policy": {
+    "policy_type": "cooldown",
+    "applies_to_candidate_ids": ["overlap_001"],
+    "title": "Add same-symbol same-direction overlap guard",
+    "recommendation": "Reject or throttle new entries when another profile has an open or recently closed same-symbol same-direction trade within the configured cooldown window.",
+    "requires_human_approval": true
+  }
+}
