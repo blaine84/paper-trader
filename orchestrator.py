@@ -315,12 +315,8 @@ def run_intraday():
         log.error(f"Scout picks error: {e}", exc_info=True)
     full_watchlist = WATCHLIST + scout_picks
 
-    # Analyst refresh (also runs here so PMs have fresh signals)
-    try:
-        console.print("[bold blue]📊 Analyst refresh...[/bold blue]")
-        analyst.run(engine, full_watchlist)
-    except Exception as e:
-        log.error(f"Analyst error: {e}", exc_info=True)
+    # Analyst signals are refreshed by the separate run_analyst_refresh job
+    # on the same schedule — no need to duplicate here.
 
     # PM profiles decide — each independently, in parallel
     console.print("[bold green]🧠 Portfolio Managers deciding...[/bold green]")
