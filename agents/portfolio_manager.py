@@ -25,6 +25,8 @@ from core.edge_score import (
 from core.portfolio_risk import (
     validate_portfolio_risk, compute_portfolio_risk, adaptive_risk_throttle,
 )
+from utils.setup_quality_gate import evaluate_setup_quality
+from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 
 log = logging.getLogger(__name__)
 
@@ -1125,6 +1127,79 @@ def get_strategy_position_multiplier(engine, strategy_key: str) -> float:
         db.close()
 
 
+def _run_gate_pipeline(db, engine, decision, signal, profile_id):
+    """
+    Run all active gates in sequence. Returns (proceed, notes, cumulative_multiplier, multiplier_breakdown).
+
+    Gate order:
+    1. Setup Quality Gate (Phase 1)
+    2. Pre-Trade Quality Gate (Phase 1)
+    3. Catalyst Timing Gate (Phase 2 — skipped until wired)
+    4. Concentration Gate (Phase 2 — skipped until wired)
+
+    Short-circuits on reject or override_required. Accumulates size multipliers on reduce_size.
+    Each gate call is wrapped in try/except — on unexpected exception, log gate_error event and treat as warn.
+    """
+    notes = []
+    cumulative_multiplier = 1.0
+    multiplier_breakdown = []
+
+    # Gate 1: Setup Quality
+    setup_type = decision.get("setup_type") or decision.get("setup") or ""
+    market_regime = decision.get("market_regime") or decision.get("regime")
+    symbol = decision.get("symbol")
+
+    try:
+        setup_result = evaluate_setup_quality(
+            engine, db, setup_type, market_regime,
+            symbol=symbol, profile=profile_id,
+        )
+        notes.append({"gate": "setup_quality_gate", **setup_result})
+        if setup_result["decision"] == "reject":
+            return False, notes, cumulative_multiplier, multiplier_breakdown
+        if setup_result.get("size_multiplier") and setup_result["decision"] == "reduce_size":
+            cumulative_multiplier *= setup_result["size_multiplier"]
+            multiplier_breakdown.append({"gate": "setup_quality_gate", "multiplier": setup_result["size_multiplier"]})
+    except Exception as exc:
+        log.error("Setup quality gate error (treating as warn): %s", exc)
+        log_trade_event(
+            db, "gate_error",
+            agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id,
+            message=f"Setup quality gate error: {exc}",
+            payload={"gate_name": "setup_quality_gate", "error": str(exc)},
+        )
+        notes.append({"gate": "setup_quality_gate", "decision": "warn", "reason_type": "gate_error", "reason": str(exc)})
+
+    # Gate 2: Pre-Trade Quality
+    try:
+        quality_result = evaluate_pre_trade_quality(
+            db, decision, signal,
+            symbol=symbol, profile=profile_id,
+        )
+        notes.append({"gate": "pre_trade_quality_gate", **quality_result})
+        if quality_result["decision"] == "reject":
+            return False, notes, cumulative_multiplier, multiplier_breakdown
+        if quality_result["decision"] == "override_required":
+            return False, notes, cumulative_multiplier, multiplier_breakdown
+        if quality_result.get("size_multiplier") and quality_result["decision"] == "reduce_size":
+            cumulative_multiplier *= quality_result["size_multiplier"]
+            multiplier_breakdown.append({"gate": "pre_trade_quality_gate", "multiplier": quality_result["size_multiplier"]})
+    except Exception as exc:
+        log.error("Pre-trade quality gate error (treating as warn): %s", exc)
+        log_trade_event(
+            db, "gate_error",
+            agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id,
+            message=f"Pre-trade quality gate error: {exc}",
+            payload={"gate_name": "pre_trade_quality_gate", "error": str(exc)},
+        )
+        notes.append({"gate": "pre_trade_quality_gate", "decision": "warn", "reason_type": "gate_error", "reason": str(exc)})
+
+    # Phase 2 gates (catalyst timing, concentration) — placeholders
+    # Will be wired in Phase 2 tasks
+
+    return True, notes, cumulative_multiplier, multiplier_breakdown
+
+
 def execute_trade(db, decision: dict, profile_id: str):
     """
     Apply a trade decision to the paper portfolio.
@@ -1255,6 +1330,45 @@ def execute_trade(db, decision: dict, profile_id: str):
         .first()
     )
     cash = bal.cash if bal else float(starting)
+
+    # ── Gate Pipeline: deterministic pre-trade safety gates ──
+    _gate_notes = []
+    _gate_multiplier = 1.0
+    _gate_multiplier_breakdown = []
+    if action in ("BUY", "SHORT"):
+        signal_for_gates = _build_signal_for_symbol(db, symbol, decision)
+        proceed, _gate_notes, _gate_multiplier, _gate_multiplier_breakdown = _run_gate_pipeline(
+            db, db.bind, decision, signal_for_gates, profile_id,
+        )
+        if not proceed:
+            gate_rejection_reasons = "; ".join(
+                n.get("reason", "") for n in _gate_notes if n.get("decision") in ("reject", "override_required")
+            )
+            log_trade_event(
+                db,
+                "gate_rejected",
+                agent=f"pm_{profile_id}",
+                symbol=symbol,
+                profile=profile_id,
+                price=price,
+                message=f"Trade rejected by gate pipeline: {gate_rejection_reasons}",
+                payload={"gate_notes": _gate_notes},
+            )
+            log.warning(
+                "DECISION: status=GATE_REJECTED symbol=%s profile=%s reason=%s",
+                symbol, profile_id, gate_rejection_reasons,
+            )
+            return False, f"Gate pipeline rejected: {gate_rejection_reasons}"
+
+        # Apply cumulative size multiplier from gates
+        if _gate_multiplier < 1.0 and quantity > 0:
+            pre_gate_qty = quantity
+            quantity = max(1, int(quantity * _gate_multiplier))
+            decision["quantity"] = quantity
+            log.info(
+                "Gate pipeline size multiplier applied: %.2f × %d → %d",
+                _gate_multiplier, pre_gate_qty, quantity,
+            )
 
     # ── Tier-1 pre-validation: similarity → edge score → portfolio risk ──
     # Tracks edge data to store on the Trade record later
