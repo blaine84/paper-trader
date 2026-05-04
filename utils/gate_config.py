@@ -51,6 +51,42 @@ SEMI_CLUSTER: set[str] = {"AMD", "NVDA", "AVGO", "SMCI", "ARM", "MU", "INTC"}
 CRYPTO_PROXY_CLUSTER: set[str] = {"COIN", "MSTR"}
 
 # ---------------------------------------------------------------------------
+# Risk Geometry Gate — Stop Distance Rules
+# ---------------------------------------------------------------------------
+
+STOP_DISTANCE_RULES: dict[str, dict] = {
+    "high_beta_mega_cap_intraday": {
+        "min_pct": 0.015,
+        "atr_multiplier": 1.5,
+        "min_reward_to_risk": 2.0,
+        "allow_pct_only_fallback": True,
+        "atr_max_age_minutes": 15,
+    },
+    "etf_intraday": {
+        "min_pct": 0.008,
+        "atr_multiplier": 1.2,
+        "min_reward_to_risk": 1.8,
+        "allow_pct_only_fallback": True,
+        "atr_max_age_minutes": 15,
+    },
+    "small_cap_momentum": {
+        "min_pct": 0.025,
+        "atr_multiplier": 2.0,
+        "min_reward_to_risk": 2.5,
+        "allow_pct_only_fallback": False,
+        "atr_max_age_minutes": 10,
+    },
+}
+
+DEFAULT_STOP_DISTANCE_RULE: dict = {
+    "min_pct": 0.012,
+    "atr_multiplier": 1.3,
+    "min_reward_to_risk": 2.0,
+    "allow_pct_only_fallback": True,
+    "atr_max_age_minutes": 15,
+}
+
+# ---------------------------------------------------------------------------
 # Feedback Rule Registry
 # ---------------------------------------------------------------------------
 
@@ -71,6 +107,7 @@ GATE_EVENT_TYPES: dict[str, str] = {
     "reduce_size": "gate_size_reduced",
     "override_required": "gate_override_required",
     "override_approved": "gate_override_approved",
+    "risk_geometry_gate_evaluated": "risk_geometry_gate_evaluated",
 }
 
 # ---------------------------------------------------------------------------

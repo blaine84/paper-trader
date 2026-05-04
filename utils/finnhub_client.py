@@ -68,8 +68,42 @@ class FinnhubClient:
         """
         OHLCV candles.
         resolution: 1, 5, 15, 30, 60, D, W, M
-        Free Finnhub tier only supports daily candles — falls back to yfinance for intraday.
+
+        For sub-daily resolutions (1, 5, 15, 30, 60): yfinance first, Finnhub fallback.
+        For daily+ resolutions (D, W, M): Finnhub first, yfinance fallback (unchanged).
+
+        Returns dict with keys: symbol, resolution, timestamps, open, high, low, close, volume, source.
+        The 'source' field is "yfinance" or "finnhub" indicating which provider supplied the data.
+        Returns empty dict {} when both sources fail.
         """
+        SUB_DAILY = {"1", "5", "15", "30", "60"}
+
+        if resolution in SUB_DAILY:
+            # yfinance primary for intraday
+            result = self._get_candles_yfinance(symbol, resolution, days)
+            if result:
+                result["source"] = "yfinance"
+                return result
+            # Finnhub fallback
+            result = self._get_candles_finnhub(symbol, resolution, days)
+            if result:
+                result["source"] = "finnhub"
+                return result
+            return {}
+        else:
+            # Daily+ unchanged: Finnhub primary
+            result = self._get_candles_finnhub(symbol, resolution, days)
+            if result:
+                result["source"] = "finnhub"
+                return result
+            result = self._get_candles_yfinance(symbol, resolution, days)
+            if result:
+                result["source"] = "yfinance"
+                return result
+            return {}
+
+    def _get_candles_finnhub(self, symbol: str, resolution: str, days: int) -> dict:
+        """Finnhub API candle fetch with rate limiting and retry logic."""
         now = int(time.time())
         since = int((datetime.utcnow() - timedelta(days=days)).timestamp())
         try:
@@ -88,10 +122,9 @@ class FinnhubClient:
                 }
         except Exception as e:
             if "403" not in str(e):
-                return {}
-
-        # Finnhub 403 or no data — fall back to yfinance
-        return self._get_candles_yfinance(symbol, resolution, days)
+                log.warning(f"Finnhub candle fetch failed for {symbol}: {e}")
+            return {}
+        return {}
 
     def _get_candles_yfinance(self, symbol: str, resolution: str, days: int) -> dict:
         """yfinance fallback for intraday candles."""

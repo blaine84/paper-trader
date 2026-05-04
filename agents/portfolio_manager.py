@@ -7,7 +7,7 @@ Scout provides symbols only — all entry/exit decisions are made here.
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, Position, Balance, Trade, DynamicStrategy, get_session
@@ -1127,6 +1127,20 @@ def get_strategy_position_multiplier(engine, strategy_key: str) -> float:
         db.close()
 
 
+def _compute_max_dollar_risk(profile_id: str, total_equity: float) -> float:
+    """Compute the maximum dollar risk per trade from the active profile.
+
+    Uses the profile's risk_per_trade_pct (or equivalent field) applied to
+    total_equity. This is the single authoritative source for max dollar risk
+    used by both initial PM sizing and the RiskGeometryGate.
+
+    Falls back to a conservative default (1% of equity) if the profile field is missing.
+    """
+    profile = PM_PROFILES.get(profile_id, {})
+    risk_pct = profile.get("risk_per_trade_pct", 0.01)
+    return total_equity * risk_pct
+
+
 def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     """
     Run all active gates in sequence. Returns (proceed, notes, cumulative_multiplier, multiplier_breakdown).
@@ -1134,8 +1148,9 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     Gate order:
     1. Setup Quality Gate (Phase 1)
     2. Pre-Trade Quality Gate (Phase 1)
-    3. Catalyst Timing Gate (Phase 2 — skipped until wired)
-    4. Concentration Gate (Phase 2 — skipped until wired)
+    3. Risk Geometry Gate (Phase 1)
+    4. Catalyst Timing Gate (Phase 2 — skipped until wired)
+    5. Concentration Gate (Phase 2 — skipped until wired)
 
     Short-circuits on reject or override_required. Accumulates size multipliers on reduce_size.
     Each gate call is wrapped in try/except — on unexpected exception, log gate_error event and treat as warn.
@@ -1208,6 +1223,91 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
             payload={"gate_name": "pre_trade_quality_gate", "error": str(exc)},
         )
         notes.append({"gate": "pre_trade_quality_gate", "decision": "warn", "reason_type": "gate_error", "reason": str(exc)})
+
+    # Gate 3: Risk Geometry Gate
+    try:
+        from utils.risk_geometry_gate import evaluate_risk_geometry
+        from utils.atr_helper import compute_intraday_atr
+
+        # Extract trade parameters from decision
+        price = decision.get("price") or decision.get("entry_price") or 0
+        try:
+            price = float(price) if price not in (None, "") else 0
+        except (TypeError, ValueError):
+            price = 0
+
+        stop = decision.get("stop") or decision.get("stop_price") or decision.get("stop_loss")
+        target = decision.get("target") or decision.get("target_price") or decision.get("profit_target")
+        quantity = decision.get("quantity", 0)
+        action = decision.get("action", "")
+
+        # Only run the gate if we have the minimum required parameters
+        if price and price > 0 and stop and target:
+            try:
+                stop = float(stop)
+                target = float(target)
+            except (TypeError, ValueError):
+                stop = 0
+                target = 0
+
+            if stop > 0 and target > 0:
+                # Compute ATR for the symbol
+                atr_data = compute_intraday_atr(symbol)
+
+                # Compute total_equity for max_dollar_risk
+                starting = PM_PROFILES[profile_id]["starting_balance"]
+                bal = (
+                    db.query(Balance)
+                    .filter_by(profile=profile_id)
+                    .order_by(Balance.timestamp.desc())
+                    .first()
+                )
+                cash = bal.cash if bal else float(starting)
+                positions = db.query(Position).filter_by(profile=profile_id).all()
+                pos_value = sum(p.quantity * p.avg_cost for p in positions)
+                total_equity = cash + pos_value
+
+                max_dollar_risk = _compute_max_dollar_risk(profile_id, total_equity)
+
+                geometry_result = evaluate_risk_geometry(
+                    entry_price=price,
+                    stop_price=stop,
+                    target_price=target,
+                    quantity=quantity,
+                    direction=action,
+                    symbol=symbol,
+                    setup_type=setup_type,
+                    atr_5min=atr_data.get("atr"),
+                    atr_timestamp=atr_data.get("timestamp"),
+                    atr_source=atr_data.get("source"),
+                    trade_timestamp=datetime.now(timezone.utc),
+                    max_dollar_risk=max_dollar_risk,
+                    quantity_policy="whole_share",
+                    db=db,
+                    profile=profile_id,
+                )
+
+                notes.append({"gate": "risk_geometry_gate", **geometry_result})
+
+                if geometry_result["decision"] == "rejected":
+                    return False, notes, cumulative_multiplier, multiplier_breakdown
+
+                if geometry_result["decision"] == "adjusted_allowed":
+                    # Propagate adjusted params for downstream use
+                    decision["stop"] = geometry_result["stop_price"]
+                    decision["stop_loss"] = geometry_result["stop_price"]
+                    decision["stop_price"] = geometry_result["stop_price"]
+                    decision["quantity"] = geometry_result["quantity"]
+
+    except Exception as exc:
+        log.error("Risk geometry gate error (treating as warn): %s", exc)
+        log_trade_event(
+            db, "gate_error",
+            agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id,
+            message=f"Risk geometry gate error: {exc}",
+            payload={"gate_name": "risk_geometry_gate", "risk_geometry_gate_failed_open": True, "error": str(exc)},
+        )
+        notes.append({"gate": "risk_geometry_gate", "decision": "warn", "reason_type": "gate_error", "risk_geometry_gate_failed_open": True, "reason": str(exc)})
 
     # Phase 2 gates (catalyst timing, concentration) — placeholders
     # Will be wired in Phase 2 tasks
@@ -1502,7 +1602,7 @@ def execute_trade(db, decision: dict, profile_id: str):
         )
         if not proceed:
             gate_rejection_reasons = "; ".join(
-                n.get("reason", "") for n in _gate_notes if n.get("decision") in ("reject", "override_required")
+                n.get("reason", "") for n in _gate_notes if n.get("decision") in ("reject", "rejected", "override_required")
             )
             log_trade_event(
                 db,
@@ -1529,6 +1629,17 @@ def execute_trade(db, decision: dict, profile_id: str):
                 "Gate pipeline size multiplier applied: %.2f × %d → %d",
                 _gate_multiplier, pre_gate_qty, quantity,
             )
+
+        # Propagate any adjusted parameters from the risk geometry gate
+        # (decision dict was updated inside _run_gate_pipeline)
+        rg_note = next((n for n in _gate_notes if n.get("gate") == "risk_geometry_gate" and n.get("decision") == "adjusted_allowed"), None)
+        if rg_note:
+            stop = rg_note["stop_price"]
+            quantity = rg_note["quantity"]
+            decision["stop"] = stop
+            decision["stop_loss"] = stop
+            decision["stop_price"] = stop
+            decision["quantity"] = quantity
 
     # ── Tier-1 pre-validation: similarity → edge score → portfolio risk ──
     # Tracks edge data to store on the Trade record later

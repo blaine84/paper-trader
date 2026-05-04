@@ -742,6 +742,32 @@ def test_high_winrate_fast_intraday_stop_buffer_is_enforced():
         "win_rate": 0.72, "total_cases": 20,
     }
 
+    _rg_passthrough = {
+        "decision": "passed_unchanged",
+        "reason": "Trade geometry validated",
+        "reason_code": "PASSED",
+        "entry_price": 100.0,
+        "stop_price": 98.5,
+        "target_price": 104.0,
+        "quantity": 50,
+        "stop_distance": 1.5,
+        "min_stop_distance": 1.5,
+        "adjusted_stop_price": None,
+        "adjusted_quantity": None,
+        "original_dollar_risk": 75.0,
+        "adjusted_dollar_risk": None,
+        "original_rr": 2.67,
+        "adjusted_rr": None,
+        "target_distance": 4.0,
+        "atr_value": None,
+        "atr_source": None,
+        "atr_timestamp": None,
+        "atr_fallback": True,
+        "rule_name": "high_beta_mega_cap_intraday",
+        "rule_source": "HIGH_BETA_CLUSTER",
+        "quantity_policy": "whole_share",
+    }
+
     with (
         patch(_FIND_SIMILAR, return_value=[]),
         patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
@@ -749,6 +775,7 @@ def test_high_winrate_fast_intraday_stop_buffer_is_enforced():
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
         patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
+        patch("utils.risk_geometry_gate.evaluate_risk_geometry", return_value=_rg_passthrough),
     ):
         mock_fh = MagicMock()
         mock_fh.get_quote.return_value = {"price": 100.0}
