@@ -1229,15 +1229,142 @@ def execute_trade(db, decision: dict, profile_id: str):
             price = live_price
         if not price or price <= 0:
             return False, "No price in decision and live quote unavailable"
-        if live_price and live_price > 0:
+        if live_price and live_price > 0 and action != "CLOSE":
             deviation = abs(price - live_price) / live_price
-            if deviation > 0.05:
+
+            if deviation > 0.10:
+                # Tier 3 — extreme deviation (>10%): reject outright
                 log.warning(
-                    "Price sanity check failed for %s: LLM price=%.2f, "
-                    "live price=%.2f (%.1f%% deviation). Using live price.",
+                    "Extreme price deviation for %s: LLM price=%.2f, "
+                    "live price=%.2f (%.1f%% deviation). Rejecting trade — "
+                    "stale context or hallucinated price.",
                     symbol, price, live_price, deviation * 100,
                 )
+                return False, (
+                    f"Extreme price deviation for {symbol}: "
+                    f"LLM price={price:.2f}, live price={live_price:.2f} "
+                    f"({deviation * 100:.1f}% deviation). "
+                    f"Trade rejected — price mismatch too large for repair."
+                )
+
+            elif deviation > 0.05:
+                # Tier 2 — moderate deviation (>5% to ≤10%): proportional repair
+                original_entry = price
+                original_stop = (
+                    decision.get("stop")
+                    or decision.get("stop_price")
+                    or decision.get("stop_loss")
+                )
+                original_target = (
+                    decision.get("target")
+                    or decision.get("target_price")
+                    or decision.get("profit_target")
+                )
+
                 price = live_price
+
+                if original_stop and original_entry:
+                    stop_ratio = (original_stop - original_entry) / original_entry
+                    new_stop = round(live_price * (1 + stop_ratio), 2)
+                else:
+                    new_stop = None
+
+                if original_target and original_entry:
+                    target_ratio = (original_target - original_entry) / original_entry
+                    new_target = round(live_price * (1 + target_ratio), 2)
+                else:
+                    new_target = None
+
+                # Validate repaired geometry before accepting
+                geometry_valid = True
+                rejection_reason = ""
+                if new_stop is not None and new_target is not None:
+                    if action == "BUY":
+                        # LONG: stop must be below entry, target must be above entry
+                        if new_stop >= live_price:
+                            geometry_valid = False
+                            rejection_reason = (
+                                f"Repaired stop ({new_stop:.2f}) >= entry ({live_price:.2f}) for BUY"
+                            )
+                        elif new_target <= live_price:
+                            geometry_valid = False
+                            rejection_reason = (
+                                f"Repaired target ({new_target:.2f}) <= entry ({live_price:.2f}) for BUY"
+                            )
+                        else:
+                            # Check R:R >= 1:1
+                            risk = live_price - new_stop
+                            reward = new_target - live_price
+                            if risk > 0 and reward / risk < 1.0:
+                                geometry_valid = False
+                                rejection_reason = (
+                                    f"Repaired R:R ({reward / risk:.2f}) < 1:1 for BUY"
+                                )
+                    elif action == "SHORT":
+                        # SHORT: stop must be above entry, target must be below entry
+                        if new_stop <= live_price:
+                            geometry_valid = False
+                            rejection_reason = (
+                                f"Repaired stop ({new_stop:.2f}) <= entry ({live_price:.2f}) for SHORT"
+                            )
+                        elif new_target >= live_price:
+                            geometry_valid = False
+                            rejection_reason = (
+                                f"Repaired target ({new_target:.2f}) >= entry ({live_price:.2f}) for SHORT"
+                            )
+                        else:
+                            # Check R:R >= 1:1
+                            risk = new_stop - live_price
+                            reward = live_price - new_target
+                            if risk > 0 and reward / risk < 1.0:
+                                geometry_valid = False
+                                rejection_reason = (
+                                    f"Repaired R:R ({reward / risk:.2f}) < 1:1 for SHORT"
+                                )
+
+                if not geometry_valid:
+                    log.warning(
+                        "Price repair geometry invalid for %s: %s. "
+                        "Original entry=%.2f, stop=%s, target=%s. "
+                        "Repaired entry=%.2f, stop=%s, target=%s. Rejecting.",
+                        symbol, rejection_reason,
+                        original_entry, original_stop, original_target,
+                        live_price, new_stop, new_target,
+                    )
+                    return False, (
+                        f"Price repair geometry invalid for {symbol}: {rejection_reason}"
+                    )
+
+                # Write repaired values back to decision dict so downstream
+                # extraction picks up corrected values
+                if new_stop is not None:
+                    decision["stop"] = new_stop
+                    if "stop_price" in decision:
+                        decision["stop_price"] = new_stop
+                    if "stop_loss" in decision:
+                        decision["stop_loss"] = new_stop
+
+                if new_target is not None:
+                    decision["target"] = new_target
+                    if "target_price" in decision:
+                        decision["target_price"] = new_target
+                    if "profit_target" in decision:
+                        decision["profit_target"] = new_target
+
+                log.warning(
+                    "Proportional price repair for %s: deviation=%.1f%%. "
+                    "Entry: %.2f → %.2f. Stop: %s → %s (ratio=%.4f). "
+                    "Target: %s → %s (ratio=%.4f).",
+                    symbol, deviation * 100,
+                    original_entry, live_price,
+                    original_stop, new_stop,
+                    stop_ratio if original_stop and original_entry else 0,
+                    original_target, new_target,
+                    target_ratio if original_target and original_entry else 0,
+                )
+
+            # Tier 1 — ≤5% deviation: no change (existing passthrough)
+
     except Exception as exc:
         log.warning("Could not verify price for %s: %s", symbol, exc)
         if not price or price <= 0:
@@ -2117,8 +2244,31 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     # Win rates by setup type — PM uses this to adjust sizing
     win_rates = get_win_rate_by_setup(engine)
 
-    # Filter signals to only symbols without open positions (entry candidates)
-    entry_signals = {sym: sig for sym, sig in signals.items() if sym not in held_symbols}
+    # Filter signals to only symbols without open positions (entry candidates),
+    # excluding HOLD signals and signals below the profile's strength threshold.
+    entry_signals = {
+        sym: sig for sym, sig in signals.items()
+        if sym not in held_symbols
+        and sig.get("signal", "").upper() != "HOLD"
+        and _meets_threshold(sig.get("strength", "weak"), profile["min_signal_strength"])
+    }
+
+    # Log filtered-out signals at DEBUG level for observability
+    for sym, sig in signals.items():
+        if sym in held_symbols:
+            continue  # already excluded by held_symbols filter, not new
+        direction = sig.get("signal", "").upper()
+        strength = sig.get("strength", "weak")
+        if direction == "HOLD":
+            log.debug(
+                "Signal filtered out: symbol=%s direction=%s strength=%s reason=HOLD_direction",
+                sym, direction, strength,
+            )
+        elif not _meets_threshold(strength, profile["min_signal_strength"]):
+            log.debug(
+                "Signal filtered out: symbol=%s direction=%s strength=%s reason=below_threshold (requires %s)",
+                sym, direction, strength, profile["min_signal_strength"],
+            )
 
     # Filter win rates to only include setup types matching entry candidates' signals
     entry_setup_types = {sig.get("setup_type") for sig in entry_signals.values() if sig.get("setup_type")}

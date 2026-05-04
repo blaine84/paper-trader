@@ -170,7 +170,11 @@ def test_edge_score_rejection():
         }),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is False
@@ -213,7 +217,11 @@ def test_hard_rejection_for_proven_bad_setup():
         patch(_ADJUST_CONFIDENCE, return_value=bad_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is False
@@ -253,7 +261,11 @@ def test_position_size_scaling_with_cap():
         patch(_ADJUST_CONFIDENCE, return_value=good_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is True, f"Trade should have succeeded: {msg}"
@@ -321,7 +333,11 @@ def test_adaptive_risk_throttling_after_loss_streak():
         patch(_ADJUST_CONFIDENCE, return_value=good_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is True, f"Trade should have succeeded: {msg}"
@@ -375,7 +391,11 @@ def test_trade_record_persistence():
         patch(_ADJUST_CONFIDENCE, return_value=good_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is True, f"Trade should have succeeded: {msg}"
@@ -444,7 +464,11 @@ def test_portfolio_risk_rejection_multi_bucket():
         patch(_ADJUST_CONFIDENCE, return_value=good_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is False, f"Trade should have been rejected: {msg}"
@@ -486,7 +510,11 @@ def test_structured_logging_output(caplog):
             patch(_ADJUST_CONFIDENCE, return_value=good_conf),
             patch(_VALIDATE_TRADE),
             patch(_CHECK_CORRELATION, return_value=""),
+            patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
         ):
+            mock_fh = MagicMock()
+            mock_fh.get_quote.return_value = {"price": 150.0}
+            mock_fh_cls.return_value = mock_fh
             ok, msg = execute_trade(db, decision, profile_id)
 
     log_text = caplog.text
@@ -545,7 +573,11 @@ def test_entry_contract_persisted_on_buy():
         patch(_ADJUST_CONFIDENCE, return_value=good_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is True, f"Trade should have succeeded: {msg}"
@@ -604,7 +636,11 @@ def test_entry_contract_persisted_on_short():
         patch(_ADJUST_CONFIDENCE, return_value=good_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is True, f"Trade should have succeeded: {msg}"
@@ -656,7 +692,11 @@ def test_entry_contract_fallback_to_stop_price_default():
         patch(_ADJUST_CONFIDENCE, return_value=good_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is True, f"Trade should have succeeded: {msg}"
@@ -769,7 +809,11 @@ def test_high_momentum_asset_cooldown_blocks_cascading_reentry():
         patch(_ADJUST_CONFIDENCE, return_value=high_wr_conf),
         patch(_VALIDATE_TRADE),
         patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
     ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 100.0}
+        mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
     assert ok is False
