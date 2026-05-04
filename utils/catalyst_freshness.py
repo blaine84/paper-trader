@@ -135,15 +135,19 @@ def get_researcher_timestamps(
 ) -> dict:
     """
     Return {symbol: (timestamp, confidence_level)} for the most recent
-    researcher sentiment per symbol.
+    researcher sentiment per symbol.  Ignores entries older than 36 hours
+    so that truly stale data is treated as absent rather than misleadingly
+    displayed.
     """
     from db.schema import AgentMemory
 
+    cutoff = datetime.now(dt_tz.utc) - timedelta(hours=36)
     result = {}
     for sym in symbols:
         row = (
             db_session.query(AgentMemory)
             .filter_by(agent="researcher", key="sentiment", symbol=sym)
+            .filter(AgentMemory.timestamp >= cutoff)
             .order_by(AgentMemory.timestamp.desc())
             .first()
         )
@@ -278,12 +282,21 @@ def compute_catalyst_freshness(
 
 
 def _format_time_et(dt_obj: datetime) -> str:
-    """Format a datetime as HH:MM AM/PM in ET, without leading zero on the hour."""
+    """Format a datetime as HH:MM AM/PM in ET, without leading zero on the hour.
+
+    Includes the date (e.g. "Apr 7") when the timestamp is NOT from today,
+    so stale data is immediately obvious.
+    """
     et_dt = dt_obj.astimezone(ET)
+    now_et = datetime.now(ET)
     hour = int(et_dt.strftime("%I"))  # %I gives 01-12; int() strips leading zero
     minute = et_dt.strftime("%M")
     ampm = et_dt.strftime("%p")
-    return f"{hour}:{minute} {ampm}"
+    time_str = f"{hour}:{minute} {ampm}"
+    if et_dt.date() != now_et.date():
+        date_str = f"{et_dt.strftime('%b')} {et_dt.day}"
+        return f"{date_str} {time_str}"
+    return time_str
 
 
 def build_freshness_label(

@@ -820,9 +820,11 @@ def assemble_morning_briefing(engine) -> dict:
     try:
         db = get_session(engine)
         try:
+            sentiment_cutoff = datetime.utcnow() - timedelta(hours=36)
             rows = (
                 db.query(AgentMemory)
                 .filter_by(agent="researcher", key="sentiment")
+                .filter(AgentMemory.timestamp >= sentiment_cutoff)
                 .order_by(AgentMemory.timestamp.desc())
                 .all()
             )

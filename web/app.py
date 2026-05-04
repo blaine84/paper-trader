@@ -60,11 +60,14 @@ def get_market_open() -> bool:
 
 
 def get_analyst_signals(db, symbols: list[str]) -> dict:
+    """Return latest analyst signal per symbol, ignoring entries older than 36 hours."""
+    cutoff = datetime.utcnow() - timedelta(hours=36)
     signals = {}
     for sym in symbols:
         mem = (
             db.query(AgentMemory)
             .filter_by(agent="analyst", symbol=sym, key="signal")
+            .filter(AgentMemory.timestamp >= cutoff)
             .order_by(AgentMemory.timestamp.desc())
             .first()
         )
@@ -74,11 +77,14 @@ def get_analyst_signals(db, symbols: list[str]) -> dict:
 
 
 def get_researcher_sentiment(db, symbols: list[str]) -> dict:
+    """Return latest researcher sentiment per symbol, ignoring entries older than 36 hours."""
+    cutoff = datetime.utcnow() - timedelta(hours=36)
     sentiment = {}
     for sym in symbols:
         mem = (
             db.query(AgentMemory)
             .filter_by(agent="researcher", symbol=sym, key="sentiment")
+            .filter(AgentMemory.timestamp >= cutoff)
             .order_by(AgentMemory.timestamp.desc())
             .first()
         )

@@ -68,7 +68,7 @@ CURRENT QUOTES:
 Analyze the above and return your research JSON.
 """
 
-    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="low", purpose="researcher_premarket")
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose="researcher_premarket")
     result = parse_json_response(raw)
     result["market_context"] = result.get("market_context", "")
     result["market_regime"] = result.get("market_regime", "unknown")

@@ -7,7 +7,7 @@ Writes signal recommendations to AgentMemory.
 
 import json
 import logging
-from datetime import datetime, timezone as dt_tz
+from datetime import datetime, timedelta, timezone as dt_tz
 from utils.finnhub_client import FinnhubClient
 from utils.technicals import compute_indicators
 from utils.llm import call_llm, parse_json_response
@@ -92,11 +92,13 @@ def run(engine, symbols: list[str]) -> dict:
     except Exception as exc:
         log.warning("Analyst feedback processing failed: %s", exc)
 
-    # Pull latest researcher sentiment from memory
+    # Pull latest researcher sentiment from memory (ignore entries older than 36h)
     recent_sentiment = {}
+    sentiment_cutoff = datetime.now(dt_tz.utc) - timedelta(hours=36)
     sentiments = (
         db.query(AgentMemory)
         .filter_by(agent="researcher", key="sentiment")
+        .filter(AgentMemory.timestamp >= sentiment_cutoff)
         .order_by(AgentMemory.timestamp.desc())
         .all()
     )

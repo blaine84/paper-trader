@@ -13,7 +13,7 @@ import argparse
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -54,11 +54,13 @@ def get_analyst_signals(db, symbols: list[str]) -> dict:
 
 def get_researcher_sentiment(db, symbols: list[str]) -> dict:
     from db.schema import AgentMemory
+    cutoff = datetime.utcnow() - timedelta(hours=36)
     sentiment = {}
     for sym in symbols:
         mem = (
             db.query(AgentMemory)
             .filter_by(agent="researcher", symbol=sym, key="sentiment")
+            .filter(AgentMemory.timestamp >= cutoff)
             .order_by(AgentMemory.timestamp.desc())
             .first()
         )
