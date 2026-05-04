@@ -26,7 +26,32 @@ Three deterministic, LLM-free modules in `core/` gate every trade:
 | Similarity Engine | `core/similarity.py` | Historical pattern matching via weighted scoring |
 | Portfolio Risk | `core/portfolio_risk.py` | Cross-position exposure control with adaptive throttling |
 
-Every BUY/SHORT runs through: similarity lookup → edge score → portfolio risk → existing validation.
+Every BUY/SHORT runs through: safety gates → similarity lookup → edge score → portfolio risk → existing validation.
+
+### Trade Safety Gates (Phase 1)
+
+Composable pre-trade validators in `utils/` that run before the Tier-1 edge/risk
+modules. Each gate returns a structured decision (`allow`, `warn`, `downgrade`,
+`reject`, `reduce_size`, or `override_required`) and logs its own audit event to
+`trade_events`. The PM orchestrates the pipeline with short-circuit-on-reject
+semantics — a rejected gate stops evaluation and no subsequent gates run.
+
+| Gate | File | Purpose |
+|---|---|---|
+| Gate Config | `utils/gate_config.py` | Shared constants and thresholds for all gates |
+| Setup Quality Gate | `utils/setup_quality_gate.py` | Blocks/downgrades setup types with poor win rates |
+| Pre-Trade Quality Gate | `utils/pre_trade_quality_gate.py` | Rejects trades with low Reviewer quality scores |
+
+The setup quality gate evaluates case-library performance using a deterministic
+rule chain: insufficient data → consecutive losses → historical underperformance
+(with recovery override) → rolling underperformance → weak but allowed → allow.
+Per-setup-type thresholds are configurable via `MIN_WIN_RATE_BY_SETUP`.
+
+The pre-trade quality gate evaluates Reviewer selection and execution scores with
+override support for high-confidence PM decisions.
+
+Phase 2 will add catalyst timing and concentration limit gates. See
+`.kiro/specs/trade-safety-gates/` for the full spec.
 
 ### Thesis-Anchored Exits
 

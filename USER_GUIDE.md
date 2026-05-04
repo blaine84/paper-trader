@@ -179,6 +179,22 @@ Each reads the same Analyst signals and Researcher context, then decides:
 - **Target** (based on key levels and required R:R)
 - **Position size** (profile's max % / stop distance)
 
+#### Trade Safety Gates
+
+Before any Tier-1 validation (edge score, portfolio risk), every BUY/SHORT runs
+through a deterministic gate pipeline. Each gate evaluates a specific risk dimension
+and returns a structured decision. The pipeline short-circuits on `reject` — skipped
+gates produce no events.
+
+| Gate | What it checks | Possible decisions |
+|---|---|---|
+| Setup Quality Gate | Case-library win rate by setup type | allow, downgrade, reject |
+| Pre-Trade Quality Gate | Reviewer selection + execution scores | allow, warn, reject, override_required |
+
+Gate decisions are logged to `trade_events` with `gate_name`, `rejection_category`,
+and `reason_type` in the payload for weekly review drill-down. All thresholds are
+centralized in `utils/gate_config.py`.
+
 #### Thesis-Anchored Exits
 
 Exit decisions are anchored to the **Entry Contract** — the original trade thesis
@@ -495,6 +511,13 @@ Confidence Adjustment (pre-trade)
   ├── Win rate 35-50% → downgrade confidence modifier
   └── Win rate ≥ 50% → no adjustment
 
+Trade Safety Gates (pre-trade, before edge score)
+  ├── Setup Quality Gate: blocks setup types with poor win rates
+  │     (per-setup thresholds, consecutive loss detection, recovery override)
+  ├── Pre-Trade Quality Gate: rejects low Reviewer scores
+  │     (score thresholds, override support for high-confidence PMs)
+  └── Each gate logs its own audit event to trade_events
+
 Meta Reviewer (weekly)
   ├── grades each agent A–F with trend
   ├── writes per-agent recommendations → agents read as context
@@ -554,7 +577,35 @@ The full lifecycle of a trade from signal to exit:
    PM decides: action, entry price, stop, target, quantity, rationale
    Entry Contract built: thesis, setup_type, structured invalidators persisted on Trade
 
-4. EDGE SCORE & RISK GATING (automatic, pre-validation)
+4. TRADE SAFETY GATES (automatic, pre-validation)
+   Deterministic gate pipeline runs before edge score / risk gating.
+   Each gate logs exactly one TradeEvent. Pipeline short-circuits on reject.
+
+   a. SETUP QUALITY GATE (utils/setup_quality_gate.py)
+      Evaluates case-library performance for the setup type:
+      ├─ < 5 cases → allow (insufficient data)
+      ├─ 3+ consecutive losses → reject
+      ├─ All-time win rate below threshold → reject (unless recovery override)
+      ├─ Rolling win rate below threshold → reject
+      ├─ Win rate above threshold but < 50% → downgrade
+      └─ Otherwise → allow
+      Per-setup thresholds: momentum_fade 35%, news_breakout 40%,
+      gap_and_go 45%, technical_breakout 40%, default 40%.
+
+   b. PRE-TRADE QUALITY GATE (utils/pre_trade_quality_gate.py)
+      Evaluates Reviewer selection and execution scores:
+      ├─ Either score missing → warn (allow with warning)
+      ├─ Both scores < 7.0 → reject
+      ├─ Execution < 6.0 and selection < 8.5 → reject
+      ├─ Execution < 7.0 and selection < 9.0 → override_required
+      └─ Otherwise → allow
+      Override: PM can provide override_confidence_score >= 8.0 + reason
+      to convert override_required → allow.
+
+   If any gate rejects → trade refused, PM logs gate_rejected event, done.
+   If gates pass → apply any cumulative size multipliers, continue to step 5.
+
+5. EDGE SCORE & RISK GATING (automatic, pre-validation)
    Three deterministic modules run before existing validation:
 
    a. SIMILARITY ENGINE
@@ -587,7 +638,7 @@ The full lifecycle of a trade from signal to exit:
 
    d. All three modules are deterministic (no LLM calls), fast (<10ms).
 
-5. BEHAVIORAL ADJUSTMENT (automatic, post-decision)
+6. BEHAVIORAL ADJUSTMENT (automatic, post-decision)
    Behavioral parameters (extracted from reviewer feedback) applied:
    ├─ Entry offset (earlier/later entries)
    ├─ Size multiplier (scale up/down)
@@ -597,7 +648,7 @@ The full lifecycle of a trade from signal to exit:
    ├─ Stop buffer (widen/tighten)
    └─ Min R:R override
 
-6. TRADE VALIDATION (automatic)
+7. TRADE VALIDATION (automatic)
    Before any trade hits the database:
    ✓ Stop price is valid and on correct side of entry
    ✓ Target price is valid and on correct side of entry
@@ -607,17 +658,17 @@ The full lifecycle of a trade from signal to exit:
    ✓ Quantity is positive
    → If any check fails, trade is REJECTED with reason logged
 
-7. STOP DERIVATION (if LLM omits stop/target)
+8. STOP DERIVATION (if LLM omits stop/target)
    Priority: ATR-based (1.5× ATR) → key level (support/resistance) → 1.5% fallback
 
-8. EXECUTION
+9. EXECUTION
    Trade written to DB with stop_price, target_price, edge_score,
    similarity_winrate, similarity_sample_size, similarity_confidence,
    thesis, setup_type, and invalidators (JSON) persisted as Entry Contract
    Position created, cash deducted
    Trade queued for review automatically
 
-9. PROFIT MANAGEMENT (every 60 seconds)
+10. PROFIT MANAGEMENT (every 60 seconds)
    ├─ +1R: take partial profit (25-50% by profile), move stop to breakeven
    ├─ +2R: take more profit (if profile allows), trail stop to +1R
    ├─ +3R: trail stop to +2R
