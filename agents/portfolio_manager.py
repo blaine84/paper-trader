@@ -1145,9 +1145,24 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     multiplier_breakdown = []
 
     # Gate 1: Setup Quality
-    setup_type = decision.get("setup_type") or decision.get("setup") or ""
-    market_regime = decision.get("market_regime") or decision.get("regime")
-    symbol = decision.get("symbol")
+    # PM decisions often omit setup metadata; fall back to the latest Analyst
+    # signal so the gate evaluates the actual setup instead of treating it as
+    # empty/insufficient-data.
+    signal = signal or {}
+    setup_type = (
+        decision.get("setup_type")
+        or decision.get("setup")
+        or signal.get("setup_type")
+        or signal.get("setup")
+        or ""
+    )
+    market_regime = (
+        decision.get("market_regime")
+        or decision.get("regime")
+        or signal.get("market_regime")
+        or signal.get("regime")
+    )
+    symbol = decision.get("symbol") or signal.get("symbol")
 
     try:
         setup_result = evaluate_setup_quality(
@@ -1213,6 +1228,11 @@ def execute_trade(db, decision: dict, profile_id: str):
     symbol = decision["symbol"]
     quantity = decision.get("quantity", 0)
     price = decision.get("price") or decision.get("entry_price") or 0
+    try:
+        price = float(price) if price not in (None, "") else 0
+    except (TypeError, ValueError):
+        log.warning("Decision for %s had non-numeric price %r", symbol, price)
+        price = 0
 
     # Sanity-check the LLM's price against a live quote. If the LLM omitted
     # price (or JSON repair produced price=0), use a live quote for valid
@@ -1221,6 +1241,10 @@ def execute_trade(db, decision: dict, profile_id: str):
         fh = FinnhubClient()
         live_quote = fh.get_quote(symbol)
         live_price = live_quote.get("price", 0)
+        try:
+            live_price = float(live_price) if live_price not in (None, "") else 0
+        except (TypeError, ValueError):
+            live_price = 0
         if (not price or price <= 0) and live_price and live_price > 0:
             log.warning(
                 "Decision for %s had missing/zero price; using live price %.2f",
