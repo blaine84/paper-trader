@@ -398,6 +398,8 @@
       const chgColor = w.change_pct >= 0 ? 'green' : 'red';
       const hasR = w.reasoning?.length > 0 || w.setup_reasoning?.length > 0;
       const exp = expandedRows.has(w.symbol);
+      const safeSetupReasoning = escHtml(w.setup_reasoning || '');
+      const safeReasoning = escHtml(w.reasoning || '');
       return `
         <tr>
           <td><strong class="sym-link" data-sym="${w.symbol}">${w.symbol}</strong></td>
@@ -410,7 +412,7 @@
           <td class="center">${w.is_scout ? '<span class="badge badge-scout">SCOUT</span>' : '<span class="dim">CORE</span>'}</td>
           <td>${hasR ? `<span class="expand-btn" onclick="toggleReasoning('${w.symbol}')">${exp ? '▲' : '▼'}</span>` : ''}</td>
         </tr>
-        ${hasR ? `<tr id="reasoning-${w.symbol}"><td colspan="9"><div class="reasoning ${exp ? 'visible' : ''}">${w.setup_reasoning ? `<strong>Setup:</strong> ${w.setup_reasoning}<br><br>` : ''}${w.reasoning || ''}</div></td></tr>` : ''}`;
+        ${hasR ? `<tr id="reasoning-${w.symbol}"><td colspan="9"><div class="reasoning ${exp ? 'visible' : ''}">${safeSetupReasoning ? `<strong>Setup:</strong> ${safeSetupReasoning}<br><br>` : ''}${safeReasoning}</div></td></tr>` : ''}`;
     }).join('');
   }
 
@@ -460,13 +462,13 @@
         lv.resistance ? `<span class="level-tag">R: ${lv.resistance}</span>` : '',
         lv.vwap ? `<span class="level-tag">VWAP: ${lv.vwap}</span>` : '',
       ].filter(Boolean).join('');
-      const cats = (w.catalysts || []).slice(0,2).map(c => `<li>${c}</li>`).join('');
+      const cats = (w.catalysts || []).slice(0,2).map(c => `<li>${escHtml(c)}</li>`).join('');
       return `
         <tr>
           <td><strong class="sym-link" data-sym="${w.symbol}">${w.symbol}</strong></td>
           <td class="center ${sentimentColor(w.sentiment)}">${w.sentiment}</td>
           <td><ul class="catalyst-list">${cats || '<li class="dim">—</li>'}</ul></td>
-          <td class="dim" style="font-size:12px">${w.invalidation || '—'}</td>
+          <td class="dim" style="font-size:12px">${escHtml(w.invalidation || '—')}</td>
           <td><div class="levels">${tags || '<span class="dim">—</span>'}</div></td>
         </tr>`;
     }).join('');
