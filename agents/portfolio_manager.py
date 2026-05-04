@@ -1213,15 +1213,22 @@ def execute_trade(db, decision: dict, profile_id: str):
     symbol = decision["symbol"]
     quantity = decision.get("quantity", 0)
     price = decision.get("price") or decision.get("entry_price") or 0
-    if not price:
-        return False, "No price in decision"
 
-    # Sanity-check the LLM's price against a live quote.
-    # Reject if the decision price deviates more than 5% from current market.
+    # Sanity-check the LLM's price against a live quote. If the LLM omitted
+    # price (or JSON repair produced price=0), use a live quote for valid
+    # symbols instead of creating noisy "No price in decision" rejects.
     try:
         fh = FinnhubClient()
         live_quote = fh.get_quote(symbol)
         live_price = live_quote.get("price", 0)
+        if (not price or price <= 0) and live_price and live_price > 0:
+            log.warning(
+                "Decision for %s had missing/zero price; using live price %.2f",
+                symbol, live_price,
+            )
+            price = live_price
+        if not price or price <= 0:
+            return False, "No price in decision and live quote unavailable"
         if live_price and live_price > 0:
             deviation = abs(price - live_price) / live_price
             if deviation > 0.05:
@@ -1233,6 +1240,8 @@ def execute_trade(db, decision: dict, profile_id: str):
                 price = live_price
     except Exception as exc:
         log.warning("Could not verify price for %s: %s", symbol, exc)
+        if not price or price <= 0:
+            return False, "No price in decision and live quote unavailable"
 
     # Extract stop/target from multiple possible keys the LLM might use
     stop = decision.get("stop") or decision.get("stop_price") or decision.get("stop_loss")
@@ -2206,6 +2215,20 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
         # by the two-tier review system above
         action = decision.get("action", "").upper()
         sym = decision.get("symbol", "")
+
+        # Guardrail: JSON repair / prose extraction can hallucinate generic
+        # labels like "AI Leader". Only allow new entries for symbols this PM
+        # cycle was explicitly asked to evaluate (or held symbols for close/trim).
+        if sym and sym not in set(symbols) and sym not in held_symbols:
+            msg = f"Rejected invented/out-of-scope symbol: {sym}"
+            log.warning(msg)
+            executed.append({
+                **decision, "executed": False,
+                "message": msg,
+                "profile": profile_id, "source": "entry_logic",
+            })
+            continue
+
         if action == "CLOSE" and sym in held_symbols:
             log.info(
                 "Ignoring LLM CLOSE for %s — close decisions are handled by "
