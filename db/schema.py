@@ -44,6 +44,11 @@ class Trade(Base):
     setup_type = Column(String(64), nullable=True)           # analyst's setup classification
     invalidators = Column(Text, nullable=True)               # JSON array of invalidator objects
 
+    # Stop metadata (StopAuthority)
+    stop_role = Column(String(32), default="initial")       # initial|breakeven|trail|manual|maintenance_tighten
+    stop_updated_by = Column(String(64), nullable=True)     # agent that last modified stop
+    stop_updated_at = Column(DateTime, nullable=True)       # when stop was last modified
+
 
 
 class TradeEvent(Base):

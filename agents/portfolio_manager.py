@@ -27,6 +27,7 @@ from core.portfolio_risk import (
 )
 from utils.setup_quality_gate import evaluate_setup_quality
 from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
+from utils.stop_authority import apply_stop_update
 
 log = logging.getLogger(__name__)
 
@@ -2249,13 +2250,27 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 # Tighten stop to breakeven if profitable
                 if unrealized_pnl > 0 and open_trade.stop_price:
                     new_stop = open_trade.entry_price  # breakeven
-                    open_trade.stop_price = new_stop
-                    db.commit()
-                    log.info(
-                        "Reversal/Close Review hold_tighten for %s: "
-                        "tightened stop to breakeven (%.2f)",
-                        symbol, new_stop,
+                    result = apply_stop_update(
+                        db,
+                        trade=open_trade,
+                        new_stop=new_stop,
+                        source_agent="portfolio_manager",
+                        stop_role="maintenance_tighten",
+                        reason=f"Reversal/Close Review hold_tighten for {symbol}",
+                        current_price=current_price,
                     )
+                    db.commit()
+                    if result.valid:
+                        log.info(
+                            "Reversal/Close Review hold_tighten for %s: "
+                            "tightened stop to breakeven (%.2f)",
+                            symbol, new_stop,
+                        )
+                    else:
+                        log.warning(
+                            "Reversal/Close Review hold_tighten rejected for %s: %s",
+                            symbol, result.reason,
+                        )
         else:
             # ── Maintenance Review (advisory signal usage) ──
             log.info("Routing %s to Maintenance Review", symbol)
@@ -2276,12 +2291,26 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 new_stop = _coerce_price(review_result.get("new_stop"), "new_stop", symbol)
                 if new_stop is None:
                     continue
-                open_trade.stop_price = new_stop
-                db.commit()
-                log.info(
-                    "Maintenance Review tighten_stop for %s: new stop=%.2f",
-                    symbol, new_stop,
+                result = apply_stop_update(
+                    db,
+                    trade=open_trade,
+                    new_stop=new_stop,
+                    source_agent="portfolio_manager",
+                    stop_role="maintenance_tighten",
+                    reason=f"Maintenance Review tighten_stop for {symbol}",
+                    current_price=current_price,
                 )
+                db.commit()
+                if result.valid:
+                    log.info(
+                        "Maintenance Review tighten_stop for %s: new stop=%.2f",
+                        symbol, new_stop,
+                    )
+                else:
+                    log.warning(
+                        "Maintenance Review tighten_stop rejected for %s: %s",
+                        symbol, result.reason,
+                    )
             elif action == "raise_target" and review_result.get("new_target"):
                 new_target = _coerce_price(review_result.get("new_target"), "new_target", symbol)
                 if new_target is None:

@@ -19,7 +19,7 @@ load_dotenv()
 log = logging.getLogger(__name__)
 
 from flask import Flask, jsonify, render_template, request
-from db.schema import init_db, get_session, Position, Balance, Trade, AgentMemory, DailyLog
+from db.schema import init_db, get_session, Position, Balance, Trade, TradeEvent, AgentMemory, DailyLog
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.finnhub_client import FinnhubClient
 from utils.catalyst_freshness import (
@@ -897,6 +897,61 @@ def api_narratives():
         return jsonify({"narratives": [], "page": page, "per_page": per_page, "total": 0})
     finally:
         db.close()
+
+
+@app.route("/api/trade-events")
+def api_trade_events():
+    """Return stop lifecycle events for a specific trade."""
+    trade_id = request.args.get("trade_id", type=int)
+    if not trade_id:
+        return jsonify({"error": "trade_id parameter required"}), 400
+
+    db = get_session(engine)
+
+    STOP_EVENT_TYPES = [
+        "stop_update_requested",
+        "stop_update_accepted",
+        "stop_update_rejected",
+        "stop_geometry_invalid",
+        "stop_triggered",
+        "stop_repaired",
+        "stop_review_required",
+    ]
+
+    events = (
+        db.query(TradeEvent)
+        .filter(
+            TradeEvent.trade_id == trade_id,
+            TradeEvent.event_type.in_(STOP_EVENT_TYPES),
+        )
+        .order_by(TradeEvent.timestamp.asc())
+        .all()
+    )
+
+    result = []
+    for e in events:
+        payload = None
+        if e.payload_json:
+            try:
+                payload = json.loads(e.payload_json)
+            except (json.JSONDecodeError, TypeError):
+                payload = e.payload_json
+
+        result.append({
+            "id": e.id,
+            "trade_id": e.trade_id,
+            "event_type": e.event_type,
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+            "agent": e.agent,
+            "symbol": e.symbol,
+            "profile": e.profile,
+            "price": e.price,
+            "message": e.message,
+            "payload": payload,
+        })
+
+    db.close()
+    return jsonify(result)
 
 
 if __name__ == "__main__":

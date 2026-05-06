@@ -15,6 +15,7 @@ import logging
 from datetime import datetime
 from db.schema import Trade, Position, Balance, AgentMemory, get_session
 from utils.trade_events import log_trade_event
+from utils.stop_authority import apply_stop_update
 
 log = logging.getLogger(__name__)
 
@@ -124,22 +125,28 @@ def _partial_close(engine, trade, quantity_pct, price, reason):
              f"(P&L: ${pnl:+.2f}) — {reason}")
 
 
-def _move_stop(engine, trade_id, new_stop, reason):
-    """Update the stop price on a trade."""
+def _move_stop(engine, trade_id, new_stop, reason, stop_role="trail", current_price=None):
+    """Update the stop price on a trade via StopAuthority."""
     db = get_session(engine)
     trade = db.query(Trade).filter_by(id=trade_id).first()
     if trade:
-        old_stop = trade.stop_price
-        trade.stop_price = new_stop
-        log_trade_event(
-            db, "stop_set", trade_id=trade.id, agent="profit_manager",
-            symbol=trade.symbol, profile=trade.profile, price=new_stop,
-            message=reason,
-            payload={"old_stop": old_stop, "new_stop": new_stop},
+        result = apply_stop_update(
+            db,
+            trade=trade,
+            new_stop=new_stop,
+            source_agent="profit_manager",
+            stop_role=stop_role,
+            reason=reason,
+            current_price=current_price,
         )
-        db.commit()
-        log.info(f"🔒 STOP MOVED: {trade.symbol} ({trade.profile}) "
-                 f"${old_stop} → ${new_stop:.2f} — {reason}")
+        if result.valid:
+            db.commit()
+            log.info(f"🔒 STOP MOVED: {trade.symbol} ({trade.profile}) "
+                     f"${result.old_stop} → ${new_stop:.2f} — {reason}")
+        else:
+            # Commit to persist audit events (stop_update_requested + rejection)
+            db.commit()
+            log.warning(f"Stop move rejected for {trade.symbol}: {result.reason}")
     db.close()
 
 
@@ -171,7 +178,8 @@ def check_profit_management(engine, trade, current_price) -> list[dict]:
 
         # Move stop to breakeven
         if not trade_actions.get("breakeven"):
-            _move_stop(engine, trade.id, trade.entry_price, f"+{r_achieved:.1f}R — stop to breakeven")
+            _move_stop(engine, trade.id, trade.entry_price, f"+{r_achieved:.1f}R — stop to breakeven",
+                       stop_role="breakeven", current_price=current_price)
             trade_actions["breakeven"] = True
             actions_taken.append({"action": "breakeven", "r": r_achieved})
 
@@ -190,7 +198,8 @@ def check_profit_management(engine, trade, current_price) -> list[dict]:
                 new_stop = trade.entry_price + risk  # +1R above entry
             else:
                 new_stop = trade.entry_price - risk  # +1R below entry (for short, stop moves down)
-            _move_stop(engine, trade.id, round(new_stop, 2), f"+{r_achieved:.1f}R — trailing stop to +1R")
+            _move_stop(engine, trade.id, round(new_stop, 2), f"+{r_achieved:.1f}R — trailing stop to +1R",
+                       stop_role="trail", current_price=current_price)
             trade_actions["trail_2r"] = True
             actions_taken.append({"action": "trail_to_1r", "r": r_achieved})
 
@@ -200,7 +209,8 @@ def check_profit_management(engine, trade, current_price) -> list[dict]:
             new_stop = trade.entry_price + (risk * 2)
         else:
             new_stop = trade.entry_price - (risk * 2)
-        _move_stop(engine, trade.id, round(new_stop, 2), f"+{r_achieved:.1f}R — trailing stop to +2R")
+        _move_stop(engine, trade.id, round(new_stop, 2), f"+{r_achieved:.1f}R — trailing stop to +2R",
+                   stop_role="trail", current_price=current_price)
         trade_actions["trail_3r"] = True
         actions_taken.append({"action": "trail_to_2r", "r": r_achieved})
 

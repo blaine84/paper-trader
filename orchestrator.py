@@ -84,7 +84,7 @@ def check_schema(engine):
     # If a column is missing, the system will crash on first query anyway —
     # better to catch it here with a clear message and auto-fix.
     expected = {
-        "trades": ["thesis", "setup_type", "invalidators"],
+        "trades": ["thesis", "setup_type", "invalidators", "stop_role", "stop_updated_by", "stop_updated_at"],
     }
 
     missing = {}
@@ -104,6 +104,9 @@ def check_schema(engine):
         "thesis": "TEXT",
         "setup_type": "VARCHAR(64)",
         "invalidators": "TEXT",
+        "stop_role": "VARCHAR(32) DEFAULT 'initial'",
+        "stop_updated_by": "VARCHAR(64)",
+        "stop_updated_at": "DATETIME",
     }
 
     raw_conn = engine.raw_connection()
@@ -116,7 +119,99 @@ def check_schema(engine):
     raw_conn.commit()
     raw_conn.close()
 
+    # If stop_role was just added, backfill existing open trades
+    if "trades" in missing and "stop_role" in missing["trades"]:
+        backfill_stop_roles(engine)
+
     console.print(f"   [yellow]⚠ Auto-migrated missing columns: {missing}[/yellow]")
+
+
+def backfill_stop_roles(engine):
+    """Backfill stop_role for existing open trades after column migration.
+
+    Idempotent — safe to run multiple times. Only updates trades where
+    stop_role is NULL or empty string.
+
+    Logic:
+    1. Query all open trades where stop_role is NULL or empty.
+    2. For each trade, look for the most recent stop-related event from
+       profit_manager (event_type in 'stop_set', 'stop_update_accepted').
+    3. If found: parse payload to infer breakeven/trail/initial.
+    4. If not found: set stop_role = 'initial'.
+
+    Requirements: 12.4, 12.5
+    """
+    import json
+    import re
+    from db.schema import Trade, TradeEvent, get_session
+
+    db = get_session(engine)
+    try:
+        # Find open trades with NULL or empty stop_role
+        trades = (
+            db.query(Trade)
+            .filter(
+                Trade.status == "open",
+                (Trade.stop_role == None) | (Trade.stop_role == ""),  # noqa: E711
+            )
+            .all()
+        )
+
+        if not trades:
+            return
+
+        for trade in trades:
+            # Look for the most recent stop-related event from profit_manager
+            latest_event = (
+                db.query(TradeEvent)
+                .filter(
+                    TradeEvent.trade_id == trade.id,
+                    TradeEvent.agent == "profit_manager",
+                    TradeEvent.event_type.in_(["stop_set", "stop_update_accepted"]),
+                )
+                .order_by(TradeEvent.timestamp.desc())
+                .first()
+            )
+
+            if latest_event:
+                # Parse payload to determine role
+                role = "initial"
+                # Check message field
+                msg = (latest_event.message or "").lower()
+                # Check payload_json field
+                payload_text = ""
+                if latest_event.payload_json:
+                    try:
+                        payload = json.loads(latest_event.payload_json)
+                        if isinstance(payload, dict):
+                            payload_text = " ".join(
+                                str(v) for v in payload.values()
+                            ).lower()
+                            # Also check 'reason' or 'message' keys specifically
+                            reason = str(payload.get("reason", "")).lower()
+                            payload_text += " " + reason
+                    except (json.JSONDecodeError, TypeError):
+                        payload_text = str(latest_event.payload_json).lower()
+
+                combined = msg + " " + payload_text
+
+                if "breakeven" in combined:
+                    role = "breakeven"
+                elif "trail" in combined or re.search(r"\+\d*r", combined):
+                    role = "trail"
+
+                trade.stop_role = role
+            else:
+                # No stop event history → initial
+                trade.stop_role = "initial"
+
+        db.commit()
+        log.info(f"Backfilled stop_role for {len(trades)} open trade(s)")
+    except Exception as e:
+        db.rollback()
+        log.error(f"Backfill stop_roles error: {e}", exc_info=True)
+    finally:
+        db.close()
 
 
 def run_pre_market():

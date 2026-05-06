@@ -41,6 +41,7 @@ semantics — a rejected gate stops evaluation and no subsequent gates run.
 | Gate Config | `utils/gate_config.py` | Shared constants and thresholds for all gates |
 | Setup Quality Gate | `utils/setup_quality_gate.py` | Blocks/downgrades setup types with poor win rates |
 | Pre-Trade Quality Gate | `utils/pre_trade_quality_gate.py` | Rejects trades with low Reviewer quality scores |
+| Risk Geometry Gate | `utils/risk_geometry_gate.py` | Validates stop distance, position size, dollar risk, R:R ratio, and target feasibility |
 
 The setup quality gate evaluates case-library performance using a deterministic
 rule chain: insufficient data → consecutive losses → historical underperformance
@@ -49,6 +50,13 @@ Per-setup-type thresholds are configurable via `MIN_WIN_RATE_BY_SETUP`.
 
 The pre-trade quality gate evaluates Reviewer selection and execution scores with
 override support for high-confidence PM decisions.
+
+The risk geometry gate validates full trade geometry before order execution. It
+computes a minimum stop distance from both a percentage-based floor and an
+ATR-based volatility floor (per symbol class), then either passes the trade
+unchanged, reconstructs it with valid geometry (adjusted stop, quantity, dollar
+risk), or rejects it outright. Symbol class rules are configurable for high-beta
+mega-caps, ETFs, and small-cap momentum setups.
 
 Phase 2 will add catalyst timing and concentration limit gates. See
 `.kiro/specs/trade-safety-gates/` for the full spec.

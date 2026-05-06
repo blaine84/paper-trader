@@ -190,6 +190,7 @@ gates produce no events.
 |---|---|---|
 | Setup Quality Gate | Case-library win rate by setup type | allow, downgrade, reject |
 | Pre-Trade Quality Gate | Reviewer selection + execution scores | allow, warn, reject, override_required |
+| Risk Geometry Gate | Stop distance, position size, dollar risk, R:R, target feasibility | passed_unchanged, adjusted_allowed, rejected |
 
 Gate decisions are logged to `trade_events` with `gate_name`, `rejection_category`,
 and `reason_type` in the payload for weekly review drill-down. All thresholds are
@@ -601,6 +602,20 @@ The full lifecycle of a trade from signal to exit:
       └─ Otherwise → allow
       Override: PM can provide override_confidence_score >= 8.0 + reason
       to convert override_required → allow.
+
+   c. RISK GEOMETRY GATE (utils/risk_geometry_gate.py)
+      Validates full trade geometry before order execution:
+      ├─ Resolves symbol class rule (high-beta mega-cap, ETF, small-cap momentum, default)
+      ├─ Validates stop direction (stop must be on correct side of entry)
+      ├─ Validates target geometry (target must be on correct side of entry)
+      ├─ Computes minimum stop distance: max(entry × min_pct, ATR_5min × atr_multiplier)
+      ├─ If stop distance adequate → validates R:R, dollar risk, position size
+      ├─ If stop too tight → reconstructs trade (adjusted stop, quantity, dollar risk)
+      ├─ Reconstructed trades validated for R:R, dollar risk, position size minimum
+      └─ Decisions: passed_unchanged, adjusted_allowed, rejected
+      ATR freshness validated per symbol class rule (atr_max_age_minutes).
+      Pct-only fallback when ATR unavailable (configurable per rule).
+      Adjusted parameters propagate to validate_trade() and order execution.
 
    If any gate rejects → trade refused, PM logs gate_rejected event, done.
    If gates pass → apply any cumulative size multipliers, continue to step 5.

@@ -7,6 +7,7 @@ import os
 import json
 from datetime import datetime, date
 from utils.finnhub_client import FinnhubClient
+from utils.stop_authority import should_stop_trigger
 from db.schema import Position, Balance, Trade, DailyLog, AgentMemory, get_session
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from rich.console import Console
@@ -42,9 +43,20 @@ def check_stop_losses(engine, profile_id: str = None) -> list:
             symbol=trade.symbol, profile=trade.profile
         ).first()
         side = pos.side if pos else "long"
-        triggered = (side == "long" and price <= trade.stop_price) or \
-                    (side == "short" and price >= trade.stop_price)
-        if triggered:
+
+        result = should_stop_trigger(
+            side=side,
+            entry_price=trade.entry_price,
+            current_price=price,
+            stop_price=trade.stop_price,
+            stop_role=getattr(trade, "stop_role", None) or "initial",
+            db=db,
+            trade_id=trade.id,
+            symbol=trade.symbol,
+            profile=trade.profile,
+            source_agent="bookkeeper",
+        )
+        if result.triggered:
             to_close.append({
                 "symbol": trade.symbol,
                 "price": price,
@@ -52,6 +64,8 @@ def check_stop_losses(engine, profile_id: str = None) -> list:
                 "trade_id": trade.id,
                 "profile": trade.profile,
             })
+        # If not triggered due to invalid geometry, skip silently
+        # (event already logged by StopAuthority)
 
     db.close()
     return to_close

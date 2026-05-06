@@ -14,6 +14,7 @@ import logging
 import yfinance as yf
 from datetime import datetime
 from db.schema import Trade, Position, AgentMemory, get_session
+from utils.stop_authority import should_stop_trigger
 from utils.trade_events import log_trade_event
 
 log = logging.getLogger(__name__)
@@ -65,41 +66,41 @@ def check_stops_and_targets(engine) -> list[dict]:
         # Determine side from the trade's direction field
         side = "short" if trade.direction == "SHORT" else "long"
 
-        # Stop loss check — require price to exceed stop by a small buffer (0.1%)
-        # to avoid false triggers from bid-ask spread noise
+        # Stop loss check — delegated to StopAuthority for unified trigger logic
         if trade.stop_price:
-            # Sanity: for long, stop should be below entry; for short, above
-            stop_valid = True
-            if side == "long" and trade.stop_price >= trade.entry_price:
-                stop_valid = False
-                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): LONG stop {trade.stop_price} is above entry {trade.entry_price} — skipping stop check")
-            elif side == "short" and trade.stop_price <= trade.entry_price:
-                stop_valid = False
-                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): SHORT stop {trade.stop_price} is below entry {trade.entry_price} — skipping stop check")
-
-            if stop_valid:
-                buffer = trade.stop_price * 0.001
-                if side == "long":
-                    hit = price <= (trade.stop_price - buffer)
-                else:
-                    hit = price >= (trade.stop_price + buffer)
-                if hit:
-                    trigger = {
-                        "type": "stop_loss",
-                        "symbol": trade.symbol,
-                        "profile": trade.profile,
-                        "price": price,
-                        "level": trade.stop_price,
-                        "side": side,
-                        "trade_id": trade.id,
-                    }
-                    triggers.append(trigger)
-                    log_trade_event(
-                        db, "stop_triggered", trade_id=trade.id, agent="price_monitor",
-                        symbol=trade.symbol, profile=trade.profile, price=price,
-                        message=f"Stop triggered at {price} vs level {trade.stop_price}",
-                        payload=trigger,
-                    )
+            result = should_stop_trigger(
+                side=side,
+                entry_price=trade.entry_price,
+                current_price=price,
+                stop_price=trade.stop_price,
+                stop_role=getattr(trade, "stop_role", None) or "initial",
+                db=db,
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                profile=trade.profile,
+                source_agent="price_monitor",
+            )
+            if result.triggered:
+                trigger = {
+                    "type": "stop_loss",
+                    "symbol": trade.symbol,
+                    "profile": trade.profile,
+                    "price": price,
+                    "level": trade.stop_price,
+                    "side": side,
+                    "trade_id": trade.id,
+                }
+                triggers.append(trigger)
+                log_trade_event(
+                    db, "stop_triggered", trade_id=trade.id, agent="price_monitor",
+                    symbol=trade.symbol, profile=trade.profile, price=price,
+                    message=f"Stop triggered at {price} vs level {trade.stop_price}",
+                    payload=trigger,
+                )
+            elif not result.geometry_valid:
+                log.warning(
+                    f"⚠️ {trade.symbol} ({trade.profile}): Stop geometry invalid — skipping stop check"
+                )
 
         # Target check — verify target is on the correct side before triggering
         if trade.target_price:
