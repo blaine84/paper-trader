@@ -62,6 +62,27 @@ HIGH_WR_STOP_BUFFER_THRESHOLD = 0.60
 MIN_HIGH_WR_INTRADAY_STOP_BUFFER_PCT = 0.015
 HIGH_MOMENTUM_ASSETS = {"AMD", "NVDA", "TSLA"}
 HIGH_MOMENTUM_COOLDOWN_MINUTES = 30
+
+def _market_time_context() -> dict[str, str | int]:
+    """Return explicit market/local time labels for LLM prompts.
+
+    The model was previously shown only UTC (e.g. 14:00 UTC), which it can
+    misread as 2 PM market time. Keep UTC for auditability, but lead with ET.
+    """
+    from pytz import timezone as _tz
+
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(_tz("America/New_York"))
+    now_mt = now_utc.astimezone(_tz("America/Denver"))
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    minutes_since_open = int((now_et - market_open).total_seconds() // 60)
+    return {
+        "et": now_et.strftime("%Y-%m-%d %H:%M %Z"),
+        "mt": now_mt.strftime("%Y-%m-%d %H:%M %Z"),
+        "utc": now_utc.strftime("%Y-%m-%d %H:%M UTC"),
+        "minutes_since_open": minutes_since_open,
+    }
+
 _FAST_INTRADAY_SETUPS = {
     "gap_and_go",
     "vwap_reclaim",
@@ -2470,8 +2491,13 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     # Build compact signal text for entry candidates
     compact_signals_text = "\n".join(compact_signal_for_pm(sym, sig) for sym, sig in entry_signals.items())
 
+    time_ctx = _market_time_context()
+
     user_prompt = f"""
-Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+Market time: {time_ctx['et']} ({time_ctx['minutes_since_open']} minutes since 9:30 AM ET open)
+Local reference: {time_ctx['mt']}
+Audit UTC: {time_ctx['utc']}
+IMPORTANT: Use Eastern market time above for intraday timing. Do not interpret UTC as local or market time.
 Profile: {profile['name']} {profile['emoji']}
 
 CURRENT PORTFOLIO:
