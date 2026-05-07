@@ -47,6 +47,25 @@ def _coerce_price(value, field_name: str, symbol: str) -> float | None:
         )
         return None
 
+
+def _coerce_quantity(value, *, symbol: str = "UNKNOWN") -> int:
+    """Normalize LLM quantity values before sizing math.
+
+    JSON-repair and local LLM output occasionally preserve explicit
+    ``null`` quantities. Treat those as zero instead of letting downstream
+    multipliers raise ``TypeError: unsupported operand type(s) for *:
+    'NoneType' and 'float'``.
+    """
+    if value in (None, ""):
+        return 0
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace(",", "")
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        log.warning("Ignoring invalid quantity for %s: %r", symbol, value)
+        return 0
+
 # Max minutes after market open (9:30 AM ET) that each setup type may be entered.
 # Setup types NOT listed here have no entry-window restriction.
 ENTRY_WINDOW_LIMITS = {
@@ -1260,7 +1279,7 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
 
         stop = decision.get("stop") or decision.get("stop_price") or decision.get("stop_loss")
         target = decision.get("target") or decision.get("target_price") or decision.get("profit_target")
-        quantity = decision.get("quantity", 0)
+        quantity = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
         action = decision.get("action", "")
 
         # Only run the gate if we have the minimum required parameters
@@ -1348,7 +1367,8 @@ def execute_trade(db, decision: dict, profile_id: str):
     """
     action = decision["action"]
     symbol = decision["symbol"]
-    quantity = decision.get("quantity", 0)
+    quantity = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
+    decision["quantity"] = quantity
     price = decision.get("price") or decision.get("entry_price") or 0
     try:
         price = float(price) if price not in (None, "") else 0
@@ -2633,7 +2653,7 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
             continue
 
         if verdict["verdict"] == "POOR_TRACK_RECORD":
-            original_qty = decision.get("quantity", 0)
+            original_qty = _coerce_quantity(decision.get("quantity", 0), symbol=sym)
             decision["quantity"] = max(1, int(original_qty * verdict["size_multiplier"]))
             log.info(
                 "LESSON WARNING: %s %s %s — avg_score=%.2f (n=%d). "
