@@ -26,6 +26,7 @@ from feedback_loop.analyst_feedback import (
     build_feedback_prompt_context,
     get_active_mitigations,
     process_pending_feedback,
+    write_feedback_health_status,
 )
 from utils.symbol_class import classify_symbol, validate_setup_for_symbol
 
@@ -90,7 +91,8 @@ def run(engine, symbols: list[str]) -> dict:
     try:
         process_pending_feedback(engine)
     except Exception as exc:
-        log.warning("Analyst feedback processing failed: %s", exc)
+        log.exception("Analyst feedback processing failed")
+        write_feedback_health_status(engine, status="failed", errors=[str(exc)])
 
     # Pull latest researcher sentiment from memory (ignore entries older than 36h)
     recent_sentiment = {}

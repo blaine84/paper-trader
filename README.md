@@ -89,6 +89,20 @@ Two event-driven news checks supplement the scheduled News Monitor:
 See the [User Guide](USER_GUIDE.md#catalyst-freshness-utilscatalyst_freshnesspy) for
 the full data flow diagram, freshness thresholds, confidence mapping, and error isolation details.
 
+### News Catalyst 24h Exit Gate
+
+A hard governance layer (`utils/news_trade_governance.py`) that enforces a 24-hour
+maximum hold duration for news-driven trades. Prevents silent swing reclassification
+that previously allowed stale-catalyst positions to persist indefinitely.
+
+- **Deterministic classification** — no LLM calls, pure field matching
+- **Durable persistence** — once classified, governance survives field drift
+- **Multi-window reconfirmation** — each `RECONFIRM_AND_HOLD` extends the expiry with fresh evidence
+- **Force-close at expiry** — regardless of `target_price` being set
+- **Swing reclassification blocked** — requires explicit authorization
+
+See the [User Guide](USER_GUIDE.md#news-catalyst-24h-exit-gate) for full details.
+
 ### Strategy Lifecycle Pipeline
 
 Dynamic strategies proposed by the Quant Researcher go through a staged deployment

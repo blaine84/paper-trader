@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from db.schema import (
+    AgentMemory,
     AnalystFeedbackQueue,
     AnalystMitigation,
     get_session,
@@ -100,48 +101,62 @@ def queue_reviewer_flags(engine, cases: list[dict]) -> list[dict]:
 def process_pending_feedback(engine) -> dict:
     """Have the Analyst respond to pending reviewer flags, then update mitigations."""
     db = get_session(engine)
-    _mark_overdue_rows(db)
-    pending = (
-        db.query(AnalystFeedbackQueue)
-        .filter(AnalystFeedbackQueue.responded_at == None)  # noqa: E711
-        .order_by(AnalystFeedbackQueue.created_at.asc())
-        .all()
-    )
-    if not pending:
-        db.commit()
+    prompt_rows = []
+    recent_text = "None"
+    has_pending = False
+    try:
+        _mark_overdue_rows(db)
+        pending = (
+            db.query(AnalystFeedbackQueue)
+            .filter(AnalystFeedbackQueue.responded_at == None)  # noqa: E711
+            .order_by(AnalystFeedbackQueue.created_at.asc())
+            .all()
+        )
+        if not pending:
+            db.commit()
+            has_pending = False
+        else:
+            has_pending = True
+            # Extract ORM data from pending rows into plain dicts BEFORE close
+            for row in pending:
+                context = {}
+                try:
+                    context = json.loads(row.reviewer_context) if row.reviewer_context else {}
+                except Exception:
+                    context = {}
+                prompt_rows.append(
+                    {
+                        "id": row.id,
+                        "symbol": row.symbol,
+                        "setup_type": row.setup_type,
+                        "date": row.date,
+                        "flag_type": row.flag_type,
+                        "severity": row.severity,
+                        "recommendation": row.recommendation,
+                        "reviewer_context": context,
+                    }
+                )
+
+            # Extract ORM data from recent_feedback into plain string BEFORE close
+            recent_feedback = (
+                db.query(AgentMemory)
+                .filter_by(agent="reviewer", key="selection_feedback")
+                .order_by(AgentMemory.timestamp.desc())
+                .limit(3)
+                .all()
+            )
+            recent_text = "\n\n".join(m.value for m in recent_feedback) if recent_feedback else "None"
+
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
         db.close()
+
+    if not has_pending:
         maybe_reset_weekly_mitigations(engine)
         return {"responses": []}
-
-    prompt_rows = []
-    for row in pending:
-        context = {}
-        try:
-            context = json.loads(row.reviewer_context) if row.reviewer_context else {}
-        except Exception:
-            context = {}
-        prompt_rows.append(
-            {
-                "id": row.id,
-                "symbol": row.symbol,
-                "setup_type": row.setup_type,
-                "date": row.date,
-                "flag_type": row.flag_type,
-                "severity": row.severity,
-                "recommendation": row.recommendation,
-                "reviewer_context": context,
-            }
-        )
-
-    recent_feedback = (
-        db.query(AgentMemory)
-        .filter_by(agent="reviewer", key="selection_feedback")
-        .order_by(AgentMemory.timestamp.desc())
-        .limit(3)
-        .all()
-    )
-    recent_text = "\n\n".join(m.value for m in recent_feedback) if recent_feedback else "None"
-    db.close()
 
     user_prompt = (
         f"Current time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
@@ -149,12 +164,16 @@ def process_pending_feedback(engine) -> dict:
         f"Flags requiring response:\n{json.dumps(prompt_rows, indent=2)}"
     )
 
+    fallback_used = False
+    llm_error = None
     try:
         raw = call_llm(ANALYST_RESPONSE_PROMPT, user_prompt, json_mode=True, tier="low", purpose="analyst_feedback_response")
         parsed = parse_json_response(raw)
         responses = parsed.get("responses", [])
     except Exception as exc:
         log.warning("Analyst feedback response failed, defaulting to accept: %s", exc)
+        fallback_used = True
+        llm_error = str(exc)
         responses = [
             {
                 "id": row["id"],
@@ -166,58 +185,109 @@ def process_pending_feedback(engine) -> dict:
             for row in prompt_rows
         ]
 
-    result = _persist_responses(engine, responses)
-    evaluate_auto_mitigation(engine)
-    maybe_reset_weekly_mitigations(engine)
+    try:
+        result = _persist_responses(engine, responses)
+        evaluate_auto_mitigation(engine)
+        maybe_reset_weekly_mitigations(engine)
+    except Exception as exc:
+        write_feedback_health_status(
+            engine,
+            status="failed",
+            pending_count=len(prompt_rows),
+            errors=[str(exc)],
+        )
+        raise
+
+    write_feedback_health_status(
+        engine,
+        status="ok",
+        pending_count=len(prompt_rows),
+        responses_stored=len(result.get("responses", [])),
+        fallback_used=fallback_used,
+        errors=[llm_error] if llm_error else None,
+    )
     return result
 
 
 def get_active_mitigations(engine) -> dict[str, dict]:
     db = get_session(engine)
-    rows = db.query(AnalystMitigation).filter_by(active=True).all()
-    result = {
-        row.setup_type: {
-            "level": row.level,
-            "deployment_multiplier": row.deployment_multiplier,
-            "signal_threshold_bump": row.signal_threshold_bump,
-            "reason": row.reason or "",
+    try:
+        rows = db.query(AnalystMitigation).filter_by(active=True).all()
+        # Extract ORM attributes into plain dicts BEFORE close
+        result = {
+            row.setup_type: {
+                "level": row.level,
+                "deployment_multiplier": row.deployment_multiplier,
+                "signal_threshold_bump": row.signal_threshold_bump,
+                "reason": row.reason or "",
+            }
+            for row in rows
         }
-        for row in rows
-    }
-    db.close()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
     return result
 
 
 def build_feedback_prompt_context(engine) -> str:
     """Build analyst prompt context from pending flags and active mitigations."""
     db = get_session(engine)
-    _mark_overdue_rows(db)
-    pending = (
-        db.query(AnalystFeedbackQueue)
-        .filter(AnalystFeedbackQueue.responded_at == None)  # noqa: E711
-        .order_by(AnalystFeedbackQueue.created_at.desc())
-        .limit(5)
-        .all()
-    )
-    mitigations = db.query(AnalystMitigation).filter_by(active=True).all()
-    db.commit()
-    db.close()
+    try:
+        _mark_overdue_rows(db)
+        pending = (
+            db.query(AnalystFeedbackQueue)
+            .filter(AnalystFeedbackQueue.responded_at == None)  # noqa: E711
+            .order_by(AnalystFeedbackQueue.created_at.desc())
+            .limit(5)
+            .all()
+        )
+        mitigations = db.query(AnalystMitigation).filter_by(active=True).all()
+
+        # Extract ORM attributes into plain dicts BEFORE commit/close
+        pending_dicts = [
+            {
+                "symbol": row.symbol,
+                "setup_type": row.setup_type,
+                "flag_type": row.flag_type,
+                "severity": row.severity,
+                "recommendation": row.recommendation,
+            }
+            for row in pending
+        ]
+        mitigation_dicts = [
+            {
+                "setup_type": row.setup_type,
+                "level": row.level,
+                "deployment_multiplier": row.deployment_multiplier,
+                "signal_threshold_bump": row.signal_threshold_bump,
+            }
+            for row in mitigations
+        ]
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
     lines = []
-    if pending:
+    if pending_dicts:
         lines.append("PENDING REVIEWER FLAGS (respond within 24h):")
-        for row in pending:
-            setup = f" [{row.setup_type}]" if row.setup_type else ""
+        for row in pending_dicts:
+            setup = f" [{row['setup_type']}]" if row["setup_type"] else ""
             lines.append(
-                f"- {row.symbol}{setup}: {row.flag_type} ({row.severity}) -> {row.recommendation}"
+                f"- {row['symbol']}{setup}: {row['flag_type']} ({row['severity']}) -> {row['recommendation']}"
             )
 
-    if mitigations:
+    if mitigation_dicts:
         lines.append("\nACTIVE ANALYST MITIGATIONS:")
-        for row in mitigations:
+        for row in mitigation_dicts:
             lines.append(
-                f"- {row.setup_type}: level {row.level}, deployment {row.deployment_multiplier:.2f}x, "
-                f"signal threshold +{row.signal_threshold_bump:.1f}"
+                f"- {row['setup_type']}: level {row['level']}, deployment {row['deployment_multiplier']:.2f}x, "
+                f"signal threshold +{row['signal_threshold_bump']:.1f}"
             )
         lines.append("When mitigations are active, prefer HOLD unless evidence is clearly stronger than normal.")
 
@@ -268,44 +338,36 @@ def get_quality_metrics(engine) -> dict:
     today = datetime.utcnow().date()
     today_start = datetime.combine(today, datetime.min.time())
 
-    _mark_overdue_rows(db)
+    try:
+        _mark_overdue_rows(db)
 
-    rows = (
-        db.query(AnalystFeedbackQueue)
-        .filter(AnalystFeedbackQueue.created_at >= today_start)
-        .all()
-    )
-    responded = [r for r in rows if r.responded_at]
-    due = [r for r in rows if r.due_at <= datetime.utcnow()]
-    valid = [r for r in responded if not (r.analyst_response == "reject" and not r.analyst_supporting_data)]
-    accepted = [r for r in valid if r.analyst_response in {"accept", "modify"}]
+        rows = (
+            db.query(AnalystFeedbackQueue)
+            .filter(AnalystFeedbackQueue.created_at >= today_start)
+            .all()
+        )
 
-    avg_response_time = None
-    if responded:
-        hours = [
-            (r.responded_at - r.created_at).total_seconds() / 3600.0
-            for r in responded
-            if r.responded_at and r.created_at
+        # Extract ORM attributes into plain dicts BEFORE commit/close
+        row_dicts = [
+            {
+                "responded_at": r.responded_at,
+                "created_at": r.created_at,
+                "due_at": r.due_at,
+                "analyst_response": r.analyst_response,
+                "analyst_supporting_data": r.analyst_supporting_data,
+            }
+            for r in rows
         ]
-        if hours:
-            avg_response_time = round(sum(hours) / len(hours), 2)
 
-    mitigations = (
-        db.query(AnalystMitigation)
-        .filter_by(active=True)
-        .order_by(AnalystMitigation.level.desc(), AnalystMitigation.setup_type.asc())
-        .all()
-    )
-    highest_level = max((m.level for m in mitigations), default=0)
+        mitigations = (
+            db.query(AnalystMitigation)
+            .filter_by(active=True)
+            .order_by(AnalystMitigation.level.desc(), AnalystMitigation.setup_type.asc())
+            .all()
+        )
 
-    result = {
-        "flags_received": len(rows),
-        "flags_accepted": len(accepted),
-        "avg_response_time": avg_response_time,
-        "response_rate": round(len(responded) / len(due), 2) if due else 1.0,
-        "acceptance_rate": round(len(accepted) / len(valid), 2) if valid else 1.0,
-        "current_mitigation_level": highest_level,
-        "active_mitigations": [
+        # Extract mitigation ORM attributes into plain dicts BEFORE commit/close
+        mitigation_dicts = [
             {
                 "setup_type": m.setup_type,
                 "level": m.level,
@@ -313,11 +375,77 @@ def get_quality_metrics(engine) -> dict:
                 "signal_threshold_bump": m.signal_threshold_bump,
             }
             for m in mitigations
-        ],
+        ]
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    # Compute metrics from plain dicts (session already closed safely)
+    now = datetime.utcnow()
+    responded = [r for r in row_dicts if r["responded_at"]]
+    due = [r for r in row_dicts if r["due_at"] <= now]
+    valid = [r for r in responded if not (r["analyst_response"] == "reject" and not r["analyst_supporting_data"])]
+    accepted = [r for r in valid if r["analyst_response"] in {"accept", "modify"}]
+
+    avg_response_time = None
+    if responded:
+        hours = [
+            (r["responded_at"] - r["created_at"]).total_seconds() / 3600.0
+            for r in responded
+            if r["responded_at"] and r["created_at"]
+        ]
+        if hours:
+            avg_response_time = round(sum(hours) / len(hours), 2)
+
+    highest_level = max((m["level"] for m in mitigation_dicts), default=0)
+
+    result = {
+        "flags_received": len(row_dicts),
+        "flags_accepted": len(accepted),
+        "avg_response_time": avg_response_time,
+        "response_rate": round(len(responded) / len(due), 2) if due else 1.0,
+        "acceptance_rate": round(len(accepted) / len(valid), 2) if valid else 1.0,
+        "current_mitigation_level": highest_level,
+        "active_mitigations": mitigation_dicts,
     }
-    db.commit()
-    db.close()
     return result
+
+
+def write_feedback_health_status(
+    engine,
+    *,
+    status: str,
+    pending_count: int = 0,
+    responses_stored: int = 0,
+    fallback_used: bool = False,
+    errors: list[str] | None = None,
+) -> None:
+    """Write an append-only health status record to AgentMemory."""
+    db = get_session(engine)
+    try:
+        record = AgentMemory(
+            agent="analyst_feedback",
+            key="feedback_processing_status",
+            value=json.dumps({
+                "status": status,
+                "pending_count": pending_count,
+                "responses_stored": responses_stored,
+                "fallback_used": fallback_used,
+                "errors": errors or [],
+                "timestamp": datetime.utcnow().isoformat(),
+            }),
+        )
+        db.add(record)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def evaluate_auto_mitigation(engine) -> None:

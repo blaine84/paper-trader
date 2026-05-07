@@ -725,6 +725,7 @@ The full lifecycle of a trade from signal to exit:
    Signal usage logged each cycle: advisory (Maintenance) vs authoritative (Reversal)
 
    Position Timer checks (every 5 min):
+   ├─ **News Governance (runs first)** — see below
    ├─ Setup-specific time limits (see below)
    ├─ Stale trade detection (momentum_fade: <0.5R after 35 min)
    ├─ Thesis revalidation at 60 min (LLM checks VWAP, volume, structure)
@@ -780,6 +781,53 @@ The full lifecycle of a trade from signal to exit:
 | news_catalyst | — | 60 min | — | 90 min |
 | short_squeeze | — | 30 min | — | 60 min |
 | **All intraday** | — | — | — | **3:45 PM ET hard wall** |
+
+### News Catalyst 24h Exit Gate
+
+A hard governance layer for news-driven trades that enforces a 24-hour maximum
+hold duration with structured reconfirmation support. Prevents the system from
+silently reclassifying overdue news-catalyst trades to `swing` (which previously
+allowed them to bypass time limits indefinitely).
+
+**Classification** — deterministic, no LLM calls. A trade is news-governed if:
+- `setup_type` is in the governed set (`news_catalyst`, `news_breakout`, `news_headline`, `confirmed_strait_of`, `sector_rotation`)
+- Entry signal `setup_type` was in the governed set (even if current setup_type drifted)
+- Entry text fields (`reason_entry`, `thesis`, `invalidators`) contain governed terms (`catalyst`, `headline`, `news`, `geopolitical`, `strait of hormuz`, `earnings`, `tariff`, `fed`, `cpi`, etc.)
+- `catalyst_type` is `news`, `geopolitical`, `earnings`, `macro`, or `headline`
+
+Once classified, governance is **persisted durably** — field drift (thesis edits,
+setup_type changes) cannot remove governance.
+
+**Governance Clock:**
+| Phase | Timing | Action |
+|---|---|---|
+| OK | Entry → Expiry - 4h | No action |
+| Warning | Expiry - 4h → Expiry | `news_reconfirmation_due` event + AgentMemory alert |
+| Grace | Expiry → Expiry + 30min | Awaiting reconfirmation (last chance) |
+| Expired | Past grace | Force-close (regardless of `target_price`) |
+
+Default expiry = entry_time + 24 hours. Configurable via `NEWS_GOVERNANCE` dict
+in `utils/news_trade_governance.py`.
+
+**Reconfirmation** — three decisions available:
+| Decision | Effect |
+|---|---|
+| `RECONFIRM_AND_HOLD` | Extends expiry (new window), requires fresh catalyst evidence |
+| `EXIT_NOW` | Immediate force-close |
+| `LET_EXPIRE` | Acknowledged decline — normal expiry proceeds |
+
+`RECONFIRM_AND_HOLD` requires: fresh evidence (≥20 chars), source timestamp newer
+than entry, thesis not deteriorating/invalidated, new expiry ≤ decided_at + 24h.
+
+**Swing reclassification blocked** — news-governed trades cannot be silently
+reclassified to `swing` by the hard wall or generic time limit logic. Explicit
+swing authorization requires a reconfirmation with `allow_swing_reclassify=true`.
+
+**Idempotency** — all governance events use `log_trade_event_once()` with a
+`dedupe_key` column to prevent duplicate writes from the 5-minute timer cycle.
+
+**Dashboard** — open positions show a governance status badge:
+`✓ ok` | `⚠ warning` | `⏳ grace` | `✗ expired` | `🔒 authorized_hold`
 
 ### Trade Validation Rules
 
