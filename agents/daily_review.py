@@ -8,7 +8,7 @@ import json
 import logging
 import subprocess
 from datetime import date, datetime, timedelta, timezone
-from db.schema import Trade, Position, DailyLog, AgentMemory, get_session
+from db.schema import Trade, Position, DailyLog, AgentMemory, TradeEvent, get_session
 from models.case import Case
 from utils.llm import call_llm, parse_json_response
 
@@ -561,12 +561,47 @@ def gather_agent_context(engine) -> dict:
             analyst_signals = None
             missing_sources.append("analyst_signals")
 
+        # --- News Governance Events (today) ---
+        from datetime import datetime as _dt
+
+        today_start = _dt.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        news_gov_events = (
+            db.query(TradeEvent)
+            .filter(TradeEvent.event_type.in_([
+                "news_expiry_force_close",
+                "news_reconfirmation_due",
+                "news_hold_authorized",
+                "news_exit_requested",
+            ]))
+            .filter(TradeEvent.timestamp >= today_start)
+            .order_by(TradeEvent.timestamp.desc())
+            .all()
+        )
+
+        news_governance_summary = []
+        for evt in news_gov_events:
+            try:
+                payload = json.loads(evt.payload_json) if evt.payload_json else {}
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            news_governance_summary.append({
+                "event_type": evt.event_type,
+                "symbol": evt.symbol,
+                "profile": evt.profile,
+                "timestamp": evt.timestamp.isoformat() if evt.timestamp else None,
+                "hours_held": payload.get("hours_held"),
+                "close_reason": payload.get("close_reason"),
+                "governance_window_id": payload.get("governance_window_id"),
+            })
+
         return {
             "market_context": market_context,
             "selection_feedback": selection_feedback,
             "execution_feedback": execution_feedback,
             "analyst_signals": analyst_signals,
             "missing_sources": missing_sources,
+            "news_governance_events": news_governance_summary,
         }
 
     except Exception as e:
@@ -582,6 +617,7 @@ def gather_agent_context(engine) -> dict:
                 "execution_feedback",
                 "analyst_signals",
             ],
+            "news_governance_events": [],
         }
     finally:
         db.close()

@@ -85,6 +85,7 @@ def check_schema(engine):
     # better to catch it here with a clear message and auto-fix.
     expected = {
         "trades": ["thesis", "setup_type", "invalidators", "stop_role", "stop_updated_by", "stop_updated_at"],
+        "trade_events": ["dedupe_key"],
     }
 
     missing = {}
@@ -107,6 +108,7 @@ def check_schema(engine):
         "stop_role": "VARCHAR(32) DEFAULT 'initial'",
         "stop_updated_by": "VARCHAR(64)",
         "stop_updated_at": "DATETIME",
+        "dedupe_key": "VARCHAR(256)",
     }
 
     raw_conn = engine.raw_connection()
@@ -118,6 +120,18 @@ def check_schema(engine):
             log.warning(f"Schema migration: added {table}.{col} ({col_type})")
     raw_conn.commit()
     raw_conn.close()
+
+    # Create unique index for trade_events dedupe_key if column was just added
+    if "trade_events" in missing and "dedupe_key" in missing["trade_events"]:
+        raw_conn = engine.raw_connection()
+        cursor = raw_conn.cursor()
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_trade_events_dedupe "
+            "ON trade_events(event_type, trade_id, dedupe_key)"
+        )
+        raw_conn.commit()
+        raw_conn.close()
+        log.warning("Schema migration: created unique index ix_trade_events_dedupe on trade_events(event_type, trade_id, dedupe_key)")
 
     # If stop_role was just added, backfill existing open trades
     if "trades" in missing and "stop_role" in missing["trades"]:

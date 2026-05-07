@@ -30,6 +30,9 @@ from rich.columns import Columns
 from db.schema import init_db, get_session, Position, Balance, Trade
 from utils.finnhub_client import FinnhubClient
 from utils.catalyst_freshness import compute_catalyst_freshness, get_breaking_news_for_symbols, get_market_day_start, ET
+from utils.news_trade_governance import (
+    NewsGovernanceClassifier, NewsGovernancePolicy, NEWS_GOVERNANCE,
+)
 from agents.quant_researcher import build_strategy_context
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 
@@ -305,12 +308,73 @@ def build_portfolio_panel(portfolio: dict) -> Panel:
 
 def build_open_positions_panel(db) -> Panel:
     rows = []
+    # Pre-compute news governance status for open trades
+    news_status_map = {}  # symbol+profile -> display_status
+    if NEWS_GOVERNANCE.get("enabled", False):
+        try:
+            classifier = NewsGovernanceClassifier()
+            policy = NewsGovernancePolicy()
+            now_utc = datetime.utcnow()
+
+            open_trades = db.query(Trade).filter_by(status="open").all()
+            for trade in open_trades:
+                # Check persisted classification first
+                persisted = classifier.get_persisted_classification(db, trade.id)
+                if persisted:
+                    is_governed = True
+                else:
+                    trade_dict = {
+                        "setup_type": trade.setup_type or "",
+                        "reason_entry": trade.reason_entry or "",
+                        "thesis": trade.thesis or "",
+                        "invalidators": trade.invalidators or "",
+                    }
+                    is_governed, _evidence = classifier.classify(trade_dict)
+
+                if is_governed and trade.entry_time:
+                    status_info = policy.evaluate(db, trade.id, trade.entry_time, now_utc)
+                    # Derive display status
+                    if status_info.get("hold_authorized"):
+                        display_status = "authorized_hold"
+                    else:
+                        display_status = status_info["status"]
+                    key = f"{trade.symbol}:{trade.profile}"
+                    news_status_map[key] = display_status
+        except Exception:
+            pass  # Graceful degradation — don't break display if governance fails
+
+    # Status color mapping
+    status_colors = {
+        "ok": "green",
+        "warning": "yellow",
+        "grace": "dark_orange",
+        "expired": "red",
+        "authorized_hold": "cyan",
+    }
+    status_icons = {
+        "ok": "✓",
+        "warning": "⚠",
+        "grace": "⏳",
+        "expired": "✗",
+        "authorized_hold": "🔒",
+    }
+
     for profile_id in ACTIVE_PROFILES:
         profile = PM_PROFILES[profile_id]
         positions = db.query(Position).filter_by(profile=profile_id).all()
         for p in positions:
-            rows.append(f"{profile['emoji']} [bold]{p.symbol}[/bold] "
-                        f"[dim]{p.side.upper()} {p.quantity} @ ${p.avg_cost:.2f}[/dim]")
+            row = (f"{profile['emoji']} [bold]{p.symbol}[/bold] "
+                   f"[dim]{p.side.upper()} {p.quantity} @ ${p.avg_cost:.2f}[/dim]")
+
+            # Append news governance status badge if governed
+            key = f"{p.symbol}:{profile_id}"
+            if key in news_status_map:
+                status = news_status_map[key]
+                color = status_colors.get(status, "dim")
+                icon = status_icons.get(status, "?")
+                row += f" [{color}]{icon} NEWS:{status}[/{color}]"
+
+            rows.append(row)
 
     content = "\n".join(rows) if rows else "[dim]No open positions[/dim]"
     return Panel(content, title="[bold green]📋 Open Positions[/bold green]", box=box.ROUNDED)

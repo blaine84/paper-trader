@@ -48,8 +48,10 @@ SETUP_TIME_LIMITS = {
 
 BUG_SETUP_TYPES = [
     "gap_and_go", "vwap_reclaim", "orb",
-    "news_catalyst", "trend_pullback", "short_squeeze",
+    "trend_pullback", "short_squeeze",
 ]
+# NOTE: "news_catalyst" excluded — news-governed trades are intentionally blocked
+# from swing reclassification by the news governance feature (Requirements 7.1-7.5).
 
 HARD_WALL_HOUR = 15
 HARD_WALL_MINUTE = 45

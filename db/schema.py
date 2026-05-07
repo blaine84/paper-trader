@@ -65,6 +65,7 @@ class TradeEvent(Base):
     price = Column(Float, nullable=True)
     message = Column(Text, nullable=True)
     payload_json = Column(Text, nullable=True)
+    dedupe_key = Column(String(256), nullable=True, index=True)
 
 
 class Position(Base):

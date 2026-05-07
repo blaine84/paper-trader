@@ -24,6 +24,11 @@ from pytz import timezone
 from db.schema import Trade, Position, AgentMemory, get_session
 from utils.trade_events import log_trade_event
 from utils.finnhub_client import FinnhubClient
+from utils.news_trade_governance import (
+    NewsGovernanceClassifier, NewsGovernancePolicy,
+    log_trade_event_once, latest_valid_reconfirmation,
+    latest_exit_request, NEWS_GOVERNANCE, validate_news_governance_config,
+)
 
 log = logging.getLogger(__name__)
 
@@ -217,6 +222,7 @@ def _escalate(trade_id, new_status) -> bool:
 
 def run(engine) -> dict:
     """Check all open positions for time-based exit conditions."""
+    validate_news_governance_config()
     db = get_session(engine)
     et_tz = timezone("America/New_York")
     now_et = datetime.now(et_tz)
@@ -238,6 +244,7 @@ def run(engine) -> dict:
             "entry_time": t.entry_time, "stop_price": t.stop_price,
             "target_price": t.target_price,
             "setup_type": _get_setup_type_for_trade(db, t),
+            "status": t.status,
         })
     db.close()
 
@@ -265,9 +272,161 @@ def run(engine) -> dict:
         trade.direction = td["direction"]; trade.entry_price = td["entry_price"]
         trade.stop_price = td["stop_price"]; trade.target_price = td["target_price"]
 
+        # ── NEWS GOVERNANCE CHECK (runs first) ──────────────────────────────
+        if NEWS_GOVERNANCE["enabled"]:
+            classifier = NewsGovernanceClassifier()
+            event_db = get_session(engine)
+            try:
+                # Persisted-classification-first flow
+                persisted = classifier.get_persisted_classification(event_db, td["id"])
+
+                if persisted:
+                    is_governed = True
+                    evidence = persisted["evidence"]
+                else:
+                    is_governed, evidence = classifier.classify(td, entry_signal=td.get("entry_signal"))
+                    if is_governed:
+                        log_trade_event_once(
+                            event_db, "news_governance_classified", td["id"],
+                            agent="position_timer", symbol=td["symbol"], profile=td["profile"],
+                            payload=evidence,
+                        )
+                        event_db.commit()
+            finally:
+                event_db.close()
+
+            if is_governed:
+                td["_news_governed"] = True
+
+                # Evaluate governance status
+                event_db = get_session(engine)
+                try:
+                    policy = NewsGovernancePolicy()
+                    status_info = policy.evaluate(event_db, td["id"], td["entry_time"], now_utc)
+
+                    if status_info["status"] == "warning":
+                        log_trade_event_once(
+                            event_db, "news_reconfirmation_due", td["id"],
+                            governance_window_id=status_info["governance_window_id"],
+                            agent="position_timer", symbol=td["symbol"], profile=td["profile"],
+                            payload={
+                                "effective_expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
+                                "warning_time": status_info["warning_time"].isoformat() if status_info["warning_time"] else None,
+                                "hours_held": round(minutes_held / 60, 1),
+                                "trade_id": td["id"],
+                                "symbol": td["symbol"],
+                                "profile": td["profile"],
+                            },
+                        )
+                        event_db.commit()
+                        # Write agent_memory for PM visibility
+                        event_db.add(AgentMemory(
+                            agent="position_timer",
+                            symbol=td["symbol"],
+                            key="news_reconfirmation_due",
+                            value=json.dumps({
+                                "trade_id": td["id"],
+                                "symbol": td["symbol"],
+                                "profile": td["profile"],
+                                "effective_expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
+                                "governance_window_id": status_info["governance_window_id"],
+                            }),
+                        ))
+                        event_db.commit()
+
+                    elif status_info["status"] == "grace":
+                        # Emit warning if not yet emitted, await reconfirmation
+                        log_trade_event_once(
+                            event_db, "news_reconfirmation_due", td["id"],
+                            governance_window_id=status_info["governance_window_id"],
+                            agent="position_timer", symbol=td["symbol"], profile=td["profile"],
+                            payload={
+                                "effective_expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
+                                "hours_held": round(minutes_held / 60, 1),
+                                "trade_id": td["id"],
+                                "symbol": td["symbol"],
+                                "profile": td["profile"],
+                                "status": "grace",
+                            },
+                        )
+                        event_db.commit()
+
+                    elif status_info["status"] == "expired":
+                        if td.get("status", "open") != "open":
+                            pass  # Already closed — skip
+                        else:
+                            try:
+                                _close_position(engine, trade, price,
+                                    f"News catalyst 24h expiry: no valid reconfirmation "
+                                    f"(window {status_info['governance_window_id']})")
+                            except Exception as e:
+                                log_trade_event_once(
+                                    event_db, "news_expiry_force_close_failed", td["id"],
+                                    governance_window_id=status_info["governance_window_id"],
+                                    agent="position_timer", symbol=td["symbol"], profile=td["profile"],
+                                    payload={"error": str(e), "governance_window_id": status_info["governance_window_id"]},
+                                )
+                                event_db.commit()
+                                continue
+
+                            # Only emit force_close AFTER confirmed close succeeds
+                            log_trade_event_once(
+                                event_db, "news_expiry_force_close", td["id"],
+                                governance_window_id=status_info["governance_window_id"],
+                                agent="position_timer", symbol=td["symbol"], profile=td["profile"],
+                                payload={
+                                    "trade_id": td["id"],
+                                    "symbol": td["symbol"],
+                                    "profile": td["profile"],
+                                    "entry_time": td["entry_time"].isoformat() if td["entry_time"] else None,
+                                    "expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
+                                    "hours_held": round(minutes_held / 60, 1),
+                                    "close_reason": f"News catalyst 24h expiry: no valid reconfirmation (window {status_info['governance_window_id']})",
+                                },
+                            )
+                            event_db.commit()
+                            continue
+
+                    elif status_info["status"] == "exit_requested":
+                        if td.get("status", "open") != "open":
+                            pass  # Already closed
+                        else:
+                            try:
+                                _close_position(engine, trade, price,
+                                    "News catalyst: EXIT_NOW reconfirmation received")
+                            except Exception as e:
+                                log_trade_event_once(
+                                    event_db, "news_expiry_force_close_failed", td["id"],
+                                    governance_window_id=status_info["governance_window_id"],
+                                    agent="position_timer", symbol=td["symbol"], profile=td["profile"],
+                                    payload={"error": str(e), "trigger": "exit_requested"},
+                                )
+                                event_db.commit()
+                                continue
+
+                            log_trade_event_once(
+                                event_db, "news_exit_requested", td["id"],
+                                governance_window_id=status_info["governance_window_id"],
+                                agent="position_timer", symbol=td["symbol"], profile=td["profile"],
+                                payload={
+                                    "trade_id": td["id"],
+                                    "symbol": td["symbol"],
+                                    "profile": td["profile"],
+                                    "exit_reason": "EXIT_NOW reconfirmation received",
+                                    "decided_by": status_info.get("latest_reconfirmation", {}).get("decided_by") if status_info.get("latest_reconfirmation") else None,
+                                    "close_confirmed": True,
+                                },
+                            )
+                            event_db.commit()
+                            continue
+                finally:
+                    event_db.close()
+
         # Hard wall: 3:45 PM ET
         if past_hard_wall and is_intraday:
             if td["target_price"] is not None:
+                if td.get("_news_governed"):
+                    continue  # News governance takes precedence — do NOT reclassify
                 # Reclassify to swing — allow overnight hold with price_monitor tracking
                 _reclassify_to_swing(engine, td["id"], td["symbol"], td["profile"],
                                      setup_type, round(minutes_held))
@@ -333,6 +492,8 @@ def run(engine) -> dict:
         # ── GENERIC SETUP LOGIC ──
         if minutes_held > limits["force_close"]:
             if td["target_price"] is not None:
+                if td.get("_news_governed"):
+                    continue  # Already handled by news governance above
                 # Reclassify to swing — no longer subject to intraday limits
                 _reclassify_to_swing(engine, td["id"], td["symbol"], td["profile"],
                                      setup_type, round(minutes_held))
