@@ -125,7 +125,7 @@ def _partial_close(engine, trade, quantity_pct, price, reason):
              f"(P&L: ${pnl:+.2f}) — {reason}")
 
 
-def _move_stop(engine, trade_id, new_stop, reason, stop_role="trail", current_price=None):
+def _move_stop(engine, trade_id, new_stop, reason, stop_role="trail", current_price=None, atr: float | None = None):
     """Update the stop price on a trade via StopAuthority."""
     db = get_session(engine)
     trade = db.query(Trade).filter_by(id=trade_id).first()
@@ -138,6 +138,7 @@ def _move_stop(engine, trade_id, new_stop, reason, stop_role="trail", current_pr
             stop_role=stop_role,
             reason=reason,
             current_price=current_price,
+            atr=atr,
         )
         if result.valid:
             db.commit()
@@ -167,6 +168,14 @@ def check_profit_management(engine, trade, current_price) -> list[dict]:
     rules = PROFIT_RULES.get(trade.profile, PROFIT_RULES["moderate"])
     risk = abs(trade.entry_price - trade.stop_price)
 
+    # Fetch ATR for minimum-change threshold in trailing stop updates
+    try:
+        from utils.atr_helper import compute_intraday_atr
+        atr_data = compute_intraday_atr(trade.symbol)
+        atr_value = atr_data.get("atr") if atr_data else None
+    except Exception:
+        atr_value = None
+
     # ── +1R: Partial profit + move stop to breakeven ──
     if r_achieved >= 1.0 and not trade_actions.get("partial_1r"):
         pct = rules["partial_at_1r"]
@@ -179,7 +188,7 @@ def check_profit_management(engine, trade, current_price) -> list[dict]:
         # Move stop to breakeven
         if not trade_actions.get("breakeven"):
             _move_stop(engine, trade.id, trade.entry_price, f"+{r_achieved:.1f}R — stop to breakeven",
-                       stop_role="breakeven", current_price=current_price)
+                       stop_role="breakeven", current_price=current_price, atr=atr_value)
             trade_actions["breakeven"] = True
             actions_taken.append({"action": "breakeven", "r": r_achieved})
 
@@ -199,7 +208,7 @@ def check_profit_management(engine, trade, current_price) -> list[dict]:
             else:
                 new_stop = trade.entry_price - risk  # +1R below entry (for short, stop moves down)
             _move_stop(engine, trade.id, round(new_stop, 2), f"+{r_achieved:.1f}R — trailing stop to +1R",
-                       stop_role="trail", current_price=current_price)
+                       stop_role="trail", current_price=current_price, atr=atr_value)
             trade_actions["trail_2r"] = True
             actions_taken.append({"action": "trail_to_1r", "r": r_achieved})
 
@@ -210,7 +219,7 @@ def check_profit_management(engine, trade, current_price) -> list[dict]:
         else:
             new_stop = trade.entry_price - (risk * 2)
         _move_stop(engine, trade.id, round(new_stop, 2), f"+{r_achieved:.1f}R — trailing stop to +2R",
-                   stop_role="trail", current_price=current_price)
+                   stop_role="trail", current_price=current_price, atr=atr_value)
         trade_actions["trail_3r"] = True
         actions_taken.append({"action": "trail_to_2r", "r": r_achieved})
 

@@ -25,7 +25,7 @@ from core.edge_score import (
 from core.portfolio_risk import (
     validate_portfolio_risk, compute_portfolio_risk, adaptive_risk_throttle,
 )
-from utils.setup_quality_gate import evaluate_setup_quality
+from utils.setup_quality_gate import evaluate_setup_quality, resolve_setup_type
 from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.stop_authority import apply_stop_update
 
@@ -1205,13 +1205,11 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     # signal so the gate evaluates the actual setup instead of treating it as
     # empty/insufficient-data.
     signal = signal or {}
-    setup_type = (
-        decision.get("setup_type")
-        or decision.get("setup")
-        or signal.get("setup_type")
-        or signal.get("setup")
-        or ""
-    )
+    setup_type = resolve_setup_type(decision, signal)
+    if setup_type is None:
+        notes.append({"gate": "setup_type_resolution", "decision": "reject", "reason": "missing setup_type"})
+        return False, notes, cumulative_multiplier, multiplier_breakdown
+
     market_regime = (
         decision.get("market_regime")
         or decision.get("regime")
@@ -2291,6 +2289,13 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 # Tighten stop to breakeven if profitable
                 if unrealized_pnl > 0 and open_trade.stop_price:
                     new_stop = open_trade.entry_price  # breakeven
+                    # Fetch ATR for minimum-change threshold
+                    try:
+                        from utils.atr_helper import compute_intraday_atr
+                        atr_data = compute_intraday_atr(symbol)
+                    except Exception:
+                        atr_data = None
+                    atr_value = atr_data.get("atr") if atr_data else None
                     result = apply_stop_update(
                         db,
                         trade=open_trade,
@@ -2299,6 +2304,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                         stop_role="maintenance_tighten",
                         reason=f"Reversal/Close Review hold_tighten for {symbol}",
                         current_price=current_price,
+                        atr=atr_value,
                     )
                     db.commit()
                     if result.valid:
@@ -2332,6 +2338,13 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 new_stop = _coerce_price(review_result.get("new_stop"), "new_stop", symbol)
                 if new_stop is None:
                     continue
+                # Fetch ATR for minimum-change threshold
+                try:
+                    from utils.atr_helper import compute_intraday_atr
+                    atr_data = compute_intraday_atr(symbol)
+                except Exception:
+                    atr_data = None
+                atr_value = atr_data.get("atr") if atr_data else None
                 result = apply_stop_update(
                     db,
                     trade=open_trade,
@@ -2340,6 +2353,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                     stop_role="maintenance_tighten",
                     reason=f"Maintenance Review tighten_stop for {symbol}",
                     current_price=current_price,
+                    atr=atr_value,
                 )
                 db.commit()
                 if result.valid:

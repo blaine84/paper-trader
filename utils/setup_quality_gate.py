@@ -163,6 +163,35 @@ def _log_gate_event(
 # ---------------------------------------------------------------------------
 
 
+def resolve_setup_type(
+    decision: dict | None, signal: dict | None
+) -> str | None:
+    """Resolve and normalize setup type from decision/signal.
+
+    Priority order:
+      1. decision.setup_type
+      2. decision.setup
+      3. signal.setup_type
+      4. signal.setup
+
+    Only string values are considered. Non-string values (int, float, list, dict,
+    bool, etc.) are treated as missing — they are never coerced via str().
+
+    Returns:
+        Stripped non-empty string, or None if missing/blank/non-string.
+    """
+    candidates = []
+    for source in (decision or {}, signal or {}):
+        for key in ("setup_type", "setup"):
+            val = source.get(key)
+            if isinstance(val, str):
+                stripped = val.strip()
+                if stripped:
+                    candidates.append(stripped)
+
+    return candidates[0] if candidates else None
+
+
 def evaluate_setup_quality(
     engine,
     db,

@@ -188,6 +188,7 @@ gates produce no events.
 
 | Gate | What it checks | Possible decisions |
 |---|---|---|
+| Setup Type Resolution | Normalizes setup type; rejects missing/blank/non-string | allow, reject |
 | Setup Quality Gate | Case-library win rate by setup type | allow, downgrade, reject |
 | Pre-Trade Quality Gate | Reviewer selection + execution scores | allow, warn, reject, override_required |
 | Risk Geometry Gate | Stop distance, position size, dollar risk, R:R, target feasibility | passed_unchanged, adjusted_allowed, rejected |
@@ -582,7 +583,15 @@ The full lifecycle of a trade from signal to exit:
    Deterministic gate pipeline runs before edge score / risk gating.
    Each gate logs exactly one TradeEvent. Pipeline short-circuits on reject.
 
-   a. SETUP QUALITY GATE (utils/setup_quality_gate.py)
+   a. SETUP TYPE RESOLUTION (utils/setup_quality_gate.py)
+      Resolves and normalizes setup type before any gate evaluates:
+      ├─ Priority: decision.setup_type > decision.setup > signal.setup_type > signal.setup
+      ├─ Strips whitespace; non-string values (int, list, dict, bool) treated as missing
+      ├─ If resolved setup type is missing/blank → REJECT (fail closed)
+      └─ Rejection logged as gate_rejected with reason "missing setup_type"
+      This ensures no trade can bypass setup-quality controls through an empty field.
+
+   b. SETUP QUALITY GATE (utils/setup_quality_gate.py)
       Evaluates case-library performance for the setup type:
       ├─ < 5 cases → allow (insufficient data)
       ├─ 3+ consecutive losses → reject
@@ -593,7 +602,7 @@ The full lifecycle of a trade from signal to exit:
       Per-setup thresholds: momentum_fade 35%, news_breakout 40%,
       gap_and_go 45%, technical_breakout 40%, default 40%.
 
-   b. PRE-TRADE QUALITY GATE (utils/pre_trade_quality_gate.py)
+   c. PRE-TRADE QUALITY GATE (utils/pre_trade_quality_gate.py)
       Evaluates Reviewer selection and execution scores:
       ├─ Either score missing → warn (allow with warning)
       ├─ Both scores < 7.0 → reject
@@ -603,7 +612,7 @@ The full lifecycle of a trade from signal to exit:
       Override: PM can provide override_confidence_score >= 8.0 + reason
       to convert override_required → allow.
 
-   c. RISK GEOMETRY GATE (utils/risk_geometry_gate.py)
+   d. RISK GEOMETRY GATE (utils/risk_geometry_gate.py)
       Validates full trade geometry before order execution:
       ├─ Resolves symbol class rule (high-beta mega-cap, ETF, small-cap momentum, default)
       ├─ Validates stop direction (stop must be on correct side of entry)
@@ -688,6 +697,31 @@ The full lifecycle of a trade from signal to exit:
    ├─ +2R: take more profit (if profile allows), trail stop to +1R
    ├─ +3R: trail stop to +2R
    └─ Each action fires once per trade, tracked in memory
+
+   Maintenance Stop Discipline (utils/stop_authority.py):
+   All maintenance stop updates (from PM maintenance review and profit manager
+   trailing) pass through layered validation before acceptance:
+
+   ├─ Monotonic Tightening: stops may only move in the risk-reducing direction
+   │    Long: new stop must be strictly above current stop
+   │    Short: new stop must be strictly below current stop
+   │    Equal values treated as no-op and rejected
+   ├─ Minimum Change Threshold: rejects noise-level adjustments
+   │    Threshold = max(0.25% × current_price, 0.25 × ATR_5min)
+   │    Fallback if ATR unavailable: 0.25% × current_price only
+   │    Fallback if price unavailable: 0.1% × current_stop
+   └─ Cooldown: 15-minute minimum between accepted stop updates per trade
+        Prevents one review loop from churning stops repeatedly
+
+   Bypasses (not subject to maintenance discipline):
+   ├─ Initial stop creation at trade entry (stop_role="initial")
+   ├─ Price-monitor stop-triggered exits
+   ├─ Target-triggered exits
+   └─ Non-maintenance agents (e.g., price_monitor)
+
+   Rejections logged as stop_update_rejected with specific reason:
+   "non-monotonic maintenance stop", "below minimum stop change threshold",
+   or "stop update cooldown active"
 
    Partial profit rules by profile:
    ├─ Conservative: 50% at +1R, 25% at +2R
