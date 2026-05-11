@@ -524,6 +524,379 @@ def _log_pm_decision_rejected(
     )
 
 
+def _should_retry_pm_contract(
+    original_decisions: list[dict],
+    norm_result: NormalizationResult,
+) -> bool:
+    """Determine whether a contract validation retry is warranted.
+
+    Returns True when ALL of the following hold:
+    1. PM_CONTRACT_RETRY_ENABLED env var is truthy
+    2. original_decisions was non-empty (PM attempted something)
+    3. norm_result.rejections is non-empty
+    4. At least one rejection has a raw_decision with action
+       matching BUY or SHORT (case-insensitive)
+
+    Gate rejections (valid orders blocked downstream) are NOT in
+    norm_result.rejections and thus never trigger retry.
+    """
+    # 1. Check env var
+    if os.environ.get("PM_CONTRACT_RETRY_ENABLED", "").strip().lower() not in ("true", "1", "yes"):
+        return False
+
+    # 2. Original decisions must be non-empty
+    if not original_decisions:
+        return False
+
+    # 3. Rejections must be non-empty
+    if not norm_result.rejections:
+        return False
+
+    # 4. At least one rejection must have a BUY or SHORT action
+    for rejection in norm_result.rejections:
+        action_raw = rejection.raw_decision.get("action")
+        if isinstance(action_raw, str) and action_raw.strip().upper() in ("BUY", "SHORT"):
+            return True
+
+    return False
+
+
+def _summarize_normalization_rejections(
+    rejections: list[NormalizedOrder],
+) -> str:
+    """Build a compact human-readable summary of normalizer rejections.
+
+    Returns a string like:
+        - AMD BUY: invalid_quantity, missing_stop_loss
+        - NVDA SHORT: invalid_geometry
+
+    Groups rejections by (symbol, action) and lists all reason_codes.
+    Used in the retry prompt to show the PM what went wrong.
+    """
+    from collections import OrderedDict
+
+    # Group reason_codes by (symbol, action), preserving insertion order
+    groups: OrderedDict[tuple[str, str], list[str]] = OrderedDict()
+
+    for r in rejections:
+        symbol = "UNKNOWN"
+        action = "UNKNOWN"
+
+        raw = r.raw_decision
+        if isinstance(raw, dict):
+            sym_val = raw.get("symbol")
+            if isinstance(sym_val, str) and sym_val.strip():
+                symbol = sym_val.strip().upper()
+            act_val = raw.get("action")
+            if isinstance(act_val, str) and act_val.strip():
+                action = act_val.strip().upper()
+
+        reason = r.reason_code or "unknown"
+        key = (symbol, action)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(reason)
+
+    lines = []
+    for (symbol, action), reasons in groups.items():
+        lines.append(f"- {symbol} {action}: {', '.join(reasons)}")
+
+    return "\n".join(lines)
+
+
+def _build_pm_contract_retry_prompt(
+    original_response: dict,
+    rejections: list[NormalizedOrder],
+    entry_signals: dict[str, dict],
+) -> tuple[str, str]:
+    """Build the system and user prompts for a contract validation retry.
+
+    Args:
+        original_response: The full parsed JSON from the first PM call
+            (contains both decisions and portfolio_notes).
+        rejections: The NormalizedOrder(ok=False) items from normalization.
+        entry_signals: The allowed entry signals dict for this cycle.
+
+    Returns:
+        (system_prompt, user_prompt) tuple for the retry LLM call.
+
+    The retry prompt includes:
+    - The original PM JSON response (decisions + portfolio_notes)
+    - A rejection summary (symbol, action, reason_code for each)
+    - Allowed symbols for this cycle
+    - Compact signal context for rejected symbols that are in entry_signals
+    - The strict output contract
+    - Instruction: "Only return corrected versions of rejected decisions;
+      do not repeat already-valid orders."
+    - Instruction: "If missing fields cannot be recovered, return empty
+      decisions and move the idea to portfolio_notes."
+
+    The retry prompt does NOT include:
+    - Full system prompt context (signals, positions, portfolio state)
+    - Maintenance/reversal review context
+    """
+    # ── System prompt: minimal contract-focused ──
+    system_prompt = (
+        "You are a portfolio manager correcting malformed trade decisions. "
+        "Your ONLY job is to fix rejected decisions into valid executable orders "
+        "or move them to portfolio_notes. Follow the output contract exactly."
+    )
+
+    # ── User prompt construction ──
+    parts: list[str] = []
+
+    # 1. Original PM JSON response
+    parts.append("## YOUR PREVIOUS RESPONSE\n")
+    parts.append(json.dumps(original_response, indent=2, default=str))
+
+    # 2. Rejection summary
+    parts.append("\n\n## REJECTION SUMMARY\n")
+    parts.append("The following decisions were rejected by the normalizer:\n")
+    parts.append(_summarize_normalization_rejections(rejections))
+
+    # 3. Allowed symbols
+    allowed_symbols = sorted(entry_signals.keys())
+    parts.append("\n\n## ALLOWED SYMBOLS\n")
+    parts.append(", ".join(allowed_symbols))
+
+    # 4. Compact signal context for rejected symbols that exist in entry_signals
+    # Build set of rejected symbols (case-insensitive lookup)
+    rejected_symbols: set[str] = set()
+    for r in rejections:
+        raw = r.raw_decision
+        if isinstance(raw, dict):
+            sym_val = raw.get("symbol")
+            if isinstance(sym_val, str) and sym_val.strip():
+                rejected_symbols.add(sym_val.strip().upper())
+
+    # Match rejected symbols against entry_signals (case-insensitive)
+    signal_lookup = {k.upper(): k for k in entry_signals}
+    signal_context_lines: list[str] = []
+    for rejected_sym in sorted(rejected_symbols):
+        canonical_key = signal_lookup.get(rejected_sym)
+        if canonical_key is not None:
+            sig = entry_signals[canonical_key]
+            context = {
+                "direction": sig.get("direction"),
+                "strength": sig.get("strength"),
+                "entry_price": sig.get("entry_price"),
+                "stop_loss": sig.get("stop_loss"),
+                "target": sig.get("target"),
+            }
+            signal_context_lines.append(
+                f"  {canonical_key}: {json.dumps(context, default=str)}"
+            )
+
+    if signal_context_lines:
+        parts.append("\n\n## SIGNAL CONTEXT FOR REJECTED SYMBOLS\n")
+        parts.append("\n".join(signal_context_lines))
+
+    # 5. Strict output contract
+    parts.append("\n\n## OUTPUT CONTRACT\n")
+    parts.append(
+        "Return valid JSON with this structure:\n"
+        '{"decisions": [...], "portfolio_notes": "..."}\n\n'
+        "Each decision in decisions[] MUST have ALL of these fields:\n"
+        "- symbol: string (must be from ALLOWED SYMBOLS above)\n"
+        "- action: BUY or SHORT\n"
+        "- quantity: positive integer (no nulls, no zero)\n"
+        "- entry_price: positive float\n"
+        "- stop_loss: positive float\n"
+        "- target: positive float\n"
+        "- setup_type: string\n"
+        "- rationale: string\n\n"
+        "Geometry rules:\n"
+        "- BUY: stop_loss < entry_price < target\n"
+        "- SHORT: target < entry_price < stop_loss"
+    )
+
+    # 6. Instructions
+    parts.append("\n\n## INSTRUCTIONS\n")
+    parts.append(
+        "Only return corrected versions of rejected decisions; "
+        "do not repeat already-valid orders.\n\n"
+        "If missing fields cannot be recovered from your previous response "
+        "or the signal context provided, return empty decisions and move the "
+        "idea to portfolio_notes. Do not invent order geometry."
+    )
+
+    user_prompt = "".join(parts)
+
+    return (system_prompt, user_prompt)
+
+
+def _deduplicate_retry_orders(
+    original_orders: list[NormalizedOrder],
+    retry_orders: list[NormalizedOrder],
+) -> list[NormalizedOrder]:
+    """Remove retry orders that conflict with an original valid order by symbol.
+
+    A retry order is considered a conflict if its symbol matches any order
+    in original_orders (case-insensitive comparison). Same profile, same cycle,
+    same symbol should have at most one entry intent.
+
+    Also deduplicates within retry_orders itself: if retry returns multiple
+    orders for the same symbol, only the first is kept.
+
+    Returns: list of retry orders that are NOT conflicts/duplicates.
+    """
+    # Build set of symbols already present in original valid orders
+    original_symbols: set[str] = set()
+    for o in original_orders:
+        if o.order and isinstance(o.order.get("symbol"), str):
+            original_symbols.add(o.order["symbol"].upper())
+
+    result: list[NormalizedOrder] = []
+    seen_retry_symbols: set[str] = set()
+
+    for retry_order in retry_orders:
+        symbol_raw = retry_order.order.get("symbol", "") if retry_order.order else ""
+        symbol_key = symbol_raw.upper() if isinstance(symbol_raw, str) else ""
+
+        # Check conflict with original orders
+        if symbol_key in original_symbols:
+            log.info(
+                "Retry order for %s skipped: conflicts with original valid order",
+                symbol_key,
+            )
+            continue
+
+        # Check duplicate within retry orders (first-in-list wins)
+        if symbol_key in seen_retry_symbols:
+            log.info(
+                "Retry order for %s skipped: duplicate within retry orders",
+                symbol_key,
+            )
+            continue
+
+        seen_retry_symbols.add(symbol_key)
+        result.append(retry_order)
+
+    return result
+
+
+def _merge_retry_notes(
+    original_notes: str,
+    retry_notes: str | None,
+) -> str:
+    """Merge original portfolio_notes with retry notes.
+
+    Rules:
+    - Original notes are always preserved.
+    - If retry_notes is non-empty, append with prefix:
+      "\\n\\nContract retry note: " + retry_notes
+    - If retry_notes is empty/None, return original_notes unchanged.
+
+    This ensures that even when retry returns decisions:[] with useful
+    explanatory notes (e.g., "AMD not executable — no valid stop level"),
+    that context is preserved for the operator.
+    """
+    if retry_notes:
+        return original_notes + "\n\nContract retry note: " + retry_notes
+    return original_notes
+
+
+def _log_retry_triggered(
+    db, profile_id: str, norm_result: NormalizationResult,
+    entry_signals: dict[str, dict],
+) -> None:
+    """Log pm_contract_retry_triggered trade event."""
+    reason_counts = collections.Counter(
+        r.reason_code for r in norm_result.rejections
+    )
+    log_trade_event(
+        db,
+        "pm_contract_retry_triggered",
+        agent="portfolio_manager",
+        symbol=None,
+        profile=profile_id,
+        payload={
+            "profile": profile_id,
+            "reason_counts": dict(reason_counts),
+            "allowed_symbols": sorted(entry_signals.keys()),
+            "initial_rejection_count": len(norm_result.rejections),
+        },
+    )
+
+
+def _log_retry_succeeded(
+    db, profile_id: str,
+    initial_norm: NormalizationResult,
+    retry_norm: NormalizationResult,
+    deduped_retry: list[NormalizedOrder],
+) -> None:
+    """Log pm_contract_retry_succeeded trade event."""
+    log_trade_event(
+        db,
+        "pm_contract_retry_succeeded",
+        agent="portfolio_manager",
+        symbol=None,
+        profile=profile_id,
+        payload={
+            "profile": profile_id,
+            "initial_rejection_count": len(initial_norm.rejections),
+            "retry_rejection_count": len(retry_norm.rejections),
+            "retry_order_count": len(deduped_retry),
+        },
+    )
+
+
+def _log_retry_failed(
+    db, profile_id: str,
+    initial_norm: NormalizationResult,
+    retry_norm: NormalizationResult,
+) -> None:
+    """Log pm_contract_retry_failed trade event."""
+    retry_reason_counts = collections.Counter(
+        r.reason_code for r in retry_norm.rejections
+    )
+    log_trade_event(
+        db,
+        "pm_contract_retry_failed",
+        agent="portfolio_manager",
+        symbol=None,
+        profile=profile_id,
+        payload={
+            "profile": profile_id,
+            "initial_rejection_count": len(initial_norm.rejections),
+            "retry_rejection_count": len(retry_norm.rejections),
+            "retry_reason_counts": dict(retry_reason_counts),
+        },
+    )
+
+
+def _log_pm_decision_corrected(
+    db, rejection: NormalizedOrder, profile_id: str,
+) -> None:
+    """Log a pm_contract_retry_corrected trade event for a rejection that was
+    subsequently fixed by the retry.
+
+    These are NOT counted as normal pm_decision_rejected — they represent
+    transient malformed output that the PM self-corrected.
+    """
+    raw_json = json.dumps(rejection.raw_decision, default=str)
+    if len(raw_json) > 2000:
+        raw_json = raw_json[:1997] + "..."
+    # Resolve symbol robustly: try raw_decision first, fall back to details
+    symbol = (
+        rejection.raw_decision.get("symbol")
+        or rejection.details.get("symbol")
+    )
+    log_trade_event(
+        db,
+        "pm_contract_retry_corrected",
+        agent="portfolio_manager",
+        symbol=None,
+        profile=profile_id,
+        payload={
+            "profile": profile_id,
+            "reason_code": rejection.reason_code,
+            "symbol": symbol,
+            "raw_decision": raw_json,
+        },
+    )
+
+
 def _coerce_price(value, field_name: str, symbol: str) -> float | None:
     """Normalize LLM/database price values before persisting or %.2f logging."""
     if value is None:
@@ -635,6 +1008,8 @@ def _format_execution_audit(
     gate_blocked: list[dict] | None = None,
     rejections: list | None = None,
     non_orders: list | None = None,
+    *,
+    retry_info: dict | None = None,
 ) -> str:
     """Categorized execution audit for PM notes.
 
@@ -643,7 +1018,10 @@ def _format_execution_audit(
         gate_blocked: Decisions that passed normalizer but were rejected by
             the gate pipeline. Each dict has at minimum: symbol, action, message.
         rejections: NormalizedOrder(ok=False) results from the normalizer.
+            Only UNRESOLVED rejections (corrected rejections excluded).
         non_orders: NonOrderRecord items (HOLD/PASS/AVOID/WATCH).
+        retry_info: Optional dict with keys: attempted (bool), succeeded (bool),
+            corrected_count (int). Describes the outcome of a contract retry.
 
     Categories:
       EXECUTED: Full trade details (action, qty, symbol, price, message)
@@ -694,6 +1072,14 @@ def _format_execution_audit(
         )
         for reason_code, count in reason_counts.most_common():
             lines.append(f"  • {reason_code}: {count}")
+
+    # ── Retry summary line ──
+    if retry_info and retry_info.get("corrected_count", 0) > 0:
+        lines.append(f"  • Contract retry corrected {retry_info['corrected_count']} malformed PM output(s).")
+    elif retry_info and retry_info.get("attempted") and not retry_info.get("succeeded"):
+        lines.append("  • Contract retry attempted; malformed output still rejected.")
+    elif rejections:
+        lines.append("  • Malformed order-shaped commentary was ignored before execution.")
 
     # ── IGNORED NON-ORDER ──
     if non_orders:
@@ -858,6 +1244,27 @@ DECISION FORMAT RULES:
 - Every decision MUST include: symbol, action (BUY/SHORT), quantity (positive integer),
   entry_price (positive number), stop_loss, target, setup_type, and rationale.
 If no trades make sense for your profile, return empty decisions array.
+
+STRICT OUTPUT CONTRACT — READ CAREFULLY
+
+If any required field (quantity, entry_price, stop_loss, target) is unknown,
+uncertain, conditional, placeholder, or null — DO NOT emit a decision.
+Put that idea in portfolio_notes instead.
+
+Forbidden inside decisions[]:
+- null values, zero quantities, placeholder prices, textual targets
+- conditional actions: BUY ON DIP, ACCUMULATE, OVERWEIGHT, UNDERWEIGHT
+- non-entry actions: HOLD, PASS, AVOID, WATCH, CLOSE, SELL, TRIM
+- sector concepts, baskets, unsupported symbols
+
+When no executable order exists, return:
+{{"decisions": [], "portfolio_notes": "..."}}
+
+Example — VALID (goes in decisions[]):
+{{"symbol":"AMD","action":"BUY","quantity":10,"entry_price":161.0,"stop_loss":152.0,"target":179.0,"setup_type":"news_catalyst_breakout","rationale":"Strong momentum with clear levels"}}
+
+Example — INVALID (belongs in portfolio_notes, NOT decisions[]):
+{{"symbol":"AMD","action":"BUY","quantity":null,"target":"next resistance","rationale":"AMD looks attractive"}}
 """
 
 
@@ -3181,12 +3588,106 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
         get_live_quote=_safe_live_quote,
     )
 
-    # Log rejection events
-    for rejection in norm_result.rejections:
+    # ── Contract Validation Retry ──
+    # NOTE: Do NOT log pm_decision_rejected yet — retry may resolve some rejections.
+    final_orders = norm_result.orders
+    final_notes = result.get("portfolio_notes", "")
+    unresolved_rejections = norm_result.rejections  # default: all rejections unresolved
+    corrected_rejections = []  # rejections that retry resolved
+    retry_info = None
+
+    if _should_retry_pm_contract(raw_decisions, norm_result):
+        # Telemetry: retry triggered
+        _log_retry_triggered(db, profile_id, norm_result, entry_signals)
+
+        retry_system, retry_user = _build_pm_contract_retry_prompt(
+            result, norm_result.rejections, entry_signals,
+        )
+
+        try:
+            retry_raw = call_llm(
+                retry_system, retry_user,
+                json_mode=True, tier=tier,
+                purpose=f"pm_contract_retry:{profile_id}",
+            )
+            retry_result = parse_json_response(retry_raw)
+            retry_decisions = retry_result.get("decisions", [])
+            retry_norm_result = normalize_pm_entry_decisions(
+                retry_decisions, entry_signals, get_live_quote=_safe_live_quote,
+            )
+
+            if retry_norm_result.orders:
+                # Deduplicate against original valid orders (by symbol)
+                deduped_retry = _deduplicate_retry_orders(
+                    norm_result.orders, retry_norm_result.orders,
+                )
+                final_orders = norm_result.orders + deduped_retry
+
+                # Classify initial rejections: corrected vs unresolved
+                retry_symbols = {o.order["symbol"].upper() for o in deduped_retry}
+                corrected_rejections = [
+                    r for r in norm_result.rejections
+                    if r.raw_decision.get("symbol", "").upper().strip() in retry_symbols
+                ]
+                unresolved_rejections = [
+                    r for r in norm_result.rejections
+                    if r not in corrected_rejections
+                ]
+
+                # Merge notes
+                retry_notes = retry_result.get("portfolio_notes", "")
+                final_notes = _merge_retry_notes(final_notes, retry_notes)
+
+                # Telemetry: retry succeeded
+                _log_retry_succeeded(db, profile_id, norm_result, retry_norm_result, deduped_retry)
+                retry_info = {"attempted": True, "succeeded": True, "corrected_count": len(corrected_rejections)}
+            else:
+                # Retry failed — keep original valid orders
+                unresolved_rejections = norm_result.rejections
+                corrected_rejections = []
+
+                # Merge retry notes even on failure
+                retry_notes = retry_result.get("portfolio_notes", "")
+                final_notes = _merge_retry_notes(final_notes, retry_notes)
+
+                # Telemetry: retry failed
+                _log_retry_failed(db, profile_id, norm_result, retry_norm_result)
+                retry_info = {"attempted": True, "succeeded": False, "corrected_count": 0}
+
+        except Exception as exc:
+            log.error("PM contract retry LLM call failed for %s: %s", profile_id, exc)
+            # Emit pm_contract_retry_failed telemetry for the exception case
+            log_trade_event(
+                db,
+                "pm_contract_retry_failed",
+                agent="portfolio_manager",
+                symbol=None,
+                profile=profile_id,
+                payload={
+                    "profile": profile_id,
+                    "initial_rejection_count": len(norm_result.rejections),
+                    "retry_rejection_count": 0,
+                    "retry_reason_counts": {},
+                    "error": str(exc)[:500],
+                },
+            )
+            # Fall through — final_orders remains norm_result.orders
+            retry_info = {"attempted": True, "succeeded": False, "corrected_count": 0}
+
+        # NOTE: Do NOT log retry_norm_result.rejections as pm_decision_rejected.
+        # Retry's own malformed outputs are captured inside pm_contract_retry_failed
+        # payload (retry_reason_counts). Logging them as normal rejections would
+        # pollute dashboard counts with the retry attempt itself.
+
+    # ── Now log rejection events with correct final disposition ──
+    for rejection in unresolved_rejections:
         _log_pm_decision_rejected(db, rejection, profile_id)
 
-    # Execute entry decisions — only normalized ok=True orders proceed
-    for norm_order in norm_result.orders:
+    for rejection in corrected_rejections:
+        _log_pm_decision_corrected(db, rejection, profile_id)
+
+    # Execute entry decisions — only final_orders proceed
+    for norm_order in final_orders:
         decision = norm_order.order
         decision = apply_params_to_decision(decision, behav_params, profile)
         if decision.get("action") == "PASS":
@@ -3298,16 +3799,17 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
     # Save PM notes with a post-validation execution audit.  The LLM's
     # portfolio_notes are written before validation/edge gates finish, so the
     # audit prevents the dashboard from implying rejected ideas became trades.
-    notes = result.get("portfolio_notes", "")
+    notes = final_notes
     # Split executed into actual fills vs gate-blocked
     actual_fills = [d for d in executed if d.get("executed")]
     gate_blocked_items = [d for d in executed if not d.get("executed")]
-    if notes or executed or norm_result.rejections or norm_result.non_orders:
+    if notes or executed or unresolved_rejections or norm_result.non_orders:
         audit = _format_execution_audit(
             actual_fills,
             gate_blocked=gate_blocked_items,
-            rejections=norm_result.rejections,
+            rejections=unresolved_rejections,
             non_orders=norm_result.non_orders,
+            retry_info=retry_info,
         )
         stored_notes = f"{notes}\n\n{audit}" if notes else audit
         mem = AgentMemory(
