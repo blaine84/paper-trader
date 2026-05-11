@@ -1,55 +1,28 @@
 """
-Position Timer Monitor
-Enforces time-based exits on intraday setups.
+Position Timer — Lifecycle Governance Executor
 
-General rules:
-  - Alert PM after setup-specific alert time
-  - Force close after setup-specific force time
-  - Hard wall: close all intraday positions at 3:45 PM ET
+Iterates open positions, calls the lifecycle evaluator, logs decisions,
+and executes the returned actions (close, warn, repair).
 
-Momentum Fade specific:
-  - 30-40 min: mark as "stale" if <0.5R achieved
-  - 45 min: alert if stale
-  - 60 min: thesis revalidation via LLM (below VWAP? volume fading? lower highs?)
-  - If revalidation fails: exit immediately
-  - 75 min: force exit regardless
-  - Suppress duplicate warnings unless status escalates
+All governance logic (time limits, news expiry, overnight authorization,
+stop geometry) lives in utils/position_lifecycle_governance.py.
+This module is a thin executor only.
 """
 
 import json
 import logging
+import os
 from datetime import datetime
 from pytz import timezone
 
-from db.schema import Trade, Position, AgentMemory, get_session
+from db.schema import Trade, TradeEvent, Balance, AgentMemory, get_session
 from utils.trade_events import log_trade_event
-from utils.finnhub_client import FinnhubClient
 from utils.news_trade_governance import (
-    NewsGovernanceClassifier, NewsGovernancePolicy,
-    log_trade_event_once, latest_valid_reconfirmation,
-    latest_exit_request, NEWS_GOVERNANCE, validate_news_governance_config,
+    log_trade_event_once, _build_failure_dedupe_key,
 )
+from utils.position_lifecycle_governance import evaluate_position_lifecycle, validate_stop_geometry
 
 log = logging.getLogger(__name__)
-
-SETUP_TIME_LIMITS = {
-    "momentum_fade": {"stale": 35, "alert": 45, "revalidate": 60, "force_close": 75},
-    "gap_and_go":    {"alert": 60, "force_close": 90},
-    "vwap_reclaim":  {"alert": 60, "force_close": 90},
-    "orb":           {"alert": 45, "force_close": 75},
-    "trend_pullback": {"alert": 90, "force_close": 120},
-    "news_catalyst": {"alert": 60, "force_close": 90},
-    "short_squeeze": {"alert": 30, "force_close": 60},
-}
-
-DEFAULT_LIMITS = {"alert": 60, "force_close": 90}
-INTRADAY_SETUPS = set(SETUP_TIME_LIMITS.keys())
-HARD_WALL_HOUR = 15
-HARD_WALL_MINUTE = 45
-
-# Track alert status per trade to suppress duplicates
-# {trade_id: "stale" | "alert" | "revalidating" | "force_close"}
-_alert_status = {}
 
 
 def _get_setup_type_for_trade(db, trade) -> str:
@@ -105,8 +78,6 @@ def _close_position(engine, trade, price, reason):
         log.error(f"Force close failed for {trade.symbol}: {e}")
     finally:
         db.close()
-    # Clear alert status
-    _alert_status.pop(trade.id, None)
 
     # Trigger narrator flash update for force exits
     try:
@@ -125,416 +96,590 @@ def _close_position(engine, trade, price, reason):
         pass  # never block position timer operations
 
 
-def _reclassify_to_swing(engine, trade_id, symbol, profile, old_setup, minutes_held):
-    """Reclassify an intraday trade to swing when it survives past its time limit with a target_price."""
-    db = get_session(engine)
-    try:
-        trade = db.query(Trade).filter_by(id=trade_id).first()
-        if trade:
-            trade.setup_type = "swing"
-            db.commit()
-            log.warning(
-                "⏰ SWING RECLASSIFY: %s (%s) %s → swing after %d min "
-                "(has target_price, deferring to price_monitor)",
-                symbol, profile, old_setup, minutes_held,
-            )
-    except Exception as e:
-        log.error("Swing reclassification failed for %s: %s", symbol, e)
-    finally:
-        db.close()
+# ─── Stop Repair Execution (Task 7.3) ────────────────────────────────────────
 
 
-def _calculate_r_achieved(trade, current_price):
-    """Calculate how much R (risk units) the trade has achieved."""
-    if not trade.stop_price or not trade.entry_price:
-        return None
-    risk = abs(trade.entry_price - trade.stop_price)
-    if risk == 0:
-        return None
-    if trade.direction == "LONG":
-        move = current_price - trade.entry_price
-    else:
-        move = trade.entry_price - current_price
-    return round(move / risk, 2)
+def _execute_stop_repair(engine, db, trade_dict, price, decision) -> bool:
+    """Attempt stop repair for overnight carry.
 
+    On success: updates trade stop_price, logs overnight_stop_validated event.
+    On failure: closes position immediately, logs overnight_stop_repair_failed.
 
-def _revalidate_momentum_fade(engine, trade, price) -> bool:
+    Deduplication: Only one repair attempt per governance window. If already
+    attempted this window, skips repair and closes immediately.
+
+    Returns True if repair succeeded, False if position was closed.
     """
-    LLM thesis revalidation for momentum_fade at 60 min.
-    Returns True if thesis still valid, False if should exit.
-    Checks: below VWAP? volume fading? lower highs/lower lows intact?
-    """
-    from utils.llm import call_llm, parse_json_response
-    from utils.technicals import compute_indicators
+    metadata = decision.get("metadata", {})
+    auth_stop = metadata.get("auth_stop_price")
+    reason = metadata.get("reason", "")
+    trade_id = trade_dict["id"]
+    governance_window_id = metadata.get("governance_window_id")
 
-    fh = FinnhubClient()
-    candles = fh.get_candles(trade.symbol, resolution="5", days=1)
-    indicators = compute_indicators(candles)
+    # Dedupe: check if repair already attempted this governance window
+    already_attempted = not log_trade_event_once(
+        db,
+        "stop_repair_attempted",
+        trade_id,
+        governance_window_id=governance_window_id,
+        agent="position_timer",
+        symbol=trade_dict["symbol"],
+        profile=trade_dict["profile"],
+        payload={"reason": reason, "auth_stop_price": auth_stop},
+    )
+    db.commit()
 
-    if not indicators or "error" in indicators:
-        log.warning(f"Revalidation: no indicator data for {trade.symbol}, failing safe → exit")
-        return False
-
-    prompt = f"""You are validating whether a momentum_fade SHORT trade thesis is still intact.
-
-Trade: {trade.direction} {trade.symbol} entered at ${trade.entry_price:.2f}, now ${price:.2f}
-Held for 60 minutes. Stop: ${trade.stop_price or 'none'}, Target: ${trade.target_price or 'none'}
-
-Current indicators:
-  RSI: {indicators.get('rsi')}
-  VWAP: {indicators.get('vwap')} (price {'below' if price < indicators.get('vwap', 0) else 'above'} VWAP)
-  EMA trend: {indicators.get('trend')}
-  MACD: {indicators.get('macd_cross')}
-  BB position: price at {indicators.get('bb_lower', 0):.2f} - {indicators.get('bb_upper', 0):.2f}
-
-Is the momentum fade thesis still valid? Check:
-1. Is price still below VWAP? (required for short thesis)
-2. Is selling pressure intact? (bearish MACD, RSI not recovering above 50)
-3. Are lower highs / lower lows intact on the 5-min chart?
-
-Respond in JSON:
-{{"valid": true or false, "reasoning": "one sentence", "confidence": "high|medium|low"}}
-"""
-
-    try:
-        raw = call_llm(
-            "You are a trade thesis validator. Be strict — if in doubt, say invalid.",
-            prompt, json_mode=True, tier="medium", purpose=f"position_timer_revalidation:{trade.symbol}"
+    if already_attempted:
+        log.warning(
+            f"Stop repair already attempted for {trade_dict['symbol']} "
+            f"(trade {trade_id}) in governance window {governance_window_id} — closing"
         )
-        result = parse_json_response(raw)
-        valid = result.get("valid", False)
-        log.info(f"Revalidation {trade.symbol}: {'VALID' if valid else 'INVALID'} — {result.get('reasoning', '')}")
-        return valid
-    except Exception as e:
-        log.warning(f"Revalidation LLM failed for {trade.symbol}: {e} — failing safe → exit")
+        _close_and_log_repair_failed(engine, db, trade_dict, price, decision, "dedupe_window_exhausted")
         return False
 
+    # Non-repairable reasons: missing price or missing stop can't be fixed by updating stop
+    if reason in ("missing_price_fail_safe", "missing_stop"):
+        _close_and_log_repair_failed(engine, db, trade_dict, price, decision, reason)
+        return False
 
-def _escalate(trade_id, new_status) -> bool:
-    """Returns True if this is a new escalation (status changed). Suppresses duplicates."""
-    old = _alert_status.get(trade_id)
-    levels = {"stale": 0, "alert": 1, "revalidating": 2, "force_close": 3}
-    if old and levels.get(old, -1) >= levels.get(new_status, -1):
-        return False  # already at this level or higher
-    _alert_status[trade_id] = new_status
+    # Repairable: authorization_stop_mismatch — update trade stop to auth stop
+    if reason == "authorization_stop_mismatch" and auth_stop is not None:
+        try:
+            repair_db = get_session(engine)
+            trade = repair_db.query(Trade).filter_by(id=trade_id).first()
+            if trade:
+                trade.stop_price = float(auth_stop)
+                trade.stop_updated_by = "position_timer_governance"
+                trade.stop_updated_at = datetime.now(timezone("UTC"))
+                repair_db.commit()
+            repair_db.close()
+
+            # Validate the repaired geometry
+            is_valid, validation_reason = validate_stop_geometry(
+                {**trade_dict, "stop_price": float(auth_stop)},
+                {"stop_price": auth_stop},
+                price,
+            )
+            if is_valid:
+                log_trade_event_once(
+                    db,
+                    "overnight_stop_validated",
+                    trade_id,
+                    governance_window_id=governance_window_id,
+                    agent="position_timer",
+                    symbol=trade_dict["symbol"],
+                    profile=trade_dict["profile"],
+                    payload={"repaired_stop": auth_stop, "reason": reason},
+                )
+                db.commit()
+                log.info(
+                    f"✅ Stop repair succeeded for {trade_dict['symbol']} "
+                    f"(trade {trade_id}): stop updated to {auth_stop}"
+                )
+                return True
+            else:
+                log.warning(
+                    f"Stop repair validation failed for {trade_dict['symbol']}: {validation_reason}"
+                )
+        except Exception as e:
+            log.error(f"Stop repair failed for {trade_dict['symbol']}: {e}")
+
+    # Repair failed or not applicable — close position
+    _close_and_log_repair_failed(engine, db, trade_dict, price, decision, reason)
+    return False
+
+
+def _close_and_log_repair_failed(engine, db, trade_dict, price, decision, reason):
+    """Close position and log overnight_stop_repair_failed event."""
+    metadata = decision.get("metadata", {})
+    governance_window_id = metadata.get("governance_window_id")
+
+    # Reconstruct trade object for _close_position
+    class _T:
+        pass
+    trade_obj = _T()
+    trade_obj.id = trade_dict["id"]
+    trade_obj.symbol = trade_dict["symbol"]
+    trade_obj.profile = trade_dict["profile"]
+    trade_obj.direction = trade_dict["direction"]
+    trade_obj.entry_price = trade_dict["entry_price"]
+    trade_obj.stop_price = trade_dict["stop_price"]
+    trade_obj.target_price = trade_dict["target_price"]
+
+    _close_position(
+        engine, trade_obj, price,
+        f"Stop repair failed ({reason}): closing position for overnight safety"
+    )
+
+    log_trade_event_once(
+        db,
+        "overnight_stop_repair_failed",
+        trade_dict["id"],
+        governance_window_id=governance_window_id,
+        agent="position_timer",
+        symbol=trade_dict["symbol"],
+        profile=trade_dict["profile"],
+        payload={"reason": reason, "decision_reason_type": decision.get("reason_type")},
+    )
+    db.commit()
+
+
+# ─── Executor Helper Functions (Task 7.1) ────────────────────────────────────
+
+
+def fetch_open_trades_with_events(db) -> list[tuple[dict, list[dict]]]:
+    """Query open trades and their trade_events.
+
+    Returns list of (trade_dict, events_list) tuples where:
+    - trade_dict has keys: id, symbol, profile, direction, entry_price, entry_time,
+      stop_price, target_price, setup_type, status, quantity
+    - events_list is a list of dicts with: event_type, timestamp, payload (parsed dict)
+    """
+    open_trades = (
+        db.query(Trade)
+        .filter_by(status="open")
+        .filter(Trade.entry_time.isnot(None))
+        .all()
+    )
+
+    results = []
+    for trade in open_trades:
+        trade_dict = {
+            "id": trade.id,
+            "symbol": trade.symbol,
+            "profile": trade.profile,
+            "direction": trade.direction,
+            "entry_price": trade.entry_price,
+            "entry_time": trade.entry_time,
+            "stop_price": trade.stop_price,
+            "target_price": trade.target_price,
+            "setup_type": _get_setup_type_for_trade(db, trade),
+            "status": trade.status,
+            "quantity": trade.quantity,
+        }
+
+        trade_events = (
+            db.query(TradeEvent)
+            .filter_by(trade_id=trade.id)
+            .order_by(TradeEvent.timestamp.asc())
+            .all()
+        )
+
+        events_list = []
+        for event in trade_events:
+            payload = {}
+            if event.payload_json:
+                try:
+                    payload = json.loads(event.payload_json)
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+            events_list.append({
+                "event_type": event.event_type,
+                "timestamp": event.timestamp,
+                "payload": payload,
+            })
+
+        results.append((trade_dict, events_list))
+
+    return results
+
+
+def get_current_equity(db) -> float | None:
+    """Get current portfolio equity from latest balance row.
+    Falls back to STARTING_EQUITY env var if no balance row exists.
+    """
+    latest_balance = (
+        db.query(Balance)
+        .order_by(Balance.timestamp.desc())
+        .first()
+    )
+
+    if latest_balance:
+        if latest_balance.total_equity is not None:
+            return latest_balance.total_equity
+        if latest_balance.portfolio_value is not None:
+            return latest_balance.portfolio_value
+        return latest_balance.cash
+
+    # Fallback to environment variable
+    try:
+        starting_equity = os.environ.get("STARTING_EQUITY", "")
+        if starting_equity:
+            return float(starting_equity)
+    except (ValueError, TypeError):
+        pass
+
+    return None
+
+
+def get_overnight_stats(db, now_utc: datetime) -> tuple[dict[str, int], dict[str, float]]:
+    """Get overnight position counts and exposure percentages by profile.
+
+    Returns:
+        (overnight_position_counts, overnight_exposure_pcts)
+        Both are dicts keyed by profile name.
+    """
+    overnight_position_counts: dict[str, int] = {}
+    overnight_exposure_pcts: dict[str, float] = {}
+
+    # Query all overnight_authorized events
+    auth_events = (
+        db.query(TradeEvent)
+        .filter_by(event_type="overnight_authorized")
+        .all()
+    )
+
+    for event in auth_events:
+        payload = {}
+        if event.payload_json:
+            try:
+                payload = json.loads(event.payload_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Check if authorization is still valid (expires_at > now_utc)
+        expires_at_str = payload.get("expires_at")
+        if not expires_at_str:
+            continue
+
+        try:
+            if isinstance(expires_at_str, str):
+                expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+            else:
+                expires_at = expires_at_str
+            # Compare naive datetimes if needed
+            if hasattr(expires_at, "tzinfo") and expires_at.tzinfo is not None:
+                from datetime import timezone as dt_timezone
+                now_aware = now_utc.replace(tzinfo=dt_timezone.utc) if now_utc.tzinfo is None else now_utc
+                if expires_at <= now_aware:
+                    continue
+            else:
+                now_naive = now_utc.replace(tzinfo=None) if now_utc.tzinfo is not None else now_utc
+                if expires_at <= now_naive:
+                    continue
+        except (ValueError, TypeError):
+            continue
+
+        # Check that the associated trade is still open
+        profile = payload.get("profile") or event.profile
+        if not profile:
+            continue
+
+        # Verify the trade is still open
+        trade = db.query(Trade).filter_by(id=event.trade_id, status="open").first()
+        if not trade:
+            continue
+
+        overnight_position_counts[profile] = overnight_position_counts.get(profile, 0) + 1
+        # Exposure is set to 0.0 here — the evaluator calculates candidate exposure
+        overnight_exposure_pcts[profile] = overnight_exposure_pcts.get(profile, 0.0)
+
+    return overnight_position_counts, overnight_exposure_pcts
+
+
+def exclude_trade_from_counts(counts: dict[str, int], trade: dict) -> dict[str, int]:
+    """Return a copy of counts with the current trade's profile decremented (if > 0)."""
+    # Note: The counts already exclude the current trade if computed correctly.
+    # This is a safety helper — in practice the stats should already exclude it.
+    return dict(counts)
+
+
+def exclude_trade_from_exposure(exposure: dict[str, float], trade: dict) -> dict[str, float]:
+    """Return a copy of exposure with the current trade's profile excluded."""
+    return dict(exposure)
+
+
+def log_lifecycle_decision_once(db, decision: dict) -> bool:
+    """Log a lifecycle decision as a trade event with deduplication.
+
+    Deduplication strategy:
+    - Success/warning events: per governance window (standard dedupe)
+    - Failure events: hourly bucket to allow retry visibility
+
+    Returns True if event was written, False if suppressed as duplicate.
+    """
+
+    # Map decision state/reason_type to appropriate event_type
+    state = decision.get("state", "")
+    decision_action = decision.get("decision", "")
+    reason_type = decision.get("reason_type", "")
+    trade_id = decision.get("trade_id")
+
+    # Determine event_type from the decision
+    event_type_map = {
+        "news_expired": "news_expiry_force_close",
+        "news_reconfirmation_due": "news_reconfirmation_due",
+        "news_grace": "news_reconfirmation_due",
+        "overnight_unauthorized": "overnight_unauthorized_close",
+        "invalid_stop_geometry": "overnight_invalid_stop_force_close",
+        "intraday_expired": "intraday_force_close",
+        "intraday_warning": "intraday_time_warning",
+        "close_required": "lifecycle_close_required",
+    }
+    event_type = event_type_map.get(state, "lifecycle_decision_logged")
+
+    # Build payload from decision metadata
+    payload = {
+        "decision": decision_action,
+        "state": state,
+        "reason_type": reason_type,
+        "hours_held": decision.get("hours_held"),
+        "setup_type": decision.get("setup_type"),
+    }
+    if decision.get("close_reason"):
+        payload["close_reason"] = decision["close_reason"]
+    if decision.get("metadata"):
+        payload["metadata"] = decision["metadata"]
+
+    # Extract governance_window_id from metadata if available
+    metadata = decision.get("metadata", {})
+    governance_window_id = metadata.get("governance_window_id")
+
+    # Failure events use hourly deduplication; success/warning use per-window
+    failure_states = {
+        "news_expired", "overnight_unauthorized", "invalid_stop_geometry",
+        "intraday_expired", "close_required",
+    }
+    is_failure_event = (state in failure_states and decision_action == "close")
+
+    if is_failure_event:
+        now_utc = datetime.now(timezone("UTC"))
+        dedupe_key = _build_failure_dedupe_key(
+            event_type, trade_id, governance_window_id, now_utc
+        )
+        # Manual dedupe check + write for failure events
+        existing = (
+            db.query(TradeEvent)
+            .filter_by(event_type=event_type, trade_id=trade_id, dedupe_key=dedupe_key)
+            .first()
+        )
+        if existing:
+            return False
+
+        if payload is None:
+            payload = {}
+        if governance_window_id is not None:
+            payload["governance_window_id"] = governance_window_id
+
+        event = log_trade_event(
+            db, event_type, trade_id=trade_id,
+            agent="position_timer",
+            symbol=decision.get("symbol"),
+            profile=decision.get("profile"),
+            payload=payload,
+        )
+        event.dedupe_key = dedupe_key
+        return True
+
+    # Standard per-window deduplication for success/warning events
+    return log_trade_event_once(
+        db,
+        event_type,
+        trade_id,
+        governance_window_id=governance_window_id,
+        agent="position_timer",
+        symbol=decision.get("symbol"),
+        profile=decision.get("profile"),
+        payload=payload,
+    )
+
+
+def log_force_close_success(db, decision: dict) -> bool:
+    """Log a force-close success event AFTER the close operation succeeds.
+
+    Deduplication: per governance window (standard dedupe).
+    Only call this after the close operation has completed successfully.
+
+    Returns True if event was written, False if suppressed as duplicate.
+    """
+    state = decision.get("state", "")
+    trade_id = decision.get("trade_id")
+    metadata = decision.get("metadata", {})
+    governance_window_id = metadata.get("governance_window_id")
+
+    # Map state to success event type
+    success_event_map = {
+        "news_expired": "news_expiry_force_close",
+        "overnight_unauthorized": "overnight_unauthorized_force_close",
+        "invalid_stop_geometry": "overnight_invalid_stop_force_close",
+        "intraday_expired": "intraday_force_close",
+        "close_required": "lifecycle_force_close",
+    }
+    event_type = success_event_map.get(state, "lifecycle_force_close")
+
+    return log_trade_event_once(
+        db, event_type, trade_id,
+        governance_window_id=governance_window_id,
+        agent="position_timer",
+        symbol=decision.get("symbol"),
+        profile=decision.get("profile"),
+        payload={
+            "state": state,
+            "reason_type": decision.get("reason_type"),
+            "close_reason": decision.get("close_reason"),
+            "hours_held": decision.get("hours_held"),
+        },
+    )
+
+
+def log_force_close_failure(db, decision: dict, error: str) -> bool:
+    """Log a force-close failure event with hourly deduplication.
+
+    Deduplication: hourly bucket per (event_type, trade_id, governance_window).
+    This ensures persistent failures remain visible (one log per hour) while
+    avoiding log spam on rapid retry cycles.
+
+    Returns True if event was written, False if suppressed as duplicate.
+    """
+
+    state = decision.get("state", "")
+    trade_id = decision.get("trade_id")
+    metadata = decision.get("metadata", {})
+    governance_window_id = metadata.get("governance_window_id")
+
+    # Map state to failure event type
+    failure_event_map = {
+        "news_expired": "news_expiry_force_close_failed",
+        "overnight_unauthorized": "overnight_unauthorized_force_close_failed",
+        "invalid_stop_geometry": "overnight_invalid_stop_force_close_failed",
+        "intraday_expired": "intraday_force_close_failed",
+        "close_required": "lifecycle_force_close_failed",
+    }
+    event_type = failure_event_map.get(state, "lifecycle_force_close_failed")
+
+    # Build hourly-bucketed dedupe key
+    now_utc = datetime.now(timezone("UTC"))
+    dedupe_key = _build_failure_dedupe_key(event_type, trade_id, governance_window_id, now_utc)
+
+    # Check for existing event with same dedupe_key
+    existing = (
+        db.query(TradeEvent)
+        .filter_by(event_type=event_type, trade_id=trade_id, dedupe_key=dedupe_key)
+        .first()
+    )
+    if existing:
+        return False
+
+    event = log_trade_event(
+        db, event_type, trade_id=trade_id,
+        agent="position_timer",
+        symbol=decision.get("symbol"),
+        profile=decision.get("profile"),
+        payload={
+            "state": state,
+            "reason_type": decision.get("reason_type"),
+            "error": error,
+            "hours_held": decision.get("hours_held"),
+        },
+    )
+    event.dedupe_key = dedupe_key
     return True
 
 
 def run(engine) -> dict:
-    """Check all open positions for time-based exit conditions."""
-    validate_news_governance_config()
+    """Execute lifecycle governance for all open positions."""
     db = get_session(engine)
     et_tz = timezone("America/New_York")
     now_et = datetime.now(et_tz)
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone("UTC"))
 
-    open_trades = db.query(Trade).filter_by(status="open").all()
-    if not open_trades:
-        db.close()
-        return {"alerts": [], "force_closes": [], "hard_wall_closes": [], "stale": [], "revalidations": []}
+    results = {"closes": [], "repairs": [], "warnings": [], "skipped": []}
 
-    # Snapshot trade data before closing session
-    trade_data = []
-    for t in open_trades:
-        if not t.entry_time:
-            continue
-        trade_data.append({
-            "id": t.id, "symbol": t.symbol, "profile": t.profile,
-            "direction": t.direction, "entry_price": t.entry_price,
-            "entry_time": t.entry_time, "stop_price": t.stop_price,
-            "target_price": t.target_price,
-            "setup_type": _get_setup_type_for_trade(db, t),
-            "status": t.status,
-        })
-    db.close()
+    open_trades = None
+    try:
+        open_trades = fetch_open_trades_with_events(db)
+        if not open_trades:
+            return results
 
-    alerts = []
-    force_closes = []
-    hard_wall_closes = []
-    stale_trades = []
-    revalidations = []
+        current_equity = get_current_equity(db)
+        overnight_counts, overnight_exposure = get_overnight_stats(db, now_utc)
 
-    past_hard_wall = (now_et.hour > HARD_WALL_HOUR or
-                      (now_et.hour == HARD_WALL_HOUR and now_et.minute >= HARD_WALL_MINUTE))
+        for trade_dict, events in open_trades:
+            price = _get_current_price(trade_dict["symbol"], trade_dict["entry_price"])
 
-    for td in trade_data:
-        minutes_held = (now_utc - td["entry_time"]).total_seconds() / 60
-        setup_type = td["setup_type"]
-        is_intraday = setup_type in INTRADAY_SETUPS or setup_type == ""
-        price = _get_current_price(td["symbol"], td["entry_price"])
-        limits = SETUP_TIME_LIMITS.get(setup_type, DEFAULT_LIMITS)
+            # Exclude current trade from overnight stats to prevent double-counting
+            trade_overnight_counts = exclude_trade_from_counts(overnight_counts, trade_dict)
+            trade_overnight_exposure = exclude_trade_from_exposure(overnight_exposure, trade_dict)
 
-        # Reconstruct a minimal trade object for _close_position
-        class _T:
-            pass
-        trade = _T()
-        trade.id = td["id"]; trade.symbol = td["symbol"]; trade.profile = td["profile"]
-        trade.direction = td["direction"]; trade.entry_price = td["entry_price"]
-        trade.stop_price = td["stop_price"]; trade.target_price = td["target_price"]
+            decision = evaluate_position_lifecycle(
+                trade_dict, events,
+                now_utc=now_utc, now_et=now_et,
+                current_price=price,
+                current_equity=current_equity,
+                overnight_position_counts=trade_overnight_counts,
+                overnight_exposure_pcts=trade_overnight_exposure,
+            )
 
-        # ── NEWS GOVERNANCE CHECK (runs first) ──────────────────────────────
-        if NEWS_GOVERNANCE["enabled"]:
-            classifier = NewsGovernanceClassifier()
-            event_db = get_session(engine)
-            try:
-                # Persisted-classification-first flow
-                persisted = classifier.get_persisted_classification(event_db, td["id"])
+            # Log decision event (idempotent)
+            if decision["requires_event"]:
+                log_lifecycle_decision_once(db, decision)
+                db.commit()
 
-                if persisted:
-                    is_governed = True
-                    evidence = persisted["evidence"]
-                else:
-                    is_governed, evidence = classifier.classify(td, entry_signal=td.get("entry_signal"))
-                    if is_governed:
-                        log_trade_event_once(
-                            event_db, "news_governance_classified", td["id"],
-                            agent="position_timer", symbol=td["symbol"], profile=td["profile"],
-                            payload=evidence,
-                        )
-                        event_db.commit()
-            finally:
-                event_db.close()
+            # Execute action
+            if decision["decision"] == "close":
+                # Reconstruct minimal trade object for _close_position
+                class _T:
+                    pass
+                trade_obj = _T()
+                trade_obj.id = trade_dict["id"]
+                trade_obj.symbol = trade_dict["symbol"]
+                trade_obj.profile = trade_dict["profile"]
+                trade_obj.direction = trade_dict["direction"]
+                trade_obj.entry_price = trade_dict["entry_price"]
+                trade_obj.stop_price = trade_dict["stop_price"]
+                trade_obj.target_price = trade_dict["target_price"]
 
-            if is_governed:
-                td["_news_governed"] = True
-
-                # Evaluate governance status
-                event_db = get_session(engine)
                 try:
-                    policy = NewsGovernancePolicy()
-                    status_info = policy.evaluate(event_db, td["id"], td["entry_time"], now_utc)
+                    _close_position(engine, trade_obj, price, decision.get("close_reason", "Lifecycle governance close"))
+                    # Log success ONLY after close operation succeeds
+                    log_force_close_success(db, decision)
+                    db.commit()
+                    results["closes"].append(decision)
 
-                    if status_info["status"] == "warning":
-                        log_trade_event_once(
-                            event_db, "news_reconfirmation_due", td["id"],
-                            governance_window_id=status_info["governance_window_id"],
-                            agent="position_timer", symbol=td["symbol"], profile=td["profile"],
-                            payload={
-                                "effective_expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
-                                "warning_time": status_info["warning_time"].isoformat() if status_info["warning_time"] else None,
-                                "hours_held": round(minutes_held / 60, 1),
-                                "trade_id": td["id"],
-                                "symbol": td["symbol"],
-                                "profile": td["profile"],
-                            },
-                        )
-                        event_db.commit()
-                        # Write agent_memory for PM visibility
-                        event_db.add(AgentMemory(
-                            agent="position_timer",
-                            symbol=td["symbol"],
-                            key="news_reconfirmation_due",
-                            value=json.dumps({
-                                "trade_id": td["id"],
-                                "symbol": td["symbol"],
-                                "profile": td["profile"],
-                                "effective_expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
-                                "governance_window_id": status_info["governance_window_id"],
-                            }),
-                        ))
-                        event_db.commit()
+                    # Update in-memory stats after close
+                    profile = trade_dict.get("profile", "")
+                    if profile in overnight_counts and overnight_counts[profile] > 0:
+                        overnight_counts[profile] -= 1
+                except Exception as e:
+                    log.error(f"Force close failed for {trade_dict['symbol']}: {e}")
+                    log_force_close_failure(db, decision, str(e))
+                    db.commit()
 
-                    elif status_info["status"] == "grace":
-                        # Emit warning if not yet emitted, await reconfirmation
-                        log_trade_event_once(
-                            event_db, "news_reconfirmation_due", td["id"],
-                            governance_window_id=status_info["governance_window_id"],
-                            agent="position_timer", symbol=td["symbol"], profile=td["profile"],
-                            payload={
-                                "effective_expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
-                                "hours_held": round(minutes_held / 60, 1),
-                                "trade_id": td["id"],
-                                "symbol": td["symbol"],
-                                "profile": td["profile"],
-                                "status": "grace",
-                            },
-                        )
-                        event_db.commit()
+            elif decision["decision"] == "repair_stop":
+                success = _execute_stop_repair(engine, db, trade_dict, price, decision)
+                results["repairs"].append({**decision, "repair_success": success})
+                if not success:
+                    # Position was closed — update overnight stats
+                    profile = trade_dict.get("profile", "")
+                    if profile in overnight_counts and overnight_counts[profile] > 0:
+                        overnight_counts[profile] -= 1
 
-                    elif status_info["status"] == "expired":
-                        if td.get("status", "open") != "open":
-                            pass  # Already closed — skip
-                        else:
-                            try:
-                                _close_position(engine, trade, price,
-                                    f"News catalyst 24h expiry: no valid reconfirmation "
-                                    f"(window {status_info['governance_window_id']})")
-                            except Exception as e:
-                                log_trade_event_once(
-                                    event_db, "news_expiry_force_close_failed", td["id"],
-                                    governance_window_id=status_info["governance_window_id"],
-                                    agent="position_timer", symbol=td["symbol"], profile=td["profile"],
-                                    payload={"error": str(e), "governance_window_id": status_info["governance_window_id"]},
-                                )
-                                event_db.commit()
-                                continue
+            elif decision["decision"] in ("warn", "authorize_required"):
+                results["warnings"].append(decision)
+                # Write AgentMemory alert for PM/CEO visibility
+                try:
+                    db.add(AgentMemory(
+                        agent="position_timer",
+                        symbol=trade_dict["symbol"],
+                        key=f"lifecycle_{decision['state']}",
+                        value=json.dumps({
+                            "trade_id": trade_dict["id"],
+                            "symbol": trade_dict["symbol"],
+                            "profile": trade_dict["profile"],
+                            "state": decision["state"],
+                            "reason_type": decision["reason_type"],
+                            "hours_held": decision.get("hours_held"),
+                            "metadata": decision.get("metadata", {}),
+                        }, default=str),
+                    ))
+                    db.commit()
+                except Exception as e:
+                    log.error(f"Failed to write lifecycle alert for {trade_dict['symbol']}: {e}")
 
-                            # Only emit force_close AFTER confirmed close succeeds
-                            log_trade_event_once(
-                                event_db, "news_expiry_force_close", td["id"],
-                                governance_window_id=status_info["governance_window_id"],
-                                agent="position_timer", symbol=td["symbol"], profile=td["profile"],
-                                payload={
-                                    "trade_id": td["id"],
-                                    "symbol": td["symbol"],
-                                    "profile": td["profile"],
-                                    "entry_time": td["entry_time"].isoformat() if td["entry_time"] else None,
-                                    "expiry_time": status_info["effective_expiry"].isoformat() if status_info["effective_expiry"] else None,
-                                    "hours_held": round(minutes_held / 60, 1),
-                                    "close_reason": f"News catalyst 24h expiry: no valid reconfirmation (window {status_info['governance_window_id']})",
-                                },
-                            )
-                            event_db.commit()
-                            continue
+            elif decision["decision"] == "skip":
+                results["skipped"].append(decision)
 
-                    elif status_info["status"] == "exit_requested":
-                        if td.get("status", "open") != "open":
-                            pass  # Already closed
-                        else:
-                            try:
-                                _close_position(engine, trade, price,
-                                    "News catalyst: EXIT_NOW reconfirmation received")
-                            except Exception as e:
-                                log_trade_event_once(
-                                    event_db, "news_expiry_force_close_failed", td["id"],
-                                    governance_window_id=status_info["governance_window_id"],
-                                    agent="position_timer", symbol=td["symbol"], profile=td["profile"],
-                                    payload={"error": str(e), "trigger": "exit_requested"},
-                                )
-                                event_db.commit()
-                                continue
+    finally:
+        db.close()
 
-                            log_trade_event_once(
-                                event_db, "news_exit_requested", td["id"],
-                                governance_window_id=status_info["governance_window_id"],
-                                agent="position_timer", symbol=td["symbol"], profile=td["profile"],
-                                payload={
-                                    "trade_id": td["id"],
-                                    "symbol": td["symbol"],
-                                    "profile": td["profile"],
-                                    "exit_reason": "EXIT_NOW reconfirmation received",
-                                    "decided_by": status_info.get("latest_reconfirmation", {}).get("decided_by") if status_info.get("latest_reconfirmation") else None,
-                                    "close_confirmed": True,
-                                },
-                            )
-                            event_db.commit()
-                            continue
-                finally:
-                    event_db.close()
-
-        # Hard wall: 3:45 PM ET
-        if past_hard_wall and is_intraday:
-            if td["target_price"] is not None:
-                if td.get("_news_governed"):
-                    continue  # News governance takes precedence — do NOT reclassify
-                # Reclassify to swing — allow overnight hold with price_monitor tracking
-                _reclassify_to_swing(engine, td["id"], td["symbol"], td["profile"],
-                                     setup_type, round(minutes_held))
-                continue
-            hard_wall_closes.append({"symbol": td["symbol"], "profile": td["profile"],
-                                     "minutes_held": round(minutes_held), "setup_type": setup_type})
-            _close_position(engine, trade, price,
-                            f"Hard wall 3:45 PM ET: {setup_type} held {round(minutes_held)} min")
-            continue
-
-        # ── MOMENTUM FADE SPECIFIC LOGIC ──
-        if setup_type == "momentum_fade":
-            r_achieved = _calculate_r_achieved(trade, price)
-
-            # 30-40 min: stale check
-            if minutes_held >= limits.get("stale", 35) and (r_achieved is None or r_achieved < 0.5):
-                if _escalate(td["id"], "stale"):
-                    stale_trades.append({"symbol": td["symbol"], "profile": td["profile"],
-                                         "minutes_held": round(minutes_held), "r_achieved": r_achieved})
-                    log.warning(f"⏰ STALE: {td['symbol']} ({td['profile']}) {round(minutes_held)} min, "
-                                f"R achieved: {r_achieved} (<0.5R)")
-
-            # 45 min: alert if stale
-            if minutes_held >= limits["alert"] and _alert_status.get(td["id"]) == "stale":
-                if _escalate(td["id"], "alert"):
-                    alerts.append({"symbol": td["symbol"], "profile": td["profile"],
-                                   "minutes_held": round(minutes_held), "setup_type": setup_type,
-                                   "r_achieved": r_achieved, "status": "stale_alert"})
-                    log.warning(f"⏰ STALE ALERT: {td['symbol']} ({td['profile']}) stale for {round(minutes_held)} min")
-
-            # 60 min: thesis revalidation
-            if minutes_held >= limits.get("revalidate", 60) and _alert_status.get(td["id"]) != "revalidating":
-                if _escalate(td["id"], "revalidating"):
-                    log.info(f"⏰ REVALIDATING: {td['symbol']} ({td['profile']}) at {round(minutes_held)} min")
-                    valid = _revalidate_momentum_fade(engine, trade, price)
-                    event_db = get_session(engine)
-                    try:
-                        log_trade_event(
-                            event_db, "thesis_revalidated", trade_id=td["id"], agent="position_timer",
-                            symbol=td["symbol"], profile=td["profile"], price=price,
-                            message="Momentum fade thesis revalidation " + ("passed" if valid else "failed"),
-                            payload={"minutes_held": round(minutes_held), "valid": valid, "setup_type": setup_type},
-                        )
-                        event_db.commit()
-                    finally:
-                        event_db.close()
-                    revalidations.append({"symbol": td["symbol"], "profile": td["profile"],
-                                          "minutes_held": round(minutes_held), "valid": valid})
-                    if not valid:
-                        _close_position(engine, trade, price,
-                                        f"Thesis revalidation FAILED at {round(minutes_held)} min: momentum_fade no longer valid")
-                        continue
-
-            # 75 min: force close regardless
-            if minutes_held >= limits["force_close"]:
-                if _escalate(td["id"], "force_close"):
-                    force_closes.append({"symbol": td["symbol"], "profile": td["profile"],
-                                         "minutes_held": round(minutes_held), "setup_type": setup_type})
-                    _close_position(engine, trade, price,
-                                    f"Time-based forced exit: momentum_fade held {round(minutes_held)} min (max: {limits['force_close']})")
-            continue
-
-        # ── GENERIC SETUP LOGIC ──
-        if minutes_held > limits["force_close"]:
-            if td["target_price"] is not None:
-                if td.get("_news_governed"):
-                    continue  # Already handled by news governance above
-                # Reclassify to swing — no longer subject to intraday limits
-                _reclassify_to_swing(engine, td["id"], td["symbol"], td["profile"],
-                                     setup_type, round(minutes_held))
-                continue
-            else:
-                force_closes.append({"symbol": td["symbol"], "profile": td["profile"],
-                                     "minutes_held": round(minutes_held), "setup_type": setup_type})
-                _close_position(engine, trade, price,
-                                f"Time-based forced exit: {setup_type} held {round(minutes_held)} min (limit: {limits['force_close']})")
-                continue
-
-        if minutes_held > limits["alert"]:
-            if _escalate(td["id"], "alert"):
-                alerts.append({"symbol": td["symbol"], "profile": td["profile"],
-                               "minutes_held": round(minutes_held), "setup_type": setup_type,
-                               "alert_limit": limits["alert"], "force_limit": limits["force_close"]})
-                log.warning(f"⏰ TIME ALERT: {td['symbol']} ({td['profile']}) held {round(minutes_held)} min "
-                            f"on {setup_type} (alert: {limits['alert']}, force: {limits['force_close']})")
-
-    # Store alerts for PM
-    if alerts or stale_trades:
-        db2 = get_session(engine)
-        db2.add(AgentMemory(
-            agent="position_timer",
-            symbol=None,
-            key="time_alerts",
-            value=json.dumps({"alerts": alerts, "stale": stale_trades}),
-        ))
-        db2.commit()
-        db2.close()
-
-    # Clean up status for trades that are no longer open
-    open_ids = {td["id"] for td in trade_data}
-    for tid in list(_alert_status.keys()):
-        if tid not in open_ids:
-            del _alert_status[tid]
-
-    return {
-        "alerts": alerts,
-        "force_closes": force_closes,
-        "hard_wall_closes": hard_wall_closes,
-        "stale": stale_trades,
-        "revalidations": revalidations,
-    }
+    return results

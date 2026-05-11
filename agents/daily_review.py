@@ -595,6 +595,20 @@ def gather_agent_context(engine) -> dict:
                 "governance_window_id": payload.get("governance_window_id"),
             })
 
+        # --- Lifecycle exceptions from EOD audit (AgentMemory) ---
+        lifecycle_exceptions_mem = (
+            db.query(AgentMemory)
+            .filter_by(agent="position_timer", key="eod_exposure_exception")
+            .order_by(AgentMemory.timestamp.desc())
+            .first()
+        )
+        lifecycle_exceptions = None
+        if lifecycle_exceptions_mem:
+            try:
+                lifecycle_exceptions = json.loads(lifecycle_exceptions_mem.value)
+            except (json.JSONDecodeError, TypeError):
+                lifecycle_exceptions = lifecycle_exceptions_mem.value
+
         return {
             "market_context": market_context,
             "selection_feedback": selection_feedback,
@@ -602,6 +616,7 @@ def gather_agent_context(engine) -> dict:
             "analyst_signals": analyst_signals,
             "missing_sources": missing_sources,
             "news_governance_events": news_governance_summary,
+            "lifecycle_exceptions": lifecycle_exceptions,
         }
 
     except Exception as e:

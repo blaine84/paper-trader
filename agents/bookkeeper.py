@@ -5,9 +5,11 @@ Tracks P&L, generates daily summaries, monitors stop losses.
 
 import os
 import json
+import logging
 from datetime import datetime, date
 from utils.finnhub_client import FinnhubClient
 from utils.stop_authority import should_stop_trigger
+from utils.eod_audit import eod_open_exposure_audit
 from db.schema import Position, Balance, Trade, DailyLog, AgentMemory, get_session
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from rich.console import Console
@@ -155,6 +157,20 @@ def end_of_day(engine) -> dict:
     db.commit()
     db.close()
 
+    # Run lifecycle governance EOD audit
+    try:
+        from pytz import timezone as pytz_timezone
+        now_utc = datetime.utcnow()
+        now_et = datetime.now(pytz_timezone("America/New_York"))
+        audit_db = get_session(engine)
+        audit_result = eod_open_exposure_audit(
+            audit_db, engine, now_utc=now_utc, now_et=now_et
+        )
+        audit_db.close()
+    except Exception as e:
+        logging.getLogger(__name__).error(f"EOD audit failed: {e}")
+        audit_result = None
+
     return {
         "date": today,
         "equity": summary["total_equity"],
@@ -162,6 +178,7 @@ def end_of_day(engine) -> dict:
         "trades": len(today_trades),
         "wins": wins,
         "losses": losses,
+        "eod_audit": audit_result,
     }
 
 

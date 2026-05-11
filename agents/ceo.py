@@ -183,6 +183,7 @@ def gather_agent_outputs(engine) -> dict[str, Any]:
         "position_health": gather_recent_memory(engine, "position_health", "health_check", 1),
         "news_monitor": gather_recent_memory(engine, "news_monitor", None, 2),
         "price_monitor_alerts": gather_recent_memory(engine, "price_monitor", "live_alerts", 1),
+        "lifecycle_exceptions": gather_recent_memory(engine, "position_timer", "eod_exposure_exception", 2),
     }
 
 
