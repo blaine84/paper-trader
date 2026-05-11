@@ -1922,8 +1922,13 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             is skipped. If a normalized BUY/SHORT somehow reaches the fallback
             path without a stop, execution is REJECTED (fail closed).
     """
-    action = decision["action"]
+    action = str(decision["action"]).upper()
+    decision["action"] = action
     symbol = decision["symbol"]
+
+    if action not in {"BUY", "SHORT", "CLOSE"}:
+        return False, f"Unsupported action: {action}"
+
     quantity = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
     decision["quantity"] = quantity
     price = decision.get("price") or decision.get("entry_price") or 0
@@ -1950,6 +1955,8 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 symbol, live_price,
             )
             price = live_price
+            decision["price"] = price
+            decision["entry_price"] = price
         if not price or price <= 0:
             return False, "No price in decision and live quote unavailable"
         if live_price and live_price > 0 and action != "CLOSE":
@@ -1985,6 +1992,8 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 )
 
                 price = live_price
+                decision["price"] = price
+                decision["entry_price"] = price
 
                 if original_stop and original_entry:
                     stop_ratio = (original_stop - original_entry) / original_entry
