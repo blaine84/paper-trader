@@ -373,7 +373,7 @@ def run_pipeline_evaluation():
 
 
 def run_analyst_refresh():
-    """Analyst-only refresh — runs every 15 min, free via local LLM."""
+    """Analyst-only refresh — morning every 15 min, afternoon every 30 min."""
     log.info("=== ANALYST REFRESH ===")
     engine = get_engine()
 
@@ -832,16 +832,28 @@ def main():
         id="pre_market",
     )
 
-    # Analyst refresh: every 15 min all day (free via local LLM)
+    # Analyst refresh: morning every 15 min (9:00–11:45 ET)
     scheduler.add_job(
         run_analyst_refresh,
         CronTrigger(
             day_of_week="mon-fri",
-            hour="9-15",
+            hour="9-11",
             minute=f"*/{LOOP_INTERVAL}",
             timezone="America/New_York",
         ),
-        id="analyst_refresh",
+        id="analyst_refresh_morning",
+    )
+
+    # Analyst refresh: afternoon every 30 min (12:00–15:30 ET)
+    scheduler.add_job(
+        run_analyst_refresh,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="12-15",
+            minute="0,30",
+            timezone="America/New_York",
+        ),
+        id="analyst_refresh_afternoon",
     )
 
     # Intraday morning (PM decisions): every 15 min, 9:30 AM – 12:00 PM ET
@@ -1035,6 +1047,7 @@ def main():
     console.print(f"   Watchlist: {', '.join(WATCHLIST)}")
     console.print(f"   Loop interval: {LOOP_INTERVAL} min")
     console.print(f"   Schedule: Sun 5PM weekly prep | 8:30 pre-market | 9:30-12 every {LOOP_INTERVAL}min | 12-4 every 30min | 4:15 EOD | 4:30 daily review")
+    console.print(f"   Analyst: every {LOOP_INTERVAL}min morning, every 30min afternoon")
 
     def _shutdown(signum, frame):
         console.print("\n[yellow]Shutting down...[/yellow]")
