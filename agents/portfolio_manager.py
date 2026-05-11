@@ -4,10 +4,13 @@ Each profile (conservative/moderate/aggressive) runs with its own isolated portf
 Scout provides symbols only — all entry/exit decisions are made here.
 """
 
+import collections
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, Position, Balance, Trade, DynamicStrategy, get_session
@@ -30,6 +33,495 @@ from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.stop_authority import apply_stop_update
 
 log = logging.getLogger(__name__)
+
+
+# ── Entry Normalizer Dataclasses ──────────────────────────────────────────────
+
+@dataclass
+class NormalizedOrder:
+    """Structured result from the entry normalizer for a single LLM decision."""
+    ok: bool
+    order: dict | None = None
+    warnings: list[str] = field(default_factory=list)
+    reason_code: str | None = None
+    reason: str | None = None
+    details: dict = field(default_factory=dict)
+    raw_decision: dict = field(default_factory=dict)
+
+
+@dataclass
+class NonOrderRecord:
+    """Record for a non-order LLM output (HOLD/PASS/AVOID/WATCH)."""
+    action: str
+    symbol: str | None = None
+    raw_decision: dict = field(default_factory=dict)
+
+
+@dataclass
+class NormalizationResult:
+    """Aggregate result from normalizing all decisions in a PM cycle."""
+    orders: list[NormalizedOrder] = field(default_factory=list)
+    rejections: list[NormalizedOrder] = field(default_factory=list)
+    non_orders: list[NonOrderRecord] = field(default_factory=list)
+
+
+# ── Entry Normalizer Constants & Helpers ──────────────────────────────────────
+
+_ENTRY_ACTIONS = {"BUY", "SHORT"}
+_NON_ORDER_ACTIONS = {"HOLD", "PASS", "AVOID", "WATCH"}
+
+
+def _validate_action(decision: dict) -> tuple[str, str | None, str | None]:
+    """Classify action from a raw LLM decision dict.
+
+    Returns (category, normalized_action, reason_code) where:
+        category: "entry" | "non_order" | "rejected"
+        normalized_action: uppercase action string, or None if missing/empty
+        reason_code: None for "entry"/"non_order", or a rejection reason code
+    """
+    action_raw = decision.get("action")
+
+    # Missing, None, or empty action
+    if action_raw is None or (isinstance(action_raw, str) and not action_raw.strip()):
+        return ("rejected", None, "missing_action")
+
+    # Non-string actions (e.g., int, bool, list) → treat as unsupported
+    if not isinstance(action_raw, str):
+        return ("rejected", None, "missing_action")
+
+    normalized = action_raw.strip().upper()
+
+    if not normalized:
+        return ("rejected", None, "missing_action")
+
+    if normalized in _ENTRY_ACTIONS:
+        return ("entry", normalized, None)
+
+    if normalized in _NON_ORDER_ACTIONS:
+        return ("non_order", normalized, None)
+
+    return ("rejected", normalized, "unsupported_action")
+
+
+def _validate_symbol(
+    symbol_raw: Any, entry_signals: dict[str, dict]
+) -> tuple[bool, str | None, str | None, dict | None]:
+    """Validate and normalize symbol against allowed set.
+
+    Returns (valid, canonical_symbol, reason_code, details).
+    """
+    # Missing, None, or non-string → missing_symbol
+    if symbol_raw is None or not isinstance(symbol_raw, str):
+        return (False, None, "missing_symbol", None)
+
+    stripped = symbol_raw.strip()
+
+    # Empty or whitespace-only → missing_symbol
+    if not stripped:
+        return (False, None, "missing_symbol", None)
+
+    # Build case-insensitive lookup: {KEY_UPPER: original_key}
+    lookup = {key.upper(): key for key in entry_signals}
+
+    canonical = lookup.get(stripped.upper())
+    if canonical is not None:
+        return (True, canonical, None, None)
+
+    # Not a member — provide extra detail if it looks like a concept
+    if "/" in stripped or " " in stripped:
+        return (
+            False,
+            None,
+            "unsupported_symbol",
+            {"symbol": stripped, "note": "appears to be a concept rather than a ticker"},
+        )
+
+    return (False, None, "unsupported_symbol", {"symbol": stripped})
+
+
+def _validate_quantity(quantity_raw: Any) -> tuple[bool, int | None, str | None]:
+    """Validate quantity is a positive whole integer.
+
+    Returns (valid, coerced_quantity, reason_code).
+    Rejects: None, booleans, fractional floats, fractional strings,
+             zero, negative, non-numeric strings.
+    """
+    import math
+
+    # Reject None
+    if quantity_raw is None:
+        return (False, None, "invalid_quantity")
+
+    # Reject booleans FIRST — isinstance(True, int) is True in Python
+    if isinstance(quantity_raw, bool):
+        return (False, None, "invalid_quantity")
+
+    # Integer path
+    if isinstance(quantity_raw, int):
+        if quantity_raw >= 1:
+            return (True, quantity_raw, None)
+        return (False, None, "invalid_quantity")
+
+    # Float path
+    if isinstance(quantity_raw, float):
+        # Reject NaN and Inf
+        if math.isnan(quantity_raw) or math.isinf(quantity_raw):
+            return (False, None, "invalid_quantity")
+        # Check if it's a whole number
+        if quantity_raw != int(quantity_raw):
+            return (False, None, "invalid_quantity")
+        int_val = int(quantity_raw)
+        if int_val >= 1:
+            return (True, int_val, None)
+        return (False, None, "invalid_quantity")
+
+    # String path
+    if isinstance(quantity_raw, str):
+        stripped = quantity_raw.strip()
+        if not stripped:
+            return (False, None, "invalid_quantity")
+        try:
+            float_val = float(stripped)
+        except (ValueError, OverflowError):
+            return (False, None, "invalid_quantity")
+        # Reject NaN/Inf strings
+        if math.isnan(float_val) or math.isinf(float_val):
+            return (False, None, "invalid_quantity")
+        # Check if it's a whole number
+        if float_val != int(float_val):
+            return (False, None, "invalid_quantity")
+        int_val = int(float_val)
+        if int_val >= 1:
+            return (True, int_val, None)
+        return (False, None, "invalid_quantity")
+
+    # Everything else → reject
+    return (False, None, "invalid_quantity")
+
+
+def _try_positive_float(value) -> float | None:
+    """Attempt to coerce a value to a positive float. Returns None on failure."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if f > 0:
+            return f
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            f = float(stripped)
+        except (ValueError, OverflowError):
+            return None
+        if f > 0:
+            return f
+        return None
+    return None
+
+
+def _resolve_price(
+    decision: dict,
+    symbol: str,
+    get_live_quote: Callable[[str], float | None] | None,
+) -> tuple[bool, float | None, str | None, str | None]:
+    """Resolve entry price with fallback to live quote.
+
+    Priority: entry_price > price > live quote repair.
+    Returns (valid, price, price_source, reason_code).
+    price_source is one of: "entry_price", "price", "live_quote", or None on failure.
+    """
+    # 1. Check entry_price key first
+    ep = _try_positive_float(decision.get("entry_price"))
+    if ep is not None:
+        return (True, ep, "entry_price", None)
+
+    # 2. Check price key
+    p = _try_positive_float(decision.get("price"))
+    if p is not None:
+        return (True, p, "price", None)
+
+    # 3. Attempt live quote repair
+    if get_live_quote is not None:
+        quote = get_live_quote(symbol)
+        live = _try_positive_float(quote)
+        if live is not None:
+            return (True, live, "live_quote", None)
+
+    # 4. All paths failed
+    return (False, None, None, "invalid_price")
+
+
+def _resolve_stop(decision: dict) -> tuple[bool, float | None, str | None]:
+    """Resolve stop price from multiple possible keys.
+
+    Keys checked in priority order: stop_loss, stop_price, stop.
+    Returns (valid, stop_price, reason_code).
+    """
+    for key in ("stop_loss", "stop_price", "stop"):
+        val = _try_positive_float(decision.get(key))
+        if val is not None:
+            return (True, val, None)
+    return (False, None, "missing_stop_loss")
+
+
+def _resolve_target(decision: dict) -> tuple[bool, float | None, str | None]:
+    """Resolve target price from multiple possible keys.
+
+    Keys checked in priority order: target, target_price, profit_target.
+    Returns (valid, target_price, reason_code).
+    """
+    for key in ("target", "target_price", "profit_target"):
+        val = _try_positive_float(decision.get(key))
+        if val is not None:
+            return (True, val, None)
+    return (False, None, "missing_target")
+
+
+def _validate_geometry(
+    action: str, entry_price: float, stop: float, target: float
+) -> tuple[bool, str | None]:
+    """Validate directional geometry consistency.
+
+    BUY:   stop < entry < target
+    SHORT: target < entry < stop
+    Returns (valid, reason_code).
+    """
+    if action == "BUY":
+        if stop < entry_price < target:
+            return (True, None)
+        return (False, "invalid_geometry")
+
+    # SHORT
+    if target < entry_price < stop:
+        return (True, None)
+    return (False, "invalid_geometry")
+
+
+def normalize_pm_entry_decisions(
+    decisions: list[dict],
+    entry_signals: dict[str, dict],
+    *,
+    get_live_quote: Callable[[str], float | None] | None = None,
+) -> NormalizationResult:
+    """Validate and normalize raw LLM decisions into structured results.
+
+    Args:
+        decisions: Raw decision dicts from LLM JSON response.
+        entry_signals: Dict of {symbol: signal_dict} for this PM cycle.
+        get_live_quote: Optional callable that returns a live price for a symbol.
+
+    Returns:
+        NormalizationResult with orders, rejections, and non_orders categorized.
+
+    Validation order (short-circuits on first failure):
+        1. Action validation (BUY/SHORT vs non-order vs unsupported)
+        2. Symbol validation (membership in entry_signals, case-insensitive)
+        3. Quantity validation (positive whole integer)
+        4. Price validation (entry_price > price > live repair)
+        5. Stop presence (stop_loss / stop_price / stop)
+        6. Target presence (target / target_price / profit_target)
+        7. Directional geometry (stop/entry/target consistency)
+        8. Setup type resolution (via resolve_setup_type — warning only, not rejection)
+    """
+    orders: list[NormalizedOrder] = []
+    rejections: list[NormalizedOrder] = []
+    non_orders: list[NonOrderRecord] = []
+
+    for item in decisions:
+        # ── Non-dict items → immediate rejection ──
+        if not isinstance(item, dict):
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code="invalid_decision_shape",
+                reason="Decision is not a dict",
+                details={"repr": repr(item)[:200]},
+                raw_decision={},
+            ))
+            continue
+
+        decision = item
+
+        # ── 1. Validate action ──
+        category, action, reason_code = _validate_action(decision)
+
+        if category == "non_order":
+            non_orders.append(NonOrderRecord(
+                action=action or "",
+                symbol=decision.get("symbol") if isinstance(decision.get("symbol"), str) else None,
+                raw_decision=decision,
+            ))
+            continue
+
+        if category == "rejected":
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code=reason_code,
+                reason=f"Action rejected: {reason_code}",
+                details={"action": decision.get("action")},
+                raw_decision=decision,
+            ))
+            continue
+
+        # category == "entry" — continue validation
+        # ── 2. Validate symbol ──
+        valid, canonical_symbol, sym_reason, sym_details = _validate_symbol(
+            decision.get("symbol"), entry_signals
+        )
+        if not valid:
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code=sym_reason,
+                reason=f"Symbol rejected: {sym_reason}",
+                details=sym_details or {},
+                raw_decision=decision,
+            ))
+            continue
+
+        # ── 3. Validate quantity ──
+        valid, quantity, qty_reason = _validate_quantity(decision.get("quantity"))
+        if not valid:
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code=qty_reason,
+                reason=f"Quantity rejected: {qty_reason}",
+                details={"quantity": decision.get("quantity")},
+                raw_decision=decision,
+            ))
+            continue
+
+        # ── 4. Resolve price ──
+        valid, price, price_source, price_reason = _resolve_price(
+            decision, canonical_symbol, get_live_quote
+        )
+        if not valid:
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code=price_reason,
+                reason=f"Price rejected: {price_reason}",
+                details={"entry_price": decision.get("entry_price"), "price": decision.get("price")},
+                raw_decision=decision,
+            ))
+            continue
+
+        # ── 5. Resolve stop ──
+        valid, stop, stop_reason = _resolve_stop(decision)
+        if not valid:
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code=stop_reason,
+                reason=f"Stop rejected: {stop_reason}",
+                details={},
+                raw_decision=decision,
+            ))
+            continue
+
+        # ── 6. Resolve target ──
+        valid, target, target_reason = _resolve_target(decision)
+        if not valid:
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code=target_reason,
+                reason=f"Target rejected: {target_reason}",
+                details={},
+                raw_decision=decision,
+            ))
+            continue
+
+        # ── 7. Validate geometry ──
+        valid, geom_reason = _validate_geometry(action, price, stop, target)
+        if not valid:
+            rejections.append(NormalizedOrder(
+                ok=False,
+                reason_code=geom_reason,
+                reason=f"Geometry rejected: {geom_reason}",
+                details={"action": action, "entry_price": price, "stop": stop, "target": target},
+                raw_decision=decision,
+            ))
+            continue
+
+        # ── 8. Resolve setup type (warning only, not rejection) ──
+        warnings: list[str] = []
+        setup_type = resolve_setup_type(decision, entry_signals.get(canonical_symbol, {}))
+        if setup_type is None:
+            warnings.append(
+                "Setup type could not be resolved — will be evaluated by gate pipeline"
+            )
+
+        # Add live quote repair warning if applicable
+        if price_source == "live_quote":
+            warnings.append(f"Price repaired from live quote: {price:.2f}")
+
+        # ── Build validated order ──
+        order = {
+            "action": action,
+            "symbol": canonical_symbol,
+            "quantity": quantity,
+            "entry_price": price,
+            "stop": stop,
+            "target": target,
+            "setup_type": setup_type,
+            "rationale": decision.get("rationale", ""),
+            "price_source": price_source,
+            "price_repaired_from_live_quote": price_source == "live_quote",
+        }
+
+        orders.append(NormalizedOrder(
+            ok=True,
+            order=order,
+            warnings=warnings,
+            raw_decision=decision,
+        ))
+
+    return NormalizationResult(
+        orders=orders,
+        rejections=rejections,
+        non_orders=non_orders,
+    )
+
+
+def _log_pm_decision_rejected(
+    db, rejection: NormalizedOrder, profile_id: str
+) -> None:
+    """Log a pm_decision_rejected trade event for a rejected decision.
+
+    Truncates raw decision JSON to 2000 characters max.
+    Includes normalized symbol if parseable, null otherwise.
+    """
+    raw_json = json.dumps(rejection.raw_decision, default=str)
+    if len(raw_json) > 2000:
+        raw_json = raw_json[:1997] + "..."
+
+    # Resolve symbol: try details first, then raw_decision
+    symbol = rejection.details.get("symbol")
+    if symbol is None:
+        raw_sym = rejection.raw_decision.get("symbol")
+        if isinstance(raw_sym, str) and raw_sym.strip():
+            symbol = raw_sym.strip()
+
+    payload = {
+        "reason_code": rejection.reason_code,
+        "reason": rejection.reason,
+        "symbol": symbol,
+        "raw_decision": raw_json,
+        "profile": profile_id,
+    }
+
+    log_trade_event(
+        db,
+        "pm_decision_rejected",
+        agent="portfolio_manager",
+        symbol=symbol,
+        profile=profile_id,
+        payload=payload,
+    )
 
 
 def _coerce_price(value, field_name: str, symbol: str) -> float | None:
@@ -138,23 +630,80 @@ def _extract_minutes(value) -> int | None:
 
 
 
-def _format_execution_audit(executed: list[dict]) -> str:
-    """Human-readable post-validation execution summary for PM notes."""
-    if not executed:
-        return "Execution audit: no executable decisions submitted."
+def _format_execution_audit(
+    executed: list[dict],
+    gate_blocked: list[dict] | None = None,
+    rejections: list | None = None,
+    non_orders: list | None = None,
+) -> str:
+    """Categorized execution audit for PM notes.
+
+    Args:
+        executed: Decisions that were filled (ok from execute_trade).
+        gate_blocked: Decisions that passed normalizer but were rejected by
+            the gate pipeline. Each dict has at minimum: symbol, action, message.
+        rejections: NormalizedOrder(ok=False) results from the normalizer.
+        non_orders: NonOrderRecord items (HOLD/PASS/AVOID/WATCH).
+
+    Categories:
+      EXECUTED: Full trade details (action, qty, symbol, price, message)
+      BLOCKED BY GATE: Individual rows with gate reason
+      REJECTED MALFORMED PM OUTPUT: Count by reason_code (no individual rows)
+      IGNORED NON-ORDER: Count by action type (no individual rows)
+    """
+    gate_blocked = gate_blocked or []
+    rejections = rejections or []
+    non_orders = non_orders or []
+
+    if not executed and not gate_blocked and not rejections and not non_orders:
+        return "Execution audit: no decisions this cycle."
 
     lines = ["Execution audit:"]
-    for d in executed:
-        action = str(d.get("action") or "?").upper()
-        symbol = d.get("symbol") or "?"
-        qty = d.get("quantity") or 0
-        price = d.get("price") or d.get("entry_price") or 0
-        status = "EXECUTED" if d.get("executed") else "REJECTED"
-        msg = d.get("message") or ""
-        line = f"- {status}: {action} {qty} {symbol} @ ${float(price or 0):.2f}"
-        if msg:
-            line += f" — {msg}"
-        lines.append(line)
+
+    # ── EXECUTED ──
+    if executed:
+        lines.append(f"── EXECUTED ({len(executed)}) ──")
+        for d in executed:
+            action = str(d.get("action") or "?").upper()
+            symbol = d.get("symbol") or "?"
+            qty = d.get("quantity") or 0
+            price = d.get("price") or d.get("entry_price") or 0
+            msg = d.get("message") or ""
+            line = f"  • {action} {qty} {symbol} @ ${float(price or 0):.2f}"
+            if msg:
+                line += f" — {msg}"
+            lines.append(line)
+
+    # ── BLOCKED BY GATE ──
+    if gate_blocked:
+        lines.append(f"── BLOCKED BY GATE ({len(gate_blocked)}) ──")
+        for d in gate_blocked:
+            action = str(d.get("action") or "?").upper()
+            symbol = d.get("symbol") or "?"
+            msg = d.get("message") or ""
+            line = f"  • {action} {symbol}"
+            if msg:
+                line += f" — {msg}"
+            lines.append(line)
+
+    # ── REJECTED MALFORMED PM OUTPUT ──
+    if rejections:
+        lines.append(f"── REJECTED MALFORMED PM OUTPUT ({len(rejections)}) ──")
+        reason_counts = collections.Counter(
+            getattr(r, "reason_code", None) or "unknown" for r in rejections
+        )
+        for reason_code, count in reason_counts.most_common():
+            lines.append(f"  • {reason_code}: {count}")
+
+    # ── IGNORED NON-ORDER ──
+    if non_orders:
+        lines.append(f"── IGNORED NON-ORDER ({len(non_orders)}) ──")
+        action_counts = collections.Counter(
+            str(getattr(no, "action", None) or "?").upper() for no in non_orders
+        )
+        summary = ", ".join(f"{act}: {cnt}" for act, cnt in action_counts.most_common())
+        lines.append(f"  • {summary}")
+
     return "\n".join(lines)
 
 def _is_fast_intraday_trade(decision: dict, signal: dict) -> bool:
@@ -269,7 +818,7 @@ The Analyst does NOT tell you how to trade. That is entirely your job.
 
 Given the Analyst's read, you decide:
   - Whether to act at all (maybe the setup is right but timing is wrong for your profile)
-  - Action: BUY / SHORT / CLOSE / pass
+  - Action: BUY / SHORT / pass
   - Entry price (based on key levels — don't just use current price blindly)
   - Stop placement (use invalidation level + your profile's risk tolerance)
   - Target (based on key levels and your profile's R:R requirements)
@@ -289,21 +838,25 @@ Decide which trades to make. For each:
   "decisions": [
     {{
       "symbol": "SPY",
-      "action": "BUY|SHORT|CLOSE|HOLD",
+      "action": "BUY",
       "quantity": 10,
-      "price": 450.00,
+      "entry_price": 450.00,
       "stop_loss": 447.00,
       "target": 455.00,
+      "setup_type": "breakout_pullback",
       "rationale": "why you're doing this given your risk profile"
     }}
   ],
   "portfolio_notes": "your overall thinking this cycle"
 }}
 
-action=BUY   — enter or add to a long position
-action=SHORT — enter or add to a short position (paper margin reserved)
-action=CLOSE — exit an existing long or short position
-HOLD decisions don't need to be listed — only include actionable trades.
+DECISION FORMAT RULES:
+- The `decisions` array is for EXECUTABLE NEW ENTRIES ONLY.
+- Valid actions: BUY or SHORT. No other actions belong in decisions[].
+- HOLD, PASS, AVOID, WATCH, OVERWEIGHT, UNDERWEIGHT, CLOSE, SELL, TRIM
+  are portfolio commentary — express them in `portfolio_notes` only.
+- Every decision MUST include: symbol, action (BUY/SHORT), quantity (positive integer),
+  entry_price (positive number), stop_loss, target, setup_type, and rationale.
 If no trades make sense for your profile, return empty decisions array.
 """
 
@@ -1354,7 +1907,7 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     return True, notes, cumulative_multiplier, multiplier_breakdown
 
 
-def execute_trade(db, decision: dict, profile_id: str):
+def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = False):
     """
     Apply a trade decision to the paper portfolio.
 
@@ -1362,6 +1915,12 @@ def execute_trade(db, decision: dict, profile_id: str):
       BUY   — open or add to a long position
       SHORT — open or add to a short position
       CLOSE — close an existing long or short position
+
+    Args:
+        normalized: If True, the decision has passed the Entry Normalizer
+            and stop/target are guaranteed present. Fallback stop derivation
+            is skipped. If a normalized BUY/SHORT somehow reaches the fallback
+            path without a stop, execution is REJECTED (fail closed).
     """
     action = decision["action"]
     symbol = decision["symbol"]
@@ -1555,6 +2114,20 @@ def execute_trade(db, decision: dict, profile_id: str):
 
     # If still no stop, derive from ATR or analyst key levels — never use flat %
     if action in ("BUY", "SHORT") and not stop and price:
+        if normalized:
+            # Normalized orders have stop guaranteed by the Entry Normalizer.
+            # If we reach here, it's an invariant violation — fail closed.
+            log.error(
+                "NORMALIZED_ORDER_INVARIANT_VIOLATED: %s reached fallback stop "
+                "derivation with no stop. This should never happen. "
+                "Rejecting trade.",
+                symbol,
+            )
+            return False, (
+                f"Normalized order for {symbol} missing stop — "
+                f"invariant violation, trade rejected"
+            )
+
         import logging
         _log = logging.getLogger(__name__)
 
@@ -2527,6 +3100,15 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
 
     time_ctx = _market_time_context()
 
+    # Build allowed symbols block for the user prompt
+    allowed_symbols_block = ""
+    if entry_signals:
+        allowed_symbols_block = (
+            "\nALLOWED ENTRY SYMBOLS THIS CYCLE:\n"
+            + ", ".join(sorted(entry_signals.keys()))
+            + "\nOnly these symbols may appear in your decisions[] array.\n"
+        )
+
     user_prompt = f"""
 Market time: {time_ctx['et']} ({time_ctx['minutes_since_open']} minutes since 9:30 AM ET open)
 Local reference: {time_ctx['mt']}
@@ -2563,7 +3145,7 @@ POSITION HEALTH (from health monitor):
 
 BEHAVIORAL ADJUSTMENTS (auto-extracted from feedback — applied to your decisions):
 {json.dumps(behav_params, indent=2) if behav_params.get('notes') else 'No adjustments active'}
-
+{allowed_symbols_block}
 Make your trading decisions for this cycle.
 NOTE: Open positions are managed by the two-tier review system. Only consider NEW entries here.
 """
@@ -2571,11 +3153,32 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
     raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier, purpose=f"pm_entry:{profile_id}")
     result = parse_json_response(raw)
 
-    # Apply behavioral parameters to decisions
+    # ── Entry Normalizer (before behavioral params) ──
     from utils.behavioral_params import apply_params_to_decision
 
-    # Execute entry decisions (only BUY/SHORT for new positions)
-    for decision in result.get("decisions", []):
+    def _safe_live_quote(sym: str) -> float | None:
+        try:
+            quote = fh.get_quote(sym)
+            price = quote.get("price", 0)
+            return float(price) if price and float(price) > 0 else None
+        except Exception as exc:
+            log.warning("Live quote fetch failed for %s: %s", sym, exc)
+            return None
+
+    raw_decisions = result.get("decisions", [])
+    norm_result = normalize_pm_entry_decisions(
+        raw_decisions,
+        entry_signals,
+        get_live_quote=_safe_live_quote,
+    )
+
+    # Log rejection events
+    for rejection in norm_result.rejections:
+        _log_pm_decision_rejected(db, rejection, profile_id)
+
+    # Execute entry decisions — only normalized ok=True orders proceed
+    for norm_order in norm_result.orders:
+        decision = norm_order.order
         decision = apply_params_to_decision(decision, behav_params, profile)
         if decision.get("action") == "PASS":
             executed.append({
@@ -2586,13 +3189,13 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
             continue
 
         # Filter out CLOSE/HOLD actions for held symbols — those are handled
-        # by the two-tier review system above
+        # by the two-tier review system above (defense-in-depth; normalizer
+        # only passes BUY/SHORT but keep as a no-op guard)
         action = decision.get("action", "").upper()
         sym = decision.get("symbol", "")
 
-        # Guardrail: JSON repair / prose extraction can hallucinate generic
-        # labels like "AI Leader". Only allow new entries for symbols this PM
-        # cycle was explicitly asked to evaluate (or held symbols for close/trim).
+        # Guardrail: defense-in-depth symbol check (normalizer already validates
+        # symbols against entry_signals, but keep as a safety net)
         if sym and sym not in set(symbols) and sym not in held_symbols:
             msg = f"Rejected invented/out-of-scope symbol: {sym}"
             log.warning(msg)
@@ -2677,7 +3280,7 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
                 original_qty, decision["quantity"],
             )
 
-        ok, msg = execute_trade(db, decision, profile_id)
+        ok, msg = execute_trade(db, decision, profile_id, normalized=True)
         executed.append({
             **decision, "executed": ok, "message": msg,
             "profile": profile_id, "source": "entry_logic",
@@ -2687,8 +3290,16 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
     # portfolio_notes are written before validation/edge gates finish, so the
     # audit prevents the dashboard from implying rejected ideas became trades.
     notes = result.get("portfolio_notes", "")
-    if notes or executed:
-        audit = _format_execution_audit(executed)
+    # Split executed into actual fills vs gate-blocked
+    actual_fills = [d for d in executed if d.get("executed")]
+    gate_blocked_items = [d for d in executed if not d.get("executed")]
+    if notes or executed or norm_result.rejections or norm_result.non_orders:
+        audit = _format_execution_audit(
+            actual_fills,
+            gate_blocked=gate_blocked_items,
+            rejections=norm_result.rejections,
+            non_orders=norm_result.non_orders,
+        )
         stored_notes = f"{notes}\n\n{audit}" if notes else audit
         mem = AgentMemory(
             agent=f"pm_{profile_id}",

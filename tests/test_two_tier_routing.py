@@ -693,10 +693,10 @@ class TestRunProfileRouting:
                 result = run_profile(engine, ["AMD"], profile_id)
 
         # execute_trade should NOT have been called for the CLOSE
-        # (only the maintenance review hold was processed, which doesn't call execute_trade)
+        # (the Entry Normalizer rejects CLOSE as unsupported_action before
+        # the decision reaches the gate pipeline or execute_trade)
         close_calls = [
             c for c in mock_exec.call_args_list
             if c[0][1].get("action") == "CLOSE" and c[0][1].get("symbol") == "AMD"
         ]
         assert len(close_calls) == 0
-        assert "Ignoring LLM CLOSE" in caplog.text
