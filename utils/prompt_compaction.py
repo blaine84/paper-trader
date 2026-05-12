@@ -96,7 +96,26 @@ def compact_signal_for_pm(symbol: str, signal: dict) -> str:
     if invalidation:
         parts.append(f"invalidation: {invalidation}")
 
-    # Key levels
+    # Current price and quote-derived key levels (for catalyst specificity gate)
+    current_price = signal.get("current_price")
+    if current_price is not None:
+        parts.append(f"current_price: {current_price}")
+
+    # Day high/low and prev_close from structured quote context
+    day_high = signal.get("day_high")
+    day_low = signal.get("day_low")
+    prev_close = signal.get("prev_close")
+    quote_levels = []
+    if day_high is not None:
+        quote_levels.append(f"H:{day_high}")
+    if day_low is not None:
+        quote_levels.append(f"L:{day_low}")
+    if prev_close is not None:
+        quote_levels.append(f"PC:{prev_close}")
+    if quote_levels:
+        parts.append(f"levels: {'/'.join(quote_levels)}")
+
+    # Key levels (analyst-defined support/resistance)
     key_levels = signal.get("key_levels")
     if key_levels:
         if isinstance(key_levels, list):

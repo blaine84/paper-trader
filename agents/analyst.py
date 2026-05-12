@@ -84,6 +84,47 @@ HOLD is a valid and useful signal. Output it whenever the setup is ambiguous or 
 """
 
 
+def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -> dict:
+    """
+    Inject structured quote fields into the analyst signal for downstream gates.
+
+    Persists: current_price, quote_timestamp, day_open, day_high, day_low,
+    prev_close, change_pct, and relative_volume (when computable).
+
+    These fields are required by the Catalyst Specificity Gate's confirmation
+    scoring to have discrimination power.
+
+    Args:
+        signal: The LLM-generated analyst signal dict (modified in place).
+        quote: The quote dict from FinnhubClient.get_quote().
+        candles: The candle data dict from FinnhubClient.get_candles().
+
+    Returns:
+        The enriched signal dict (same reference as input).
+    """
+    # Persist structured quote fields
+    if quote:
+        signal["current_price"] = quote.get("price")
+        signal["quote_timestamp"] = quote.get("timestamp")
+        signal["day_open"] = quote.get("open")
+        signal["day_high"] = quote.get("high")
+        signal["day_low"] = quote.get("low")
+        signal["prev_close"] = quote.get("prev_close")
+        signal["change_pct"] = quote.get("change_pct")
+
+    # Compute relative_volume from candle data if available.
+    # relative_volume = current period volume / average volume over lookback.
+    if candles and candles.get("volume"):
+        volumes = candles["volume"]
+        if len(volumes) >= 2:
+            current_vol = volumes[-1]
+            avg_vol = sum(volumes[:-1]) / len(volumes[:-1])
+            if avg_vol > 0:
+                signal["relative_volume"] = round(current_vol / avg_vol, 2)
+
+    return signal
+
+
 def run(engine, symbols: list[str]) -> dict:
     fh = FinnhubClient()
     db = get_session(engine)
@@ -246,6 +287,10 @@ Produce your trading signal JSON for {sym}.
             signal = apply_signal_mitigation(signal, active_mitigations)
             validation_result = validate_setup_for_symbol(sym, signal.get("setup_type"))
             signal.update(validation_result)
+
+            # Enrich signal with structured quote context for downstream gates
+            enrich_signal_with_quote_context(signal, quote, candles)
+
             signals[sym] = signal
         except Exception as e:
             log.error(f"Analyst error for {sym}: {e}")

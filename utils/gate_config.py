@@ -108,6 +108,7 @@ GATE_EVENT_TYPES: dict[str, str] = {
     "override_required": "gate_override_required",
     "override_approved": "gate_override_approved",
     "risk_geometry_gate_evaluated": "risk_geometry_gate_evaluated",
+    "catalyst_specificity_gate_evaluated": "catalyst_specificity_gate_evaluated",
 }
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,7 @@ GATE_EVENT_TYPES: dict[str, str] = {
 REJECTION_REASONS: set[str] = {
     "setup_quality_gate",
     "pre_trade_quality_gate",
+    "catalyst_specificity_gate",
     "catalyst_timing_risk",
     "concentration_limit",
     "correlation_limit",
@@ -126,4 +128,20 @@ REJECTION_REASONS: set[str] = {
     "signal_invalidated",
     "timeout_expired",
     "pm_override_missing",
+}
+
+# ---------------------------------------------------------------------------
+# Catalyst Specificity Gate — Profile Thresholds
+# ---------------------------------------------------------------------------
+
+CATALYST_SPECIFICITY_PROFILE_THRESHOLDS: dict[str, dict[str, int]] = {
+    "conservative": {"allow": 8, "warn": 6},
+    "moderate": {"allow": 7, "warn": 5},
+    "aggressive": {"allow": 6, "warn": 4},
+}
+
+CATALYST_SPECIFICITY_SECTOR_SYMPATHY_SIZE_MULTIPLIER: dict[str, float] = {
+    "conservative": 0.0,
+    "moderate": 0.5,
+    "aggressive": 0.5,
 }

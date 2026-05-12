@@ -1,0 +1,25 @@
+{
+    "symbol_aliases": {
+        "AMD": ["AMD", "Advanced Micro Devices"],
+        "NVDA": ["NVDA", "Nvidia", "NVIDIA"],
+        "TSLA": ["TSLA", "Tesla"],
+        "MSFT": ["MSFT", "Microsoft"],
+        "SPY": ["SPY", "S&P 500", "S&P", "large-cap index"],
+        "QQQ": ["QQQ", "Nasdaq", "Nasdaq 100", "NDX"],
+        "IWM": ["IWM", "Russell 2000", "small caps"],
+        "DIA": ["DIA", "Dow", "Dow Jones"],
+        "TLT": ["TLT", "Treasury", "Treasuries", "yields", "rates"],
+        "GLD": ["GLD", "gold", "bullion"],
+        "XLK": ["XLK", "technology sector", "tech sector"],
+        "XLF": ["XLF", "financials", "banks"],
+        "XLE": ["XLE", "energy sector", "oil", "gas"]
+    },
+    "readthrough_relationships": {
+        "NVDA": ["Lumentum", "TSMC", "Super Micro", "Dell", "Microsoft", "Meta", "Amazon", "Google"],
+        "AMD": ["TSMC", "Super Micro", "Microsoft", "Meta", "Amazon", "Google"],
+        "TSLA": ["Panasonic", "BYD", "CATL", "lithium", "EV deliveries"],
+        "MSFT": ["OpenAI", "Azure", "LinkedIn", "Activision"],
+        "XLE": ["WTI", "Brent", "OPEC", "oil inventory", "crude"],
+        "TLT": ["Treasury yields", "Fed", "CPI", "PCE", "jobs report"]
+    }
+}

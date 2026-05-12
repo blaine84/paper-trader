@@ -372,6 +372,38 @@ class TestCompactSignalForPm:
         assert "SPY" in result
         assert "reasoning:" not in result
 
+    def test_current_price_included(self):
+        """Current price from quote context is included when present."""
+        sig = _make_full_signal("AAPL", 0, current_price=152.35)
+        result = compact_signal_for_pm("AAPL", sig)
+        assert "current_price: 152.35" in result
+
+    def test_quote_levels_included(self):
+        """Day high, day low, and prev_close from quote context are included."""
+        sig = _make_full_signal("NVDA", 0, day_high=155.0, day_low=148.5, prev_close=150.0)
+        result = compact_signal_for_pm("NVDA", sig)
+        assert "levels:" in result
+        assert "H:155.0" in result
+        assert "L:148.5" in result
+        assert "PC:150.0" in result
+
+    def test_partial_quote_levels(self):
+        """Only available quote levels are shown (graceful with missing fields)."""
+        sig = _make_full_signal("AMD", 0, day_high=120.0, prev_close=118.0)
+        result = compact_signal_for_pm("AMD", sig)
+        assert "H:120.0" in result
+        assert "PC:118.0" in result
+        assert "L:" not in result
+
+    def test_no_quote_fields_no_extra_output(self):
+        """Signal without quote fields does not include current_price or levels line."""
+        sig = _make_full_signal("TSLA", 0)
+        result = compact_signal_for_pm("TSLA", sig)
+        assert "current_price:" not in result
+        # "levels: H:" or "levels: L:" or "levels: PC:" should not appear
+        # (key_levels is a different field and is expected)
+        assert "| levels:" not in result
+
 
 # ===========================================================================
 # Tests for compact_daily_log_for_narrator

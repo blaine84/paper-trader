@@ -30,6 +30,7 @@ from core.portfolio_risk import (
 )
 from utils.setup_quality_gate import evaluate_setup_quality, resolve_setup_type
 from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
+from utils.catalyst_specificity import evaluate_catalyst_specificity
 from utils.stop_authority import apply_stop_update
 
 log = logging.getLogger(__name__)
@@ -2149,6 +2150,7 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     Gate order:
     1. Setup Quality Gate (Phase 1)
     2. Pre-Trade Quality Gate (Phase 1)
+    2.5. Catalyst Specificity Gate (Phase 1)
     3. Risk Geometry Gate (Phase 1)
     4. Catalyst Timing Gate (Phase 2 — skipped until wired)
     5. Concentration Gate (Phase 2 — skipped until wired)
@@ -2222,6 +2224,56 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
             payload={"gate_name": "pre_trade_quality_gate", "error": str(exc)},
         )
         notes.append({"gate": "pre_trade_quality_gate", "decision": "warn", "reason_type": "gate_error", "reason": str(exc)})
+
+    # Gate 2.5: Catalyst Specificity Gate
+    try:
+        catalyst_result = evaluate_catalyst_specificity(
+            decision=decision,
+            signal=signal,
+            profile=profile_id,
+            db=db,
+        )
+        notes.append({"gate": "catalyst_specificity_gate", **catalyst_result})
+
+        catalyst_decision = catalyst_result.get("decision", "allow")
+
+        if catalyst_decision == "block":
+            return False, notes, cumulative_multiplier, multiplier_breakdown
+
+        if catalyst_decision == "reduce_size":
+            cat_multiplier = catalyst_result.get("size_multiplier", 1.0)
+            if cat_multiplier < 1.0:
+                # Update decision["quantity"] directly so risk geometry evaluates reduced size
+                original_qty = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
+                reduced_qty = max(1, int(original_qty * cat_multiplier))
+                log.info(
+                    "CATALYST SPECIFICITY GATE: %s reduce_size — qty %d → %d "
+                    "(multiplier=%.2f, reason_type=%s, score=%d)",
+                    symbol, original_qty, reduced_qty,
+                    cat_multiplier, catalyst_result.get("reason_type", ""),
+                    catalyst_result.get("score", 0),
+                )
+                decision["quantity"] = reduced_qty
+                cumulative_multiplier *= cat_multiplier
+                multiplier_breakdown.append({"gate": "catalyst_specificity_gate", "multiplier": cat_multiplier})
+
+        elif catalyst_decision == "warn":
+            log.info(
+                "CATALYST SPECIFICITY GATE: %s warn — score=%d, reason_type=%s, reason=%s",
+                symbol, catalyst_result.get("score", 0),
+                catalyst_result.get("reason_type", ""),
+                catalyst_result.get("reason", ""),
+            )
+
+    except Exception as exc:
+        log.error("Catalyst specificity gate error (treating as warn): %s", exc)
+        log_trade_event(
+            db, "gate_error",
+            agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id,
+            message=f"Catalyst specificity gate error: {exc}",
+            payload={"gate_name": "catalyst_specificity_gate", "error": str(exc)},
+        )
+        notes.append({"gate": "catalyst_specificity_gate", "decision": "warn", "reason_type": "gate_error", "reason": str(exc)})
 
     # Gate 3: Risk Geometry Gate
     try:
