@@ -161,6 +161,76 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
     return normalized
 
 
+def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> dict:
+    """Replace hallucinated/cross-symbol key levels with market-data levels.
+
+    The LLM is allowed to interpret structure, but it must not invent price
+    levels.  We keep numeric LLM levels only when they are plausibly near the
+    current quote; otherwise we fall back to deterministic quote/indicator data.
+    """
+    current = quote.get("price") if isinstance(quote, dict) else None
+    try:
+        current = float(current)
+    except (TypeError, ValueError):
+        current = None
+
+    if not current or current <= 0:
+        signal["key_levels"] = {}
+        signal["key_levels_sanitized"] = True
+        signal["key_levels_sanitize_reason"] = "missing_current_price"
+        return signal
+
+    raw_levels = signal.get("key_levels") if isinstance(signal.get("key_levels"), dict) else {}
+    sanitized = {}
+    removed = {}
+
+    # Anything farther than 20% from current price is almost certainly copied
+    # from another ticker/timeframe for this intraday system.
+    max_distance_pct = 20.0
+
+    for name, value in raw_levels.items():
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            removed[name] = value
+            continue
+        if val <= 0:
+            removed[name] = value
+            continue
+        dist_pct = abs((current - val) / current) * 100
+        if dist_pct <= max_distance_pct:
+            sanitized[name] = round(val, 4)
+        else:
+            removed[name] = value
+
+    def _num(source: dict, key: str):
+        try:
+            val = source.get(key)
+            return round(float(val), 4) if val is not None and float(val) > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    fallback = {
+        "support": _num(quote, "low"),
+        "resistance": _num(quote, "high"),
+        "vwap": _num(indicators, "vwap"),
+        "prior_high": _num(quote, "high"),
+        "prior_low": _num(quote, "low"),
+    }
+
+    for key, val in fallback.items():
+        if key not in sanitized and val is not None:
+            sanitized[key] = val
+
+    if removed:
+        signal["key_levels_sanitized"] = True
+        signal["removed_key_levels"] = removed
+        signal["key_levels_sanitize_reason"] = "level_too_far_from_current_price_or_non_numeric"
+
+    signal["key_levels"] = sanitized
+    return signal
+
+
 def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -> dict:
     """
     Inject structured quote fields into the analyst signal for downstream gates.
@@ -362,6 +432,7 @@ Produce your trading signal JSON for {sym}.
             raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose=f"analyst_signal:{sym}")
             signal = parse_json_response(raw)
             signal = normalize_analyst_signal_shape(signal, sym)
+            signal = sanitize_analyst_key_levels(signal, quote, indicators)
             signal = apply_signal_mitigation(signal, active_mitigations)
             validation_result = validate_setup_for_symbol(sym, signal.get("setup_type"))
             signal.update(validation_result)

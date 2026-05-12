@@ -342,6 +342,20 @@ def evaluate_invalidators(trade, current_price: float, candle_data: dict | None 
     return breached
 
 
+def _level_plausible_for_price(symbol: str, level_name: str, level: float, price: float) -> bool:
+    """Guard Price Monitor against stale/cross-symbol analyst levels."""
+    if not price or not level or price <= 0 or level <= 0:
+        return False
+    dist_pct = abs((price - level) / price) * 100
+    if dist_pct > 20.0:
+        log.warning(
+            "Skipping implausible analyst level for %s: %s=%s current=%s distance=%.1f%%",
+            symbol, level_name, level, price, dist_pct,
+        )
+        return False
+    return True
+
+
 def check_entry_triggers(engine) -> list[dict]:
     """Check analyst signals for key level breaches that could trigger entries."""
     db = get_session(engine)
@@ -387,6 +401,8 @@ def check_entry_triggers(engine) -> list[dict]:
         if sig.get("signal") == "LONG" and resistance:
             try:
                 r = float(resistance)
+                if not _level_plausible_for_price(sym, "resistance", r, price):
+                    continue
                 if price > r:
                     triggers.append({
                         "type": "breakout",
@@ -406,6 +422,8 @@ def check_entry_triggers(engine) -> list[dict]:
         if sig.get("signal") == "SHORT" and support:
             try:
                 s = float(support)
+                if not _level_plausible_for_price(sym, "support", s, price):
+                    continue
                 if price < s:
                     triggers.append({
                         "type": "breakdown",
@@ -506,6 +524,8 @@ def check_momentum(engine) -> list[dict]:
                 for level_name, level_val in levels.items():
                     try:
                         lv = float(level_val)
+                        if not _level_plausible_for_price(sym, level_name, lv, price):
+                            continue
                         dist_pct = abs((price - lv) / lv) * 100
                         if dist_pct <= ALERT_THRESHOLDS["approach_level_pct"]:
                             alerts.append({
