@@ -81,7 +81,84 @@ Respond in JSON:
 gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
 
 HOLD is a valid and useful signal. Output it whenever the setup is ambiguous or low quality.
+
+STRICT OUTPUT CONTRACT:
+- Return exactly the analyst signal object above.
+- Do NOT return a `decisions` array.
+- Do NOT output BUY, SELL, SHORT, entry_price, stop_loss, target, quantity, or portfolio_notes.
+- You are not the Portfolio Manager. If tempted to propose a trade, express only LONG/SHORT/HOLD signal quality and key levels.
 """
+
+
+def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
+    """Coerce malformed analyst LLM output back into the analyst signal schema.
+
+    Local models occasionally drift into Portfolio Manager format, e.g.
+    {"decisions": [{"action": "BUY", ...}], "portfolio_notes": ...}.  That
+    must never be persisted as an analyst signal because PM treats analyst
+    memory as authoritative signal context.  When schema drift is detected,
+    quarantine it as a weak HOLD rather than letting contaminated decisions
+    flow downstream.
+    """
+    if not isinstance(signal, dict):
+        return {
+            "symbol": symbol,
+            "signal": "HOLD",
+            "strength": "weak",
+            "confidence": "low",
+            "setup_type": "malformed_analyst_output",
+            "setup_reasoning": "Analyst LLM returned a non-object response; quarantined.",
+            "reasoning": "Malformed analyst output was downgraded to HOLD before persistence.",
+            "key_levels": {},
+            "invalidation": "N/A — malformed analyst output",
+            "indicators": {},
+            "malformed_output_quarantined": True,
+            "raw_malformed_output": str(signal)[:1000],
+        }
+
+    # Hard quarantine PM-shaped responses.  Do not salvage BUY/SHORT into a
+    # tradeable signal; the model crossed agent boundaries, so confidence is low.
+    if "decisions" in signal or "portfolio_notes" in signal:
+        return {
+            "symbol": symbol,
+            "signal": "HOLD",
+            "strength": "weak",
+            "confidence": "low",
+            "setup_type": "malformed_analyst_output",
+            "setup_reasoning": "Analyst LLM returned Portfolio Manager decision schema; quarantined.",
+            "reasoning": "Malformed analyst output was downgraded to HOLD before persistence to avoid contaminating PM entry decisions.",
+            "key_levels": {},
+            "invalidation": "N/A — malformed analyst output",
+            "indicators": {},
+            "malformed_output_quarantined": True,
+            "raw_malformed_output": json.dumps(signal, default=str)[:2000],
+        }
+
+    normalized = dict(signal)
+    normalized["symbol"] = symbol
+
+    valid_signals = {"LONG", "SHORT", "HOLD"}
+    sig = str(normalized.get("signal", "HOLD")).upper().strip()
+    normalized["signal"] = sig if sig in valid_signals else "HOLD"
+
+    valid_strengths = {"weak", "moderate", "strong"}
+    strength = str(normalized.get("strength", "weak")).lower().strip()
+    normalized["strength"] = strength if strength in valid_strengths else "weak"
+
+    valid_conf = {"low", "medium", "high"}
+    confidence = str(normalized.get("confidence", "low")).lower().strip()
+    normalized["confidence"] = confidence if confidence in valid_conf else "low"
+
+    normalized.setdefault("setup_type", "unknown")
+    normalized.setdefault("setup_reasoning", "")
+    normalized.setdefault("reasoning", "")
+    if not isinstance(normalized.get("key_levels"), dict):
+        normalized["key_levels"] = {}
+    normalized.setdefault("invalidation", "")
+    if not isinstance(normalized.get("indicators"), dict):
+        normalized["indicators"] = {}
+
+    return normalized
 
 
 def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -> dict:
@@ -284,6 +361,7 @@ Produce your trading signal JSON for {sym}.
 """
             raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose=f"analyst_signal:{sym}")
             signal = parse_json_response(raw)
+            signal = normalize_analyst_signal_shape(signal, sym)
             signal = apply_signal_mitigation(signal, active_mitigations)
             validation_result = validate_setup_for_symbol(sym, signal.get("setup_type"))
             signal.update(validation_result)
