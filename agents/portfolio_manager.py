@@ -1240,11 +1240,13 @@ Decide which trades to make. For each:
 DECISION FORMAT RULES:
 - The `decisions` array is for EXECUTABLE NEW ENTRIES ONLY.
 - Valid actions: BUY or SHORT. No other actions belong in decisions[].
+- Symbols in decisions[] MUST come from the ALLOWED ENTRY SYMBOLS block in the user prompt.
+- Do NOT create trades from breaking news, strategy context, sector themes, baskets, or general market opinions unless that exact ticker is also in ALLOWED ENTRY SYMBOLS.
 - HOLD, PASS, AVOID, WATCH, OVERWEIGHT, UNDERWEIGHT, CLOSE, SELL, TRIM
   are portfolio commentary — express them in `portfolio_notes` only.
 - Every decision MUST include: symbol, action (BUY/SHORT), quantity (positive integer),
   entry_price (positive number), stop_loss, target, setup_type, and rationale.
-If no trades make sense for your profile, return empty decisions array.
+If no allowed entry symbol has a fully executable setup, return an empty decisions array.
 
 STRICT OUTPUT CONTRACT — READ CAREFULLY
 
@@ -3530,6 +3532,17 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 sym, direction, strength, profile["min_signal_strength"],
             )
 
+    if not entry_signals:
+        log.info(
+            "No eligible PM entry signals for profile=%s after filtering; skipping entry LLM to avoid invented/malformed decisions",
+            profile_id,
+        )
+        return {
+            "decisions": [],
+            "portfolio_notes": "No eligible entry signals after filtering; skipped new-entry decision cycle.",
+            "profile": profile_id,
+        }
+
     # Filter win rates to only include setup types matching entry candidates' signals
     entry_setup_types = {sig.get("setup_type") for sig in entry_signals.values() if sig.get("setup_type")}
     if entry_setup_types:
@@ -3574,7 +3587,8 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
         allowed_symbols_block = (
             "\nALLOWED ENTRY SYMBOLS THIS CYCLE:\n"
             + ", ".join(sorted(entry_signals.keys()))
-            + "\nOnly these symbols may appear in your decisions[] array.\n"
+            + "\nOnly these symbols may appear in your decisions[] array. "
+            "If a ticker is not listed here, it must not appear in decisions[].\n"
         )
 
     user_prompt = f"""
