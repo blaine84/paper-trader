@@ -574,6 +574,16 @@ def check_llm_connectivity():
             console.print(f"   [yellow]⚠ LLM low tier FAILED: {e} (will use fallback)[/yellow]")
             log.warning(f"LLM low tier check failed: {e}")
 
+    # Finance tier (only if configured)
+    if os.getenv("LLM_FINANCE_PROVIDER"):
+        try:
+            result = call_llm("You are a test.", probe, tier="finance", purpose="startup_probe:finance")
+            console.print(f"   [green]✓ LLM finance tier OK[/green] "
+                          f"({os.getenv('LLM_FINANCE_PROVIDER')} / {os.getenv('LLM_FINANCE_MODEL')})")
+        except Exception as e:
+            console.print(f"   [yellow]⚠ LLM finance tier FAILED: {e} (will use medium fallback)[/yellow]")
+            log.warning(f"LLM finance tier check failed: {e}")
+
 
 def run_price_monitor():
     """Every 60 seconds — check prices against stops/targets/key levels."""

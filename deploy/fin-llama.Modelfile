@@ -1,0 +1,27 @@
+# fin-llama3.1-8b Modelfile for Ollama
+#
+# Model: us4/fin-llama3.1-8b (LLaMA 3.1 8B fine-tuned with LoRA on financial news)
+# Source: https://huggingface.co/us4/fin-llama3.1-8b
+# GGUF:   model-q4_k_m.gguf (4.92GB, pre-quantized Q4_K_M)
+# Download: https://huggingface.co/us4/fin-llama3.1-8b/resolve/main/model-q4_k_m.gguf
+#
+# License: "[More Information Needed]" per HuggingFace listing — verify before production use.
+#
+# Usage:
+#   1. Download the GGUF weights:
+#      wget https://huggingface.co/us4/fin-llama3.1-8b/resolve/main/model-q4_k_m.gguf
+#   2. Place the file at the path specified in FROM below (or update the path)
+#   3. Create the model in Ollama:
+#      ollama create fin-llama3.1:8b-finance -f deploy/fin-llama.Modelfile
+#
+# Memory footprint: ~4.92GB for this model. On the Mac Mini M4 16GB, this leaves room
+# for llama3.1:8b (~5GB) alongside it, with ~6GB for the OS and mistral.
+# Recommended: set OLLAMA_MAX_LOADED_MODELS=2 to keep fin-llama and llama3.1:8b hot.
+#
+# No TEMPLATE directive needed — Ollama handles the standard LLaMA 3.1 chat format natively.
+
+FROM /path/to/model-q4_k_m.gguf
+
+PARAMETER temperature 0.15
+PARAMETER top_p 0.9
+PARAMETER num_ctx 4096

@@ -44,11 +44,20 @@ def _with_retry(fn):
 def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier: str = "high", purpose: str = None) -> str:
     """
     Call the LLM.
-    tier="high"   — LLM_PROVIDER/LLM_MODEL (Sonnet for critical decisions)
-    tier="medium" — LLM_MED_PROVIDER/LLM_MED_MODEL (local 8b for heavy local work)
-    tier="low"    — LLM_LOW_PROVIDER/LLM_LOW_MODEL (fast local for simple tasks)
+    tier="high"    — LLM_PROVIDER/LLM_MODEL (Sonnet for critical decisions)
+    tier="finance" — LLM_FINANCE_PROVIDER/LLM_FINANCE_MODEL (fin-llama3.1-8b for financial reasoning)
+    tier="medium"  — LLM_MED_PROVIDER/LLM_MED_MODEL (local 8b for heavy local work)
+    tier="low"     — LLM_LOW_PROVIDER/LLM_LOW_MODEL (fast local for simple tasks)
     """
-    if tier == "medium":
+    start = time.time()
+
+    if tier == "finance":
+        provider = os.getenv("LLM_FINANCE_PROVIDER", "").lower()
+        model = os.getenv("LLM_FINANCE_MODEL", None)
+        if not provider:
+            log.warning("Finance tier not configured (LLM_FINANCE_PROVIDER not set), falling back to medium")
+            return call_llm(system_prompt, user_prompt, json_mode, tier="medium", purpose=purpose)
+    elif tier == "medium":
         provider = os.getenv("LLM_MED_PROVIDER", os.getenv("LLM_LOW_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))).lower()
         model = os.getenv("LLM_MED_MODEL", os.getenv("LLM_LOW_MODEL", None))
     elif tier == "low":
@@ -58,27 +67,43 @@ def call_llm(system_prompt: str, user_prompt: str, json_mode: bool = False, tier
         provider = os.getenv("LLM_PROVIDER", "openai").lower()
         model = None
 
-    dispatch = {
-        "openai": lambda: _call_openai(system_prompt, user_prompt, json_mode, model),
-        "anthropic": lambda: _call_anthropic(system_prompt, user_prompt, model),
-        "mistral": lambda: _call_mistral(system_prompt, user_prompt, json_mode, model),
-        "ollama": lambda: _call_ollama(system_prompt, user_prompt, model, purpose=purpose or "unlabeled"),
-    }
-    if provider not in dispatch:
-        raise ValueError(f"Unknown LLM provider: {provider}")
+    # Track actual provider/model for logging (may change on fallback)
+    actual_provider = provider
+    actual_model = model
 
-    fn = dispatch[provider]
+    if tier == "finance" and provider == "ollama":
+        # Use finance-specific wrapper with fallback to medium tier
+        result, actual_provider, actual_model = _call_ollama_finance(
+            system_prompt, user_prompt, model, purpose=purpose or "unlabeled"
+        )
+    else:
+        dispatch = {
+            "openai": lambda: _call_openai(system_prompt, user_prompt, json_mode, model),
+            "anthropic": lambda: _call_anthropic(system_prompt, user_prompt, model),
+            "mistral": lambda: _call_mistral(system_prompt, user_prompt, json_mode, model),
+            "ollama": lambda: _call_ollama(system_prompt, user_prompt, model, purpose=purpose or "unlabeled"),
+        }
+        if provider not in dispatch:
+            raise ValueError(f"Unknown LLM provider: {provider}")
 
-    # Retry once on empty response (local models sometimes return nothing on overload)
-    for attempt in range(2):
-        result = fn()
-        if result and result.strip():
-            return result
-        if attempt == 0:
-            log.warning("LLM returned empty response (provider=%s, tier=%s), retrying once", provider, tier)
-            time.sleep(2)
+        fn = dispatch[provider]
 
-    return result or ""
+        # Retry once on empty response (local models sometimes return nothing on overload)
+        result = None
+        for attempt in range(2):
+            result = fn()
+            if result and result.strip():
+                break
+            if attempt == 0:
+                log.warning("LLM returned empty response (provider=%s, tier=%s), retrying once", provider, tier)
+                time.sleep(2)
+
+        result = result or ""
+
+    elapsed = time.time() - start
+    log.info("LLM call: tier=%s provider=%s model=%s elapsed=%.1fs", tier, actual_provider, actual_model, elapsed)
+
+    return result
 
 
 def _call_openai(system_prompt: str, user_prompt: str, json_mode: bool, model: str = None) -> str:
@@ -140,11 +165,31 @@ def _call_mistral(system_prompt: str, user_prompt: str, json_mode: bool, model: 
     return _with_retry(lambda: client.chat.complete(**kwargs).choices[0].message.content)
 
 
-def _call_ollama(system_prompt: str, user_prompt: str, model: str = None, purpose: str = "unlabeled") -> str:
+def _call_ollama_finance(system_prompt: str, user_prompt: str, model: str = None, purpose: str = "unlabeled") -> tuple:
+    """Call Ollama for finance tier with fallback to medium tier on failure.
+
+    Returns a tuple of (response_text, actual_provider, actual_model) so the
+    caller can log the real model that served the response.
+    """
+    timeout = int(os.getenv("OLLAMA_FINANCE_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", 600)))
+    try:
+        result = _call_ollama(system_prompt, user_prompt, model, purpose=purpose, timeout=timeout)
+        return (result, "ollama", model)
+    except Exception as e:
+        med_model = os.getenv("LLM_MED_MODEL", os.getenv("LLM_LOW_MODEL", None))
+        log.warning(
+            "Finance tier failed (%s), falling back to medium tier (model=%s)",
+            e, med_model,
+        )
+        result = _call_ollama(system_prompt, user_prompt, med_model, purpose=purpose)
+        return (result, "ollama", med_model)
+
+
+def _call_ollama(system_prompt: str, user_prompt: str, model: str = None, purpose: str = "unlabeled", timeout: int = None) -> str:
     import requests
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
-    timeout = int(os.getenv("OLLAMA_TIMEOUT", 600))
+    timeout = timeout or int(os.getenv("OLLAMA_TIMEOUT", 600))
 
     json_instruction = "\n\nYou MUST respond with valid JSON only. No markdown, no explanation, no preamble."
     system_content = system_prompt + json_instruction

@@ -429,7 +429,7 @@ ANALYST FEEDBACK LOOP:
 {freshness_context}
 Produce your trading signal JSON for {sym}.
 """
-            raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="medium", purpose=f"analyst_signal:{sym}")
+            raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="finance", purpose=f"analyst_signal:{sym}")
             signal = parse_json_response(raw)
             signal = normalize_analyst_signal_shape(signal, sym)
             signal = sanitize_analyst_key_levels(signal, quote, indicators)
