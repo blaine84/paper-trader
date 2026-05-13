@@ -70,6 +70,64 @@ class NormalizationResult:
 
 _ENTRY_ACTIONS = {"BUY", "SHORT"}
 _NON_ORDER_ACTIONS = {"HOLD", "PASS", "AVOID", "WATCH"}
+MAX_PM_PORTFOLIO_NOTE_CHARS = 420
+MAX_PM_RATIONALE_CHARS = 280
+
+
+def _compact_text_for_decision_log(value, max_chars: int) -> str:
+    """Keep operator-facing decision log text concise and single-line.
+
+    Local/specialized models can obey the JSON shape while still writing long
+    narrative commentary.  The dashboard decision log is an operator feed, not
+    a scratchpad, so clamp prose deterministically before persistence.
+    """
+    if value is None:
+        return ""
+    text = " ".join(str(value).split())
+    if len(text) <= max_chars:
+        return text
+
+    # Prefer a clean sentence boundary, but only if it does not discard too
+    # much useful context. Otherwise cut at the last word boundary.
+    boundary = max(text.rfind(". ", 0, max_chars - 1), text.rfind("; ", 0, max_chars - 1))
+    if boundary >= int(max_chars * 0.55):
+        return text[: boundary + 1].strip()
+
+    clipped = text[: max_chars - 1].rstrip()
+    space = clipped.rfind(" ")
+    if space >= int(max_chars * 0.70):
+        clipped = clipped[:space].rstrip()
+    return clipped.rstrip(".,;:") + "…"
+
+
+def _enforce_pm_decision_log_contract(result: dict) -> dict:
+    """Clamp PM notes/rationales to the dashboard-facing contract."""
+    if not isinstance(result, dict):
+        return result
+
+    sanitized = dict(result)
+    sanitized["portfolio_notes"] = _compact_text_for_decision_log(
+        sanitized.get("portfolio_notes", ""),
+        MAX_PM_PORTFOLIO_NOTE_CHARS,
+    )
+
+    decisions = sanitized.get("decisions")
+    if isinstance(decisions, list):
+        clean_decisions = []
+        for decision in decisions:
+            if isinstance(decision, dict):
+                d = dict(decision)
+                if "rationale" in d:
+                    d["rationale"] = _compact_text_for_decision_log(
+                        d.get("rationale", ""),
+                        MAX_PM_RATIONALE_CHARS,
+                    )
+                clean_decisions.append(d)
+            else:
+                clean_decisions.append(decision)
+        sanitized["decisions"] = clean_decisions
+
+    return sanitized
 
 
 def _validate_action(decision: dict) -> tuple[str, str | None, str | None]:
@@ -1262,6 +1320,13 @@ Forbidden inside decisions[]:
 
 When no executable order exists, return:
 {{"decisions": [], "portfolio_notes": "..."}}
+
+DECISION LOG BREVITY CONTRACT:
+- `portfolio_notes` is an operator dashboard note, not chain-of-thought.
+- Keep `portfolio_notes` <= 420 characters, max 3 terse clauses/sentences.
+- Each decision `rationale` must be <= 280 characters.
+- No markdown headings, numbered analysis, long narratives, or step-by-step deliberation.
+- State only: action/pass, primary blocker or catalyst, and risk control.
 
 Example — VALID (goes in decisions[]):
 {{"symbol":"AMD","action":"BUY","quantity":10,"entry_price":161.0,"stop_loss":152.0,"target":179.0,"setup_type":"news_catalyst_breakout","rationale":"Strong momentum with clear levels"}}
@@ -3633,7 +3698,7 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
 """
 
     raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier, purpose=f"pm_entry:{profile_id}")
-    result = parse_json_response(raw)
+    result = _enforce_pm_decision_log_contract(parse_json_response(raw))
 
     # ── Entry Normalizer (before behavioral params) ──
     from utils.behavioral_params import apply_params_to_decision
@@ -3865,7 +3930,7 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
     # Save PM notes with a post-validation execution audit.  The LLM's
     # portfolio_notes are written before validation/edge gates finish, so the
     # audit prevents the dashboard from implying rejected ideas became trades.
-    notes = final_notes
+    notes = _compact_text_for_decision_log(final_notes, MAX_PM_PORTFOLIO_NOTE_CHARS)
     # Split executed into actual fills vs gate-blocked
     actual_fills = [d for d in executed if d.get("executed")]
     gate_blocked_items = [d for d in executed if not d.get("executed")]
