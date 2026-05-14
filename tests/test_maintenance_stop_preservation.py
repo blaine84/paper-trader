@@ -384,6 +384,9 @@ CONCRETE_PRESERVATION_CASES = [
     ("buy", 56.95, 57.10, "buy alias — valid monotonic passes through"),
     ("SHORT", 457.00, 455.00, "SHORT uppercase — valid monotonic passes through"),
     ("sell", 457.00, 455.00, "sell alias — valid monotonic passes through"),
+    ("long", float("nan"), 57.10, "old_stop=NaN — delegates to stop authority"),
+    ("long", float("inf"), 57.10, "old_stop=+inf — delegates to stop authority"),
+    ("short", float("-inf"), 455.00, "old_stop=-inf — delegates to stop authority"),
 ]
 
 

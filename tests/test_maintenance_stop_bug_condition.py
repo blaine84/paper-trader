@@ -35,6 +35,10 @@ CONCRETE_BUG_CASES = [
     ("long", 56.95, 0, "invalid_stop_value"),           # invalid: zero
     ("long", 56.95, -1.0, "invalid_stop_value"),        # invalid: negative
     ("long", 56.95, "abc", "invalid_stop_value"),       # invalid: non-numeric
+    ("long", 56.95, "NaN", "invalid_stop_value"),       # invalid: NaN string
+    ("long", 56.95, float("inf"), "invalid_stop_value"),  # invalid: +inf
+    ("long", 56.95, float("-inf"), "invalid_stop_value"),  # invalid: -inf
+    ("short", 457.00, float("nan"), "invalid_stop_value"),  # invalid: NaN float
 ]
 
 
@@ -164,6 +168,10 @@ def test_bug_condition_random_inputs_are_suppressed(case):
         "LONG_invalid_zero",
         "LONG_invalid_negative",
         "LONG_invalid_non_numeric",
+        "LONG_invalid_NaN_string",
+        "LONG_invalid_pos_inf",
+        "LONG_invalid_neg_inf",
+        "SHORT_invalid_NaN_float",
     ],
 )
 def test_bug_condition_concrete_cases_are_suppressed(side, old_stop, new_stop_raw, expected_reason):

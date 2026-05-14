@@ -1018,7 +1018,7 @@ def should_suppress_maintenance_stop(side, old_stop, new_stop_raw):
         old_stop_f = float(old_stop)
     except (TypeError, ValueError):
         return (False, None)
-    if old_stop_f <= 0:
+    if old_stop_f <= 0 or not math.isfinite(old_stop_f):
         return (False, None)
 
     # --- Validate new_stop_raw ---
@@ -1056,8 +1056,9 @@ def _log_maintenance_stop_suppressed(
     """Log a maintenance_stop_suppressed event for a suppressed tighten_stop proposal.
 
     Emits exactly one event per trade per maintenance review invocation.
-    The ``proposed_stop_raw`` field is included in the payload only when
-    ``new_stop_raw`` cannot be parsed as a valid float.
+    The ``proposed_stop_raw`` field is included in the payload whenever
+    ``new_stop_raw`` is not a usable stop value — i.e. None, non-parseable,
+    zero, negative, or non-finite (NaN/inf).
 
     Parameters
     ----------
