@@ -7,6 +7,7 @@ Scout provides symbols only — all entry/exit decisions are made here.
 import collections
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -1021,14 +1022,14 @@ def should_suppress_maintenance_stop(side, old_stop, new_stop_raw):
         return (False, None)
 
     # --- Validate new_stop_raw ---
-    # If new_stop_raw is None, non-numeric, zero, or negative → suppress
+    # If new_stop_raw is None, non-numeric, zero, negative, or non-finite → suppress
     if new_stop_raw is None:
         return (True, "invalid_stop_value")
     try:
         new_stop_f = float(new_stop_raw)
     except (TypeError, ValueError):
         return (True, "invalid_stop_value")
-    if new_stop_f <= 0:
+    if new_stop_f <= 0 or not math.isfinite(new_stop_f):
         return (True, "invalid_stop_value")
 
     # --- Monotonicity check (side-aware) ---
@@ -1077,15 +1078,21 @@ def _log_maintenance_stop_suppressed(
     reason : str
         Suppression reason ("non_monotonic_or_noop" or "invalid_stop_value").
     """
-    # Determine proposed_stop (float if parseable, else None)
+    # Determine proposed_stop (valid positive finite float, else None)
+    # Always include proposed_stop_raw when proposed_stop is not a usable value
     proposed_stop = None
-    proposed_stop_raw_str = None
-    if new_stop_raw is not None:
+    include_raw = False
+    if new_stop_raw is None:
+        include_raw = True
+    else:
         try:
-            proposed_stop = float(new_stop_raw)
+            val = float(new_stop_raw)
+            if val > 0 and math.isfinite(val):
+                proposed_stop = val
+            else:
+                include_raw = True
         except (TypeError, ValueError):
-            # Not a valid float — include raw value in payload
-            proposed_stop_raw_str = str(new_stop_raw)
+            include_raw = True
 
     payload = {
         "trade_id": trade_id,
@@ -1098,9 +1105,9 @@ def _log_maintenance_stop_suppressed(
         "source_action": "tighten_stop",
     }
 
-    # Only include proposed_stop_raw when proposed_stop is not a valid float
-    if proposed_stop_raw_str is not None:
-        payload["proposed_stop_raw"] = proposed_stop_raw_str
+    # Include proposed_stop_raw when proposed_stop is not a usable value
+    if include_raw:
+        payload["proposed_stop_raw"] = str(new_stop_raw)
 
     log_trade_event(
         db,
@@ -3588,7 +3595,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
 
             # Apply maintenance actions
             action = review_result.get("action", "hold")
-            if action == "tighten_stop" and review_result.get("new_stop"):
+            if action == "tighten_stop":
                 new_stop_raw = review_result.get("new_stop")
                 # Suppression check: intercept invalid/non-monotonic proposals
                 # BEFORE _coerce_price() so null/non-numeric values produce a
