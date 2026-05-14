@@ -914,6 +914,147 @@ def _coerce_price(value, field_name: str, symbol: str) -> float | None:
         return None
 
 
+def should_suppress_maintenance_stop(side, old_stop, new_stop_raw):
+    """Determine whether a maintenance tighten_stop proposal should be suppressed.
+
+    Pure deterministic function — no side effects, no logging, no I/O.
+    Called from the maintenance review tighten_stop branch BEFORE _coerce_price()
+    to intercept invalid/non-monotonic proposals before they reach apply_stop_update().
+
+    Parameters
+    ----------
+    side : str | None
+        Trade side (long/LONG/buy, short/SHORT/sell, or unknown/None).
+    old_stop : float | int | str | None
+        Current stop value for the position.
+    new_stop_raw : any
+        Raw proposed stop value from the LLM (before coercion).
+
+    Returns
+    -------
+    tuple[bool, str | None]
+        (should_suppress, reason) where reason is one of:
+        - "invalid_stop_value" — new_stop is null, non-numeric, zero, or negative
+        - "non_monotonic_or_noop" — new_stop is not strictly tighter than old_stop
+        - None — proposal should pass through to apply_stop_update()
+    """
+    # --- Normalize side case-insensitively ---
+    normalized_side = None
+    if isinstance(side, str) and side.strip():
+        lower_side = side.strip().lower()
+        if lower_side in ("long", "buy"):
+            normalized_side = "long"
+        elif lower_side in ("short", "sell"):
+            normalized_side = "short"
+
+    # Unknown/missing side → delegate to stop authority
+    if normalized_side is None:
+        return (False, None)
+
+    # --- Validate old_stop ---
+    # If old_stop is None, non-positive, or non-numeric → delegate to stop authority
+    if old_stop is None:
+        return (False, None)
+    try:
+        old_stop_f = float(old_stop)
+    except (TypeError, ValueError):
+        return (False, None)
+    if old_stop_f <= 0:
+        return (False, None)
+
+    # --- Validate new_stop_raw ---
+    # If new_stop_raw is None, non-numeric, zero, or negative → suppress
+    if new_stop_raw is None:
+        return (True, "invalid_stop_value")
+    try:
+        new_stop_f = float(new_stop_raw)
+    except (TypeError, ValueError):
+        return (True, "invalid_stop_value")
+    if new_stop_f <= 0:
+        return (True, "invalid_stop_value")
+
+    # --- Monotonicity check (side-aware) ---
+    if normalized_side == "long" and new_stop_f <= old_stop_f:
+        return (True, "non_monotonic_or_noop")
+    if normalized_side == "short" and new_stop_f >= old_stop_f:
+        return (True, "non_monotonic_or_noop")
+
+    # Valid monotonic proposal → pass through
+    return (False, None)
+
+
+def _log_maintenance_stop_suppressed(
+    db,
+    *,
+    trade_id: int,
+    symbol: str,
+    profile: str,
+    side: str,
+    old_stop,
+    new_stop_raw,
+    reason: str,
+) -> None:
+    """Log a maintenance_stop_suppressed event for a suppressed tighten_stop proposal.
+
+    Emits exactly one event per trade per maintenance review invocation.
+    The ``proposed_stop_raw`` field is included in the payload only when
+    ``new_stop_raw`` cannot be parsed as a valid float.
+
+    Parameters
+    ----------
+    db : Session
+        SQLAlchemy session (caller owns commit/rollback).
+    trade_id : int
+        ID of the trade whose stop proposal was suppressed.
+    symbol : str
+        Ticker symbol for the position.
+    profile : str
+        Profile ID that owns the position.
+    side : str
+        Trade side ("long" or "short").
+    old_stop : float | None
+        Current stop price for the position.
+    new_stop_raw : any
+        Raw proposed stop value from the LLM (before coercion).
+    reason : str
+        Suppression reason ("non_monotonic_or_noop" or "invalid_stop_value").
+    """
+    # Determine proposed_stop (float if parseable, else None)
+    proposed_stop = None
+    proposed_stop_raw_str = None
+    if new_stop_raw is not None:
+        try:
+            proposed_stop = float(new_stop_raw)
+        except (TypeError, ValueError):
+            # Not a valid float — include raw value in payload
+            proposed_stop_raw_str = str(new_stop_raw)
+
+    payload = {
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "profile": profile,
+        "side": side,
+        "old_stop": old_stop,
+        "proposed_stop": proposed_stop,
+        "reason": reason,
+        "source_action": "tighten_stop",
+    }
+
+    # Only include proposed_stop_raw when proposed_stop is not a valid float
+    if proposed_stop_raw_str is not None:
+        payload["proposed_stop_raw"] = proposed_stop_raw_str
+
+    log_trade_event(
+        db,
+        "maintenance_stop_suppressed",
+        trade_id=trade_id,
+        agent="portfolio_manager",
+        symbol=symbol,
+        profile=profile,
+        payload=payload,
+    )
+
+
 def _coerce_quantity(value, *, symbol: str = "UNKNOWN") -> int:
     """Normalize LLM quantity values before sizing math.
 
@@ -1309,6 +1450,11 @@ RULES:
 4. Tighten stop only if the position has moved favorably and you want to lock in gains.
 5. Raise target only if new evidence supports a higher target while the thesis remains intact.
 6. Trim partial only if the position is significantly profitable and you want to reduce risk.
+7. For LONG positions: `tighten_stop` is valid only if `new_stop > current stop`.
+8. For SHORT positions: `tighten_stop` is valid only if `new_stop < current stop`.
+9. If your proposed stop equals the current stop, use `hold` instead.
+10. If you are uncertain about the stop value, use `hold`.
+11. `tighten_stop` must never loosen risk controls; it must strictly tighten them.
 
 Respond with JSON only:
 {{
@@ -3378,7 +3524,29 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
             # Apply maintenance actions
             action = review_result.get("action", "hold")
             if action == "tighten_stop" and review_result.get("new_stop"):
-                new_stop = _coerce_price(review_result.get("new_stop"), "new_stop", symbol)
+                new_stop_raw = review_result.get("new_stop")
+                # Suppression check: intercept invalid/non-monotonic proposals
+                # BEFORE _coerce_price() so null/non-numeric values produce a
+                # maintenance_stop_suppressed event rather than being silently
+                # swallowed by _coerce_price() → None → continue.
+                suppressed, suppress_reason = should_suppress_maintenance_stop(
+                    pos.side, open_trade.stop_price, new_stop_raw
+                )
+                if suppressed:
+                    _log_maintenance_stop_suppressed(
+                        db,
+                        trade_id=open_trade.id,
+                        symbol=symbol,
+                        profile=profile_id,
+                        side=pos.side,
+                        old_stop=open_trade.stop_price,
+                        new_stop_raw=new_stop_raw,
+                        reason=suppress_reason,
+                    )
+                    db.commit()
+                    continue
+
+                new_stop = _coerce_price(new_stop_raw, "new_stop", symbol)
                 if new_stop is None:
                     continue
                 # Fetch ATR for minimum-change threshold
