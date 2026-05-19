@@ -3463,21 +3463,48 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
         db.close()
         return {"decisions": [], "portfolio_notes": notes, "profile": profile_id}
 
-    # Position health from health monitor
-    health_mem = (
-        db.query(AgentMemory)
-        .filter_by(agent="position_health", key="health_check")
-        .order_by(AgentMemory.timestamp.desc())
-        .first()
-    )
-    health_text = health_mem.value if health_mem else "No health data"
-
     # ── PHASE 1: Two-tier review for existing open positions ──
     # Track signal usage for audit logging (Req 4.4)
     signal_usage_log = []  # list of {"symbol", "usage": "advisory"|"authoritative"}
     review_decisions = []
 
     open_positions = db.query(Position).filter_by(profile=profile_id).all()
+    open_symbols = {p.symbol for p in open_positions}
+
+    # Position health from health monitor. Never feed stale/global health into
+    # new-entry decisions: old XLE/TSLA assessments can make a flat portfolio
+    # look like it still has critical positions.
+    if not open_positions:
+        health_text = "No open positions for this profile; no position-health context applies."
+    else:
+        health_mem = (
+            db.query(AgentMemory)
+            .filter_by(agent="position_health", key="health_check")
+            .order_by(AgentMemory.timestamp.desc())
+            .first()
+        )
+        health_text = "No fresh matching position-health data."
+        if health_mem and health_mem.timestamp:
+            age = datetime.utcnow() - health_mem.timestamp.replace(tzinfo=None)
+            if age <= timedelta(hours=2):
+                try:
+                    health_data = json.loads(health_mem.value)
+                    assessments = [
+                        a for a in health_data.get("assessments", [])
+                        if a.get("profile") == profile_id and a.get("symbol") in open_symbols
+                    ]
+                    if assessments:
+                        health_text = json.dumps({
+                            "assessments": assessments,
+                            "summary": health_data.get("summary", ""),
+                        })
+                except Exception as exc:
+                    log.warning("Failed to parse position health memory for %s: %s", profile_id, exc)
+            else:
+                health_text = (
+                    f"Latest position-health memory is stale ({age.total_seconds() / 3600:.1f}h old); "
+                    "ignored for this cycle."
+                )
 
     for pos in open_positions:
         symbol = pos.symbol
