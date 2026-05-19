@@ -1,5 +1,7 @@
 """Shadow ledger for blocked trade candidates — Phase 0 capture layer."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -307,7 +309,7 @@ def record_blocked_candidate(
                 "trade_event_id": trade_event_id,
             },
         )
-        db.commit()
+        db.flush()
         return result.lastrowid
 
     except IntegrityError as exc:

@@ -2919,6 +2919,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 message=f"Trade rejected by gate pipeline: {gate_rejection_reasons}",
                 payload={"gate_notes": _gate_notes},
             )
+            db.flush()  # ensure trade_event.id is populated for shadow ledger linkage
 
             # Determine blocked_by: single rejecting gate or "gate_pipeline"
             rejecting_gates = [
@@ -4036,6 +4037,7 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
     # ── Now log rejection events with correct final disposition ──
     for rejection in unresolved_rejections:
         trade_event = _log_pm_decision_rejected(db, rejection, profile_id)
+        db.flush()  # ensure trade_event.id is populated for shadow ledger linkage
 
         # ── Shadow ledger: record PM normalizer rejection ──
         raw = rejection.raw_decision
