@@ -33,6 +33,7 @@ from utils.setup_quality_gate import evaluate_setup_quality, resolve_setup_type
 from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.catalyst_specificity import evaluate_catalyst_specificity
 from utils.stop_authority import apply_stop_update
+from utils.shadow_ledger import record_blocked_candidate
 
 log = logging.getLogger(__name__)
 
@@ -549,11 +550,13 @@ def normalize_pm_entry_decisions(
 
 def _log_pm_decision_rejected(
     db, rejection: NormalizedOrder, profile_id: str
-) -> None:
+):
     """Log a pm_decision_rejected trade event for a rejected decision.
 
     Truncates raw decision JSON to 2000 characters max.
     Includes normalized symbol if parseable, null otherwise.
+
+    Returns the TradeEvent object from log_trade_event for trade_event_id linkage.
     """
     raw_json = json.dumps(rejection.raw_decision, default=str)
     if len(raw_json) > 2000:
@@ -574,7 +577,7 @@ def _log_pm_decision_rejected(
         "profile": profile_id,
     }
 
-    log_trade_event(
+    return log_trade_event(
         db,
         "pm_decision_rejected",
         agent="portfolio_manager",
@@ -2906,7 +2909,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             gate_rejection_reasons = "; ".join(
                 n.get("reason", "") for n in _gate_notes if n.get("decision") in ("reject", "rejected", "override_required")
             )
-            log_trade_event(
+            trade_event = log_trade_event(
                 db,
                 "gate_rejected",
                 agent=f"pm_{profile_id}",
@@ -2916,6 +2919,50 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 message=f"Trade rejected by gate pipeline: {gate_rejection_reasons}",
                 payload={"gate_notes": _gate_notes},
             )
+
+            # Determine blocked_by: single rejecting gate or "gate_pipeline"
+            rejecting_gates = [
+                n.get("gate", "unknown")
+                for n in _gate_notes
+                if n.get("decision") in ("reject", "rejected", "override_required", "block")
+            ]
+            if len(rejecting_gates) == 1:
+                blocked_by = rejecting_gates[0]
+            else:
+                blocked_by = "gate_pipeline"
+
+            # Build block_reason — include "block" decisions for completeness
+            block_reason = gate_rejection_reasons or "; ".join(
+                n.get("reason", "") for n in _gate_notes if n.get("decision") in ("block",)
+            ) or "Gate pipeline rejected"
+
+            record_blocked_candidate(
+                db,
+                symbol=symbol,
+                action=action,
+                blocked_by=blocked_by,
+                block_reason=block_reason,
+                profile=profile_id,
+                entry_price=price,
+                stop_price=(
+                    decision.get("stop")
+                    or decision.get("stop_price")
+                    or decision.get("stop_loss")
+                ),
+                target_price=(
+                    decision.get("target")
+                    or decision.get("target_price")
+                    or decision.get("profit_target")
+                ),
+                quantity=quantity,
+                gate_notes=_gate_notes,
+                decision_snapshot=decision,
+                signal_snapshot=signal_for_gates,
+                source="analyst_signal",
+                agent=f"pm_{profile_id}",
+                trade_event_id=trade_event.id if trade_event else None,
+            )
+
             log.warning(
                 "DECISION: status=GATE_REJECTED symbol=%s profile=%s reason=%s",
                 symbol, profile_id, gate_rejection_reasons,
@@ -3988,7 +4035,31 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
 
     # ── Now log rejection events with correct final disposition ──
     for rejection in unresolved_rejections:
-        _log_pm_decision_rejected(db, rejection, profile_id)
+        trade_event = _log_pm_decision_rejected(db, rejection, profile_id)
+
+        # ── Shadow ledger: record PM normalizer rejection ──
+        raw = rejection.raw_decision
+        sym = raw.get("symbol") if isinstance(raw, dict) else None
+        if sym and isinstance(sym, str) and sym.strip():
+            record_blocked_candidate(
+                db,
+                symbol=sym.strip(),
+                action=raw.get("action", "UNKNOWN") if isinstance(raw, dict) else "UNKNOWN",
+                blocked_by="pm_normalizer",
+                block_reason=f"{rejection.reason_code}: {rejection.reason}",
+                reason_code=rejection.reason_code,
+                entry_price=_try_positive_float(raw.get("entry_price")),
+                stop_price=_try_positive_float(
+                    raw.get("stop_loss") or raw.get("stop_price") or raw.get("stop")
+                ),
+                target_price=_try_positive_float(
+                    raw.get("target") or raw.get("target_price") or raw.get("profit_target")
+                ),
+                decision_snapshot=raw,
+                source="pm_llm_decision",
+                agent=f"pm_{profile_id}",
+                trade_event_id=trade_event.id if trade_event else None,
+            )
 
     for rejection in corrected_rejections:
         _log_pm_decision_corrected(db, rejection, profile_id)
@@ -4051,6 +4122,17 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
                     "(%d min since open, max %d)",
                     sym, setup, setup, int(minutes_since_open), max_minutes,
                 )
+                record_blocked_candidate(
+                    db, symbol=sym, action=decision["action"],
+                    blocked_by="entry_timing_gate",
+                    block_reason=f"{setup} window closed ({int(minutes_since_open)} min, max {max_minutes})",
+                    profile=profile_id, setup_type=setup,
+                    entry_price=decision.get("entry_price"),
+                    stop_price=decision.get("stop_loss") or decision.get("stop_price"),
+                    target_price=decision.get("target") or decision.get("target_price"),
+                    decision_snapshot=decision, signal_snapshot=entry_signals.get(sym),
+                    source="analyst_signal", agent=f"pm_{profile_id}",
+                )
                 decision["action"] = "PASS"
                 decision["rationale"] = (
                     f"Entry timing gate: {setup} window closed "
@@ -4078,6 +4160,24 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
                 sym, signal.get("bias"), signal.get("setup_type"),
                 verdict.get("avg_score_5") or verdict.get("avg_score_3") or 0,
                 verdict["sample_size"],
+            )
+            avg_score = verdict.get("avg_score_5") or verdict.get("avg_score_3") or 0
+            record_blocked_candidate(
+                db, symbol=sym, action=action,
+                blocked_by="track_record_gate",
+                block_reason=f"Track record BLOCK: avg_score={avg_score}, sample_size={verdict['sample_size']}, match_type={verdict.get('match_type', '')}",
+                profile=profile_id, setup_type=signal.get("setup_type", ""),
+                gate_notes={
+                    "avg_score_3": verdict.get("avg_score_3"),
+                    "avg_score_5": verdict.get("avg_score_5"),
+                    "sample_size": verdict.get("sample_size"),
+                    "size_multiplier": verdict.get("size_multiplier"),
+                    "match_type": verdict.get("match_type"),
+                    "bias": verdict.get("bias"),
+                    "setup_type": verdict.get("setup_type"),
+                },
+                decision_snapshot=decision, signal_snapshot=signal,
+                source="analyst_signal", agent=f"pm_{profile_id}",
             )
             executed.append({
                 **decision, "executed": False,

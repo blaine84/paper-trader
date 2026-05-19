@@ -1,0 +1,337 @@
+"""Shadow ledger for blocked trade candidates — Phase 0 capture layer."""
+
+import hashlib
+import json
+import logging
+from datetime import date, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+
+log = logging.getLogger(__name__)
+
+
+def ensure_shadow_ledger_schema(engine) -> None:
+    """Create blocked_trade_candidates table and indexes if they don't exist.
+
+    Called once at system startup. Logs errors but never raises —
+    a schema failure must not prevent the system from starting.
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS blocked_trade_candidates (
+                        id INTEGER PRIMARY KEY,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        symbol VARCHAR(10),
+                        action VARCHAR(16) NOT NULL,
+                        direction VARCHAR(10),
+                        profile VARCHAR(16),
+                        setup_type VARCHAR(64),
+                        entry_price REAL,
+                        stop_price REAL,
+                        target_price REAL,
+                        quantity REAL,
+                        blocked_by VARCHAR(64) NOT NULL,
+                        block_reason TEXT NOT NULL,
+                        reason_code VARCHAR(64),
+                        gate_notes_json TEXT,
+                        decision_snapshot_json TEXT,
+                        signal_snapshot_json TEXT,
+                        source VARCHAR(64),
+                        agent VARCHAR(64),
+                        dedupe_key VARCHAR(255),
+                        trade_event_id INTEGER REFERENCES trade_events(id) ON DELETE SET NULL
+                    )
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_blocked_created_at
+                    ON blocked_trade_candidates (created_at)
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_blocked_symbol_created
+                    ON blocked_trade_candidates (symbol, created_at)
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_blocked_by_created
+                    ON blocked_trade_candidates (blocked_by, created_at)
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_blocked_dedupe
+                    ON blocked_trade_candidates (dedupe_key)
+                    WHERE dedupe_key IS NOT NULL
+                    """
+                )
+            )
+
+            conn.commit()
+            log.info("Shadow ledger schema ensured successfully.")
+    except Exception as exc:
+        log.error("Failed to ensure shadow ledger schema: %s", exc)
+
+
+_ET = ZoneInfo("America/New_York")
+
+
+def compute_dedupe_key(
+    *,
+    profile: str | None,
+    symbol: str | None,
+    action: str,
+    setup_type: str | None,
+    blocked_by: str,
+    entry_price: float | None,
+    stop_price: float | None,
+    target_price: float | None,
+    block_reason: str,
+) -> str:
+    """Compute a deterministic deduplication key for a blocked candidate.
+
+    Uses the current market session date (America/New_York) to prevent
+    ambiguity near UTC midnight.
+
+    Components: date (market session date in America/New_York), profile, symbol,
+    action, setup_type, blocked_by, round(entry_price, 2), round(stop_price, 2),
+    round(target_price, 2), sha256(block_reason)[:16].
+
+    Returns a pipe-delimited string ≤255 chars.
+    """
+    # Market session date in America/New_York
+    session_date = datetime.now(_ET).strftime("%Y-%m-%d")
+
+    # Substitute "none" for None values
+    prof = profile if profile is not None else "none"
+    sym = symbol.upper() if symbol is not None else "none"
+    act = action.upper()
+    setup = setup_type if setup_type is not None else "none"
+
+    # Round prices to 2 decimal places, "none" if null
+    entry = f"{round(entry_price, 2)}" if entry_price is not None else "none"
+    stop = f"{round(stop_price, 2)}" if stop_price is not None else "none"
+    target = f"{round(target_price, 2)}" if target_price is not None else "none"
+
+    # SHA-256 hash of block_reason, first 16 chars
+    reason_hash = hashlib.sha256(block_reason.encode("utf-8")).hexdigest()[:16]
+
+    key = "|".join([
+        session_date,
+        prof,
+        sym,
+        act,
+        setup,
+        blocked_by,
+        entry,
+        stop,
+        target,
+        reason_hash,
+    ])
+
+    # Ensure output ≤255 chars by truncating if necessary
+    return key[:255]
+
+
+def record_blocked_candidate(
+    db,
+    symbol: str | None,
+    action: str,
+    blocked_by: str,
+    block_reason: str,
+    *,
+    direction: str | None = None,
+    profile: str | None = None,
+    setup_type: str | None = None,
+    entry_price: float | None = None,
+    stop_price: float | None = None,
+    target_price: float | None = None,
+    quantity: float | None = None,
+    reason_code: str | None = None,
+    decision_snapshot: dict | str | None = None,
+    signal_snapshot: dict | str | None = None,
+    gate_notes: list | str | None = None,
+    source: str | None = None,
+    agent: str | None = None,
+    trade_event_id: int | None = None,
+) -> int | None:
+    """Record a blocked trade candidate in the shadow ledger.
+
+    Args:
+        direction: Explicit trade direction ("long" or "short"). If not provided,
+            derived from action: BUY → "long", SHORT → "short". Callers may pass
+            it explicitly when the signal carries a direction that differs from
+            the simple action mapping.
+
+    Returns:
+        int: The new row's primary key on successful insert.
+        None: On deduplication skip, validation failure, or error.
+
+    This function is guaranteed not to raise — all exceptions are caught and logged.
+    """
+    try:
+        # --- Validate required fields ---
+        if not action or not action.strip():
+            log.warning("record_blocked_candidate: missing required field 'action'")
+            return None
+        if not blocked_by or not blocked_by.strip():
+            log.warning("record_blocked_candidate: missing required field 'blocked_by'")
+            return None
+        if not block_reason or not block_reason.strip():
+            log.warning("record_blocked_candidate: missing required field 'block_reason'")
+            return None
+
+        # --- Validate symbol (nullable only for pm_normalizer) ---
+        if symbol is None and blocked_by != "pm_normalizer":
+            log.warning(
+                "record_blocked_candidate: symbol is None and blocked_by is '%s' (not pm_normalizer)",
+                blocked_by,
+            )
+            return None
+
+        # --- Derive direction from action if not explicitly provided ---
+        if direction is None:
+            action_upper = action.strip().upper()
+            if action_upper == "BUY":
+                direction = "long"
+            elif action_upper == "SHORT":
+                direction = "short"
+
+        # --- Serialize dict/list arguments to JSON ---
+        def _serialize(val: dict | list | str | None) -> str | None:
+            if val is None:
+                return None
+            if isinstance(val, str):
+                return val
+            return json.dumps(val, default=str)
+
+        decision_snapshot_json = _serialize(decision_snapshot)
+        signal_snapshot_json = _serialize(signal_snapshot)
+        gate_notes_json = _serialize(gate_notes)
+
+        # --- Compute dedupe_key ---
+        dedupe_key = None
+        try:
+            dedupe_key = compute_dedupe_key(
+                profile=profile,
+                symbol=symbol,
+                action=action,
+                setup_type=setup_type,
+                blocked_by=blocked_by,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                target_price=target_price,
+                block_reason=block_reason,
+            )
+        except Exception as exc:
+            log.error(
+                "record_blocked_candidate: failed to compute dedupe_key for symbol=%s, blocked_by=%s: %s",
+                symbol,
+                blocked_by,
+                exc,
+            )
+
+        # --- Pre-check dedupe_key ---
+        if dedupe_key is not None:
+            result = db.execute(
+                text("SELECT EXISTS(SELECT 1 FROM blocked_trade_candidates WHERE dedupe_key = :dk)"),
+                {"dk": dedupe_key},
+            )
+            if result.scalar():
+                log.debug(
+                    "record_blocked_candidate: dedupe skip for symbol=%s, blocked_by=%s",
+                    symbol,
+                    blocked_by,
+                )
+                return None
+
+        # --- Execute INSERT ---
+        result = db.execute(
+            text(
+                """
+                INSERT INTO blocked_trade_candidates (
+                    symbol, action, direction, profile, setup_type,
+                    entry_price, stop_price, target_price, quantity,
+                    blocked_by, block_reason, reason_code,
+                    gate_notes_json, decision_snapshot_json, signal_snapshot_json,
+                    source, agent, dedupe_key, trade_event_id
+                ) VALUES (
+                    :symbol, :action, :direction, :profile, :setup_type,
+                    :entry_price, :stop_price, :target_price, :quantity,
+                    :blocked_by, :block_reason, :reason_code,
+                    :gate_notes_json, :decision_snapshot_json, :signal_snapshot_json,
+                    :source, :agent, :dedupe_key, :trade_event_id
+                )
+                """
+            ),
+            {
+                "symbol": symbol,
+                "action": action,
+                "direction": direction,
+                "profile": profile,
+                "setup_type": setup_type,
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "quantity": quantity,
+                "blocked_by": blocked_by,
+                "block_reason": block_reason,
+                "reason_code": reason_code,
+                "gate_notes_json": gate_notes_json,
+                "decision_snapshot_json": decision_snapshot_json,
+                "signal_snapshot_json": signal_snapshot_json,
+                "source": source,
+                "agent": agent,
+                "dedupe_key": dedupe_key,
+                "trade_event_id": trade_event_id,
+            },
+        )
+        db.commit()
+        return result.lastrowid
+
+    except IntegrityError as exc:
+        exc_msg = str(exc).lower()
+        if "dedupe_key" in exc_msg or "uq_blocked_dedupe" in exc_msg:
+            log.debug(
+                "record_blocked_candidate: dedupe constraint hit (race) for symbol=%s, blocked_by=%s",
+                symbol,
+                blocked_by,
+            )
+            return None
+        else:
+            log.error(
+                "record_blocked_candidate: IntegrityError for symbol=%s, blocked_by=%s: %s",
+                symbol,
+                blocked_by,
+                exc,
+            )
+            return None
+    except Exception as exc:
+        log.error(
+            "record_blocked_candidate: unexpected error for symbol=%s, blocked_by=%s: %s",
+            symbol,
+            blocked_by,
+            exc,
+        )
+        return None

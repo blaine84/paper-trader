@@ -19,6 +19,7 @@ load_dotenv()
 
 from db.schema import init_db, Balance
 from sqlalchemy.orm import sessionmaker
+from utils.shadow_ledger import ensure_shadow_ledger_schema
 import agents.researcher as researcher
 import agents.analyst as analyst
 import agents.portfolio_manager as pm
@@ -547,6 +548,7 @@ def run_once():
     engine = get_engine()
     ensure_initial_balance(engine)
     check_schema(engine)
+    ensure_shadow_ledger_schema(engine)
     console.print("[bold]Running single cycle...[/bold]")
     run_pre_market()
     run_intraday()
@@ -831,6 +833,7 @@ def main():
     engine = get_engine()
     ensure_initial_balance(engine)
     check_schema(engine)
+    ensure_shadow_ledger_schema(engine)
     check_llm_connectivity()
 
     scheduler = BlockingScheduler(timezone="America/New_York")
