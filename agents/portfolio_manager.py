@@ -4397,9 +4397,15 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
     # Split executed into actual fills vs gate-blocked (needed for outcome categorization)
     actual_fills = [d for d in executed if d.get("executed")]
     gate_blocked_items = [d for d in executed if not d.get("executed")]
+    filled_symbols = {str(d.get("symbol", "")).upper() for d in actual_fills if d.get("symbol")}
 
-    # 1. scaffold_unavailable: scaffold returned None or status != "ok"
+    # 1. scaffold_unavailable: scaffold returned None or status != "ok".
+    # Do not log a no-trade outcome for a symbol that actually filled in this
+    # same PM/profile cycle; the fill is the authoritative outcome and logging
+    # both makes the decision log contradict itself.
     for sym in entry_signals:
+        if str(sym).upper() in filled_symbols:
+            continue
         sr = scaffold_results.get(sym)
         if sr is None:
             _log_no_trade_outcome(
