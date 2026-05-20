@@ -588,6 +588,20 @@ def _log_pm_decision_rejected(
     )
 
 
+def _store_pm_cycle_note(db, profile_id: str, notes: str) -> str:
+    """Persist an operator-facing PM cycle note for the decision log."""
+    stored_notes = _compact_text_for_decision_log(notes, MAX_PM_PORTFOLIO_NOTE_CHARS)
+    if stored_notes:
+        db.add(AgentMemory(
+            agent=f"pm_{profile_id}",
+            symbol=None,
+            key="notes",
+            value=stored_notes,
+        ))
+        db.commit()
+    return stored_notes
+
+
 def _log_no_trade_outcome(
     db,
     symbol: str,
@@ -3560,8 +3574,9 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     max_loss = portfolio["starting_balance"] * profile["max_daily_loss_pct"]
     if abs(portfolio["daily_pnl"]) >= max_loss and portfolio["daily_pnl"] < 0:
         notes = f"Daily loss limit hit (${portfolio['daily_pnl']:,.2f}). No more trades today."
+        stored_notes = _store_pm_cycle_note(db, profile_id, notes)
         db.close()
-        return {"decisions": [], "portfolio_notes": notes, "profile": profile_id}
+        return {"decisions": [], "portfolio_notes": stored_notes, "profile": profile_id}
 
     # ── PHASE 1: Two-tier review for existing open positions ──
     # Track signal usage for audit logging (Req 4.4)
@@ -3953,9 +3968,12 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
             "No eligible PM entry signals for profile=%s after filtering; skipping entry LLM to avoid invented/malformed decisions",
             profile_id,
         )
+        notes = "No eligible entry signals after filtering; skipped new-entry decision cycle."
+        stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+        db.close()
         return {
             "decisions": [],
-            "portfolio_notes": "No eligible entry signals after filtering; skipped new-entry decision cycle.",
+            "portfolio_notes": stored_notes,
             "profile": profile_id,
         }
 
@@ -4491,14 +4509,7 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
             retry_info=retry_info,
         )
         stored_notes = f"{notes}\n\n{audit}" if notes else audit
-        mem = AgentMemory(
-            agent=f"pm_{profile_id}",
-            symbol=None,
-            key="notes",
-            value=stored_notes,
-        )
-        db.add(mem)
-        db.commit()
+        stored_notes = _store_pm_cycle_note(db, profile_id, stored_notes)
     else:
         stored_notes = notes
 
