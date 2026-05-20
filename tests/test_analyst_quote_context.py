@@ -14,7 +14,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from sqlalchemy import create_engine
 
-from agents.analyst import enrich_signal_with_quote_context
+from agents.analyst import enrich_signal_with_quote_context, sanitize_analyst_session_levels
 from db.schema import Base, AgentMemory, get_session
 
 
@@ -218,6 +218,53 @@ class TestEnrichSignalWithQuoteContext:
         assert result["setup_type"] == "news_catalyst"
         # New fields added
         assert result["current_price"] == 155.42
+
+    def test_sanitizes_implausible_candle_session_levels_after_enrichment(self):
+        """Cross-symbol candle levels should be removed from top-level and key_levels."""
+        signal = {
+            "symbol": "TLT",
+            "signal": "LONG",
+            "key_levels": {
+                "support": 82.5,
+                "resistance": 84.0,
+                "vwap": 83.06,
+            },
+        }
+        quote = {
+            "symbol": "TLT",
+            "price": 83.06,
+            "open": 83.0,
+            "high": 83.25,
+            "low": 82.9,
+            "prev_close": 83.02,
+            "change_pct": 0.05,
+            "timestamp": "2026-05-20T13:30:17",
+        }
+        candles = {
+            "timestamps": [1779195600, 1779282000],
+            "open": [492.0, 495.26],
+            "high": [496.34, 495.26],
+            "low": [492.58, 495.26],
+            "close": [493.95, 495.26],
+            "volume": [1000, 1000],
+        }
+
+        enrich_signal_with_quote_context(signal, quote, candles)
+        result = sanitize_analyst_session_levels(signal, quote)
+
+        assert "day_open" not in result
+        assert "day_high" not in result
+        assert "day_low" not in result
+        assert "prior_day_high" not in result
+        assert "prior_day_low" not in result
+        assert "prior_day_close" not in result
+        assert "day_high" not in result["key_levels"]
+        assert "day_low" not in result["key_levels"]
+        assert "prior_high" not in result["key_levels"]
+        assert "prior_low" not in result["key_levels"]
+        assert result["key_levels"]["support"] == 82.5
+        assert result["session_levels_sanitized"] is True
+
 
 
 # --- Integration test: verify signal is persisted to AgentMemory with quote fields ---

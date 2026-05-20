@@ -12,12 +12,16 @@ Checks:
 import json
 import logging
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from db.schema import Trade, Position, AgentMemory, get_session
 from utils.stop_authority import should_stop_trigger
 from utils.trade_events import log_trade_event
 
 log = logging.getLogger(__name__)
+
+
+MAX_ANALYST_SIGNAL_AGE_MINUTES = 90
+_logged_stale_signal_symbols = set()
 
 
 def get_batch_quotes(symbols: list[str]) -> dict:
@@ -356,6 +360,24 @@ def _level_plausible_for_price(symbol: str, level_name: str, level: float, price
     return True
 
 
+def _analyst_signal_is_fresh(memory_row: AgentMemory, max_age_minutes: int = MAX_ANALYST_SIGNAL_AGE_MINUTES) -> bool:
+    """Return True only for analyst signals recent enough to trigger entries.
+
+    AgentMemory timestamps are stored as UTC-naive datetimes by the SQLAlchemy
+    default. Treat naive values as UTC so old signals cannot wake back up days
+    or weeks later when price revisits an old level.
+    """
+    ts = getattr(memory_row, "timestamp", None)
+    if ts is None:
+        return False
+
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+
+    age = datetime.now(timezone.utc) - ts.astimezone(timezone.utc)
+    return timedelta(0) <= age <= timedelta(minutes=max_age_minutes)
+
+
 def check_entry_triggers(engine) -> list[dict]:
     """Check analyst signals for key level breaches that could trigger entries."""
     db = get_session(engine)
@@ -373,6 +395,17 @@ def check_entry_triggers(engine) -> list[dict]:
     signal_data = {}
     for s in signals:
         if s.symbol not in seen:
+            if not _analyst_signal_is_fresh(s):
+                if s.symbol not in _logged_stale_signal_symbols:
+                    log.info(
+                        "Skipping stale analyst signal for %s: timestamp=%s max_age=%sm",
+                        s.symbol,
+                        s.timestamp,
+                        MAX_ANALYST_SIGNAL_AGE_MINUTES,
+                    )
+                    _logged_stale_signal_symbols.add(s.symbol)
+                seen.add(s.symbol)
+                continue
             try:
                 signal_data[s.symbol] = json.loads(s.value)
             except Exception:
@@ -518,6 +551,8 @@ def check_momentum(engine) -> list[dict]:
             .first()
         )
         if sig_mem:
+            if not _analyst_signal_is_fresh(sig_mem):
+                continue
             try:
                 sig = json.loads(sig_mem.value)
                 levels = sig.get("key_levels", {})

@@ -161,6 +161,58 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
     return normalized
 
 
+def _current_price_from_quote(quote: dict) -> float | None:
+    current = quote.get("price") if isinstance(quote, dict) else None
+    try:
+        current = float(current)
+    except (TypeError, ValueError):
+        return None
+    return current if current > 0 else None
+
+
+def _price_level_is_plausible(value, current: float, max_distance_pct: float = 20.0) -> bool:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return False
+    if val <= 0 or current <= 0:
+        return False
+    dist_pct = abs((current - val) / current) * 100
+    return dist_pct <= max_distance_pct
+
+
+def sanitize_analyst_session_levels(signal: dict, quote: dict, max_distance_pct: float = 20.0) -> dict:
+    """Remove candle-derived session levels that are implausible vs current price.
+
+    yfinance/Finnhub occasionally return cross-symbol or stale candle levels.
+    This protects both top-level structured fields and mirrored key_levels after
+    quote/candle enrichment has overwritten the LLM output.
+    """
+    current = _current_price_from_quote(quote)
+    if not current:
+        return signal
+
+    removed = {}
+    for field in ("day_open", "day_high", "day_low", "prior_day_high", "prior_day_low", "prior_day_close"):
+        if field in signal and signal.get(field) is not None:
+            if not _price_level_is_plausible(signal.get(field), current, max_distance_pct):
+                removed[field] = signal.pop(field)
+
+    key_levels = signal.get("key_levels")
+    if isinstance(key_levels, dict):
+        for key in ("day_high", "day_low", "prior_high", "prior_low"):
+            if key in key_levels and key_levels.get(key) is not None:
+                if not _price_level_is_plausible(key_levels.get(key), current, max_distance_pct):
+                    removed[f"key_levels.{key}"] = key_levels.pop(key)
+
+    if removed:
+        signal["session_levels_sanitized"] = True
+        signal["removed_session_levels"] = removed
+        signal["session_levels_sanitize_reason"] = "level_too_far_from_current_price_or_non_numeric"
+
+    return signal
+
+
 def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> dict:
     """Replace hallucinated/cross-symbol key levels with market-data levels.
 
@@ -168,13 +220,9 @@ def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> 
     levels.  We keep numeric LLM levels only when they are plausibly near the
     current quote; otherwise we fall back to deterministic quote/indicator data.
     """
-    current = quote.get("price") if isinstance(quote, dict) else None
-    try:
-        current = float(current)
-    except (TypeError, ValueError):
-        current = None
+    current = _current_price_from_quote(quote)
 
-    if not current or current <= 0:
+    if not current:
         signal["key_levels"] = {}
         signal["key_levels_sanitized"] = True
         signal["key_levels_sanitize_reason"] = "missing_current_price"
@@ -510,8 +558,12 @@ Produce your trading signal JSON for {sym}.
             validation_result = validate_setup_for_symbol(sym, signal.get("setup_type"))
             signal.update(validation_result)
 
-            # Enrich signal with structured quote context for downstream gates
+            # Enrich signal with structured quote context for downstream gates,
+            # then sanitize again because enrichment can overwrite key/session
+            # levels with provider-derived values.
             enrich_signal_with_quote_context(signal, quote, candles)
+            signal = sanitize_analyst_session_levels(signal, quote)
+            signal = sanitize_analyst_key_levels(signal, quote, indicators)
 
             signals[sym] = signal
         except Exception as e:
