@@ -1232,7 +1232,6 @@ def _coerce_quantity(value, *, symbol: str = "UNKNOWN") -> int:
 ENTRY_WINDOW_LIMITS = {
     "gap_and_go": 60,
     "orb": 60,
-    "momentum_fade": 60,
     "short_squeeze": 60,
 }
 
