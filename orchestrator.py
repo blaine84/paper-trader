@@ -20,6 +20,7 @@ load_dotenv()
 from db.schema import init_db, Balance
 from sqlalchemy.orm import sessionmaker
 from utils.shadow_ledger import ensure_shadow_ledger_schema
+from utils.shadow_outcomes import update_blocked_candidate_outcomes
 import agents.researcher as researcher
 import agents.analyst as analyst
 import agents.portfolio_manager as pm
@@ -519,6 +520,17 @@ def run_daily_review():
         log.error(f"Slack afternoon report error: {e}", exc_info=True)
 
 
+def run_shadow_outcomes():
+    """Score blocked trade candidates after their outcome windows mature."""
+    engine = get_engine()
+    try:
+        result = update_blocked_candidate_outcomes(engine)
+        if result.get("inserted"):
+            log.info(f"Shadow outcomes: {result}")
+    except Exception as e:
+        log.error(f"Shadow outcomes error: {e}", exc_info=True)
+
+
 def run_ceo_daily():
     """4:45 PM ET — CEO daily operating memo."""
     log.info("=== CEO DAILY MEMO ===")
@@ -931,6 +943,15 @@ def main():
         run_price_spike_news_check,
         CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/15", timezone="America/New_York"),
         id="price_spike_news",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Shadow outcomes: score blocked candidates after 15/30/60 minute windows mature
+    scheduler.add_job(
+        run_shadow_outcomes,
+        CronTrigger(day_of_week="mon-fri", hour="9-16", minute="*/5", timezone="America/New_York"),
+        id="shadow_outcomes",
         max_instances=1,
         coalesce=True,
     )

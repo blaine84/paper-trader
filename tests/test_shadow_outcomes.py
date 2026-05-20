@@ -1,0 +1,87 @@
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import text
+from sqlalchemy.orm import sessionmaker
+
+from db.schema import init_db
+from utils.shadow_ledger import ensure_shadow_ledger_schema, record_blocked_candidate
+from utils.shadow_outcomes import score_blocked_candidate, update_blocked_candidate_outcomes
+
+
+def _candles(start, closes):
+    rows = []
+    for i, close in enumerate(closes):
+        rows.append({
+            "timestamp": start + timedelta(minutes=i),
+            "high": close + 0.05,
+            "low": close - 0.05,
+            "close": close,
+        })
+    return rows
+
+
+def test_score_blocked_candidate_classifies_saved_us_when_stop_hits_first():
+    created = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
+    candidate = {
+        "id": 1,
+        "created_at": created,
+        "symbol": "NVDA",
+        "action": "BUY",
+        "direction": "long",
+        "entry_price": 100.0,
+        "stop_price": 99.0,
+        "target_price": 105.0,
+    }
+    candles = _candles(created, [100.0, 99.8, 98.9, 99.2])
+
+    outcome = score_blocked_candidate(candidate, window_label="15m", window_minutes=15, candles=candles)
+
+    assert outcome["first_hit"] == "stop"
+    assert outcome["outcome_label"] == "would_hit_stop"
+    assert outcome["gate_verdict"] == "saved_us"
+    assert outcome["pnl_pct"] < 0
+
+
+def test_update_blocked_candidate_outcomes_inserts_companion_rows(tmp_path):
+    db_path = tmp_path / "paper.db"
+    engine = init_db(str(db_path))
+    ensure_shadow_ledger_schema(engine)
+
+    created = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
+    now = created + timedelta(minutes=61)
+
+    def candle_fetcher(symbol, start, end):
+        assert symbol == "NVDA"
+        return _candles(created, [100.0] * 20 + [101.0] * 20 + [102.0] * 25)
+
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    candidate_id = record_blocked_candidate(
+        db,
+        "NVDA",
+        "BUY",
+        "risk_geometry_gate",
+        "Adjusted R:R below minimum",
+        direction="long",
+        profile="moderate",
+        entry_price=100.0,
+        stop_price=98.0,
+        target_price=104.0,
+    )
+    db.commit()
+    db.close()
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE blocked_trade_candidates SET created_at = :created WHERE id = :id"),
+            {"created": created.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"), "id": candidate_id},
+        )
+
+    result = update_blocked_candidate_outcomes(engine, now=now, candle_fetcher=candle_fetcher)
+
+    assert result["inserted"] == 3
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT eval_window, gate_verdict FROM blocked_trade_candidate_outcomes ORDER BY eval_window")
+        ).fetchall()
+    assert {r[0] for r in rows} == {"15m", "30m", "60m"}

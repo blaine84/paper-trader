@@ -90,6 +90,50 @@ def ensure_shadow_ledger_schema(engine) -> None:
                 )
             )
 
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS blocked_trade_candidate_outcomes (
+                        id INTEGER PRIMARY KEY,
+                        blocked_candidate_id INTEGER NOT NULL REFERENCES blocked_trade_candidates(id) ON DELETE CASCADE,
+                        eval_window VARCHAR(16) NOT NULL,
+                        evaluated_at DATETIME NOT NULL,
+                        eval_price REAL,
+                        pnl_pct REAL,
+                        mfe_pct REAL,
+                        mae_pct REAL,
+                        stop_hit BOOLEAN DEFAULT 0,
+                        target_hit BOOLEAN DEFAULT 0,
+                        first_hit VARCHAR(16),
+                        first_hit_at DATETIME,
+                        outcome_label VARCHAR(64),
+                        gate_verdict VARCHAR(64),
+                        notes_json TEXT,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(blocked_candidate_id, eval_window)
+                    )
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_blocked_outcomes_candidate
+                    ON blocked_trade_candidate_outcomes (blocked_candidate_id)
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_blocked_outcomes_verdict_created
+                    ON blocked_trade_candidate_outcomes (gate_verdict, created_at)
+                    """
+                )
+            )
+
             conn.commit()
             log.info("Shadow ledger schema ensured successfully.")
     except Exception as exc:

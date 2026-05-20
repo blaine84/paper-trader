@@ -139,6 +139,7 @@
       <div class="tab" onclick="switchTab('performance')">Performance</div>
       <div class="tab" onclick="switchTab('feedback')">Agent Feedback</div>
       <div class="tab" onclick="switchTab('decisions')">Decision Log</div>
+      <div class="tab" onclick="switchTab('shadow')">Shadow Ledger</div>
       <div class="tab" onclick="switchTab('meta')">System Review</div>
       <div class="tab" onclick="switchTab('daily')">Daily P&L</div>
       <div class="tab" onclick="switchTab('journal')">📓 Journal</div>
@@ -253,6 +254,19 @@
       <div id="decisionsContent"><div class="empty-state">Loading decisions...</div></div>
     </div>
 
+    <!-- Shadow Ledger -->
+    <div id="tab-shadow" class="tab-content">
+      <div id="shadowSummary" class="stat-grid"></div>
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Symbol</th><th>Profile</th><th>Blocked By</th>
+          <th class="right">Entry</th><th class="center">Window</th><th class="right">P&L %</th>
+          <th class="right">MFE %</th><th class="right">MAE %</th><th>Verdict</th><th>Reason</th>
+        </tr></thead>
+        <tbody id="shadowBody"></tbody>
+      </table>
+    </div>
+
     <!-- System Review -->
     <div id="tab-meta" class="tab-content">
       <div id="metaContent"><div class="empty-state">Loading system review...</div></div>
@@ -300,6 +314,7 @@
     if (name === 'performance') loadPerformance();
     if (name === 'feedback') loadFeedback();
     if (name === 'decisions') loadDecisions();
+    if (name === 'shadow') loadShadowOutcomes();
     if (name === 'meta') loadMeta();
     if (name === 'positions') loadPositions();
     if (name === 'journal') loadJournal();
@@ -1145,6 +1160,56 @@
         <div class="day-header">${date} <span class="dim">(${items.length})</span></div>
         ${cards}
       </div>`;
+    }).join('');
+  }
+
+  async function loadShadowOutcomes() {
+    try {
+      const res = await fetch('/api/shadow-outcomes?days=7&limit=200');
+      renderShadowOutcomes(await res.json());
+    } catch(e) {}
+  }
+
+  function renderShadowOutcomes(data) {
+    const summaryEl = document.getElementById('shadowSummary');
+    const bodyEl = document.getElementById('shadowBody');
+    const s = data.summary || {};
+    const cards = [
+      ['saved_us', 'Saved Us', 'green'],
+      ['possibly_overblocked', 'Maybe Overblocked', 'yellow'],
+      ['blocked_winner', 'Blocked Winner', 'red'],
+      ['neutral', 'Neutral', 'dim'],
+      ['pending', 'Pending 60m', 'cyan'],
+    ];
+    summaryEl.innerHTML = cards.map(([key, label, cls]) => `
+      <div class="stat-box"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${s[key] || 0}</div></div>
+    `).join('');
+
+    const rows = data.rows || [];
+    if (!rows.length) {
+      bodyEl.innerHTML = '<tr><td colspan="11" class="center dim">No blocked candidates yet.</td></tr>';
+      return;
+    }
+
+    const verdictClass = v => ({saved_us:'green', blocked_winner:'red', possibly_overblocked:'yellow', ambiguous:'yellow', neutral:'dim'}[v] || 'cyan');
+    bodyEl.innerHTML = rows.map(r => {
+      const time = r.created_at ? new Date(r.created_at + 'Z').toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) : '—';
+      const reason = r.block_reason || '';
+      const window = r.eval_window || 'pending';
+      const verdict = r.gate_verdict || 'pending';
+      return `<tr>
+        <td class="dim">${time}</td>
+        <td><strong>${r.symbol || '—'}</strong></td>
+        <td>${r.profile || '—'}</td>
+        <td>${r.blocked_by || '—'}</td>
+        <td class="right">${fmt(r.entry_price)}</td>
+        <td class="center"><span class="badge" style="background:#21262d;color:#8b949e">${window}</span></td>
+        <td class="right ${pnlColor(r.pnl_pct)}">${r.pnl_pct != null ? (r.pnl_pct >= 0 ? '+' : '') + fmt(r.pnl_pct) : '—'}</td>
+        <td class="right green">${r.mfe_pct != null ? '+' + fmt(r.mfe_pct) : '—'}</td>
+        <td class="right red">${r.mae_pct != null ? fmt(r.mae_pct) : '—'}</td>
+        <td><span class="${verdictClass(verdict)}">${verdict}</span>${r.outcome_label ? `<br><span class="dim">${r.outcome_label}</span>` : ''}</td>
+        <td class="dim" title="${reason.replace(/"/g, '&quot;')}">${reason.slice(0, 90)}${reason.length > 90 ? '…' : ''}</td>
+      </tr>`;
     }).join('');
   }
 

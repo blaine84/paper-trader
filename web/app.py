@@ -19,6 +19,7 @@ load_dotenv()
 log = logging.getLogger(__name__)
 
 from flask import Flask, jsonify, render_template, request
+from sqlalchemy import text
 from db.schema import init_db, get_session, Position, Balance, Trade, TradeEvent, AgentMemory, DailyLog
 from models.pm_profiles import PM_PROFILES, ACTIVE_PROFILES
 from utils.finnhub_client import FinnhubClient
@@ -30,9 +31,11 @@ from utils.catalyst_freshness import (
     ET,
 )
 from feedback_loop.analyst_feedback import get_quality_metrics
+from utils.shadow_ledger import ensure_shadow_ledger_schema
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
+ensure_shadow_ledger_schema(engine)
 
 
 def get_quotes(symbols: list[str]) -> dict:
@@ -897,6 +900,56 @@ def api_narratives():
         return jsonify({"narratives": [], "page": page, "per_page": per_page, "total": 0})
     finally:
         db.close()
+
+
+@app.route("/api/shadow-outcomes")
+def api_shadow_outcomes():
+    """Return blocked candidate outcomes for the dashboard shadow ledger view."""
+    days = request.args.get("days", default=7, type=int)
+    days = max(1, min(days or 7, 30))
+    limit = request.args.get("limit", default=100, type=int)
+    limit = max(1, min(limit or 100, 500))
+
+    with engine.connect() as conn:
+        summary_rows = conn.execute(
+            text(
+                """
+                SELECT
+                  COALESCE(o.gate_verdict, 'pending') AS gate_verdict,
+                  COUNT(*) AS count
+                FROM blocked_trade_candidates b
+                LEFT JOIN blocked_trade_candidate_outcomes o
+                  ON o.blocked_candidate_id = b.id AND o.eval_window = '60m'
+                WHERE datetime(b.created_at) >= datetime('now', :cutoff)
+                GROUP BY COALESCE(o.gate_verdict, 'pending')
+                """
+            ),
+            {"cutoff": f"-{days} days"},
+        ).mappings().all()
+
+        rows = conn.execute(
+            text(
+                """
+                SELECT
+                  b.id, b.created_at, b.symbol, b.action, b.direction, b.profile,
+                  b.setup_type, b.entry_price, b.stop_price, b.target_price,
+                  b.blocked_by, b.block_reason,
+                  o.eval_window, o.evaluated_at, o.eval_price, o.pnl_pct,
+                  o.mfe_pct, o.mae_pct, o.stop_hit, o.target_hit, o.first_hit,
+                  o.outcome_label, o.gate_verdict
+                FROM blocked_trade_candidates b
+                LEFT JOIN blocked_trade_candidate_outcomes o
+                  ON o.blocked_candidate_id = b.id
+                WHERE datetime(b.created_at) >= datetime('now', :cutoff)
+                ORDER BY b.created_at DESC, o.eval_window ASC
+                LIMIT :limit
+                """
+            ),
+            {"cutoff": f"-{days} days", "limit": limit},
+        ).mappings().all()
+
+    summary = {r["gate_verdict"]: r["count"] for r in summary_rows}
+    return jsonify({"summary": summary, "rows": [dict(r) for r in rows]})
 
 
 @app.route("/api/trade-events")

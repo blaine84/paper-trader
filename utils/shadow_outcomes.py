@@ -1,0 +1,313 @@
+"""Outcome tracking for blocked trade candidates.
+
+This module turns the shadow ledger from "we captured the reject" into
+"was the reject right in hindsight?" by periodically scoring blocked
+candidates against later market prices.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import text
+
+log = logging.getLogger(__name__)
+
+OUTCOME_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("15m", 15),
+    ("30m", 30),
+    ("60m", 60),
+)
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        raw = value.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            try:
+                dt = datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _num(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        out = float(value)
+        return out if out > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _direction(row: dict[str, Any]) -> str | None:
+    direction = (row.get("direction") or "").lower()
+    action = (row.get("action") or "").upper()
+    if direction in {"long", "short"}:
+        return direction
+    if action == "BUY":
+        return "long"
+    if action == "SHORT":
+        return "short"
+    return None
+
+
+def _as_candles(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    candles: list[dict[str, Any]] = []
+    for r in records:
+        ts = _parse_dt(r.get("timestamp") or r.get("time") or r.get("datetime"))
+        close = _num(r.get("close"))
+        if ts is None or close is None:
+            continue
+        high = _num(r.get("high")) or close
+        low = _num(r.get("low")) or close
+        candles.append({"timestamp": ts, "high": high, "low": low, "close": close})
+    return sorted(candles, key=lambda c: c["timestamp"])
+
+
+def _fetch_yfinance_candles(symbol: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    """Fetch one-minute candles as normalized UTC records."""
+    try:
+        import yfinance as yf
+
+        hist = yf.Ticker(symbol).history(
+            start=start.astimezone(timezone.utc),
+            end=end.astimezone(timezone.utc) + timedelta(minutes=2),
+            interval="1m",
+            auto_adjust=False,
+            prepost=False,
+        )
+        if hist is None or hist.empty:
+            return []
+
+        records: list[dict[str, Any]] = []
+        for idx, row in hist.iterrows():
+            ts = idx.to_pydatetime()
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            else:
+                ts = ts.astimezone(timezone.utc)
+            records.append({
+                "timestamp": ts,
+                "high": float(row.get("High")),
+                "low": float(row.get("Low")),
+                "close": float(row.get("Close")),
+            })
+        return _as_candles(records)
+    except Exception as exc:
+        log.warning("Shadow outcome: yfinance candles failed for %s: %s", symbol, exc)
+        return []
+
+
+def score_blocked_candidate(
+    candidate: dict[str, Any],
+    *,
+    window_label: str,
+    window_minutes: int,
+    candles: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Score one blocked candidate for one elapsed outcome window.
+
+    Returns a dict ready for insertion into blocked_trade_candidate_outcomes,
+    or None when the candidate cannot be scored yet.
+    """
+    created_at = _parse_dt(candidate.get("created_at"))
+    entry = _num(candidate.get("entry_price"))
+    direction = _direction(candidate)
+    if created_at is None or entry is None or direction is None:
+        return None
+
+    eval_at = created_at + timedelta(minutes=window_minutes)
+    window_candles = [c for c in _as_candles(candles) if created_at <= c["timestamp"] <= eval_at]
+    if not window_candles:
+        return None
+
+    eval_price = window_candles[-1]["close"]
+    highs = [c["high"] for c in window_candles]
+    lows = [c["low"] for c in window_candles]
+    stop = _num(candidate.get("stop_price"))
+    target = _num(candidate.get("target_price"))
+
+    if direction == "long":
+        pnl_pct = (eval_price - entry) / entry * 100
+        mfe_pct = (max(highs) - entry) / entry * 100
+        mae_pct = (min(lows) - entry) / entry * 100
+    else:
+        pnl_pct = (entry - eval_price) / entry * 100
+        mfe_pct = (entry - min(lows)) / entry * 100
+        mae_pct = (entry - max(highs)) / entry * 100
+
+    first_hit = None
+    first_hit_at = None
+    stop_hit = False
+    target_hit = False
+    for candle in window_candles:
+        if direction == "long":
+            hit_stop = stop is not None and candle["low"] <= stop
+            hit_target = target is not None and candle["high"] >= target
+        else:
+            hit_stop = stop is not None and candle["high"] >= stop
+            hit_target = target is not None and candle["low"] <= target
+
+        stop_hit = stop_hit or hit_stop
+        target_hit = target_hit or hit_target
+        if first_hit is None and (hit_stop or hit_target):
+            first_hit = "ambiguous" if hit_stop and hit_target else ("stop" if hit_stop else "target")
+            first_hit_at = candle["timestamp"]
+            if first_hit != "ambiguous":
+                break
+
+    if first_hit == "target":
+        outcome_label = "would_hit_target"
+        gate_verdict = "blocked_winner"
+    elif first_hit in {"stop", "ambiguous"}:
+        outcome_label = "would_hit_stop" if first_hit == "stop" else "ambiguous_stop_and_target"
+        gate_verdict = "saved_us" if first_hit == "stop" else "ambiguous"
+    elif pnl_pct > 0.15:
+        outcome_label = "winner_so_far"
+        gate_verdict = "possibly_overblocked"
+    elif pnl_pct < -0.15:
+        outcome_label = "loser_so_far"
+        gate_verdict = "saved_us"
+    else:
+        outcome_label = "flat_so_far"
+        gate_verdict = "neutral"
+
+    return {
+        "blocked_candidate_id": candidate.get("id"),
+        "eval_window": window_label,
+        "evaluated_at": eval_at.replace(tzinfo=None),
+        "eval_price": round(eval_price, 4),
+        "pnl_pct": round(pnl_pct, 4),
+        "mfe_pct": round(mfe_pct, 4),
+        "mae_pct": round(mae_pct, 4),
+        "stop_hit": int(stop_hit),
+        "target_hit": int(target_hit),
+        "first_hit": first_hit,
+        "first_hit_at": first_hit_at.replace(tzinfo=None) if first_hit_at else None,
+        "outcome_label": outcome_label,
+        "gate_verdict": gate_verdict,
+        "notes_json": json.dumps({
+            "entry_price": entry,
+            "stop_price": stop,
+            "target_price": target,
+            "direction": direction,
+            "candles_scored": len(window_candles),
+        }),
+    }
+
+
+def update_blocked_candidate_outcomes(
+    engine,
+    *,
+    now: datetime | None = None,
+    max_rows: int = 50,
+    candle_fetcher=_fetch_yfinance_candles,
+) -> dict[str, int]:
+    """Score due blocked candidates and insert companion outcome rows."""
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    inserted = 0
+    skipped = 0
+    candidates_seen = 0
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT * FROM blocked_trade_candidates
+                WHERE symbol IS NOT NULL
+                  AND entry_price IS NOT NULL
+                  AND action IN ('BUY', 'SHORT')
+                  AND datetime(created_at) <= datetime(:now, '-15 minutes')
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"now": now_utc.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"), "limit": max_rows},
+        ).mappings().all()
+
+        for row in rows:
+            candidate = dict(row)
+            candidates_seen += 1
+            created_at = _parse_dt(candidate.get("created_at"))
+            if created_at is None:
+                skipped += 1
+                continue
+
+            due_windows: list[tuple[str, int]] = []
+            for label, minutes in OUTCOME_WINDOWS:
+                if created_at + timedelta(minutes=minutes) > now_utc:
+                    continue
+                exists = conn.execute(
+                    text(
+                        """
+                        SELECT 1 FROM blocked_trade_candidate_outcomes
+                        WHERE blocked_candidate_id = :id AND eval_window = :window
+                        LIMIT 1
+                        """
+                    ),
+                    {"id": candidate["id"], "window": label},
+                ).scalar()
+                if not exists:
+                    due_windows.append((label, minutes))
+
+            if not due_windows:
+                continue
+
+            max_minutes = max(minutes for _, minutes in due_windows)
+            candles = candle_fetcher(
+                candidate["symbol"],
+                created_at - timedelta(minutes=1),
+                created_at + timedelta(minutes=max_minutes),
+            )
+            if not candles:
+                skipped += len(due_windows)
+                continue
+
+            for label, minutes in due_windows:
+                scored = score_blocked_candidate(
+                    candidate,
+                    window_label=label,
+                    window_minutes=minutes,
+                    candles=candles,
+                )
+                if not scored:
+                    skipped += 1
+                    continue
+                conn.execute(
+                    text(
+                        """
+                        INSERT OR IGNORE INTO blocked_trade_candidate_outcomes (
+                            blocked_candidate_id, eval_window, evaluated_at, eval_price,
+                            pnl_pct, mfe_pct, mae_pct, stop_hit, target_hit, first_hit,
+                            first_hit_at, outcome_label, gate_verdict, notes_json
+                        ) VALUES (
+                            :blocked_candidate_id, :eval_window, :evaluated_at, :eval_price,
+                            :pnl_pct, :mfe_pct, :mae_pct, :stop_hit, :target_hit, :first_hit,
+                            :first_hit_at, :outcome_label, :gate_verdict, :notes_json
+                        )
+                        """
+                    ),
+                    scored,
+                )
+                inserted += 1
+
+    return {"candidates_seen": candidates_seen, "inserted": inserted, "skipped": skipped}
