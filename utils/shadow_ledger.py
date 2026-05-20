@@ -156,6 +156,41 @@ def compute_dedupe_key(
     return key[:255]
 
 
+def _count_scaffold_entries_this_cycle(db, symbol: str | None, signal_id: str | None) -> int:
+    """Count scaffold-aware entries already recorded for this signal in the current cycle.
+
+    Uses the current market session date (America/New_York) and checks for entries
+    that have geometry_candidate_id in their decision_snapshot_json.
+
+    Returns the count, or 0 on error.
+    """
+    try:
+        session_date = datetime.now(_ET).strftime("%Y-%m-%d")
+        # Query entries for this symbol today that contain geometry_candidate_id
+        result = db.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM blocked_trade_candidates
+                WHERE symbol = :symbol
+                  AND created_at >= :session_start
+                  AND decision_snapshot_json LIKE '%geometry_candidate_id%'
+                """
+            ),
+            {
+                "symbol": symbol,
+                "session_start": f"{session_date} 00:00:00",
+            },
+        )
+        return result.scalar() or 0
+    except Exception as exc:
+        log.debug("_count_scaffold_entries_this_cycle: error counting entries: %s", exc)
+        return 0
+
+
+# Maximum scaffold-aware rejection entries per signal per cycle
+_MAX_SCAFFOLD_ENTRIES_PER_SIGNAL_PER_CYCLE = 10
+
+
 def record_blocked_candidate(
     db,
     symbol: str | None,
@@ -177,6 +212,9 @@ def record_blocked_candidate(
     source: str | None = None,
     agent: str | None = None,
     trade_event_id: int | None = None,
+    geometry_candidate_id: str | None = None,
+    geometry_candidate_name: str | None = None,
+    scaffold_snapshot: dict | None = None,
 ) -> int | None:
     """Record a blocked trade candidate in the shadow ledger.
 
@@ -185,6 +223,11 @@ def record_blocked_candidate(
             derived from action: BUY → "long", SHORT → "short". Callers may pass
             it explicitly when the signal carries a direction that differs from
             the simple action mapping.
+        geometry_candidate_id: Optional scaffold candidate_id for scaffold-aware
+            rejection recording.
+        geometry_candidate_name: Optional scaffold candidate name (informational).
+        scaffold_snapshot: Optional full scaffold output dict. When provided, it is
+            stored in the signal_snapshot_json column alongside the signal data.
 
     Returns:
         int: The new row's primary key on successful insert.
@@ -219,6 +262,78 @@ def record_blocked_candidate(
                 direction = "long"
             elif action_upper == "SHORT":
                 direction = "short"
+
+        # --- Scaffold-aware rejection recording ---
+        # When geometry_candidate_id is provided, this is a scaffold-aware rejection.
+        # Cap at 10 entries per signal per cycle to prevent noise from bulk rejections.
+        if geometry_candidate_id is not None:
+            current_count = _count_scaffold_entries_this_cycle(db, symbol, None)
+            if current_count >= _MAX_SCAFFOLD_ENTRIES_PER_SIGNAL_PER_CYCLE:
+                log.debug(
+                    "record_blocked_candidate: scaffold entry cap reached (%d) for symbol=%s, skipping",
+                    current_count,
+                    symbol,
+                )
+                return None
+
+        # Enrich decision_snapshot with scaffold candidate geometry fields
+        if geometry_candidate_id is not None or geometry_candidate_name is not None:
+            # Parse existing decision_snapshot if it's a string
+            if isinstance(decision_snapshot, str):
+                try:
+                    decision_snapshot = json.loads(decision_snapshot)
+                except (json.JSONDecodeError, TypeError):
+                    decision_snapshot = {}
+            elif decision_snapshot is None:
+                decision_snapshot = {}
+            elif not isinstance(decision_snapshot, dict):
+                decision_snapshot = {}
+
+            # Add scaffold candidate fields to decision snapshot
+            if geometry_candidate_id is not None:
+                decision_snapshot["geometry_candidate_id"] = geometry_candidate_id
+            if geometry_candidate_name is not None:
+                decision_snapshot["geometry_candidate_name"] = geometry_candidate_name
+
+            # Record candidate geometry fields (defensive — include whatever is available)
+            # Try to get risk_reward from scaffold_snapshot candidate data if available
+            candidate_risk_reward = None
+            if scaffold_snapshot and isinstance(scaffold_snapshot, dict):
+                candidates = scaffold_snapshot.get("candidates", [])
+                if isinstance(candidates, list):
+                    for candidate in candidates:
+                        if isinstance(candidate, dict) and candidate.get("candidate_id") == geometry_candidate_id:
+                            candidate_risk_reward = candidate.get("risk_reward")
+                            break
+
+            decision_snapshot["candidate_geometry"] = {
+                "entry_price": entry_price,
+                "stop_loss": stop_price,
+                "target": target_price,
+                "risk_reward": candidate_risk_reward,
+            }
+
+            # Record rejection reason and gate/profile identifier
+            decision_snapshot["rejection_reason"] = block_reason
+            decision_snapshot["rejected_by"] = blocked_by
+            if profile is not None:
+                decision_snapshot["rejection_profile"] = profile
+
+        # Enrich signal_snapshot with scaffold_snapshot when provided
+        if scaffold_snapshot is not None:
+            # Parse existing signal_snapshot if it's a string
+            if isinstance(signal_snapshot, str):
+                try:
+                    signal_snapshot = json.loads(signal_snapshot)
+                except (json.JSONDecodeError, TypeError):
+                    signal_snapshot = {}
+            elif signal_snapshot is None:
+                signal_snapshot = {}
+            elif not isinstance(signal_snapshot, dict):
+                signal_snapshot = {}
+
+            # Store the full scaffold snapshot alongside the signal data
+            signal_snapshot["scaffold_snapshot"] = scaffold_snapshot
 
         # --- Serialize dict/list arguments to JSON ---
         def _serialize(val: dict | list | str | None) -> str | None:

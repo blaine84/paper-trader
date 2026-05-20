@@ -249,10 +249,10 @@ class TestFormatCasesDigestForPm:
 # ===========================================================================
 
 class TestCompactSignalForPm:
-    """Validates: Requirement 2.4"""
+    """Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5"""
 
-    def test_all_decision_critical_fields_preserved(self):
-        """Signal with all fields preserves direction, strength, setup, levels, confidence."""
+    def test_analyst_owned_fields_preserved(self):
+        """Signal with all fields preserves direction, strength, setup, confidence."""
         sig = _make_full_signal("AAPL", 0)
         result = compact_signal_for_pm("AAPL", sig)
 
@@ -260,10 +260,24 @@ class TestCompactSignalForPm:
         assert "LONG" in result
         assert "strong" in result
         assert "news_breakout" in result
-        assert "150.0" in result  # entry
-        assert "145.0" in result  # stop
-        assert "165.0" in result  # target
         assert "high" in result   # confidence
+
+    def test_no_entry_stop_target_displayed(self):
+        """Entry, stop, and target fields are NOT displayed (Requirement 2.1)."""
+        sig = _make_full_signal("AAPL", 0)
+        result = compact_signal_for_pm("AAPL", sig)
+
+        # Must NOT contain entry/stop/target lines or placeholders
+        assert "entry:" not in result.lower()
+        assert "stop:" not in result.lower()
+        # "target:" should not appear as a field display
+        # (it may appear in scaffold table header, but not as signal field)
+        assert "entry: 150.0" not in result
+        assert "stop: 145.0" not in result
+        assert "target: 165.0" not in result
+        assert "entry: ?" not in result
+        assert "stop: ?" not in result
+        assert "target: ?" not in result
 
     def test_invalidation_preserved(self):
         """Invalidation level is included when present."""
@@ -278,53 +292,43 @@ class TestCompactSignalForPm:
         result = compact_signal_for_pm("NVDA", sig)
         assert "key_levels:" in result
 
-    def test_symbol_class_preserved(self):
-        """Symbol class is included when present."""
-        sig = _make_full_signal("AMD", 0)
-        result = compact_signal_for_pm("AMD", sig)
-        assert "symbol_class: momentum" in result
-
-    def test_catalyst_warning_preserved(self):
-        """Catalyst warning is included when present."""
-        sig = _make_full_signal("GOOG", 0, catalyst_warning="stale catalyst")
-        result = compact_signal_for_pm("GOOG", sig)
-        assert "stale catalyst" in result
-
-    def test_freshness_warning_preserved(self):
-        """Freshness warning is included when present."""
-        sig = _make_full_signal("META", 0, freshness_warning="data is 4 hours old")
-        result = compact_signal_for_pm("META", sig)
-        assert "freshness:" in result
-        assert "4 hours old" in result
-
-    def test_reasoning_truncated_at_240_chars(self):
-        """Reasoning is truncated to 240 chars max."""
-        long_reasoning = "A" * 500
-        sig = _make_full_signal("AAPL", 0, reasoning=long_reasoning)
+    def test_key_levels_dict_format(self):
+        """Key levels as dict shows support, resistance, VWAP."""
+        sig = {
+            "signal": "LONG",
+            "strength": "strong",
+            "setup_type": "breakout",
+            "confidence": "high",
+            "current_price": 150.0,
+            "key_levels": {"support": 145.0, "resistance": 155.0, "vwap": 149.5},
+        }
         result = compact_signal_for_pm("AAPL", sig)
+        assert "support: 145.0" in result
+        assert "resistance: 155.0" in result
+        assert "VWAP: 149.5" in result
 
-        # Find the reasoning portion
-        reasoning_idx = result.find("reasoning: ")
-        assert reasoning_idx != -1
-        reasoning_part = result[reasoning_idx + len("reasoning: "):]
-        # Should be truncated: 237 chars + "..."
-        assert len(reasoning_part) <= 240
-        assert reasoning_part.endswith("...")
-
-    def test_short_reasoning_not_truncated(self):
-        """Short reasoning is preserved in full."""
-        short_reasoning = "Strong setup with clear catalyst."
-        sig = _make_full_signal("AAPL", 0, reasoning=short_reasoning)
-        result = compact_signal_for_pm("AAPL", sig)
-        assert short_reasoning in result
-        # Should not have truncation marker
-        assert result.count("...") == 0
+    def test_missing_null_fields_omitted(self):
+        """Missing or null Analyst-owned fields are omitted, not shown as placeholders (Requirement 2.3)."""
+        sig = {
+            "signal": "LONG",
+            # strength is missing
+            # setup_type is missing
+            # confidence is missing
+            "current_price": 100.0,
+        }
+        result = compact_signal_for_pm("SPY", sig)
+        assert "SPY" in result
+        assert "LONG" in result
+        assert "current_price: 100.0" in result
+        # Missing fields should NOT appear with "?" placeholders
+        assert "?" not in result
+        assert "None" not in result
+        assert "setup:" not in result
+        assert "confidence:" not in result
 
     def test_indicators_omitted(self):
         """Full indicator objects are NOT included in compact output."""
         sig = _make_full_signal("AAPL", 0)
-        # Use a reasoning that won't contain indicator-like words
-        sig["reasoning"] = "Strong setup with clear catalyst and favorable risk/reward."
         result = compact_signal_for_pm("AAPL", sig)
         # The actual indicator object keys/structures should not appear
         assert '"rsi"' not in result
@@ -343,34 +347,14 @@ class TestCompactSignalForPm:
             "strength": "moderate",
             "setup_type": "momentum_fade",
             "confidence": "medium",
-            "entry": 200.0,
-            "stop": 205.0,
-            "target": 190.0,
-            "reasoning": "Overextended move.",
         }
         result = compact_signal_for_pm("TSLA", sig)
         assert "TSLA" in result
         assert "SHORT" in result
         assert "moderate" in result
-        # No invalidation, key_levels, symbol_class, catalyst_warning
+        # No invalidation, key_levels
         assert "invalidation:" not in result
         assert "key_levels:" not in result
-        assert "symbol_class:" not in result
-
-    def test_no_reasoning(self):
-        """Signal with no reasoning field still works."""
-        sig = {
-            "signal": "LONG",
-            "strength": "strong",
-            "setup_type": "gap_and_go",
-            "confidence": "high",
-            "entry": 100.0,
-            "stop": 97.0,
-            "target": 106.0,
-        }
-        result = compact_signal_for_pm("SPY", sig)
-        assert "SPY" in result
-        assert "reasoning:" not in result
 
     def test_current_price_included(self):
         """Current price from quote context is included when present."""
@@ -378,31 +362,71 @@ class TestCompactSignalForPm:
         result = compact_signal_for_pm("AAPL", sig)
         assert "current_price: 152.35" in result
 
-    def test_quote_levels_included(self):
-        """Day high, day low, and prev_close from quote context are included."""
-        sig = _make_full_signal("NVDA", 0, day_high=155.0, day_low=148.5, prev_close=150.0)
-        result = compact_signal_for_pm("NVDA", sig)
-        assert "levels:" in result
-        assert "H:155.0" in result
-        assert "L:148.5" in result
-        assert "PC:150.0" in result
-
-    def test_partial_quote_levels(self):
-        """Only available quote levels are shown (graceful with missing fields)."""
-        sig = _make_full_signal("AMD", 0, day_high=120.0, prev_close=118.0)
-        result = compact_signal_for_pm("AMD", sig)
-        assert "H:120.0" in result
-        assert "PC:118.0" in result
-        assert "L:" not in result
-
-    def test_no_quote_fields_no_extra_output(self):
-        """Signal without quote fields does not include current_price or levels line."""
+    def test_no_current_price_no_extra_output(self):
+        """Signal without current_price does not include current_price line."""
         sig = _make_full_signal("TSLA", 0)
         result = compact_signal_for_pm("TSLA", sig)
         assert "current_price:" not in result
-        # "levels: H:" or "levels: L:" or "levels: PC:" should not appear
-        # (key_levels is a different field and is expected)
-        assert "| levels:" not in result
+
+    def test_scaffold_none_shows_unavailable_message(self):
+        """When scaffold_result is None, shows 'No geometry scaffold available' message (Requirement 2.4)."""
+        sig = {"signal": "LONG", "strength": "strong", "setup_type": "breakout", "confidence": "high"}
+        result = compact_signal_for_pm("AAPL", sig, scaffold_result=None)
+        assert "No geometry scaffold available" in result
+        assert "PM must not trade this signal" in result
+
+    def test_scaffold_insufficient_data_shows_message(self):
+        """When scaffold status is 'insufficient_data', shows unavailable message with reason (Requirement 2.4)."""
+        sig = {"signal": "LONG", "strength": "strong", "setup_type": "breakout", "confidence": "high"}
+        scaffold = {"status": "insufficient_data", "reason": "Missing current_price", "candidates": []}
+        result = compact_signal_for_pm("AAPL", sig, scaffold_result=scaffold)
+        assert "No geometry scaffold available" in result
+        assert "PM must not trade this signal" in result
+        assert "Missing current_price" in result
+
+    def test_scaffold_not_tradeable_shows_message(self):
+        """When scaffold status is 'not_tradeable_signal', shows no executable candidates message (Requirement 2.5)."""
+        sig = {"signal": "HOLD", "strength": "weak"}
+        scaffold = {"status": "not_tradeable_signal", "reason": "Signal direction is HOLD", "candidates": []}
+        result = compact_signal_for_pm("AAPL", sig, scaffold_result=scaffold)
+        assert "No executable geometry scaffold candidates" in result
+        assert "PM must not trade this signal" in result
+        assert "Signal direction is HOLD" in result
+
+    def test_scaffold_ok_shows_candidates_table(self):
+        """When scaffold status is 'ok', renders candidates table (Requirement 9.1)."""
+        sig = {"signal": "LONG", "strength": "strong", "setup_type": "breakout", "confidence": "high"}
+        scaffold = {
+            "status": "ok",
+            "reason": "",
+            "candidates": [
+                {
+                    "candidate_id": "aapl_long_pullback_to_vwap_1",
+                    "name": "pullback_to_vwap",
+                    "entry_price": 149.50,
+                    "stop_loss": 149.20,
+                    "target": 150.10,
+                    "risk_reward": 2.0,
+                    "trigger": "Price touches VWAP",
+                },
+            ],
+        }
+        result = compact_signal_for_pm("AAPL", sig, scaffold_result=scaffold)
+        assert "Geometry Scaffold Candidates" in result
+        assert "aapl_long_pullback_to_vwap_1" in result
+        assert "pullback_to_vwap" in result
+        assert "149.5" in result
+        assert "2.0" in result
+
+    def test_backward_compatible_without_scaffold(self):
+        """Calling without scaffold_result (old call pattern) still works."""
+        sig = _make_full_signal("AAPL", 0)
+        # Old callers pass (symbol, signal) — scaffold_result defaults to None
+        result = compact_signal_for_pm("AAPL", sig)
+        assert "AAPL" in result
+        assert "LONG" in result
+        # Should show scaffold unavailable message
+        assert "No geometry scaffold available" in result
 
 
 # ===========================================================================

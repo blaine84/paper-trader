@@ -63,91 +63,137 @@ def format_cases_digest_for_pm(cases: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def compact_signal_for_pm(symbol: str, signal: dict) -> str:
+def compact_signal_for_pm(symbol: str, signal: dict, scaffold_result: dict | None = None) -> str:
     """
     Compact analyst signal representation for PM entry prompts.
 
-    Preserves all decision-critical fields: signal direction, strength,
-    setup_type, entry/stop/target levels, confidence, invalidation level,
-    key_levels, symbol_class/setup reclassification metadata,
-    freshness/catalyst warning (if present), and reasoning_summary
-    (first 240 chars of reasoning).
+    Displays only Analyst-owned fields: symbol, direction, strength, setup_type,
+    confidence, current_price, key_levels (support, resistance, VWAP), and
+    invalidation. Omits fields that are missing or null rather than showing
+    placeholders.
 
-    Omits full indicator detail objects and reasoning beyond 240 chars.
+    Does NOT display entry_price, stop_loss, or target fields — those are
+    owned by the geometry scaffold, not the Analyst.
+
+    When scaffold_result is provided, appends formatted scaffold candidates
+    or failure reason via format_scaffold_for_pm().
     """
-    direction = signal.get("signal", "?")
-    strength = signal.get("strength", "?")
-    setup_type = signal.get("setup_type", "?")
-    confidence = signal.get("confidence", "?")
-
-    entry = signal.get("entry", "?")
-    stop = signal.get("stop", "?")
-    target = signal.get("target", "?")
-
-    parts = [
-        f"{symbol}: {direction} ({strength})",
-        f"setup: {setup_type}",
-        f"entry: {entry} / stop: {stop} / target: {target}",
-        f"confidence: {confidence}",
-    ]
-
-    # Invalidation level
-    invalidation = signal.get("invalidation")
-    if invalidation:
-        parts.append(f"invalidation: {invalidation}")
-
-    # Current price and quote-derived key levels (for catalyst specificity gate)
+    # --- Analyst-owned fields only; omit missing/null ---
+    direction = signal.get("signal")
+    strength = signal.get("strength")
+    setup_type = signal.get("setup_type")
+    confidence = signal.get("confidence")
     current_price = signal.get("current_price")
+    invalidation = signal.get("invalidation")
+
+    # Header line always includes symbol and direction (if available)
+    header_parts = [symbol]
+    if direction:
+        if strength:
+            header_parts[0] = f"{symbol}: {direction} ({strength})"
+        else:
+            header_parts[0] = f"{symbol}: {direction}"
+    parts = [header_parts[0]]
+
+    if setup_type:
+        parts.append(f"setup: {setup_type}")
+
+    if confidence:
+        parts.append(f"confidence: {confidence}")
+
     if current_price is not None:
         parts.append(f"current_price: {current_price}")
 
-    # Day high/low and prev_close from structured quote context
-    day_high = signal.get("day_high")
-    day_low = signal.get("day_low")
-    prev_close = signal.get("prev_close")
-    quote_levels = []
-    if day_high is not None:
-        quote_levels.append(f"H:{day_high}")
-    if day_low is not None:
-        quote_levels.append(f"L:{day_low}")
-    if prev_close is not None:
-        quote_levels.append(f"PC:{prev_close}")
-    if quote_levels:
-        parts.append(f"levels: {'/'.join(quote_levels)}")
-
-    # Key levels (analyst-defined support/resistance)
+    # Key levels — extract support, resistance, VWAP from key_levels dict
     key_levels = signal.get("key_levels")
-    if key_levels:
+    if key_levels and isinstance(key_levels, dict):
+        kl_parts = []
+        support = key_levels.get("support")
+        resistance = key_levels.get("resistance")
+        vwap = key_levels.get("vwap") or key_levels.get("VWAP")
+        if support is not None:
+            kl_parts.append(f"support: {support}")
+        if resistance is not None:
+            kl_parts.append(f"resistance: {resistance}")
+        if vwap is not None:
+            kl_parts.append(f"VWAP: {vwap}")
+        if kl_parts:
+            parts.append(f"key_levels: [{', '.join(kl_parts)}]")
+    elif key_levels:
+        # Legacy list or string format
         if isinstance(key_levels, list):
             levels_str = ", ".join(str(lv) for lv in key_levels)
         else:
             levels_str = str(key_levels)
         parts.append(f"key_levels: [{levels_str}]")
 
-    # Symbol class / setup reclassification metadata
-    symbol_class = signal.get("symbol_class")
-    if symbol_class:
-        parts.append(f"symbol_class: {symbol_class}")
+    if invalidation:
+        parts.append(f"invalidation: {invalidation}")
 
-    # Freshness / catalyst warning
-    catalyst_warning = signal.get("catalyst_warning")
-    if catalyst_warning:
-        parts.append(f"⚠ {catalyst_warning}")
+    result = " | ".join(parts)
 
-    freshness_warning = signal.get("freshness_warning")
-    if freshness_warning:
-        parts.append(f"⚠ freshness: {freshness_warning}")
+    # Append scaffold section
+    if scaffold_result is not None:
+        result += "\n" + format_scaffold_for_pm(scaffold_result)
+    else:
+        result += "\n" + "No geometry scaffold available — PM must not trade this signal."
 
-    # Reasoning summary — first 240 chars
-    reasoning = signal.get("reasoning") or ""
-    if reasoning:
-        if len(reasoning) > 240:
-            reasoning_summary = reasoning[:237] + "..."
-        else:
-            reasoning_summary = reasoning
-        parts.append(f"reasoning: {reasoning_summary}")
+    return result
 
-    return " | ".join(parts)
+
+def format_scaffold_for_pm(scaffold_result: dict) -> str:
+    """Format geometry scaffold output for PM prompt injection.
+
+    If status == "ok": renders candidates table with candidate_id, name,
+    entry_price, stop_loss, target, risk_reward, trigger.
+
+    If status != "ok": renders failure message with reason.
+    """
+    status = scaffold_result.get("status", "")
+    reason = scaffold_result.get("reason", "")
+
+    if status == "ok":
+        candidates = scaffold_result.get("candidates", [])
+        if not candidates:
+            return "No geometry scaffold available — PM must not trade this signal."
+
+        lines = ["--- Geometry Scaffold Candidates ---"]
+        header = f"{'ID':<40} {'Name':<25} {'Entry':<10} {'Stop':<10} {'Target':<10} {'R:R':<6} {'Trigger'}"
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        for c in candidates:
+            cid = str(c.get("candidate_id", ""))
+            name = str(c.get("name", ""))
+            entry_price = c.get("entry_price", "")
+            stop_loss = c.get("stop_loss", "")
+            target = c.get("target", "")
+            rr = c.get("risk_reward", "")
+            trigger = str(c.get("trigger", ""))
+            lines.append(
+                f"{cid:<40} {name:<25} {entry_price:<10} {stop_loss:<10} {target:<10} {rr:<6} {trigger}"
+            )
+
+        return "\n".join(lines)
+
+    elif status == "insufficient_data":
+        msg = "No geometry scaffold available — PM must not trade this signal."
+        if reason:
+            msg += f"\nReason: {reason}"
+        return msg
+
+    elif status == "not_tradeable_signal":
+        msg = "No executable geometry scaffold candidates — PM must not trade this signal."
+        if reason:
+            msg += f"\nReason: {reason}"
+        return msg
+
+    else:
+        # Unknown status — fail safe
+        msg = "No geometry scaffold available — PM must not trade this signal."
+        if reason:
+            msg += f"\nReason: {reason}"
+        return msg
 
 
 def compact_daily_log_for_narrator(log: dict) -> str:
