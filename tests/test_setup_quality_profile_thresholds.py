@@ -27,6 +27,7 @@ def _seed_cases(db, setup_type="momentum_fade"):
             setup_type=setup_type,
             outcome=outcome,
             pnl_pct=1.0 if outcome == "success" else -0.5,
+            lesson="test case",
             created_at=now - timedelta(days=idx),
         ))
     db.commit()
