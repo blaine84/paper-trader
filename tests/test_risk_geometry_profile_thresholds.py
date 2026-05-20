@@ -1,3 +1,5 @@
+import pytest
+
 from utils.risk_geometry_gate import evaluate_risk_geometry
 
 
@@ -28,7 +30,7 @@ def test_high_beta_adjusted_rr_is_profile_aware():
     assert "below minimum 1.50" in moderate["reason"]
 
     assert aggressive["decision"] == "adjusted_allowed"
-    assert aggressive["adjusted_rr"] == 1.3
+    assert aggressive["adjusted_rr"] == pytest.approx(1.3)
     assert aggressive["min_reward_to_risk"] == 1.25
 
 
@@ -43,5 +45,5 @@ def test_high_beta_unchanged_rr_is_profile_aware():
     assert "below minimum 1.50" in moderate["reason"]
 
     assert aggressive["decision"] == "passed_unchanged"
-    assert aggressive["original_rr"] == 1.3
+    assert aggressive["original_rr"] == pytest.approx(1.3)
     assert aggressive["min_reward_to_risk"] == 1.25
