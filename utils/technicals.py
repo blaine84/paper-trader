@@ -3,8 +3,27 @@ Technical indicator calculations using the `ta` library.
 Input: candle data dict from FinnhubClient.get_candles()
 """
 
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
 import pandas as pd
 import ta
+
+
+def _candle_session_dates(candles: dict) -> list[str | None]:
+    """Return UTC calendar dates for each candle timestamp, when available."""
+    timestamps = candles.get("timestamps") or candles.get("timestamp") or candles.get("t") or []
+    dates: list[str | None] = []
+    for ts in timestamps:
+        try:
+            if isinstance(ts, (int, float)):
+                dates.append(datetime.fromtimestamp(ts, timezone.utc).date().isoformat())
+            else:
+                dates.append(str(ts)[:10])
+        except Exception:
+            dates.append(None)
+    return dates
 
 
 def compute_indicators(candles: dict) -> dict:
@@ -22,6 +41,10 @@ def compute_indicators(candles: dict) -> dict:
         "close":  candles["close"],
         "volume": candles["volume"],
     })
+
+    session_dates = _candle_session_dates(candles)
+    if len(session_dates) == len(df):
+        df["session_date"] = session_dates
 
     if len(df) < 20:
         return {"error": "Not enough candles for indicators"}
@@ -45,12 +68,22 @@ def compute_indicators(candles: dict) -> dict:
     df["bb_mid"]   = bb.bollinger_mavg()
     df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
 
-    # Volume
-    df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
+    # Volume. VWAP must reset each session; get_candles(days=2) intentionally
+    # includes yesterday for indicator warmup, so a plain 2-day cumulative VWAP
+    # contaminates today's intraday read.
+    if "session_date" in df.columns and df["session_date"].notna().any():
+        pv = df["close"] * df["volume"]
+        grouped_dates = df["session_date"]
+        df["vwap"] = pv.groupby(grouped_dates, dropna=False).cumsum() / df["volume"].groupby(grouped_dates, dropna=False).cumsum()
+    else:
+        df["vwap"] = (df["close"] * df["volume"]).cumsum() / df["volume"].cumsum()
 
     last = df.iloc[-1]
+    latest_date = last.get("session_date") if "session_date" in df.columns else None
+    today_df = df[df["session_date"] == latest_date] if latest_date else df
+    prior_df = df[df["session_date"] != latest_date] if latest_date else df.iloc[0:0]
 
-    return {
+    result = {
         "price":       round(last["close"], 2),
         "ema9":        round(last["ema9"], 2),
         "ema21":       round(last["ema21"], 2),
@@ -67,3 +100,19 @@ def compute_indicators(candles: dict) -> dict:
         "trend":       "bullish" if last["ema9"] > last["ema21"] else "bearish",
         "macd_cross":  "bullish" if last["macd_diff"] > 0 else "bearish",
     }
+
+    if latest_date and not today_df.empty:
+        result.update({
+            "session_date": latest_date,
+            "session_open": round(float(today_df.iloc[0]["open"]), 2),
+            "session_high": round(float(today_df["high"].max()), 2),
+            "session_low": round(float(today_df["low"].min()), 2),
+        })
+    if not prior_df.empty:
+        result.update({
+            "prior_session_high": round(float(prior_df["high"].max()), 2),
+            "prior_session_low": round(float(prior_df["low"].min()), 2),
+            "prior_session_close": round(float(prior_df.iloc[-1]["close"]), 2),
+        })
+
+    return result

@@ -231,12 +231,64 @@ def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> 
     return signal
 
 
+def _session_levels_from_candles(candles: dict) -> dict:
+    """Derive current/prior session levels from candle timestamps.
+
+    get_candles(days=2) returns yesterday + today for indicator warmup. The
+    analyst/PM need explicit session boundaries so today's day_high/day_low are
+    not confused with prior session levels.
+    """
+    if not candles or not candles.get("close"):
+        return {}
+
+    timestamps = candles.get("timestamps") or candles.get("timestamp") or candles.get("t") or []
+    if not timestamps or len(timestamps) != len(candles.get("close", [])):
+        return {}
+
+    from datetime import datetime, timezone as _timezone
+
+    dates = []
+    for ts in timestamps:
+        try:
+            if isinstance(ts, (int, float)):
+                dates.append(datetime.fromtimestamp(ts, _timezone.utc).date().isoformat())
+            else:
+                dates.append(str(ts)[:10])
+        except Exception:
+            dates.append(None)
+
+    valid_dates = [d for d in dates if d]
+    if not valid_dates:
+        return {}
+
+    current_session = valid_dates[-1]
+    current_idx = [i for i, d in enumerate(dates) if d == current_session]
+    prior_idx = [i for i, d in enumerate(dates) if d and d != current_session]
+    levels = {"session_date": current_session}
+
+    if current_idx:
+        levels.update({
+            "day_open": candles["open"][current_idx[0]],
+            "day_high": max(candles["high"][i] for i in current_idx),
+            "day_low": min(candles["low"][i] for i in current_idx),
+        })
+    if prior_idx:
+        levels.update({
+            "prior_day_high": max(candles["high"][i] for i in prior_idx),
+            "prior_day_low": min(candles["low"][i] for i in prior_idx),
+            "prior_day_close": candles["close"][prior_idx[-1]],
+        })
+
+    return levels
+
+
 def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -> dict:
     """
     Inject structured quote fields into the analyst signal for downstream gates.
 
-    Persists: current_price, quote_timestamp, day_open, day_high, day_low,
-    prev_close, change_pct, and relative_volume (when computable).
+    Persists: current_price, quote_timestamp, session_date, day_open, day_high,
+    day_low, prior_day_high, prior_day_low, prev_close, change_pct, and
+    relative_volume (when computable).
 
     These fields are required by the Catalyst Specificity Gate's confirmation
     scoring to have discrimination power.
@@ -249,15 +301,36 @@ def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -
     Returns:
         The enriched signal dict (same reference as input).
     """
-    # Persist structured quote fields
+    session_levels = _session_levels_from_candles(candles)
+
+    # Persist structured quote fields. Prefer candle-derived session levels for
+    # day_open/day_high/day_low because quote APIs can be ambiguous around
+    # premarket/regular-session boundaries.
     if quote:
         signal["current_price"] = quote.get("price")
         signal["quote_timestamp"] = quote.get("timestamp")
-        signal["day_open"] = quote.get("open")
-        signal["day_high"] = quote.get("high")
-        signal["day_low"] = quote.get("low")
+        signal["day_open"] = session_levels.get("day_open", quote.get("open"))
+        signal["day_high"] = session_levels.get("day_high", quote.get("high"))
+        signal["day_low"] = session_levels.get("day_low", quote.get("low"))
         signal["prev_close"] = quote.get("prev_close")
         signal["change_pct"] = quote.get("change_pct")
+
+    for key in ("session_date", "prior_day_high", "prior_day_low", "prior_day_close"):
+        if key in session_levels:
+            signal[key] = session_levels[key]
+
+    # Keep key_levels honest too; the LLM often maps quote day high/low into
+    # prior_high/prior_low unless we overwrite with deterministic candle levels.
+    key_levels = signal.get("key_levels")
+    if isinstance(key_levels, dict):
+        if "prior_day_high" in session_levels:
+            key_levels["prior_high"] = session_levels["prior_day_high"]
+        if "prior_day_low" in session_levels:
+            key_levels["prior_low"] = session_levels["prior_day_low"]
+        if "day_high" in session_levels:
+            key_levels["day_high"] = session_levels["day_high"]
+        if "day_low" in session_levels:
+            key_levels["day_low"] = session_levels["day_low"]
 
     # Compute relative_volume from candle data if available.
     # relative_volume = current period volume / average volume over lookback.
