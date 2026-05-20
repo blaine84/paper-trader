@@ -88,9 +88,10 @@ class TestEnrichSignalWithQuoteContext:
 
         assert result["current_price"] == 155.42
         assert result["quote_timestamp"] == "2025-01-15T14:30:00"
-        assert result["day_open"] == 152.10
-        assert result["day_high"] == 156.80
-        assert result["day_low"] == 151.50
+        # Candle-derived session levels are preferred when available.
+        assert result["day_open"] == 150.0
+        assert result["day_high"] == 155.0
+        assert result["day_low"] == 149.0
         assert result["prev_close"] == 151.00
         assert result["change_pct"] == 2.93
 
@@ -336,9 +337,10 @@ def test_integration_signal_persisted_with_quote_fields(
     signal = result["AMD"]
     assert signal["current_price"] == 155.42
     assert signal["quote_timestamp"] == "2025-01-15T14:30:00"
-    assert signal["day_open"] == 152.10
-    assert signal["day_high"] == 156.80
-    assert signal["day_low"] == 151.50
+    # Candle-derived session levels are preferred when available.
+    assert signal["day_open"] == 150.0
+    assert signal["day_high"] == 155.0
+    assert signal["day_low"] == 149.0
     assert signal["prev_close"] == 151.00
     assert signal["change_pct"] == 2.93
     assert signal["relative_volume"] >= 1.9
@@ -354,9 +356,9 @@ def test_integration_signal_persisted_with_quote_fields(
     stored = json.loads(mem.value)
     assert stored["current_price"] == 155.42
     assert stored["quote_timestamp"] == "2025-01-15T14:30:00"
-    assert stored["day_open"] == 152.10
-    assert stored["day_high"] == 156.80
-    assert stored["day_low"] == 151.50
+    assert stored["day_open"] == 150.0
+    assert stored["day_high"] == 155.0
+    assert stored["day_low"] == 149.0
     assert stored["prev_close"] == 151.00
     assert stored["change_pct"] == 2.93
     assert stored["relative_volume"] >= 1.9
