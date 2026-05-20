@@ -72,6 +72,20 @@ def _resolve_rule(symbol: str, setup_type: str | None) -> tuple[dict, str, str]:
     return DEFAULT_STOP_DISTANCE_RULE, "default", "default"
 
 
+def _min_reward_to_risk(rule: dict, profile: str | None) -> float:
+    """Resolve risk-geometry R:R floor, allowing profile-specific overrides.
+
+    The gate's job is to enforce executable geometry, not to flatten every PM
+    personality into the same threshold. Unknown profiles fall back to the
+    rule's legacy min_reward_to_risk value.
+    """
+    by_profile = rule.get("min_reward_to_risk_by_profile") or {}
+    profile_key = profile.lower() if isinstance(profile, str) else None
+    if profile_key and profile_key in by_profile:
+        return float(by_profile[profile_key])
+    return float(rule.get("min_reward_to_risk", 2.0))
+
+
 def _compute_min_stop_distance(
     entry_price: float,
     rule: dict,
@@ -481,7 +495,7 @@ def _evaluate_risk_geometry_inner(
         original_dollar_risk = quantity * stop_distance
 
         # Validate R:R
-        min_rr = rule.get("min_reward_to_risk", 2.0)
+        min_rr = _min_reward_to_risk(rule, profile)
         if original_rr < min_rr:
             return _build_rejection(
                 reason=f"Reward-to-risk ratio {original_rr:.2f} below minimum {min_rr:.2f}",
@@ -562,6 +576,7 @@ def _evaluate_risk_geometry_inner(
             "rule_name": rule_name,
             "rule_source": rule_source,
             "quantity_policy": quantity_policy,
+            "min_reward_to_risk": min_rr,
         }
         _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
         return result
@@ -658,7 +673,7 @@ def _evaluate_risk_geometry_inner(
             )
 
         # Validate: adjusted R:R
-        min_rr = rule.get("min_reward_to_risk", 2.0)
+        min_rr = _min_reward_to_risk(rule, profile)
         if adjusted_rr < min_rr:
             return _build_rejection(
                 reason=f"Adjusted R:R {adjusted_rr:.2f} below minimum {min_rr:.2f} after stop adjustment",
@@ -715,6 +730,7 @@ def _evaluate_risk_geometry_inner(
             "rule_name": rule_name,
             "rule_source": rule_source,
             "quantity_policy": quantity_policy,
+            "min_reward_to_risk": min_rr,
         }
         _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
         return result

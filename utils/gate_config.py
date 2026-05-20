@@ -59,6 +59,11 @@ STOP_DISTANCE_RULES: dict[str, dict] = {
         "min_pct": 0.015,
         "atr_multiplier": 1.5,
         "min_reward_to_risk": 2.0,
+        "min_reward_to_risk_by_profile": {
+            "conservative": 2.0,
+            "moderate": 1.5,
+            "aggressive": 1.25,
+        },
         "allow_pct_only_fallback": True,
         "atr_max_age_minutes": 15,
     },
@@ -66,6 +71,11 @@ STOP_DISTANCE_RULES: dict[str, dict] = {
         "min_pct": 0.008,
         "atr_multiplier": 1.2,
         "min_reward_to_risk": 1.8,
+        "min_reward_to_risk_by_profile": {
+            "conservative": 1.8,
+            "moderate": 1.5,
+            "aggressive": 1.25,
+        },
         "allow_pct_only_fallback": True,
         "atr_max_age_minutes": 15,
     },
@@ -73,6 +83,11 @@ STOP_DISTANCE_RULES: dict[str, dict] = {
         "min_pct": 0.025,
         "atr_multiplier": 2.0,
         "min_reward_to_risk": 2.5,
+        "min_reward_to_risk_by_profile": {
+            "conservative": 2.5,
+            "moderate": 2.0,
+            "aggressive": 1.5,
+        },
         "allow_pct_only_fallback": False,
         "atr_max_age_minutes": 10,
     },
@@ -82,6 +97,11 @@ DEFAULT_STOP_DISTANCE_RULE: dict = {
     "min_pct": 0.012,
     "atr_multiplier": 1.3,
     "min_reward_to_risk": 2.0,
+    "min_reward_to_risk_by_profile": {
+        "conservative": 2.0,
+        "moderate": 1.5,
+        "aggressive": 1.25,
+    },
     "allow_pct_only_fallback": True,
     "atr_max_age_minutes": 15,
 }
