@@ -19,6 +19,37 @@ MIN_WIN_RATE_BY_SETUP: dict[str, float] = {
 }
 DEFAULT_MIN_WIN_RATE: float = 0.40
 
+# Profile-aware setup quality floors. The base setup thresholds remain the
+# conservative default; moderate/aggressive can take more experimental flow
+# without letting truly broken setups run unchecked.
+MIN_WIN_RATE_BY_SETUP_PROFILE: dict[str, dict[str, float]] = {
+    "momentum_fade": {
+        "conservative": 0.35,
+        "moderate": 0.30,
+        "aggressive": 0.20,
+    },
+    "news_breakout": {
+        "conservative": 0.40,
+        "moderate": 0.35,
+        "aggressive": 0.25,
+    },
+    "gap_and_go": {
+        "conservative": 0.45,
+        "moderate": 0.40,
+        "aggressive": 0.30,
+    },
+    "technical_breakout": {
+        "conservative": 0.40,
+        "moderate": 0.35,
+        "aggressive": 0.25,
+    },
+}
+DEFAULT_MIN_WIN_RATE_BY_PROFILE: dict[str, float] = {
+    "conservative": DEFAULT_MIN_WIN_RATE,
+    "moderate": 0.35,
+    "aggressive": 0.25,
+}
+
 ROLLING_WINDOW: int = 5
 MIN_CASES_FOR_BLOCK: int = 5
 MIN_ROLLING_CASES: int = 3

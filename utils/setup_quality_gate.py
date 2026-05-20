@@ -26,10 +26,12 @@ from db.schema import get_session
 from utils.gate_config import (
     CONSECUTIVE_LOSS_PAUSE_THRESHOLD,
     DEFAULT_MIN_WIN_RATE,
+    DEFAULT_MIN_WIN_RATE_BY_PROFILE,
     GATE_EVENT_TYPES,
     MIN_CASES_FOR_BLOCK,
     MIN_ROLLING_CASES,
     MIN_WIN_RATE_BY_SETUP,
+    MIN_WIN_RATE_BY_SETUP_PROFILE,
     RECOVERY_MIN_ROLLING_CASES,
     RECOVERY_WIN_RATE_MARGIN,
     REQUIRE_POSITIVE_ROLLING_AVG_PNL_FOR_RECOVERY,
@@ -95,6 +97,17 @@ def _check_consecutive_losses(cases: list[Any], threshold: int) -> bool:
     if len(cases) < threshold:
         return False
     return all(c.outcome != "success" for c in cases[:threshold])
+
+
+def _resolve_threshold(setup_type: str, profile: str | None) -> float:
+    """Resolve setup-quality win-rate floor with profile-aware overrides."""
+    profile_key = profile.lower() if isinstance(profile, str) else None
+    setup_profile_thresholds = MIN_WIN_RATE_BY_SETUP_PROFILE.get(setup_type, {})
+    if profile_key and profile_key in setup_profile_thresholds:
+        return float(setup_profile_thresholds[profile_key])
+    if profile_key and profile_key in DEFAULT_MIN_WIN_RATE_BY_PROFILE:
+        return float(DEFAULT_MIN_WIN_RATE_BY_PROFILE[profile_key])
+    return float(MIN_WIN_RATE_BY_SETUP.get(setup_type, DEFAULT_MIN_WIN_RATE))
 
 
 def _check_recovery_override(
@@ -229,7 +242,7 @@ def evaluate_setup_quality(
     Side effects:
         Logs exactly one TradeEvent to the provided *db* session.
     """
-    threshold = MIN_WIN_RATE_BY_SETUP.get(setup_type, DEFAULT_MIN_WIN_RATE)
+    threshold = _resolve_threshold(setup_type, profile)
 
     # Fetch case history --------------------------------------------------
     cases = _get_cases_for_setup(engine, setup_type)
