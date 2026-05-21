@@ -103,6 +103,10 @@ def test_pm_filter_summary_explains_all_hold_batch_and_sanity_conflicts():
                 "score": 4,
                 "reasons": ["price_above_vwap_0.40%"],
             },
+            "llm_veto_required": True,
+            "llm_veto_present": False,
+            "llm_veto_missing": True,
+            "llm_veto_reason": "MISSING_LLM_VETO_REASON: Analyst output HOLD despite deterministic LONG sanity.",
         },
         "QQQ": {
             "signal": "HOLD",
@@ -122,7 +126,11 @@ def test_pm_filter_summary_explains_all_hold_batch_and_sanity_conflicts():
     assert summary["confidence_counts"] == {"low": 2}
     assert summary["setup_counts"] == {"trend_pullback": 1, "momentum_fade": 1}
     assert summary["sanity_conflicts"][0]["symbol"] == "SPY"
+    assert summary["veto_required"] == 1
+    assert summary["veto_missing"] == 1
+    assert summary["sanity_conflicts"][0]["veto_missing"] is True
     assert "eligible=0" in text
+    assert "veto_missing=1" in text
     assert "sanity_conflicts" in text
 
 

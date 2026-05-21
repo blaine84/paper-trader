@@ -2147,6 +2147,9 @@ def summarize_entry_signal_filter(
         "confidence_counts": {},
         "setup_counts": {},
         "sanity_conflicts": [],
+        "veto_required": 0,
+        "veto_present": 0,
+        "veto_missing": 0,
         "min_signal_strength": min_signal_strength,
     }
 
@@ -2166,12 +2169,23 @@ def summarize_entry_signal_filter(
         totals["setup_counts"][setup_type] = totals["setup_counts"].get(setup_type, 0) + 1
 
         sanity = sig.get("deterministic_sanity")
+        if sig.get("llm_veto_required"):
+            totals["veto_required"] += 1
+        if sig.get("llm_veto_present"):
+            totals["veto_present"] += 1
+        if sig.get("llm_veto_missing"):
+            totals["veto_missing"] += 1
+
         if isinstance(sanity, dict) and sanity.get("conflict"):
             totals["sanity_conflicts"].append({
                 "symbol": sym,
                 "llm_signal": sanity.get("llm_signal"),
                 "deterministic_bias": sanity.get("bias"),
                 "score": sanity.get("score"),
+                "veto_required": bool(sig.get("llm_veto_required")),
+                "veto_present": bool(sig.get("llm_veto_present")),
+                "veto_missing": bool(sig.get("llm_veto_missing")),
+                "veto_reason": str(sig.get("llm_veto_reason") or "")[:160],
                 "reasons": sanity.get("reasons", [])[:6],
             })
 
@@ -2198,6 +2212,9 @@ def format_entry_signal_filter_summary(summary: dict) -> str:
         f"strengths={summary.get('strength_counts', {})}",
         f"confidences={summary.get('confidence_counts', {})}",
         f"setups={summary.get('setup_counts', {})}",
+        f"veto_required={summary.get('veto_required', 0)}",
+        f"veto_present={summary.get('veto_present', 0)}",
+        f"veto_missing={summary.get('veto_missing', 0)}",
     ]
     conflicts = summary.get("sanity_conflicts") or []
     if conflicts:
