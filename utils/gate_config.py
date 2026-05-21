@@ -97,6 +97,21 @@ STOP_DISTANCE_RULES: dict[str, dict] = {
         },
         "allow_pct_only_fallback": True,
         "atr_max_age_minutes": 15,
+        "tactical_stop_by_profile": {
+            "aggressive": {
+                "enabled": True,
+                "qualifying_setups": [
+                    "support_bounce",
+                    "vwap_pullback",
+                    "pullback_continuation",
+                ],
+                "conditional_setups": ["news_breakout"],
+                "tactical_context_indicators": ["support", "bounce", "vwap", "pullback"],
+                "min_pct": 0.002,
+                "atr_multiplier": 1.0,
+                "min_reward_to_risk": 1.25,
+            }
+        },
     },
     "etf_intraday": {
         "min_pct": 0.008,

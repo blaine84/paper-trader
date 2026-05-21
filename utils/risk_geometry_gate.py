@@ -9,6 +9,7 @@ See: .kiro/specs/risk-geometry-gate/design.md
 
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
 
 from utils.gate_config import (
@@ -135,6 +136,21 @@ def _compute_min_stop_distance(
             return None, True
 
 
+def _compute_tactical_min_stop(
+    entry_price: float,
+    atr_5min: float,
+    min_pct: float,
+    atr_multiplier: float,
+) -> float:
+    """Compute tactical minimum stop distance.
+
+    Returns max(entry_price * min_pct, atr_5min * atr_multiplier)
+    """
+    pct_floor = entry_price * min_pct
+    atr_floor = atr_5min * atr_multiplier
+    return max(pct_floor, atr_floor)
+
+
 def _apply_quantity_policy(
     raw_quantity: float,
     policy: str,
@@ -156,6 +172,198 @@ def _apply_quantity_policy(
         # fractional: truncate to given decimal precision
         factor = 10 ** precision
         return math.floor(raw_quantity * factor) / factor
+
+
+def _has_tactical_context(
+    indicators: list[str],
+    metadata: str | None,
+    rationale: str | None,
+) -> bool:
+    """Case-insensitive word-boundary match for tactical context indicators.
+
+    Uses \\b word boundaries to prevent false positives (e.g., "support" must not
+    match "unsupported"). Returns True if any indicator is found as a whole word
+    in metadata or rationale.
+    """
+    combined = ""
+    if metadata:
+        combined += metadata.lower()
+    if rationale:
+        combined += " " + rationale.lower()
+    if not combined.strip():
+        return False
+    return any(
+        re.search(r"\b" + re.escape(ind.lower()) + r"\b", combined)
+        for ind in indicators
+    )
+
+
+def _evaluate_tactical_stop_exception(
+    *,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    quantity: int | float,
+    direction: str,
+    symbol: str,
+    setup_type: str | None,
+    atr_5min: float | None,
+    atr_timestamp: datetime | None,
+    trade_timestamp: datetime | None,
+    max_dollar_risk: float,
+    profile: str | None,
+    rule: dict,
+    rule_name: str,
+    trade_metadata: str | None,
+    trade_rationale: str | None,
+    atr_source: str | None,
+    rule_source: str | None,
+    quantity_policy: str,
+) -> dict | None:
+    """Evaluate tactical stop exception for high-beta aggressive trades.
+
+    Returns:
+        - Result dict with decision="passed_unchanged" + tactical metadata if
+          exception applies and passes all validation.
+        - None if exception does not apply or tactical validation fails
+          (caller should continue to global path).
+
+    Error handling:
+        Wraps entire body in try/except. Any unexpected exception is logged as
+        a warning and returns None (fail-closed fallback to global path).
+    """
+    try:
+        # --- Normalize inputs ---
+        profile_key = profile.lower() if isinstance(profile, str) else None
+        setup_key = setup_type.lower() if isinstance(setup_type, str) else None
+
+        # --- Check profile exists in tactical config ---
+        tactical_config = rule.get("tactical_stop_by_profile")
+        if not tactical_config or not isinstance(tactical_config, dict):
+            return None
+
+        if profile_key is None or profile_key not in tactical_config:
+            return None
+
+        profile_cfg = tactical_config[profile_key]
+
+        # --- Check enabled flag ---
+        if not profile_cfg.get("enabled", False):
+            return None
+
+        # --- Validate all required fields present ---
+        required_fields = [
+            "enabled",
+            "qualifying_setups",
+            "conditional_setups",
+            "tactical_context_indicators",
+            "min_pct",
+            "atr_multiplier",
+            "min_reward_to_risk",
+        ]
+        for field in required_fields:
+            if field not in profile_cfg:
+                return None
+
+        # --- Check setup eligibility ---
+        if setup_key is None:
+            return None
+
+        qualifying_setups = [s.lower() for s in profile_cfg["qualifying_setups"]]
+        conditional_setups = [s.lower() for s in profile_cfg["conditional_setups"]]
+
+        if setup_key in qualifying_setups:
+            # Unconditional qualification
+            pass
+        elif setup_key in conditional_setups:
+            # Conditional: requires tactical context indicator match
+            indicators = profile_cfg["tactical_context_indicators"]
+            if not _has_tactical_context(indicators, trade_metadata, trade_rationale):
+                return None
+        else:
+            # Not in either list
+            return None
+
+        # --- Validate ATR freshness ---
+        if atr_5min is None or atr_5min <= 0:
+            return None
+        if atr_timestamp is None:
+            return None
+
+        effective_trade_ts = trade_timestamp if trade_timestamp is not None else datetime.now(timezone.utc)
+        atr_max_age_minutes = rule.get("atr_max_age_minutes", 15)
+        atr_age = effective_trade_ts - atr_timestamp
+        if atr_age > timedelta(minutes=atr_max_age_minutes):
+            return None
+
+        # --- Compute tactical minimum stop ---
+        tactical_min_stop = _compute_tactical_min_stop(
+            entry_price=entry_price,
+            atr_5min=atr_5min,
+            min_pct=profile_cfg["min_pct"],
+            atr_multiplier=profile_cfg["atr_multiplier"],
+        )
+
+        # --- Compute stop and target distances ---
+        stop_distance = abs(entry_price - stop_price)
+        target_distance = abs(target_price - entry_price)
+
+        # --- Validate stop_distance >= tactical_min_stop ---
+        if stop_distance < tactical_min_stop:
+            return None
+
+        # --- Validate original R:R ---
+        original_rr = target_distance / stop_distance if stop_distance > 0 else 0.0
+        min_rr = profile_cfg["min_reward_to_risk"]
+        if original_rr < min_rr:
+            return None
+
+        # --- Validate dollar risk ---
+        dollar_risk = quantity * stop_distance
+        if dollar_risk > max_dollar_risk:
+            return None
+
+        # --- All checks passed: return tactical pass result ---
+        return {
+            "decision": "passed_unchanged",
+            "reason": "Trade geometry validated \u2014 aggressive tactical stop accepted",
+            "reason_code": "PASSED_TACTICAL",
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "quantity": quantity,
+            "stop_distance": stop_distance,
+            "target_distance": target_distance,
+            "min_stop_distance": tactical_min_stop,
+            "adjusted_stop_price": None,
+            "adjusted_quantity": None,
+            "original_dollar_risk": dollar_risk,
+            "adjusted_dollar_risk": None,
+            "original_rr": original_rr,
+            "adjusted_rr": None,
+            "atr_value": atr_5min,
+            "atr_source": atr_source,
+            "atr_timestamp": atr_timestamp,
+            "atr_fallback": False,
+            "rule_name": rule_name,
+            "rule_source": rule_source,
+            "quantity_policy": quantity_policy,
+            "min_reward_to_risk": min_rr,
+            "tactical_stop_applied": True,
+            "tactical_min_stop_distance": tactical_min_stop,
+        }
+
+    except Exception as exc:
+        log.warning(
+            "Tactical stop exception evaluation failed (fail-closed): %s "
+            "[symbol=%s, profile=%s, setup_type=%s, entry_price=%s]",
+            exc,
+            symbol,
+            profile,
+            setup_type,
+            entry_price,
+        )
+        return None
 
 
 def _reconstruct_trade(
@@ -226,6 +434,8 @@ def evaluate_risk_geometry(
     db=None,
     profile: str | None = None,
     agent: str = "portfolio_manager",
+    trade_metadata: str | None = None,
+    trade_rationale: str | None = None,
 ) -> dict:
     """Evaluate trade geometry and return gate decision.
 
@@ -260,6 +470,8 @@ def evaluate_risk_geometry(
             db=db,
             profile=profile,
             agent=agent,
+            trade_metadata=trade_metadata,
+            trade_rationale=trade_rationale,
         )
     except Exception as exc:
         log.error("RiskGeometryGate unexpected error (fail-open): %s", exc)
@@ -332,6 +544,8 @@ def _evaluate_risk_geometry_inner(
     db,
     profile: str | None,
     agent: str,
+    trade_metadata: str | None = None,
+    trade_rationale: str | None = None,
 ) -> dict:
     """Core evaluation logic (may raise on truly unexpected errors)."""
 
@@ -448,6 +662,33 @@ def _evaluate_risk_geometry_inner(
             profile=profile,
             agent=agent,
         )
+
+    # Step 4.5: Tactical stop exception check (high-beta aggressive only)
+    if rule_name == "high_beta_mega_cap_intraday":
+        tactical_result = _evaluate_tactical_stop_exception(
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            quantity=quantity,
+            direction=norm_direction,
+            symbol=symbol,
+            setup_type=setup_type,
+            atr_5min=atr_5min,
+            atr_timestamp=atr_timestamp,
+            trade_timestamp=trade_timestamp,
+            max_dollar_risk=max_dollar_risk,
+            profile=profile,
+            rule=rule,
+            rule_name=rule_name,
+            trade_metadata=trade_metadata,
+            trade_rationale=trade_rationale,
+            atr_source=atr_source,
+            rule_source=rule_source,
+            quantity_policy=quantity_policy,
+        )
+        if tactical_result is not None:
+            _log_gate_event(tactical_result, symbol=symbol, db=db, profile=profile, agent=agent)
+            return tactical_result
 
     # Step 5: Compute min stop distance
     min_stop_result = _compute_min_stop_distance(
