@@ -1,4 +1,8 @@
-from agents.analyst import compute_deterministic_signal_sanity
+from agents.analyst import (
+    build_deterministic_sanity_prompt_context,
+    compute_deterministic_signal_sanity,
+    enforce_veto_accountability,
+)
 from agents.portfolio_manager import (
     format_entry_signal_filter_summary,
     summarize_entry_signal_filter,
@@ -32,6 +36,57 @@ def test_deterministic_sanity_does_not_flag_ambiguous_hold():
 
     assert sanity["bias"] == "HOLD"
     assert sanity["conflict"] is False
+
+
+def test_enforce_veto_accountability_marks_missing_veto_reason():
+    signal = {
+        "signal": "HOLD",
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "SHORT",
+            "score": -4,
+            "reasons": ["price_below_vwap_-0.50%"],
+        },
+    }
+
+    enforced = enforce_veto_accountability(signal)
+
+    assert enforced["llm_veto_required"] is True
+    assert enforced["llm_veto_present"] is False
+    assert enforced["llm_veto_missing"] is True
+    assert "MISSING_LLM_VETO_REASON" in enforced["llm_veto_reason"]
+
+
+def test_enforce_veto_accountability_accepts_concrete_veto_reason():
+    signal = {
+        "signal": "HOLD",
+        "llm_veto_reason": "VWAP break is occurring on thin relative volume and directly into prior-day support.",
+        "veto_evidence": ["relative_volume=0.42", "prior_day_support=nearby"],
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "SHORT",
+            "score": -4,
+        },
+    }
+
+    enforced = enforce_veto_accountability(signal)
+
+    assert enforced["llm_veto_required"] is True
+    assert enforced["llm_veto_present"] is True
+    assert enforced["llm_veto_missing"] is False
+
+
+def test_deterministic_sanity_prompt_context_demands_veto_for_directional_precheck():
+    text = build_deterministic_sanity_prompt_context({
+        "bias": "SHORT",
+        "score": -5,
+        "reasons": ["price_below_vwap_-0.60%"],
+    })
+
+    assert "Deterministic sanity favors SHORT" in text
+    assert "llm_veto_reason" in text
 
 
 def test_pm_filter_summary_explains_all_hold_batch_and_sanity_conflicts():

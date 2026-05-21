@@ -75,12 +75,20 @@ Respond in JSON:
     "ema_trend": "bullish|bearish|neutral",
     "above_vwap": true,
     "bb_position": "upper|middle|lower|outside_upper|outside_lower"
-  }
+  },
+  "llm_veto_reason": "required when you output HOLD while deterministic sanity favors LONG/SHORT; otherwise null",
+  "veto_evidence": ["specific evidence that overrules the deterministic directional read"]
 }
 
 gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
 
 HOLD is a valid and useful signal. Output it whenever the setup is ambiguous or low quality.
+
+VETO ACCOUNTABILITY:
+- If the DETERMINISTIC TECHNICAL SANITY CHECK below says bias=LONG or bias=SHORT and you still output HOLD, you MUST fill llm_veto_reason with the specific disqualifying evidence.
+- Acceptable veto reasons include: stale/missing catalyst for a catalyst-dependent setup, conflicting key levels, thin/invalid volume, overextension/chop, invalid symbol/setup mapping, or explicit reviewer mitigation.
+- Do not use vague vetoes like "risk-off", "uncertain market", or "mixed indicators" unless you name the exact conflicting indicators/levels.
+- If no concrete veto exists, output the deterministic direction as the signal with appropriate weak/moderate strength; PM decides whether to trade.
 
 STRICT OUTPUT CONTRACT:
 - Return exactly the analyst signal object above.
@@ -337,6 +345,59 @@ def _safe_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def build_deterministic_sanity_prompt_context(precheck: dict) -> str:
+    """Format deterministic sanity for the Analyst prompt."""
+    if not isinstance(precheck, dict):
+        return "No deterministic sanity check available."
+    bias = precheck.get("bias", "HOLD")
+    score = precheck.get("score", 0)
+    reasons = precheck.get("reasons", [])
+    if bias in {"LONG", "SHORT"}:
+        instruction = (
+            f"Deterministic sanity favors {bias} (score={score}). "
+            "If you output HOLD, populate llm_veto_reason with concrete disqualifying evidence."
+        )
+    else:
+        instruction = "Deterministic sanity is neutral; HOLD is acceptable when the setup is ambiguous."
+    return json.dumps({
+        "bias": bias,
+        "score": score,
+        "reasons": reasons,
+        "instruction": instruction,
+    }, indent=2)
+
+
+def enforce_veto_accountability(signal: dict) -> dict:
+    """Require a structured veto when LLM HOLD conflicts with deterministic sanity."""
+    sanity = signal.get("deterministic_sanity")
+    if not isinstance(sanity, dict) or not sanity.get("conflict"):
+        signal.setdefault("llm_veto_required", False)
+        return signal
+
+    llm_signal = str(sanity.get("llm_signal") or signal.get("signal") or "").upper()
+    deterministic_bias = sanity.get("bias")
+    veto_text = str(signal.get("llm_veto_reason") or "").strip()
+    veto_evidence = signal.get("veto_evidence")
+
+    if llm_signal == "HOLD" and deterministic_bias in {"LONG", "SHORT"}:
+        signal["llm_veto_required"] = True
+        signal["llm_veto_present"] = bool(veto_text)
+        if not isinstance(veto_evidence, list):
+            signal["veto_evidence"] = [] if veto_evidence in (None, "") else [str(veto_evidence)]
+        if not veto_text:
+            signal["llm_veto_reason"] = (
+                "MISSING_LLM_VETO_REASON: Analyst output HOLD despite deterministic "
+                f"{deterministic_bias} sanity score={sanity.get('score')} without concrete veto evidence."
+            )
+            signal["llm_veto_missing"] = True
+        else:
+            signal["llm_veto_missing"] = False
+    else:
+        signal.setdefault("llm_veto_required", False)
+
+    return signal
 
 
 def compute_deterministic_signal_sanity(signal: dict, quote: dict, indicators: dict) -> dict:
@@ -629,6 +690,15 @@ CATALYST FRESHNESS:
             if breaking_alerts:
                 freshness_context += f"\nBREAKING NEWS ALERTS:\n{json.dumps(breaking_alerts, indent=2)}\n"
 
+            precheck_signal = {"signal": "HOLD"}
+            enrich_signal_with_quote_context(precheck_signal, quote, candles)
+            deterministic_precheck = compute_deterministic_signal_sanity(
+                precheck_signal, quote, indicators
+            )
+            deterministic_precheck_context = build_deterministic_sanity_prompt_context(
+                deterministic_precheck
+            )
+
             user_prompt = f"""
 Symbol: {sym}
 Time: {datetime.now(dt_tz.utc).strftime('%Y-%m-%d %H:%M UTC')}
@@ -647,6 +717,9 @@ CURRENT QUOTE:
 
 TECHNICAL INDICATORS:
 {json.dumps(indicators, indent=2)}
+
+DETERMINISTIC TECHNICAL SANITY CHECK:
+{deterministic_precheck_context}
 
 RESEARCH SENTIMENT:
 {json.dumps(sentiment, indent=2)}
@@ -679,13 +752,16 @@ Produce your trading signal JSON for {sym}.
             signal["deterministic_sanity"] = compute_deterministic_signal_sanity(
                 signal, quote, indicators
             )
+            signal = enforce_veto_accountability(signal)
             if signal["deterministic_sanity"].get("conflict"):
                 log.warning(
-                    "Analyst sanity conflict for %s: llm=%s deterministic=%s score=%s reasons=%s",
+                    "Analyst sanity conflict for %s: llm=%s deterministic=%s score=%s veto_required=%s veto_present=%s reasons=%s",
                     sym,
                     signal["deterministic_sanity"].get("llm_signal"),
                     signal["deterministic_sanity"].get("bias"),
                     signal["deterministic_sanity"].get("score"),
+                    signal.get("llm_veto_required"),
+                    signal.get("llm_veto_present"),
                     signal["deterministic_sanity"].get("reasons"),
                 )
 
