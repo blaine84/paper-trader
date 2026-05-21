@@ -221,6 +221,37 @@ def sanitize_analyst_session_levels(signal: dict, quote: dict, max_distance_pct:
     return signal
 
 
+def validate_candle_indicator_alignment(
+    symbol: str,
+    quote: dict,
+    candles: dict,
+    indicators: dict,
+    max_close_distance_pct: float = 5.0,
+    max_vwap_distance_pct: float = 20.0,
+) -> None:
+    """Reject cross-symbol/stale candle contamination before prompting Analyst."""
+    current = _current_price_from_quote(quote)
+    closes = candles.get("close") if isinstance(candles, dict) else None
+    if current and closes:
+        last_close = _safe_float(closes[-1])
+        if last_close is not None and last_close > 0:
+            dist_pct = abs((current - last_close) / current) * 100
+            if dist_pct > max_close_distance_pct:
+                raise ValueError(
+                    f"candle_quote_mismatch for {symbol}: quote={current} "
+                    f"last_close={last_close} dist_pct={dist_pct:.2f}"
+                )
+
+    vwap = _safe_float(indicators.get("vwap") if isinstance(indicators, dict) else None)
+    if current and vwap and vwap > 0:
+        dist_pct = abs((current - vwap) / current) * 100
+        if dist_pct > max_vwap_distance_pct:
+            raise ValueError(
+                f"indicator_quote_mismatch for {symbol}: quote={current} "
+                f"vwap={vwap} dist_pct={dist_pct:.2f}"
+            )
+
+
 def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> dict:
     """Replace hallucinated/cross-symbol key levels with market-data levels.
 
@@ -276,7 +307,10 @@ def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> 
 
     for key, val in fallback.items():
         if key not in sanitized and val is not None:
-            sanitized[key] = val
+            if _price_level_is_plausible(val, current, max_distance_pct):
+                sanitized[key] = val
+            else:
+                removed[f"fallback.{key}"] = val
 
     if removed:
         signal["key_levels_sanitized"] = True
@@ -624,9 +658,10 @@ def run(engine, symbols: list[str]) -> dict:
     def _analyze_symbol(sym):
         """Analyze a single symbol — runs in its own thread."""
         try:
+            quote = fh.get_quote(sym)
             candles = fh.get_candles(sym, resolution="5", days=2)
             indicators = compute_indicators(candles)
-            quote = fh.get_quote(sym)
+            validate_candle_indicator_alignment(sym, quote, candles, indicators)
             sentiment = recent_sentiment.get(sym, {})
 
             case_context = {

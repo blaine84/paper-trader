@@ -2,6 +2,8 @@ from agents.analyst import (
     build_deterministic_sanity_prompt_context,
     compute_deterministic_signal_sanity,
     enforce_veto_accountability,
+    sanitize_analyst_key_levels,
+    validate_candle_indicator_alignment,
 )
 from agents.portfolio_manager import (
     format_entry_signal_filter_summary,
@@ -87,6 +89,32 @@ def test_deterministic_sanity_prompt_context_demands_veto_for_directional_preche
 
     assert "Deterministic sanity favors SHORT" in text
     assert "llm_veto_reason" in text
+
+
+def test_validate_candle_indicator_alignment_rejects_cross_symbol_candles():
+    quote = {"price": 280.0}
+    candles = {"close": [738.0]}
+    indicators = {"vwap": 738.0}
+
+    try:
+        validate_candle_indicator_alignment("IWM", quote, candles, indicators)
+    except ValueError as exc:
+        assert "candle_quote_mismatch" in str(exc)
+    else:
+        raise AssertionError("expected cross-symbol candle mismatch to be rejected")
+
+
+def test_sanitize_key_levels_drops_implausible_fallback_vwap():
+    signal = {"key_levels": {}}
+    quote = {"price": 280.0, "low": 278.0, "high": 282.0}
+    indicators = {"vwap": 738.0}
+
+    sanitized = sanitize_analyst_key_levels(signal, quote, indicators)
+
+    assert sanitized["key_levels"]["support"] == 278.0
+    assert sanitized["key_levels"]["resistance"] == 282.0
+    assert "vwap" not in sanitized["key_levels"]
+    assert sanitized["removed_key_levels"]["fallback.vwap"] == 738.0
 
 
 def test_pm_filter_summary_explains_all_hold_batch_and_sanity_conflicts():
