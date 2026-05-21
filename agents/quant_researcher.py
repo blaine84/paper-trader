@@ -9,6 +9,7 @@ Outputs strategy recommendations that feed Analyst and PM.
 
 import json
 from datetime import datetime, timedelta, date
+from typing import Optional
 from utils.llm import call_llm, parse_json_response
 from utils.case_library import query_cases, get_win_rate_by_setup, format_cases_for_prompt
 from db.schema import AgentMemory, get_session
@@ -71,6 +72,112 @@ Only include strategies with fit_score >= 5. Rank by fit_score descending.
 """
 
 
+VALID_RECOMMENDATIONS = {"lean_into", "use_with_caution", "avoid"}
+
+
+def _normalize_recommendation(value) -> str:
+    """Coerce loose LLM recommendation text into the strict enum.
+
+    Finance models sometimes copy the schema literal
+    ``lean_into|use_with_caution|avoid`` instead of selecting one option. If
+    that leaks downstream, prompt builders treat every strategy as actionable
+    caution and Analyst can become globally muted. Default malformed values to
+    ``use_with_caution`` so they do not masquerade as a deliberate lean-in or
+    avoid call.
+    """
+    if not isinstance(value, str):
+        return "use_with_caution"
+    rec = value.strip().lower().replace(" ", "_").replace("today", "").strip("_ .")
+    if rec in VALID_RECOMMENDATIONS:
+        return rec
+    if "|" in rec:
+        return "use_with_caution"
+    if "avoid" in rec:
+        return "avoid"
+    if "lean" in rec:
+        return "lean_into"
+    if "caution" in rec or "watch" in rec or "monitor" in rec:
+        return "use_with_caution"
+    return "use_with_caution"
+
+
+def _has_real_market_context(text: Optional[str]) -> bool:
+    return bool((text or "").strip())
+
+
+def _normalize_quant_result(result: dict, market_regime: Optional[str], market_context_text: Optional[str]) -> dict:
+    """Normalize Quant Researcher output before persistence/prompt injection."""
+    if not isinstance(result, dict):
+        result = {}
+
+    inferred_regime = (
+        market_regime
+        or result.get("market_regime")
+        or result.get("regime")
+        or "unknown"
+    )
+    if inferred_regime not in {"risk_on", "risk_off", "mixed"}:
+        inferred_regime = "unknown"
+    result["market_regime"] = inferred_regime
+
+    no_regime_basis = inferred_regime == "unknown" and not _has_real_market_context(market_context_text)
+    if no_regime_basis:
+        result["market_conditions_summary"] = (
+            "No deterministic current market regime is available from Researcher; "
+            "do not infer risk-on/risk-off bias from Quant context alone."
+        )
+        result["regime_note"] = "Regime unknown; require live technical/catalyst confirmation."
+
+    normalized_strategies = []
+    for strategy in result.get("strategies", []) or []:
+        if not isinstance(strategy, dict):
+            continue
+        strategy = dict(strategy)
+        strategy["recommendation"] = _normalize_recommendation(strategy.get("recommendation"))
+        try:
+            strategy["fit_score"] = float(strategy.get("fit_score", 0) or 0)
+        except (TypeError, ValueError):
+            strategy["fit_score"] = 0.0
+        if no_regime_basis:
+            strategy["conditions_met"] = [
+                c for c in strategy.get("conditions_met", [])
+                if "risk_on" not in str(c) and "risk_off" not in str(c)
+            ]
+            strategy["analyst_guidance"] = (
+                "Use this setup only when live price action, catalyst freshness, "
+                "volume, and key levels independently confirm it; Quant has no "
+                "current regime bias."
+            )
+            strategy["pm_guidance"] = (
+                "Do not reject or accept solely because of regime context; require "
+                "valid entry geometry and current confirmation."
+            )
+        if strategy["fit_score"] >= 5:
+            normalized_strategies.append(strategy)
+    result["strategies"] = sorted(
+        normalized_strategies,
+        key=lambda s: s.get("fit_score", 0),
+        reverse=True,
+    )
+    return result
+
+
+def _strategy_context_header(data: dict) -> list[str]:
+    regime = data.get("market_regime", "unknown")
+    if regime == "unknown":
+        return [
+            "Market conditions: No deterministic current market regime available.",
+            "Regime note: Do not treat Quant context as a reason to globally downgrade signals to HOLD.",
+            "",
+        ]
+    return [
+        f"Market conditions: {data.get('market_conditions_summary', '')}",
+        f"Primary strategy today: {data.get('primary_strategy', '?')}",
+        f"Regime note: {data.get('regime_note', '')}",
+        "",
+    ]
+
+
 def get_internal_stats(engine) -> dict:
     """
     Pull internal win rates per setup_type from the case library,
@@ -128,10 +235,7 @@ def build_strategy_context(engine, market_regime: str = None) -> str:
     if ts < (datetime.utcnow() - timedelta(days=1)).isoformat():
         return "Strategy recommendations are stale — run quant_researcher again."
 
-    lines = [f"Market conditions: {data.get('market_conditions_summary', '')}"]
-    lines.append(f"Primary strategy today: {data.get('primary_strategy', '?')}")
-    lines.append(f"Regime note: {data.get('regime_note', '')}")
-    lines.append("")
+    lines = _strategy_context_header(data)
 
     for s in data.get("strategies", []):
         if s.get("recommendation") == "avoid":
@@ -216,10 +320,7 @@ def build_pm_strategy_context(engine, market_regime: str = None) -> str:
     if ts < (datetime.utcnow() - timedelta(days=1)).isoformat():
         return "Strategy recommendations are stale — run quant_researcher again."
 
-    lines = [f"Market conditions: {data.get('market_conditions_summary', '')}"]
-    lines.append(f"Primary strategy today: {data.get('primary_strategy', '?')}")
-    lines.append(f"Regime note: {data.get('regime_note', '')}")
-    lines.append("")
+    lines = _strategy_context_header(data)
 
     for s in data.get("strategies", []):
         if s.get("recommendation") == "avoid":
@@ -408,13 +509,8 @@ If no new strategies are warranted, return "proposed_strategies": [].
     result = parse_json_response(raw)
     result["timestamp"] = datetime.utcnow().isoformat()
 
-    inferred_regime = (
-        market_regime
-        or result.get("market_regime")
-        or result.get("regime")
-        or "unknown"
-    )
-    result.setdefault("market_regime", inferred_regime)
+    result = _normalize_quant_result(result, market_regime, market_context_text)
+    inferred_regime = result.get("market_regime", "unknown")
 
     # Some models return a looser schema (for example top_strategies). Normalize
     # it so downstream reports and agents do not silently show unavailable data.
