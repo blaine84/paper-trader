@@ -330,6 +330,118 @@ def _session_levels_from_candles(candles: dict) -> dict:
     return levels
 
 
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_deterministic_signal_sanity(signal: dict, quote: dict, indicators: dict) -> dict:
+    """Simple non-LLM directional sanity check for Analyst output.
+
+    This is deliberately *not* a trade decision and does not override the LLM.
+    It gives us a stable instrument panel when the Analyst goes globally timid:
+    if the model says HOLD while deterministic trend/VWAP/momentum inputs lean
+    clearly LONG or SHORT, PM skips become diagnosable instead of mysterious.
+    """
+    signal_direction = str(signal.get("signal", "HOLD") or "HOLD").upper()
+    score = 0
+    reasons = []
+
+    current = _safe_float(quote.get("price") if isinstance(quote, dict) else None)
+    change_pct = _safe_float(quote.get("change_pct") if isinstance(quote, dict) else None)
+    vwap = _safe_float(indicators.get("vwap") if isinstance(indicators, dict) else None)
+    rsi = _safe_float(indicators.get("rsi") if isinstance(indicators, dict) else None)
+    relative_volume = _safe_float(signal.get("relative_volume"))
+
+    trend = str(indicators.get("trend", "") if isinstance(indicators, dict) else "").lower()
+    ema_trend = str(indicators.get("ema_trend", "") if isinstance(indicators, dict) else "").lower()
+    macd_bias = str(
+        indicators.get("macd_bias", indicators.get("macd", ""))
+        if isinstance(indicators, dict) else ""
+    ).lower()
+
+    if current is not None and vwap is not None and vwap > 0:
+        dist_pct = ((current - vwap) / vwap) * 100
+        if dist_pct >= 0.15:
+            score += 2
+            reasons.append(f"price_above_vwap_{dist_pct:.2f}%")
+        elif dist_pct <= -0.15:
+            score -= 2
+            reasons.append(f"price_below_vwap_{dist_pct:.2f}%")
+        else:
+            reasons.append("price_near_vwap")
+
+    if trend == "bullish" or ema_trend == "bullish":
+        score += 1
+        reasons.append("bullish_trend")
+    elif trend == "bearish" or ema_trend == "bearish":
+        score -= 1
+        reasons.append("bearish_trend")
+
+    if "bull" in macd_bias:
+        score += 1
+        reasons.append("bullish_macd")
+    elif "bear" in macd_bias:
+        score -= 1
+        reasons.append("bearish_macd")
+
+    if rsi is not None:
+        if 50 <= rsi <= 70:
+            score += 1
+            reasons.append(f"constructive_rsi_{rsi:.1f}")
+        elif 30 <= rsi <= 50:
+            score -= 1
+            reasons.append(f"soft_rsi_{rsi:.1f}")
+        elif rsi > 78:
+            score -= 1
+            reasons.append(f"overextended_rsi_{rsi:.1f}")
+        elif rsi < 22:
+            score += 1
+            reasons.append(f"capitulation_rsi_{rsi:.1f}")
+
+    if change_pct is not None:
+        if change_pct >= 0.35:
+            score += 1
+            reasons.append(f"positive_change_{change_pct:.2f}%")
+        elif change_pct <= -0.35:
+            score -= 1
+            reasons.append(f"negative_change_{change_pct:.2f}%")
+
+    if relative_volume is not None:
+        if relative_volume >= 1.5:
+            reasons.append(f"relative_volume_confirming_{relative_volume:.2f}x")
+        elif relative_volume < 0.7:
+            reasons.append(f"thin_relative_volume_{relative_volume:.2f}x")
+
+    if score >= 3:
+        deterministic_bias = "LONG"
+    elif score <= -3:
+        deterministic_bias = "SHORT"
+    else:
+        deterministic_bias = "HOLD"
+
+    conflict = (
+        signal_direction == "HOLD"
+        and deterministic_bias in {"LONG", "SHORT"}
+    ) or (
+        signal_direction in {"LONG", "SHORT"}
+        and deterministic_bias in {"LONG", "SHORT"}
+        and signal_direction != deterministic_bias
+    )
+
+    return {
+        "bias": deterministic_bias,
+        "score": score,
+        "reasons": reasons,
+        "llm_signal": signal_direction,
+        "conflict": conflict,
+    }
+
+
 def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -> dict:
     """
     Inject structured quote fields into the analyst signal for downstream gates.
@@ -564,6 +676,18 @@ Produce your trading signal JSON for {sym}.
             enrich_signal_with_quote_context(signal, quote, candles)
             signal = sanitize_analyst_session_levels(signal, quote)
             signal = sanitize_analyst_key_levels(signal, quote, indicators)
+            signal["deterministic_sanity"] = compute_deterministic_signal_sanity(
+                signal, quote, indicators
+            )
+            if signal["deterministic_sanity"].get("conflict"):
+                log.warning(
+                    "Analyst sanity conflict for %s: llm=%s deterministic=%s score=%s reasons=%s",
+                    sym,
+                    signal["deterministic_sanity"].get("llm_signal"),
+                    signal["deterministic_sanity"].get("bias"),
+                    signal["deterministic_sanity"].get("score"),
+                    signal["deterministic_sanity"].get("reasons"),
+                )
 
             signals[sym] = signal
         except Exception as e:
