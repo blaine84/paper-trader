@@ -1,0 +1,160 @@
+# config/sector_scout_config.yaml
+enabled: true
+
+sector_buckets:
+  ai_semi:
+    enabled: true
+    name: "AI / Semiconductors"
+    symbols:
+      - "AVGO"
+      - "SMCI"
+      - "ARM"
+      - "MU"
+      - "INTC"
+      - "MRVL"
+      - "QCOM"
+      - "LRCX"
+      - "KLAC"
+      - "AMAT"
+    sector_etf: "SMH"
+    core_re_ranking: false
+  software_cloud_cyber:
+    enabled: true
+    name: "Software / Cloud / Cyber"
+    symbols:
+      - "CRM"
+      - "NOW"
+      - "PANW"
+      - "CRWD"
+      - "ZS"
+      - "DDOG"
+      - "NET"
+      - "SNOW"
+      - "MDB"
+      - "PLTR"
+    sector_etf: "IGV"
+    core_re_ranking: false
+  ev_high_beta:
+    enabled: true
+    name: "EV / High-Beta"
+    symbols:
+      - "RIVN"
+      - "LCID"
+      - "NIO"
+      - "XPEV"
+      - "LI"
+      - "PLUG"
+      - "FCEL"
+      - "BLNK"
+      - "CHPT"
+      - "QS"
+    sector_etf: "DRIV"
+    core_re_ranking: false
+  financials:
+    enabled: true
+    name: "Financials"
+    symbols:
+      - "GS"
+      - "MS"
+      - "JPM"
+      - "BAC"
+      - "C"
+      - "SCHW"
+      - "HOOD"
+      - "SOFI"
+      - "NU"
+      - "AFRM"
+    sector_etf: "XLF"
+    core_re_ranking: false
+  energy_commodities:
+    enabled: true
+    name: "Energy / Commodities"
+    symbols:
+      - "XOM"
+      - "CVX"
+      - "OXY"
+      - "SLB"
+      - "HAL"
+      - "DVN"
+      - "FANG"
+      - "MPC"
+      - "VLO"
+      - "PSX"
+    sector_etf: "XLE"
+    core_re_ranking: false
+  defense_industrials:
+    enabled: true
+    name: "Defense / Industrials"
+    symbols:
+      - "LMT"
+      - "RTX"
+      - "NOC"
+      - "GD"
+      - "BA"
+      - "LHX"
+      - "HII"
+      - "TDG"
+      - "GE"
+      - "HON"
+    sector_etf: "ITA"
+    core_re_ranking: false
+  crypto_beta:
+    enabled: false
+    name: "Crypto-Beta"
+    symbols:
+      - "COIN"
+      - "MSTR"
+      - "MARA"
+      - "RIOT"
+      - "CLSK"
+      - "HUT"
+      - "BITF"
+      - "CIFR"
+    sector_etf: null
+    core_re_ranking: false
+
+hard_gates:
+  min_price: 5.0
+  max_spread_pct: 5.0
+  min_market_cap: 500000000  # $500M
+  proxy_market_cap_enabled: true
+
+score_penalties:
+  stale_news_threshold_minutes: 120
+  stale_news_deduction: 15.0
+  missing_news_deduction: 20.0  # applied when news_freshness_minutes is None (no news data at all)
+  unknown_spread_deduction: 10.0
+  weak_sector_confirmation_deduction: 10.0
+  low_rvol_threshold: 1.2
+  low_rvol_deduction: 12.0
+  low_dollar_volume_threshold: 5000000  # $5M
+  low_dollar_volume_deduction: 8.0
+
+scoring_weights:
+  move_pct: 25.0
+  relative_volume: 20.0
+  dollar_volume: 15.0
+  news_freshness: 20.0
+  sector_confirmation: 10.0
+  spread_sanity: 5.0
+  data_completeness: 5.0
+
+scoring_caps:
+  move_pct_max: 15.0       # cap at 15% move
+  relative_volume_max: 10.0  # cap at 10x RVOL
+
+budget_ceilings:
+  max_sectors_per_run: 7
+  max_candidates_per_sector: 20
+  max_finalists_per_sector: 5
+  max_expanded_watchlist: 12
+  pipeline_timeout_seconds: 90
+
+chief_scout:
+  max_picks: 8
+  fallback_limit: 3
+
+reanalysis_cooldown:
+  score_change_threshold: 15.0
+  new_catalyst_required: true
+  move_pct_change_threshold: 2.0

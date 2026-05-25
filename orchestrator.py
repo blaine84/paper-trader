@@ -27,10 +27,17 @@ import agents.portfolio_manager as pm
 import agents.bookkeeper as bookkeeper
 import agents.reviewer as reviewer
 import agents.scout as scout
+from agents.scout import run_intraday_scan
 import agents.weekly_prep as weekly_prep
 import agents.quant_researcher as quant_researcher
 import agents.daily_review as daily_review
 import agents.ceo as ceo
+from utils.expanded_watchlist import get_expanded_watchlist
+from utils.sector_scout_outcomes import (
+    record_analyst_outcome,
+    record_pm_outcome,
+    record_trade_outcome,
+)
 
 console = Console()
 logging.basicConfig(
@@ -384,11 +391,33 @@ def run_analyst_refresh():
         scout_picks = scout.get_todays_picks(engine)
     except Exception as e:
         log.error(f"Scout picks error: {e}", exc_info=True)
-    full_watchlist = WATCHLIST + scout_picks
+
+    # Include Expanded Watchlist symbols from sector scout pipeline
+    # NOTE (Req 7.4, 12.1): Expanded symbols go through the SAME analyst.run()
+    # and pm.run_profile() gate pipeline as Core_Watchlist symbols — no reduced
+    # rigor, no fast-track, no special handling.
+    expanded_symbols = []
+    try:
+        expanded_symbols = get_expanded_watchlist(engine)
+    except Exception as e:
+        log.error(f"Expanded watchlist error: {e}", exc_info=True)
+
+    full_watchlist = WATCHLIST + scout_picks + [s for s in expanded_symbols if s not in WATCHLIST and s not in scout_picks]
 
     try:
         console.print("[bold blue]📊 Analyst refresh...[/bold blue]")
-        analyst.run(engine, full_watchlist)
+        signals = analyst.run(engine, full_watchlist)
+
+        # Outcome tracking hook (Req 10.5): record analyst signals for expanded candidates
+        if expanded_symbols and signals:
+            today = datetime.now().strftime("%Y-%m-%d")
+            for sym in expanded_symbols:
+                sig = signals.get(sym, {})
+                signal_direction = (sig.get("signal") or "NO_SIGNAL").upper()
+                try:
+                    record_analyst_outcome(engine, sym, today, signal_direction)
+                except Exception as e:
+                    log.debug(f"Outcome tracking (analyst) error for {sym}: {e}")
     except Exception as e:
         log.error(f"Analyst error: {e}", exc_info=True)
 
@@ -424,7 +453,18 @@ def run_intraday():
         scout_picks = scout.get_todays_picks(engine)
     except Exception as e:
         log.error(f"Scout picks error: {e}", exc_info=True)
-    full_watchlist = WATCHLIST + scout_picks
+
+    # Include Expanded Watchlist symbols from sector scout pipeline
+    # NOTE (Req 7.4, 12.1): Expanded symbols go through the SAME PM gate
+    # pipeline (catalyst specificity, risk geometry, stop authority) as
+    # Core_Watchlist symbols — no reduced rigor, no fast-track.
+    expanded_symbols = []
+    try:
+        expanded_symbols = get_expanded_watchlist(engine)
+    except Exception as e:
+        log.error(f"Expanded watchlist error: {e}", exc_info=True)
+
+    full_watchlist = WATCHLIST + scout_picks + [s for s in expanded_symbols if s not in WATCHLIST and s not in scout_picks]
 
     # Analyst signals are refreshed by the separate run_analyst_refresh job
     # on the same schedule — no need to duplicate here.
@@ -440,6 +480,33 @@ def run_intraday():
             for d in result.get("decisions", []):
                 status = "✅" if d.get("executed") else "❌"
                 log.info(f"  [{profile_id}] {status} {d['action']} {d.get('quantity', '')} {d['symbol']} @ ${d.get('price', 0):.2f}")
+
+            # Outcome tracking hook (Req 10.5): record PM status for expanded candidates
+            if expanded_symbols:
+                today = datetime.now().strftime("%Y-%m-%d")
+                decisions = result.get("decisions", [])
+                decided_symbols = set()
+                for d in decisions:
+                    sym = d.get("symbol", "")
+                    if sym not in expanded_symbols:
+                        continue
+                    decided_symbols.add(sym)
+                    if d.get("executed"):
+                        pm_status = "executed"
+                    else:
+                        pm_status = "rejected"
+                    try:
+                        record_pm_outcome(eng, sym, today, pm_status)
+                    except Exception:
+                        pass
+                # Symbols in expanded watchlist that PM considered eligible
+                # (had a signal) but didn't produce a decision → "no_entry"
+                for sym in expanded_symbols:
+                    if sym not in decided_symbols:
+                        try:
+                            record_pm_outcome(eng, sym, today, "no_entry")
+                        except Exception:
+                            pass
         except Exception as e:
             log.error(f"PM {profile_id} error: {e}", exc_info=True)
 
@@ -453,6 +520,44 @@ def run_intraday():
         bookkeeper.print_dashboard(engine)
     except Exception as e:
         log.error(f"Dashboard error: {e}", exc_info=True)
+
+
+def run_sector_scout_confirmation():
+    """10:00 AM ET — Sector scout confirmation scan after initial session volatility."""
+    log.info("=== SECTOR SCOUT CONFIRMATION ===")
+    engine = get_engine()
+    try:
+        console.print("[bold cyan]🔭 Sector Scout confirmation scan...[/bold cyan]")
+        result = run_intraday_scan(engine, WATCHLIST, run_type="confirmation")
+        picks = result.get("picks", [])
+        if picks:
+            symbols = [p.get("symbol", p) if isinstance(p, dict) else str(p) for p in picks]
+            log.info(f"Sector Scout confirmation: {len(picks)} picks — {', '.join(symbols)}")
+        else:
+            log.info("Sector Scout confirmation: no new picks")
+        if result.get("skipped_symbols"):
+            log.info(f"  Cooldown skipped: {', '.join(result['skipped_symbols'])}")
+    except Exception as e:
+        log.error(f"Sector Scout confirmation error: {e}", exc_info=True)
+
+
+def run_sector_scout_midday():
+    """12:30 PM ET — Sector scout midday unusual-mover scan."""
+    log.info("=== SECTOR SCOUT MIDDAY ===")
+    engine = get_engine()
+    try:
+        console.print("[bold cyan]🔭 Sector Scout midday scan...[/bold cyan]")
+        result = run_intraday_scan(engine, WATCHLIST, run_type="midday")
+        picks = result.get("picks", [])
+        if picks:
+            symbols = [p.get("symbol", p) if isinstance(p, dict) else str(p) for p in picks]
+            log.info(f"Sector Scout midday: {len(picks)} picks — {', '.join(symbols)}")
+        else:
+            log.info("Sector Scout midday: no new picks")
+        if result.get("skipped_symbols"):
+            log.info(f"  Cooldown skipped: {', '.join(result['skipped_symbols'])}")
+    except Exception as e:
+        log.error(f"Sector Scout midday error: {e}", exc_info=True)
 
 
 def run_weekly_prep():
@@ -477,10 +582,69 @@ def run_weekly_prep():
         log.error(f"Meta Reviewer error: {e}", exc_info=True)
 
 
+def _record_expanded_trade_outcomes(engine) -> None:
+    """Record trade outcomes for expanded watchlist candidates (Req 10.5).
+
+    Checks today's closed trades and records outcomes for any symbols
+    that were in the expanded watchlist.
+    """
+    from db.schema import Trade, get_session
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    expanded_symbols = []
+    try:
+        expanded_symbols = get_expanded_watchlist(engine)
+    except Exception:
+        return
+
+    if not expanded_symbols:
+        return
+
+    db = get_session(engine)
+    try:
+        # Find trades closed today for expanded symbols
+        today_start = datetime.strptime(today, "%Y-%m-%d")
+        today_end = today_start + timedelta(days=1)
+
+        closed_trades = (
+            db.query(Trade)
+            .filter(
+                Trade.symbol.in_(expanded_symbols),
+                Trade.status == "closed",
+                Trade.exit_time >= today_start,
+                Trade.exit_time < today_end,
+            )
+            .all()
+        )
+
+        for trade in closed_trades:
+            outcome = {
+                "direction": trade.direction,
+                "entry_price": trade.entry_price,
+                "exit_price": trade.exit_price,
+                "pnl": trade.pnl,
+                "pnl_pct": trade.pnl_pct,
+                "profile": trade.profile,
+                "setup_type": trade.setup_type,
+            }
+            try:
+                record_trade_outcome(engine, trade.symbol, today, outcome)
+            except Exception:
+                pass
+    finally:
+        db.close()
+
+
 def run_post_market():
     """4:15 PM ET — End of day wrap-up."""
     log.info("=== POST-MARKET / END OF DAY ===")
     engine = get_engine()
+
+    # Outcome tracking hook (Req 10.5): record trade outcomes for expanded candidates
+    try:
+        _record_expanded_trade_outcomes(engine)
+    except Exception as e:
+        log.debug(f"Outcome tracking (trade) error: {e}")
 
     # Reviewer runs independently — failure here doesn't block EOD
     try:
@@ -911,6 +1075,24 @@ def main():
         run_price_monitor,
         CT(day_of_week="mon-fri", hour="9-15", second="0", timezone="America/New_York"),
         id="price_monitor",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Sector Scout confirmation scan: 10:00 AM ET, Mon-Fri
+    scheduler.add_job(
+        run_sector_scout_confirmation,
+        CronTrigger(day_of_week="mon-fri", hour=10, minute=0, timezone="America/New_York"),
+        id="sector_scout_confirmation",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Sector Scout midday scan: 12:30 PM ET, Mon-Fri
+    scheduler.add_job(
+        run_sector_scout_midday,
+        CronTrigger(day_of_week="mon-fri", hour=12, minute=30, timezone="America/New_York"),
+        id="sector_scout_midday",
         max_instances=1,
         coalesce=True,
     )

@@ -609,6 +609,15 @@ def gather_agent_context(engine) -> dict:
             except (json.JSONDecodeError, TypeError):
                 lifecycle_exceptions = lifecycle_exceptions_mem.value
 
+        # --- Sector Scout Metrics ---
+        sector_scout_metrics = None
+        try:
+            from utils.sector_scout_metrics import compute_daily_metrics
+            sector_scout_metrics = compute_daily_metrics(db.get_bind())
+        except Exception as e:
+            logger.warning(f"Failed to gather sector scout metrics: {e}")
+            missing_sources.append("sector_scout_metrics")
+
         return {
             "market_context": market_context,
             "selection_feedback": selection_feedback,
@@ -617,6 +626,7 @@ def gather_agent_context(engine) -> dict:
             "missing_sources": missing_sources,
             "news_governance_events": news_governance_summary,
             "lifecycle_exceptions": lifecycle_exceptions,
+            "sector_scout_metrics": sector_scout_metrics,
         }
 
     except Exception as e:
@@ -852,6 +862,7 @@ def build_deterministic_summary(
         "process_metrics": process_metrics,
         "activity_flags": activity_flags,
         "day_context": day_context,
+        "sector_scout_metrics": agent_context.get("sector_scout_metrics"),
     }
 
 
@@ -1028,6 +1039,18 @@ def _build_llm_prompt(summary: dict) -> str:
     prompt["process_metrics"] = summary.get("process_metrics", {})
     prompt["activity_flags"] = summary.get("activity_flags", {})
     prompt["day_context"] = summary.get("day_context", {})
+
+    # Sector Scout metrics (if available)
+    scout_metrics = summary.get("sector_scout_metrics")
+    if scout_metrics and scout_metrics.get("expanded_candidates_surfaced", 0) > 0:
+        prompt["sector_scout_metrics"] = {
+            "expanded_candidates_surfaced": scout_metrics.get("expanded_candidates_surfaced", 0),
+            "pct_reaching_analyst_long_short": scout_metrics.get("pct_reaching_analyst_long_short", 0.0),
+            "pct_reaching_pm_eligible": scout_metrics.get("pct_reaching_pm_eligible", 0.0),
+            "executed_trade_count": len(scout_metrics.get("executed_trade_outcomes", [])),
+            "top_rejection_codes": scout_metrics.get("top_rejection_reason_codes", [])[:5],
+            "top_penalty_codes": scout_metrics.get("top_penalty_reason_codes", [])[:5],
+        }
 
     return json.dumps(prompt, default=str)
 
