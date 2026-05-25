@@ -14,6 +14,7 @@ A multi-agent paper trading system for day trading SPY, QQQ, IWM, TSLA, NVDA, AM
 | 🔍 Reviewer | Scores closed trades, extracts lessons, feeds back |
 | 📝 Narrator | Bloomberg-style desk commentary throughout the day (read-only) |
 | 🔬 Quant Researcher | Proposes dynamic strategies, runs backtester, retires underperformers |
+| 🔭 Sector Scout | Multi-sector deterministic screening + Chief Scout LLM curation |
 | 🎯 Orchestrator | Runs the market-hours loop via APScheduler |
 
 ### Core Modules (Tier 1)
@@ -74,6 +75,33 @@ Exit decisions are anchored to the original trade thesis, not signal freshness:
 | Thesis Invalidation Engine | Price Monitor evaluates structured invalidator conditions every 60s. |
 
 PM profiles have an `opposing_evidence_threshold` (conservative: moderate, moderate/aggressive: strong) that gates when opposing signals trigger a Reversal/Close Review.
+
+### Sector Scout Expansion
+
+A multi-sector deterministic screening pipeline that widens daily opportunity
+discovery without weakening trade execution gates. Design principle: **wider
+funnel, same strict bouncer**.
+
+| Component | File | Purpose |
+|---|---|---|
+| Config | `config/sector_scout_config.yaml` | Sector buckets, scoring weights, budget ceilings |
+| Models | `utils/sector_scout_models.py` | CandidateRow dataclass, RunSummary, ChiefScoutPick |
+| Screener | `utils/sector_scout.py` | Data collection, hard gates, scoring, ranking |
+| Chief Scout | `utils/sector_scout_chief.py` | LLM curation + deterministic fallback |
+| Watchlist | `utils/expanded_watchlist.py` | Daily expanded watchlist management |
+| Persistence | `utils/sector_scout_persistence.py` | Run summaries and candidate row storage |
+| Outcomes | `utils/sector_scout_outcomes.py` | Lifecycle tracking (analyst → PM → trade) |
+| Metrics | `utils/sector_scout_metrics.py` | Daily success metrics and reporting |
+| Logging | `utils/scout_logging.py` | Structured event logging |
+
+**Pipeline flow:** Config → Sector Screeners (7 buckets) → Hard Gates → Scout Score
+→ Ranking → Chief Scout LLM (0–8 picks) → Expanded Watchlist → Analyst/PM loops.
+
+**Schedule:** Premarket (existing), 10:00 ET confirmation scan, 12:30 ET midday scan.
+Intraday scans use reanalysis cooldown to avoid redundant work.
+
+**Budget ceilings:** Max 7 sectors/run, 20 candidates/sector, 5 finalists/sector,
+12 total expanded watchlist symbols, 90s pipeline timeout.
 
 ### Catalyst Freshness
 
@@ -160,11 +188,13 @@ python orchestrator.py once
 ```
 
 ## Schedule (ET)
-- **8:30 AM** — Pre-market: Scout scans, Researcher + Analyst prep, Pipeline evaluation
+- **8:30 AM** — Pre-market: Scout scans (incl. sector screening), Researcher + Analyst prep, Pipeline evaluation
 - **9:30–4:00 PM** — Intraday: every 15 min (configurable)
+- **10:00 AM** — Sector Scout confirmation scan (post-open volatility settle)
 - **Every 15 min** — Price-spike news check (fetches news for symbols with unusual moves)
 - **Every 30 min** — Position news poll (fetches news for symbols with open positions)
 - **10 AM, 12 PM, 2 PM** — Scheduled News Monitor (full breaking news scan)
+- **12:30 PM** — Sector Scout midday unusual-mover scan
 - **4:15 PM** — EOD: Reviewer scores, daily log saved
 - **4:30 PM** — Daily Review journal generation
 

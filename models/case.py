@@ -71,6 +71,9 @@ class Case(Base):
     outcome = Column(String(8), nullable=False)       # success | failure | partial
     pnl_pct = Column(Float, nullable=True)
     holding_minutes = Column(Integer, nullable=True)  # how long the trade was held
+    exit_category = Column(String(40), nullable=True)
+    # One of: bad_entry | valid_entry_bad_exit_policy |
+    #         valid_exit_thesis_invalidated | forced_exit_missing_metadata
 
     # --- Structured Lesson ---
     lesson = Column(Text, nullable=False)

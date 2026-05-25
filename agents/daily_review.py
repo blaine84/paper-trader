@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from db.schema import Trade, Position, DailyLog, AgentMemory, TradeEvent, get_session
 from models.case import Case
 from utils.llm import call_llm, parse_json_response
+from utils.setup_aware_evaluator import SETUP_EXIT_EVENT_TYPES
 
 logger = logging.getLogger("daily_review")
 
@@ -47,10 +48,12 @@ def run(engine) -> dict:
         agent_context = gather_agent_context(engine)
         previous_review = load_previous_review(engine, today)
         cases = gather_cases_today(engine, today)
+        setup_aware_exits = gather_setup_aware_exit_summary(engine, today)
 
         # Build deterministic summary, then generate narrative
         summary = build_deterministic_summary(
-            trade_perf, git_commits, agent_context, cases, previous_review
+            trade_perf, git_commits, agent_context, cases, previous_review,
+            setup_aware_exits=setup_aware_exits,
         )
         review = generate_narrative(summary)
 
@@ -722,6 +725,93 @@ def gather_cases_today(engine, today: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Setup-aware exit summary
+# ---------------------------------------------------------------------------
+
+
+def gather_setup_aware_exit_summary(engine, today: str) -> dict:
+    """
+    Query trade_events for setup-aware exit event types from today.
+
+    Groups events by setup_type and event_type, counts timer-based closes
+    (setup_exit_force_close) vs thesis-invalidation closes
+    (setup_exit_thesis_invalidated).
+
+    Args:
+        engine: SQLAlchemy engine
+        today: date string in YYYY-MM-DD format
+
+    Returns:
+        Summary dict with total counts, per-setup-type breakdown,
+        and top-level counts for timer closes, thesis invalidations,
+        and revalidated holds.
+    """
+    db = get_session(engine)
+    try:
+        today_start = datetime.strptime(today, "%Y-%m-%d").replace(hour=0, minute=0, second=0)
+        today_end = datetime.strptime(today, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+
+        events = (
+            db.query(TradeEvent)
+            .filter(TradeEvent.event_type.in_(SETUP_EXIT_EVENT_TYPES))
+            .filter(TradeEvent.timestamp >= today_start)
+            .filter(TradeEvent.timestamp <= today_end)
+            .all()
+        )
+
+        by_setup_type: dict[str, dict[str, int]] = {}
+        timer_based_closes = 0
+        thesis_invalidation_closes = 0
+        revalidated_holds = 0
+
+        for evt in events:
+            # Extract setup_type from payload_json
+            setup_type = "unknown"
+            try:
+                if evt.payload_json:
+                    payload = json.loads(evt.payload_json)
+                    setup_type = payload.get("setup_type", "unknown")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            # Initialize setup_type bucket with all event types at 0
+            if setup_type not in by_setup_type:
+                by_setup_type[setup_type] = {et: 0 for et in SETUP_EXIT_EVENT_TYPES}
+
+            # Increment the event type count for this setup
+            if evt.event_type in by_setup_type[setup_type]:
+                by_setup_type[setup_type][evt.event_type] += 1
+
+            # Top-level counters
+            if evt.event_type == "setup_exit_force_close":
+                timer_based_closes += 1
+            elif evt.event_type == "setup_exit_thesis_invalidated":
+                thesis_invalidation_closes += 1
+            elif evt.event_type == "setup_exit_revalidated_hold":
+                revalidated_holds += 1
+
+        return {
+            "total_setup_aware_events": len(events),
+            "by_setup_type": by_setup_type,
+            "timer_based_closes": timer_based_closes,
+            "thesis_invalidation_closes": thesis_invalidation_closes,
+            "revalidated_holds": revalidated_holds,
+        }
+
+    except Exception as e:
+        logger.error(f"Error gathering setup-aware exit summary: {e}")
+        return {
+            "total_setup_aware_events": 0,
+            "by_setup_type": {},
+            "timer_based_closes": 0,
+            "thesis_invalidation_closes": 0,
+            "revalidated_holds": 0,
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # Deterministic summary builder
 # ---------------------------------------------------------------------------
 
@@ -732,6 +822,7 @@ def build_deterministic_summary(
     agent_context: dict | None,
     cases: list[dict] | None,
     previous_review: dict | None,
+    setup_aware_exits: dict | None = None,
 ) -> dict:
     """
     Assemble all gathered data into a structured summary dict.
@@ -746,6 +837,7 @@ def build_deterministic_summary(
         agent_context: Dict from gather_agent_context, or None
         cases: List of case dicts from gather_cases_today, or None
         previous_review: Previous review dict from load_previous_review, or None
+        setup_aware_exits: Dict from gather_setup_aware_exit_summary, or None
 
     Returns:
         Deterministic summary dict per the design schema.
@@ -863,6 +955,13 @@ def build_deterministic_summary(
         "activity_flags": activity_flags,
         "day_context": day_context,
         "sector_scout_metrics": agent_context.get("sector_scout_metrics"),
+        "setup_aware_exits": setup_aware_exits if setup_aware_exits else {
+            "total_setup_aware_events": 0,
+            "by_setup_type": {},
+            "timer_based_closes": 0,
+            "thesis_invalidation_closes": 0,
+            "revalidated_holds": 0,
+        },
     }
 
 

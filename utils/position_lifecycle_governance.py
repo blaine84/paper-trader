@@ -13,6 +13,8 @@ executing trades or mutating state.
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
+from utils.setup_aware_evaluator import evaluate_setup_aware_lifecycle
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle States
@@ -207,23 +209,6 @@ def most_recent_completed_hard_wall(now_et: datetime) -> datetime | None:
 
     return None
 
-
-# ---------------------------------------------------------------------------
-# Intraday Setup Time Limits (minutes)
-# ---------------------------------------------------------------------------
-
-SETUP_TIME_LIMITS = {
-    "momentum_fade": {"stale": 35, "alert": 45, "revalidate": 60, "force_close": 75},
-    "gap_and_go":    {"alert": 60, "force_close": 90},
-    "vwap_reclaim":  {"alert": 60, "force_close": 90},
-    "orb":           {"alert": 45, "force_close": 75},
-    "trend_pullback": {"alert": 90, "force_close": 120},
-    "news_catalyst": {"alert": 60, "force_close": 90},
-    "short_squeeze": {"alert": 30, "force_close": 60},
-}
-
-DEFAULT_LIMITS = {"alert": 60, "force_close": 90}
-INTRADAY_SETUPS = set(SETUP_TIME_LIMITS.keys())
 
 # ---------------------------------------------------------------------------
 # News Governance Classification Constants (local to avoid coupling to DB module)
@@ -1161,82 +1146,6 @@ def _check_overnight_stop_geometry(
     return None
 
 
-def _check_intraday_force_close(
-    trade: dict, events: list[dict], now_utc: datetime
-) -> dict | None:
-    """Priority 6: Check intraday setup time limits.
-
-    If the position has been held past its force-close limit, return
-    intraday_expired with decision close. Does NOT reclassify to swing.
-    """
-    entry_time = _parse_dt(trade.get("entry_time"))
-    if entry_time is None:
-        return None
-
-    setup_type = trade.get("setup_type", "") or ""
-    limits = SETUP_TIME_LIMITS.get(setup_type, DEFAULT_LIMITS)
-    force_close_minutes = limits.get("force_close", DEFAULT_LIMITS["force_close"])
-
-    minutes_held = (now_utc - entry_time).total_seconds() / 60
-
-    if minutes_held > force_close_minutes:
-        return _build_decision(
-            trade,
-            now_utc,
-            decision="close",
-            state="intraday_expired",
-            reason_type="intraday_time_limit_exceeded",
-            requires_event=True,
-            close_reason=f"Time-based forced exit: {setup_type or 'unknown'} held {round(minutes_held)} min (limit: {force_close_minutes})",
-            metadata={
-                "minutes_held": round(minutes_held),
-                "force_close_limit": force_close_minutes,
-                "setup_type": setup_type,
-            },
-        )
-
-    return None
-
-
-def _check_intraday_warning(trade: dict, now_utc: datetime) -> dict | None:
-    """Priority 7: Check intraday warning windows.
-
-    Returns intraday_warning with decision warn when the position is past
-    the alert threshold but before the force-close limit.
-    """
-    entry_time = _parse_dt(trade.get("entry_time"))
-    if entry_time is None:
-        return None
-
-    setup_type = trade.get("setup_type", "") or ""
-    limits = SETUP_TIME_LIMITS.get(setup_type, DEFAULT_LIMITS)
-    alert_minutes = limits.get("alert", DEFAULT_LIMITS["alert"])
-    force_close_minutes = limits.get("force_close", DEFAULT_LIMITS["force_close"])
-
-    minutes_held = (now_utc - entry_time).total_seconds() / 60
-
-    # Only warn if past alert threshold but before force-close
-    # (force-close is handled by priority 6, so this should only fire
-    # when minutes_held > alert but <= force_close)
-    if minutes_held > alert_minutes:
-        return _build_decision(
-            trade,
-            now_utc,
-            decision="warn",
-            state="intraday_warning",
-            reason_type="intraday_time_warning",
-            requires_event=True,
-            metadata={
-                "minutes_held": round(minutes_held),
-                "alert_limit": alert_minutes,
-                "force_limit": force_close_minutes,
-                "setup_type": setup_type,
-            },
-        )
-
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Helper: Check for valid overnight authorization in events
 # ---------------------------------------------------------------------------
@@ -1286,6 +1195,8 @@ def evaluate_position_lifecycle(
     current_equity: float | None = None,
     overnight_position_counts: dict[str, int] | None = None,
     overnight_exposure_pcts: dict[str, float] | None = None,
+    market_data_timestamp: datetime | None = None,
+    shadow_mode: bool = False,
 ) -> dict:
     """Deterministic lifecycle evaluator. Pure function — no DB writes, no side effects.
 
@@ -1305,6 +1216,10 @@ def evaluate_position_lifecycle(
             (excluding the current trade).
         overnight_exposure_pcts: {profile: pct} of existing overnight exposure
             (excluding the current trade).
+        market_data_timestamp: When current_price was last updated (for
+            setup-aware revalidation freshness checks).
+        shadow_mode: If True, setup-aware evaluator logs decisions without
+            altering execution (compares against legacy behavior).
 
     Returns:
         Dict with all LifecycleDecision fields (decision, state, reason_type,
@@ -1345,17 +1260,22 @@ def evaluate_position_lifecycle(
     if result is not None:
         return result
 
-    # Priority 6: Intraday force-close time limits
-    result = _check_intraday_force_close(trade, events, now_utc)
-    if result is not None:
+    # Priority 6: Setup-aware intraday lifecycle (replaces old force-close + warning)
+    result = evaluate_setup_aware_lifecycle(
+        trade,
+        events,
+        now_utc=now_utc,
+        now_et=now_et,
+        current_price=current_price,
+        market_data_timestamp=market_data_timestamp,
+        shadow_mode=shadow_mode,
+    )
+    # The setup-aware evaluator always returns a decision (hold/warn/close)
+    # If it returns a decisive close or warn, or requires an event, use it
+    if result.get("decision") in ("close", "warn") or result.get("requires_event"):
         return result
 
-    # Priority 7: Intraday warning windows
-    result = _check_intraday_warning(trade, now_utc)
-    if result is not None:
-        return result
-
-    # Default: No decisive governance condition fired.
+    # Priority 7 (Default): No decisive governance condition fired.
     # Determine whether position has valid overnight authorization.
     if _has_valid_overnight_auth(events, now_utc):
         return _build_decision(

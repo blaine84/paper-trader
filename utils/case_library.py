@@ -14,6 +14,9 @@ def store_case(engine, case_data: dict) -> Case:
     """
     Write a structured case to the library.
     case_data should match Case column names.
+
+    If trade_id is present and exit_category is not already set,
+    automatically classifies the trade exit using case-memory classification.
     """
     import json as _json
     # Ensure list fields are stored as JSON strings (not raw lists or double-encoded)
@@ -30,6 +33,16 @@ def store_case(engine, case_data: dict) -> Case:
                     case_data[field] = parsed
             except Exception:
                 case_data[field] = _json.dumps([val])
+
+    # Auto-classify exit category if trade_id is present and not already set
+    if case_data.get("trade_id") and not case_data.get("exit_category"):
+        try:
+            exit_category = _classify_exit_for_trade(engine, case_data)
+            if exit_category:
+                case_data["exit_category"] = exit_category
+        except Exception:
+            pass  # Classification is best-effort; don't block case storage
+
     db = get_session(engine)
     case = Case(**{k: v for k, v in case_data.items() if hasattr(Case, k)})
     db.add(case)
@@ -37,6 +50,66 @@ def store_case(engine, case_data: dict) -> Case:
     db.refresh(case)
     db.close()
     return case
+
+
+def _classify_exit_for_trade(engine, case_data: dict) -> str | None:
+    """Fetch trade and events from DB, then classify exit category.
+
+    Returns the exit category string, or None if classification cannot be performed.
+    """
+    from db.schema import Trade, TradeEvent
+    from utils.case_memory_classifier import classify_trade_exit
+
+    db = get_session(engine)
+    try:
+        trade_id = case_data.get("trade_id")
+        trade = db.query(Trade).filter_by(id=trade_id).first()
+        if not trade:
+            return None
+
+        # Build trade dict for classifier
+        trade_dict = {
+            "id": trade.id,
+            "symbol": trade.symbol,
+            "setup_type": case_data.get("setup_type") or getattr(trade, "setup_type", None),
+            "direction": getattr(trade, "direction", None),
+            "entry_price": trade.entry_price,
+            "exit_price": trade.exit_price,
+            "pnl": trade.pnl,
+            "status": trade.status,
+        }
+
+        # Fetch trade events
+        events_rows = (
+            db.query(TradeEvent)
+            .filter_by(trade_id=trade_id)
+            .order_by(TradeEvent.timestamp)
+            .all()
+        )
+        events = []
+        for e in events_rows:
+            event_dict = {
+                "event_type": e.event_type,
+                "message": e.message,
+            }
+            # Parse payload_json if present
+            if e.payload_json:
+                try:
+                    import json as _json
+                    payload = _json.loads(e.payload_json)
+                    if isinstance(payload, dict):
+                        event_dict["payload"] = payload
+                        if "reason" in payload:
+                            event_dict["reason"] = payload["reason"]
+                        if "close_reason" in payload:
+                            event_dict["reason"] = payload["close_reason"]
+                except (ValueError, TypeError):
+                    pass
+            events.append(event_dict)
+
+        return classify_trade_exit(trade_dict, events)
+    finally:
+        db.close()
 
 
 def query_cases(
@@ -100,6 +173,7 @@ def query_cases(
             "outcome": c.outcome,
             "pnl_pct": c.pnl_pct,
             "holding_minutes": c.holding_minutes,
+            "exit_category": c.exit_category,
             "lesson": c.lesson,
             "conditions_for_success": json.loads(c.conditions_for_success) if c.conditions_for_success else [],
             "conditions_to_avoid": json.loads(c.conditions_to_avoid) if c.conditions_to_avoid else [],

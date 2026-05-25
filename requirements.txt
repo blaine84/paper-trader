@@ -13,3 +13,4 @@ rich
 flask
 yfinance
 pytz
+PyYAML

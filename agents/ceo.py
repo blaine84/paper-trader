@@ -16,8 +16,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from db.schema import AgentMemory, DailyLog, Trade, get_session
+from db.schema import AgentMemory, DailyLog, Trade, TradeEvent, get_session
 from utils.llm import call_llm, parse_json_response
+from utils.setup_aware_evaluator import SETUP_EXIT_EVENT_TYPES
 
 logger = logging.getLogger("ceo")
 
@@ -112,6 +113,7 @@ def build_context(engine, period: str) -> dict[str, Any]:
         "recent_errors": gather_recent_errors(limit=80 if period == "weekly" else 40),
         "git_changes": gather_git_changes(days=days),
         "open_positions": gather_open_positions(engine),
+        "setup_aware_governance": gather_setup_aware_governance_inputs(engine),
     }
 
 
@@ -203,6 +205,136 @@ def gather_open_positions(engine) -> list[dict[str, Any]]:
             }
             for p in db.query(Position).all()
         ]
+    finally:
+        db.close()
+
+
+def gather_setup_aware_governance_inputs(engine) -> dict[str, Any]:
+    """Gather setup-aware exit governance data for CEO memo context.
+
+    Queries trade_events for setup-aware event types from the last 24 hours
+    and collects counts and up to 3 representative examples per category.
+    """
+    db = get_session(engine)
+    try:
+        since = datetime.utcnow() - timedelta(hours=24)
+        events = (
+            db.query(TradeEvent)
+            .filter(
+                TradeEvent.event_type.in_(SETUP_EXIT_EVENT_TYPES),
+                TradeEvent.timestamp >= since,
+            )
+            .order_by(TradeEvent.timestamp.desc())
+            .all()
+        )
+
+        # Parse all events into dicts with payload
+        parsed_events = []
+        for ev in events:
+            payload = {}
+            if ev.payload_json:
+                try:
+                    payload = json.loads(ev.payload_json)
+                except Exception:
+                    pass
+            parsed_events.append({
+                "trade_id": ev.trade_id,
+                "event_type": ev.event_type,
+                "symbol": ev.symbol,
+                "timestamp": ev.timestamp.isoformat() if ev.timestamp else None,
+                "payload": payload,
+            })
+
+        # Category 1: Forced exits by setup type
+        forced_exits = [e for e in parsed_events if e["event_type"] == "setup_exit_force_close"]
+        forced_by_setup: dict[str, int] = {}
+        for e in forced_exits:
+            st = e["payload"].get("setup_type", "unknown")
+            forced_by_setup[st] = forced_by_setup.get(st, 0) + 1
+        forced_examples = [
+            {
+                "trade_id": e["trade_id"],
+                "symbol": e["symbol"],
+                "setup_type": e["payload"].get("setup_type", "unknown"),
+                "minutes_held": e["payload"].get("minutes_held"),
+            }
+            for e in forced_exits[:3]
+        ]
+
+        # Category 2: Revalidated holds by setup type
+        revalidated_holds = [e for e in parsed_events if e["event_type"] == "setup_exit_revalidated_hold"]
+        revalidated_by_setup: dict[str, int] = {}
+        for e in revalidated_holds:
+            st = e["payload"].get("setup_type", "unknown")
+            revalidated_by_setup[st] = revalidated_by_setup.get(st, 0) + 1
+        revalidated_examples = [
+            {
+                "trade_id": e["trade_id"],
+                "symbol": e["symbol"],
+                "setup_type": e["payload"].get("setup_type", "unknown"),
+                "minutes_held": e["payload"].get("minutes_held"),
+            }
+            for e in revalidated_holds[:3]
+        ]
+
+        # Category 3: News-breakout trades closed by timer vs invalidation
+        news_breakout_force = [
+            e for e in forced_exits
+            if e["payload"].get("setup_type") in ("news_breakout", "news_catalyst")
+        ]
+        news_breakout_invalidated = [
+            e for e in parsed_events
+            if e["event_type"] == "setup_exit_thesis_invalidated"
+            and e["payload"].get("setup_type") in ("news_breakout", "news_catalyst")
+        ]
+        news_examples = [
+            {
+                "trade_id": e["trade_id"],
+                "symbol": e["symbol"],
+                "setup_type": e["payload"].get("setup_type", "unknown"),
+                "close_type": "timer" if e["event_type"] == "setup_exit_force_close" else "thesis_invalidated",
+                "minutes_held": e["payload"].get("minutes_held"),
+            }
+            for e in (news_breakout_force + news_breakout_invalidated)[:3]
+        ]
+
+        # Category 4: Missing exit metadata prevented extension
+        missing_metadata = [
+            e for e in parsed_events
+            if e["event_type"] == "setup_exit_revalidation_failed"
+            and "missing criteria" in (e["payload"].get("reason", "") or "").lower()
+        ]
+        missing_metadata_examples = [
+            {
+                "trade_id": e["trade_id"],
+                "symbol": e["symbol"],
+                "setup_type": e["payload"].get("setup_type", "unknown"),
+                "reason": e["payload"].get("reason", ""),
+            }
+            for e in missing_metadata[:3]
+        ]
+
+        return {
+            "forced_exits": {
+                "count": len(forced_exits),
+                "by_setup_type": forced_by_setup,
+                "examples": forced_examples,
+            },
+            "revalidated_holds": {
+                "count": len(revalidated_holds),
+                "by_setup_type": revalidated_by_setup,
+                "examples": revalidated_examples,
+            },
+            "news_breakout_exits": {
+                "timer_closes": len(news_breakout_force),
+                "thesis_invalidation_closes": len(news_breakout_invalidated),
+                "examples": news_examples,
+            },
+            "missing_metadata_denials": {
+                "count": len(missing_metadata),
+                "examples": missing_metadata_examples,
+            },
+        }
     finally:
         db.close()
 

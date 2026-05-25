@@ -21,6 +21,7 @@ from utils.news_trade_governance import (
     log_trade_event_once, _build_failure_dedupe_key,
 )
 from utils.position_lifecycle_governance import evaluate_position_lifecycle, validate_stop_geometry
+from utils.setup_aware_evaluator import SETUP_EXIT_EVENT_TYPES
 
 log = logging.getLogger(__name__)
 
@@ -583,6 +584,9 @@ def run(engine) -> dict:
     now_et = datetime.now(et_tz)
     now_utc = datetime.now(timezone("UTC"))
 
+    # Read shadow mode configuration
+    shadow_mode = os.environ.get("SETUP_AWARE_SHADOW_MODE", "false").lower() in ("true", "1", "yes")
+
     results = {"closes": [], "repairs": [], "warnings": [], "skipped": []}
 
     open_trades = None
@@ -596,6 +600,7 @@ def run(engine) -> dict:
 
         for trade_dict, events in open_trades:
             price = _get_current_price(trade_dict["symbol"], trade_dict["entry_price"])
+            market_data_timestamp = datetime.now(timezone("UTC"))
 
             # Exclude current trade from overnight stats to prevent double-counting
             trade_overnight_counts = exclude_trade_from_counts(overnight_counts, trade_dict)
@@ -608,7 +613,28 @@ def run(engine) -> dict:
                 current_equity=current_equity,
                 overnight_position_counts=trade_overnight_counts,
                 overnight_exposure_pcts=trade_overnight_exposure,
+                market_data_timestamp=market_data_timestamp,
+                shadow_mode=shadow_mode,
             )
+
+            # Shadow mode handling: log both decisions, execute legacy
+            if shadow_mode and decision.get("metadata", {}).get("shadow_mode"):
+                log.info(
+                    f"[SHADOW] Setup-aware decision for {trade_dict['symbol']}: "
+                    f"state={decision['state']}, decision={decision['decision']}"
+                )
+                legacy = decision.get("metadata", {}).get("legacy_decision", {})
+                log.info(f"[SHADOW] Legacy decision for {trade_dict['symbol']}: {legacy}")
+
+                # In shadow mode, override with legacy decision for execution
+                if legacy.get("decision") == "close":
+                    decision["decision"] = "close"
+                    decision["close_reason"] = f"Legacy timer: {legacy.get('reason_type', 'time_limit')}"
+                elif legacy.get("decision") == "hold":
+                    decision["decision"] = "allow"
+                    decision["requires_event"] = False
+                elif legacy.get("decision") == "warn":
+                    decision["decision"] = "warn"
 
             # Log decision event (idempotent)
             if decision["requires_event"]:
