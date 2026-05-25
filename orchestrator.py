@@ -38,6 +38,7 @@ from utils.sector_scout_outcomes import (
     record_pm_outcome,
     record_trade_outcome,
 )
+from utils.position_lifecycle_governance import is_trading_day
 
 console = Console()
 logging.basicConfig(
@@ -58,6 +59,7 @@ LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL_MINUTES", 15))
 
 
 _engine = None
+_market_closed_skips_logged = set()
 
 
 def get_engine():
@@ -65,6 +67,26 @@ def get_engine():
     if _engine is None:
         _engine = init_db("db/paper_trader.db")
     return _engine
+
+
+def _skip_closed_market_job(job_name: str, now_et=None) -> bool:
+    """Return True when a market-day job should not run on a closed session."""
+    if now_et is None:
+        from pytz import timezone
+        now_et = datetime.now(timezone("America/New_York"))
+
+    if is_trading_day(now_et):
+        return False
+
+    key = (job_name, now_et.date())
+    if key not in _market_closed_skips_logged:
+        log.info(
+            "MARKET_CLOSED_SKIP: job=%s date=%s reason=holiday_or_weekend",
+            job_name,
+            now_et.date().isoformat(),
+        )
+        _market_closed_skips_logged.add(key)
+    return True
 
 
 def ensure_initial_balance(engine):
@@ -239,6 +261,8 @@ def backfill_stop_roles(engine):
 
 def run_pre_market():
     """8:30 AM ET — Research + Analysis prep before open."""
+    if _skip_closed_market_job("pre_market"):
+        return
     log.info("=== PRE-MARKET RUN ===")
     engine = get_engine()
 
@@ -383,6 +407,8 @@ def run_pipeline_evaluation():
 
 def run_analyst_refresh():
     """Analyst-only refresh — morning every 15 min, afternoon every 30 min."""
+    if _skip_closed_market_job("analyst_refresh"):
+        return
     log.info("=== ANALYST REFRESH ===")
     engine = get_engine()
 
@@ -424,6 +450,8 @@ def run_analyst_refresh():
 
 def run_intraday():
     """PM decisions + stop checks — runs on the split schedule."""
+    if _skip_closed_market_job("intraday"):
+        return
     log.info("=== INTRADAY CYCLE ===")
     engine = get_engine()
 
@@ -524,6 +552,8 @@ def run_intraday():
 
 def run_sector_scout_confirmation():
     """10:00 AM ET — Sector scout confirmation scan after initial session volatility."""
+    if _skip_closed_market_job("sector_scout_confirmation"):
+        return
     log.info("=== SECTOR SCOUT CONFIRMATION ===")
     engine = get_engine()
     try:
@@ -543,6 +573,8 @@ def run_sector_scout_confirmation():
 
 def run_sector_scout_midday():
     """12:30 PM ET — Sector scout midday unusual-mover scan."""
+    if _skip_closed_market_job("sector_scout_midday"):
+        return
     log.info("=== SECTOR SCOUT MIDDAY ===")
     engine = get_engine()
     try:
@@ -637,6 +669,8 @@ def _record_expanded_trade_outcomes(engine) -> None:
 
 def run_post_market():
     """4:15 PM ET — End of day wrap-up."""
+    if _skip_closed_market_job("post_market"):
+        return
     log.info("=== POST-MARKET / END OF DAY ===")
     engine = get_engine()
 
@@ -665,6 +699,8 @@ def run_post_market():
 
 def run_daily_review():
     """4:30 PM ET — Daily review journal generation."""
+    if _skip_closed_market_job("daily_review"):
+        return
     log.info("=== DAILY REVIEW ===")
     engine = get_engine()
     try:
@@ -686,6 +722,8 @@ def run_daily_review():
 
 def run_shadow_outcomes():
     """Score blocked trade candidates after their outcome windows mature."""
+    if _skip_closed_market_job("shadow_outcomes"):
+        return
     engine = get_engine()
     try:
         result = update_blocked_candidate_outcomes(engine)
@@ -697,6 +735,8 @@ def run_shadow_outcomes():
 
 def run_ceo_daily():
     """4:45 PM ET — CEO daily operating memo."""
+    if _skip_closed_market_job("ceo_daily"):
+        return
     log.info("=== CEO DAILY MEMO ===")
     engine = get_engine()
     try:
@@ -709,6 +749,8 @@ def run_ceo_daily():
 
 def run_ceo_weekly():
     """Friday 4:50 PM ET — CEO weekly strategy memo."""
+    if _skip_closed_market_job("ceo_weekly"):
+        return
     log.info("=== CEO WEEKLY STRATEGY MEMO ===")
     engine = get_engine()
     try:
@@ -768,7 +810,7 @@ def run_price_monitor():
     # Only run during market hours (9:30 AM - 4:00 PM ET)
     from pytz import timezone
     et = datetime.now(timezone("America/New_York"))
-    if et.weekday() >= 5:  # weekend
+    if _skip_closed_market_job("price_monitor", et):
         return
     market_open = et.replace(hour=9, minute=30, second=0)
     market_close = et.replace(hour=16, minute=0, second=0)
@@ -886,6 +928,8 @@ def run_price_monitor():
 
 def run_news_monitor():
     """Every 2 hours — check for breaking news catalysts."""
+    if _skip_closed_market_job("news_monitor"):
+        return
     log.info("=== NEWS MONITOR ===")
     engine = get_engine()
     try:
@@ -901,6 +945,8 @@ def run_news_monitor():
 
 def run_position_health():
     """Every hour — review open position health."""
+    if _skip_closed_market_job("position_health"):
+        return
     log.info("=== POSITION HEALTH CHECK ===")
     engine = get_engine()
     try:
@@ -915,7 +961,7 @@ def run_price_spike_news_check():
     """Every ~15 min — check for price spikes and fetch news for spiking symbols."""
     from pytz import timezone
     et = datetime.now(timezone("America/New_York"))
-    if et.weekday() >= 5:  # weekend
+    if _skip_closed_market_job("price_spike_news", et):
         return
     market_open = et.replace(hour=9, minute=30, second=0)
     market_close = et.replace(hour=16, minute=0, second=0)
@@ -953,7 +999,7 @@ def run_position_news_poll():
     """Every ~30 min — fetch news for symbols with open positions."""
     from pytz import timezone
     et = datetime.now(timezone("America/New_York"))
-    if et.weekday() >= 5:  # weekend
+    if _skip_closed_market_job("position_news_poll", et):
         return
     market_open = et.replace(hour=9, minute=30, second=0)
     market_close = et.replace(hour=16, minute=0, second=0)
@@ -977,6 +1023,8 @@ def run_position_news_poll():
 
 def run_position_timer():
     """Every 5 minutes — check position hold times and enforce exits."""
+    if _skip_closed_market_job("position_timer"):
+        return
     engine = get_engine()
     try:
         import agents.position_timer as position_timer
@@ -991,6 +1039,8 @@ def run_position_timer():
 
 def run_narrator(update_type: str):
     """Generic narrator runner for cron-triggered update types."""
+    if update_type != "sunday_prep" and _skip_closed_market_job(f"narrator_{update_type}"):
+        return
     log.info(f"=== NARRATOR: {update_type} ===")
     engine = get_engine()
     try:
@@ -1149,6 +1199,8 @@ def main():
 
     # Reviewer queue: every 15 min during market hours, process pending reviews
     def run_reviewer_queue():
+        if _skip_closed_market_job("reviewer_queue"):
+            return
         engine = get_engine()
         try:
             review = reviewer.run(engine, min_unreviewed=1)
