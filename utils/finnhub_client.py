@@ -7,6 +7,7 @@ Free tier limit: 60 calls/minute — rate limiting is built in.
 import os
 import time
 import logging
+import threading
 import finnhub
 from datetime import datetime, timedelta
 
@@ -17,6 +18,7 @@ class FinnhubClient:
     CALLS_PER_MINUTE = 55  # stay under the 60 limit with a small buffer
     _shared_call_times = []  # shared across all instances
     _shared_lock = None
+    _yfinance_lock = threading.Lock()
 
     def __init__(self):
         api_key = os.getenv("FINNHUB_API_KEY")
@@ -138,8 +140,13 @@ class FinnhubClient:
             interval = interval_map.get(resolution, "5m")
             # yfinance limits: 1m = 7 days, 5m/15m/30m = 60 days
             period = f"{min(days, 7)}d" if resolution == "1" else f"{min(days, 59)}d"
-            df = yf.download(symbol, period=period, interval=interval,
-                             progress=False, auto_adjust=True)
+            # yfinance uses module-level/shared state internally. Concurrent
+            # downloads from Analyst worker threads have produced cross-symbol
+            # candle contamination (e.g. IWM receiving SPY-priced candles).
+            # Serialize downloads so each symbol's OHLCV frame is isolated.
+            with FinnhubClient._yfinance_lock:
+                df = yf.download(symbol, period=period, interval=interval,
+                                 progress=False, auto_adjust=True, threads=False)
             if df.empty:
                 return {}
 

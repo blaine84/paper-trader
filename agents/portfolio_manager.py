@@ -2130,6 +2130,98 @@ def _meets_threshold(signal_strength: str, threshold: str) -> bool:
     return sig_val >= thr_val
 
 
+def summarize_entry_signal_filter(
+    signals: dict[str, dict],
+    held_symbols: set[str],
+    min_signal_strength: str,
+) -> dict:
+    """Explain why PM entry filtering produced zero or few candidates."""
+    totals = {
+        "total": len(signals),
+        "held": 0,
+        "eligible": 0,
+        "hold": 0,
+        "below_threshold": 0,
+        "direction_counts": {},
+        "strength_counts": {},
+        "confidence_counts": {},
+        "setup_counts": {},
+        "sanity_conflicts": [],
+        "veto_required": 0,
+        "veto_present": 0,
+        "veto_missing": 0,
+        "min_signal_strength": min_signal_strength,
+    }
+
+    for sym, sig in signals.items():
+        if sym in held_symbols:
+            totals["held"] += 1
+            continue
+
+        direction = str(sig.get("signal", "") or "").upper() or "UNKNOWN"
+        strength = str(sig.get("strength", "weak") or "weak").lower()
+        confidence = str(sig.get("confidence", "unknown") or "unknown").lower()
+        setup_type = str(sig.get("setup_type", "unknown") or "unknown")
+
+        totals["direction_counts"][direction] = totals["direction_counts"].get(direction, 0) + 1
+        totals["strength_counts"][strength] = totals["strength_counts"].get(strength, 0) + 1
+        totals["confidence_counts"][confidence] = totals["confidence_counts"].get(confidence, 0) + 1
+        totals["setup_counts"][setup_type] = totals["setup_counts"].get(setup_type, 0) + 1
+
+        sanity = sig.get("deterministic_sanity")
+        if sig.get("llm_veto_required"):
+            totals["veto_required"] += 1
+        if sig.get("llm_veto_present"):
+            totals["veto_present"] += 1
+        if sig.get("llm_veto_missing"):
+            totals["veto_missing"] += 1
+
+        if isinstance(sanity, dict) and sanity.get("conflict"):
+            totals["sanity_conflicts"].append({
+                "symbol": sym,
+                "llm_signal": sanity.get("llm_signal"),
+                "deterministic_bias": sanity.get("bias"),
+                "score": sanity.get("score"),
+                "veto_required": bool(sig.get("llm_veto_required")),
+                "veto_present": bool(sig.get("llm_veto_present")),
+                "veto_missing": bool(sig.get("llm_veto_missing")),
+                "veto_reason": str(sig.get("llm_veto_reason") or "")[:160],
+                "reasons": sanity.get("reasons", [])[:6],
+            })
+
+        if direction == "HOLD":
+            totals["hold"] += 1
+        elif not _meets_threshold(strength, min_signal_strength):
+            totals["below_threshold"] += 1
+        else:
+            totals["eligible"] += 1
+
+    return totals
+
+
+def format_entry_signal_filter_summary(summary: dict) -> str:
+    """Compact one-line PM skip reason for logs and cycle notes."""
+    parts = [
+        f"total={summary.get('total', 0)}",
+        f"eligible={summary.get('eligible', 0)}",
+        f"held={summary.get('held', 0)}",
+        f"hold={summary.get('hold', 0)}",
+        f"below_threshold={summary.get('below_threshold', 0)}",
+        f"min_strength={summary.get('min_signal_strength')}",
+        f"directions={summary.get('direction_counts', {})}",
+        f"strengths={summary.get('strength_counts', {})}",
+        f"confidences={summary.get('confidence_counts', {})}",
+        f"setups={summary.get('setup_counts', {})}",
+        f"veto_required={summary.get('veto_required', 0)}",
+        f"veto_present={summary.get('veto_present', 0)}",
+        f"veto_missing={summary.get('veto_missing', 0)}",
+    ]
+    conflicts = summary.get("sanity_conflicts") or []
+    if conflicts:
+        parts.append(f"sanity_conflicts={conflicts[:5]}")
+    return "; ".join(parts)
+
+
 def _check_reversal_triggers(
     db, trade, position_data: dict, signal: dict | None, profile: dict
 ) -> dict | None:
@@ -3963,12 +4055,20 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 sym, direction, strength, profile["min_signal_strength"],
             )
 
+    filter_summary = summarize_entry_signal_filter(
+        signals, held_symbols, profile["min_signal_strength"]
+    )
+
     if not entry_signals:
+        summary_text = format_entry_signal_filter_summary(filter_summary)
         log.info(
-            "No eligible PM entry signals for profile=%s after filtering; skipping entry LLM to avoid invented/malformed decisions",
-            profile_id,
+            "No eligible PM entry signals for profile=%s after filtering; %s; skipping entry LLM to avoid invented/malformed decisions",
+            profile_id, summary_text,
         )
-        notes = "No eligible entry signals after filtering; skipped new-entry decision cycle."
+        notes = (
+            "No eligible entry signals after filtering; skipped new-entry decision cycle. "
+            f"Filter summary: {summary_text}"
+        )
         stored_notes = _store_pm_cycle_note(db, profile_id, notes)
         db.close()
         return {

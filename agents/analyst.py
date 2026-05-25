@@ -75,12 +75,20 @@ Respond in JSON:
     "ema_trend": "bullish|bearish|neutral",
     "above_vwap": true,
     "bb_position": "upper|middle|lower|outside_upper|outside_lower"
-  }
+  },
+  "llm_veto_reason": "required when you output HOLD while deterministic sanity favors LONG/SHORT; otherwise null",
+  "veto_evidence": ["specific evidence that overrules the deterministic directional read"]
 }
 
 gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
 
 HOLD is a valid and useful signal. Output it whenever the setup is ambiguous or low quality.
+
+VETO ACCOUNTABILITY:
+- If the DETERMINISTIC TECHNICAL SANITY CHECK below says bias=LONG or bias=SHORT and you still output HOLD, you MUST fill llm_veto_reason with the specific disqualifying evidence.
+- Acceptable veto reasons include: stale/missing catalyst for a catalyst-dependent setup, conflicting key levels, thin/invalid volume, overextension/chop, invalid symbol/setup mapping, or explicit reviewer mitigation.
+- Do not use vague vetoes like "risk-off", "uncertain market", or "mixed indicators" unless you name the exact conflicting indicators/levels.
+- If no concrete veto exists, output the deterministic direction as the signal with appropriate weak/moderate strength; PM decides whether to trade.
 
 STRICT OUTPUT CONTRACT:
 - Return exactly the analyst signal object above.
@@ -213,6 +221,37 @@ def sanitize_analyst_session_levels(signal: dict, quote: dict, max_distance_pct:
     return signal
 
 
+def validate_candle_indicator_alignment(
+    symbol: str,
+    quote: dict,
+    candles: dict,
+    indicators: dict,
+    max_close_distance_pct: float = 5.0,
+    max_vwap_distance_pct: float = 20.0,
+) -> None:
+    """Reject cross-symbol/stale candle contamination before prompting Analyst."""
+    current = _current_price_from_quote(quote)
+    closes = candles.get("close") if isinstance(candles, dict) else None
+    if current and closes:
+        last_close = _safe_float(closes[-1])
+        if last_close is not None and last_close > 0:
+            dist_pct = abs((current - last_close) / current) * 100
+            if dist_pct > max_close_distance_pct:
+                raise ValueError(
+                    f"candle_quote_mismatch for {symbol}: quote={current} "
+                    f"last_close={last_close} dist_pct={dist_pct:.2f}"
+                )
+
+    vwap = _safe_float(indicators.get("vwap") if isinstance(indicators, dict) else None)
+    if current and vwap and vwap > 0:
+        dist_pct = abs((current - vwap) / current) * 100
+        if dist_pct > max_vwap_distance_pct:
+            raise ValueError(
+                f"indicator_quote_mismatch for {symbol}: quote={current} "
+                f"vwap={vwap} dist_pct={dist_pct:.2f}"
+            )
+
+
 def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> dict:
     """Replace hallucinated/cross-symbol key levels with market-data levels.
 
@@ -268,7 +307,10 @@ def sanitize_analyst_key_levels(signal: dict, quote: dict, indicators: dict) -> 
 
     for key, val in fallback.items():
         if key not in sanitized and val is not None:
-            sanitized[key] = val
+            if _price_level_is_plausible(val, current, max_distance_pct):
+                sanitized[key] = val
+            else:
+                removed[f"fallback.{key}"] = val
 
     if removed:
         signal["key_levels_sanitized"] = True
@@ -328,6 +370,171 @@ def _session_levels_from_candles(candles: dict) -> dict:
         })
 
     return levels
+
+
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_deterministic_sanity_prompt_context(precheck: dict) -> str:
+    """Format deterministic sanity for the Analyst prompt."""
+    if not isinstance(precheck, dict):
+        return "No deterministic sanity check available."
+    bias = precheck.get("bias", "HOLD")
+    score = precheck.get("score", 0)
+    reasons = precheck.get("reasons", [])
+    if bias in {"LONG", "SHORT"}:
+        instruction = (
+            f"Deterministic sanity favors {bias} (score={score}). "
+            "If you output HOLD, populate llm_veto_reason with concrete disqualifying evidence."
+        )
+    else:
+        instruction = "Deterministic sanity is neutral; HOLD is acceptable when the setup is ambiguous."
+    return json.dumps({
+        "bias": bias,
+        "score": score,
+        "reasons": reasons,
+        "instruction": instruction,
+    }, indent=2)
+
+
+def enforce_veto_accountability(signal: dict) -> dict:
+    """Require a structured veto when LLM HOLD conflicts with deterministic sanity."""
+    sanity = signal.get("deterministic_sanity")
+    if not isinstance(sanity, dict) or not sanity.get("conflict"):
+        signal.setdefault("llm_veto_required", False)
+        return signal
+
+    llm_signal = str(sanity.get("llm_signal") or signal.get("signal") or "").upper()
+    deterministic_bias = sanity.get("bias")
+    veto_text = str(signal.get("llm_veto_reason") or "").strip()
+    veto_evidence = signal.get("veto_evidence")
+
+    if llm_signal == "HOLD" and deterministic_bias in {"LONG", "SHORT"}:
+        signal["llm_veto_required"] = True
+        signal["llm_veto_present"] = bool(veto_text)
+        if not isinstance(veto_evidence, list):
+            signal["veto_evidence"] = [] if veto_evidence in (None, "") else [str(veto_evidence)]
+        if not veto_text:
+            signal["llm_veto_reason"] = (
+                "MISSING_LLM_VETO_REASON: Analyst output HOLD despite deterministic "
+                f"{deterministic_bias} sanity score={sanity.get('score')} without concrete veto evidence."
+            )
+            signal["llm_veto_missing"] = True
+        else:
+            signal["llm_veto_missing"] = False
+    else:
+        signal.setdefault("llm_veto_required", False)
+
+    return signal
+
+
+def compute_deterministic_signal_sanity(signal: dict, quote: dict, indicators: dict) -> dict:
+    """Simple non-LLM directional sanity check for Analyst output.
+
+    This is deliberately *not* a trade decision and does not override the LLM.
+    It gives us a stable instrument panel when the Analyst goes globally timid:
+    if the model says HOLD while deterministic trend/VWAP/momentum inputs lean
+    clearly LONG or SHORT, PM skips become diagnosable instead of mysterious.
+    """
+    signal_direction = str(signal.get("signal", "HOLD") or "HOLD").upper()
+    score = 0
+    reasons = []
+
+    current = _safe_float(quote.get("price") if isinstance(quote, dict) else None)
+    change_pct = _safe_float(quote.get("change_pct") if isinstance(quote, dict) else None)
+    vwap = _safe_float(indicators.get("vwap") if isinstance(indicators, dict) else None)
+    rsi = _safe_float(indicators.get("rsi") if isinstance(indicators, dict) else None)
+    relative_volume = _safe_float(signal.get("relative_volume"))
+
+    trend = str(indicators.get("trend", "") if isinstance(indicators, dict) else "").lower()
+    ema_trend = str(indicators.get("ema_trend", "") if isinstance(indicators, dict) else "").lower()
+    macd_bias = str(
+        indicators.get("macd_bias", indicators.get("macd", ""))
+        if isinstance(indicators, dict) else ""
+    ).lower()
+
+    if current is not None and vwap is not None and vwap > 0:
+        dist_pct = ((current - vwap) / vwap) * 100
+        if dist_pct >= 0.15:
+            score += 2
+            reasons.append(f"price_above_vwap_{dist_pct:.2f}%")
+        elif dist_pct <= -0.15:
+            score -= 2
+            reasons.append(f"price_below_vwap_{dist_pct:.2f}%")
+        else:
+            reasons.append("price_near_vwap")
+
+    if trend == "bullish" or ema_trend == "bullish":
+        score += 1
+        reasons.append("bullish_trend")
+    elif trend == "bearish" or ema_trend == "bearish":
+        score -= 1
+        reasons.append("bearish_trend")
+
+    if "bull" in macd_bias:
+        score += 1
+        reasons.append("bullish_macd")
+    elif "bear" in macd_bias:
+        score -= 1
+        reasons.append("bearish_macd")
+
+    if rsi is not None:
+        if 50 <= rsi <= 70:
+            score += 1
+            reasons.append(f"constructive_rsi_{rsi:.1f}")
+        elif 30 <= rsi <= 50:
+            score -= 1
+            reasons.append(f"soft_rsi_{rsi:.1f}")
+        elif rsi > 78:
+            score -= 1
+            reasons.append(f"overextended_rsi_{rsi:.1f}")
+        elif rsi < 22:
+            score += 1
+            reasons.append(f"capitulation_rsi_{rsi:.1f}")
+
+    if change_pct is not None:
+        if change_pct >= 0.35:
+            score += 1
+            reasons.append(f"positive_change_{change_pct:.2f}%")
+        elif change_pct <= -0.35:
+            score -= 1
+            reasons.append(f"negative_change_{change_pct:.2f}%")
+
+    if relative_volume is not None:
+        if relative_volume >= 1.5:
+            reasons.append(f"relative_volume_confirming_{relative_volume:.2f}x")
+        elif relative_volume < 0.7:
+            reasons.append(f"thin_relative_volume_{relative_volume:.2f}x")
+
+    if score >= 3:
+        deterministic_bias = "LONG"
+    elif score <= -3:
+        deterministic_bias = "SHORT"
+    else:
+        deterministic_bias = "HOLD"
+
+    conflict = (
+        signal_direction == "HOLD"
+        and deterministic_bias in {"LONG", "SHORT"}
+    ) or (
+        signal_direction in {"LONG", "SHORT"}
+        and deterministic_bias in {"LONG", "SHORT"}
+        and signal_direction != deterministic_bias
+    )
+
+    return {
+        "bias": deterministic_bias,
+        "score": score,
+        "reasons": reasons,
+        "llm_signal": signal_direction,
+        "conflict": conflict,
+    }
 
 
 def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -> dict:
@@ -451,9 +658,10 @@ def run(engine, symbols: list[str]) -> dict:
     def _analyze_symbol(sym):
         """Analyze a single symbol — runs in its own thread."""
         try:
+            quote = fh.get_quote(sym)
             candles = fh.get_candles(sym, resolution="5", days=2)
             indicators = compute_indicators(candles)
-            quote = fh.get_quote(sym)
+            validate_candle_indicator_alignment(sym, quote, candles, indicators)
             sentiment = recent_sentiment.get(sym, {})
 
             case_context = {
@@ -517,6 +725,15 @@ CATALYST FRESHNESS:
             if breaking_alerts:
                 freshness_context += f"\nBREAKING NEWS ALERTS:\n{json.dumps(breaking_alerts, indent=2)}\n"
 
+            precheck_signal = {"signal": "HOLD"}
+            enrich_signal_with_quote_context(precheck_signal, quote, candles)
+            deterministic_precheck = compute_deterministic_signal_sanity(
+                precheck_signal, quote, indicators
+            )
+            deterministic_precheck_context = build_deterministic_sanity_prompt_context(
+                deterministic_precheck
+            )
+
             user_prompt = f"""
 Symbol: {sym}
 Time: {datetime.now(dt_tz.utc).strftime('%Y-%m-%d %H:%M UTC')}
@@ -535,6 +752,9 @@ CURRENT QUOTE:
 
 TECHNICAL INDICATORS:
 {json.dumps(indicators, indent=2)}
+
+DETERMINISTIC TECHNICAL SANITY CHECK:
+{deterministic_precheck_context}
 
 RESEARCH SENTIMENT:
 {json.dumps(sentiment, indent=2)}
@@ -564,6 +784,21 @@ Produce your trading signal JSON for {sym}.
             enrich_signal_with_quote_context(signal, quote, candles)
             signal = sanitize_analyst_session_levels(signal, quote)
             signal = sanitize_analyst_key_levels(signal, quote, indicators)
+            signal["deterministic_sanity"] = compute_deterministic_signal_sanity(
+                signal, quote, indicators
+            )
+            signal = enforce_veto_accountability(signal)
+            if signal["deterministic_sanity"].get("conflict"):
+                log.warning(
+                    "Analyst sanity conflict for %s: llm=%s deterministic=%s score=%s veto_required=%s veto_present=%s reasons=%s",
+                    sym,
+                    signal["deterministic_sanity"].get("llm_signal"),
+                    signal["deterministic_sanity"].get("bias"),
+                    signal["deterministic_sanity"].get("score"),
+                    signal.get("llm_veto_required"),
+                    signal.get("llm_veto_present"),
+                    signal["deterministic_sanity"].get("reasons"),
+                )
 
             signals[sym] = signal
         except Exception as e:
