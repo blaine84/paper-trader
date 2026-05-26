@@ -11,6 +11,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
@@ -21,6 +22,7 @@ OUTCOME_WINDOWS: tuple[tuple[str, int], ...] = (
     ("30m", 30),
     ("60m", 60),
 )
+MARKET_TZ = ZoneInfo("America/New_York")
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -63,6 +65,48 @@ def _direction(row: dict[str, Any]) -> str | None:
     if action == "SHORT":
         return "short"
     return None
+
+
+def _overlaps_regular_session(start: datetime, end: datetime) -> bool:
+    """Return whether an interval includes any regular NYSE session time."""
+    start_et = start.astimezone(MARKET_TZ)
+    end_et = end.astimezone(MARKET_TZ)
+    day = start_et.date()
+    while day <= end_et.date():
+        if day.weekday() < 5:
+            market_open = datetime.combine(day, datetime.min.time(), tzinfo=MARKET_TZ).replace(
+                hour=9, minute=30
+            )
+            market_close = market_open.replace(hour=16, minute=0)
+            if start_et <= market_close and end_et >= market_open:
+                return True
+        day += timedelta(days=1)
+    return False
+
+
+def _unscorable_outcome(candidate: dict[str, Any], window_label: str, window_minutes: int) -> dict[str, Any]:
+    """Build a terminal outcome record for a window with no market candles by design."""
+    created_at = _parse_dt(candidate.get("created_at"))
+    evaluated_at = created_at + timedelta(minutes=window_minutes)
+    return {
+        "blocked_candidate_id": candidate.get("id"),
+        "eval_window": window_label,
+        "evaluated_at": evaluated_at.replace(tzinfo=None),
+        "eval_price": None,
+        "pnl_pct": None,
+        "mfe_pct": None,
+        "mae_pct": None,
+        "stop_hit": 0,
+        "target_hit": 0,
+        "first_hit": None,
+        "first_hit_at": None,
+        "outcome_label": "unscorable_no_regular_session",
+        "gate_verdict": "unscorable",
+        "notes_json": json.dumps({
+            "reason": "evaluation window does not overlap regular trading session",
+            "candles_scored": 0,
+        }),
+    }
 
 
 def _as_candles(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -272,17 +316,43 @@ def update_blocked_candidate_outcomes(
             if not due_windows:
                 continue
 
-            max_minutes = max(minutes for _, minutes in due_windows)
+            regular_session_windows = []
+            for label, minutes in due_windows:
+                if _overlaps_regular_session(created_at, created_at + timedelta(minutes=minutes)):
+                    regular_session_windows.append((label, minutes))
+                    continue
+                conn.execute(
+                    text(
+                        """
+                        INSERT OR IGNORE INTO blocked_trade_candidate_outcomes (
+                            blocked_candidate_id, eval_window, evaluated_at, eval_price,
+                            pnl_pct, mfe_pct, mae_pct, stop_hit, target_hit, first_hit,
+                            first_hit_at, outcome_label, gate_verdict, notes_json
+                        ) VALUES (
+                            :blocked_candidate_id, :eval_window, :evaluated_at, :eval_price,
+                            :pnl_pct, :mfe_pct, :mae_pct, :stop_hit, :target_hit, :first_hit,
+                            :first_hit_at, :outcome_label, :gate_verdict, :notes_json
+                        )
+                        """
+                    ),
+                    _unscorable_outcome(candidate, label, minutes),
+                )
+                inserted += 1
+
+            if not regular_session_windows:
+                continue
+
+            max_minutes = max(minutes for _, minutes in regular_session_windows)
             candles = candle_fetcher(
                 candidate["symbol"],
                 created_at - timedelta(minutes=1),
                 created_at + timedelta(minutes=max_minutes),
             )
             if not candles:
-                skipped += len(due_windows)
+                skipped += len(regular_session_windows)
                 continue
 
-            for label, minutes in due_windows:
+            for label, minutes in regular_session_windows:
                 scored = score_blocked_candidate(
                     candidate,
                     window_label=label,
