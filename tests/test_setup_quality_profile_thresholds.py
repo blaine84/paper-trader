@@ -33,6 +33,22 @@ def _seed_cases(db, setup_type="momentum_fade"):
     db.commit()
 
 
+def _add_cases(db, outcomes, setup_type="news_breakout", pnls=None):
+    now = datetime.utcnow()
+    pnls = pnls or [1.0 if outcome == "success" else -0.5 for outcome in outcomes]
+    for idx, (outcome, pnl_pct) in enumerate(zip(outcomes, pnls)):
+        db.add(Case(
+            symbol="AMD",
+            date=(now - timedelta(days=idx)).strftime("%Y-%m-%d"),
+            setup_type=setup_type,
+            outcome=outcome,
+            pnl_pct=pnl_pct,
+            lesson="test case",
+            created_at=now - timedelta(days=idx),
+        ))
+    db.commit()
+
+
 def test_momentum_fade_setup_quality_is_profile_aware():
     engine, db = _engine_and_session()
     _seed_cases(db)
@@ -57,3 +73,57 @@ def test_conservative_keeps_original_momentum_fade_floor():
 
     assert conservative["threshold"] == 0.35
     assert conservative["decision"] == "reject"
+
+
+def test_profitable_partial_breaks_consecutive_loss_pause_without_counting_as_win():
+    engine, db = _engine_and_session()
+    _add_cases(
+        db,
+        ["partial", "failure", "failure", "success", "success"],
+        pnls=[0.27, -3.60, -3.60, 1.0, 1.0],
+    )
+
+    result = evaluate_setup_quality(
+        engine, db, "news_breakout", profile="aggressive", symbol="AMD"
+    )
+
+    assert result["win_rate"] == 0.40
+    assert result["reason_type"] != "consecutive_losses"
+    assert result["decision"] == "downgrade"
+
+
+def test_non_profitable_partial_still_counts_toward_consecutive_loss_pause():
+    engine, db = _engine_and_session()
+    _add_cases(
+        db,
+        ["partial", "failure", "failure", "success", "success"],
+        pnls=[0.0, -3.60, -3.60, 1.0, 1.0],
+    )
+
+    result = evaluate_setup_quality(
+        engine, db, "news_breakout", profile="aggressive", symbol="AMD"
+    )
+
+    assert result["decision"] == "reject"
+    assert result["reason_type"] == "consecutive_losses"
+
+
+def test_recovery_override_can_fire_with_the_configured_rolling_window():
+    engine, db = _engine_and_session()
+    _add_cases(
+        db,
+        [
+            "success", "failure", "success", "failure", "success",
+            "failure", "failure", "failure", "failure", "failure",
+        ],
+        pnls=[1.0, -0.2, 1.0, -0.2, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+    )
+
+    result = evaluate_setup_quality(
+        engine, db, "news_breakout", profile="conservative", symbol="AMD"
+    )
+
+    assert result["win_rate"] == 0.30
+    assert result["rolling_sample_size"] == 5
+    assert result["decision"] == "allow"
+    assert result["reason_type"] == "recovery_override"

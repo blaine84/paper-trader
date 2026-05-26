@@ -56,7 +56,9 @@ MIN_ROLLING_CASES: int = 3
 CONSECUTIVE_LOSS_PAUSE_THRESHOLD: int = 3
 
 # Recovery override
-RECOVERY_MIN_ROLLING_CASES: int = 10
+# Recovery evaluates the configured rolling window, so this minimum must be
+# attainable within that window.
+RECOVERY_MIN_ROLLING_CASES: int = ROLLING_WINDOW
 RECOVERY_WIN_RATE_MARGIN: float = 0.15
 REQUIRE_POSITIVE_ROLLING_AVG_PNL_FOR_RECOVERY: bool = True
 

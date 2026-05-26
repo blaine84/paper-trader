@@ -92,11 +92,17 @@ def _compute_rolling_stats(
 def _check_consecutive_losses(cases: list[Any], threshold: int) -> bool:
     """Return ``True`` if the most recent *threshold* cases are all losses.
 
-    A loss is any case whose ``outcome`` is not ``"success"``.
+    A profitable partial outcome breaks a loss streak without being promoted
+    to a win for win-rate calculations. Other non-success outcomes still count
+    toward the consecutive-loss pause.
     """
     if len(cases) < threshold:
         return False
-    return all(c.outcome != "success" for c in cases[:threshold])
+    return all(
+        c.outcome != "success"
+        and not (c.outcome == "partial" and c.pnl_pct is not None and c.pnl_pct > 0)
+        for c in cases[:threshold]
+    )
 
 
 def _resolve_threshold(setup_type: str, profile: str | None) -> float:

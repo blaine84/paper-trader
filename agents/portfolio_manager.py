@@ -55,7 +55,7 @@ class NormalizedOrder:
 
 @dataclass
 class NonOrderRecord:
-    """Record for a non-order LLM output (HOLD/PASS/AVOID/WATCH)."""
+    """Record for a normalized non-order LLM output (HOLD/PASS/AVOID/WATCH)."""
     action: str
     symbol: str | None = None
     raw_decision: dict = field(default_factory=dict)
@@ -73,6 +73,7 @@ class NormalizationResult:
 
 _ENTRY_ACTIONS = {"BUY", "SHORT"}
 _NON_ORDER_ACTIONS = {"HOLD", "PASS", "AVOID", "WATCH"}
+_ACTION_ALIASES = {"SKIP": "PASS"}
 MAX_PM_PORTFOLIO_NOTE_CHARS = 420
 MAX_PM_RATIONALE_CHARS = 280
 
@@ -155,6 +156,8 @@ def _validate_action(decision: dict) -> tuple[str, str | None, str | None]:
 
     if not normalized:
         return ("rejected", None, "missing_action")
+
+    normalized = _ACTION_ALIASES.get(normalized, normalized)
 
     if normalized in _ENTRY_ACTIONS:
         return ("entry", normalized, None)
