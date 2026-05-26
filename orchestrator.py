@@ -117,6 +117,7 @@ def check_schema(engine):
     expected = {
         "trades": ["thesis", "setup_type", "invalidators", "stop_role", "stop_updated_by", "stop_updated_at"],
         "trade_events": ["dedupe_key"],
+        "cases": ["exit_category"],
     }
 
     missing = {}
@@ -140,6 +141,7 @@ def check_schema(engine):
         "stop_updated_by": "VARCHAR(64)",
         "stop_updated_at": "DATETIME",
         "dedupe_key": "VARCHAR(256)",
+        "exit_category": "VARCHAR(40)",
     }
 
     raw_conn = engine.raw_connection()
