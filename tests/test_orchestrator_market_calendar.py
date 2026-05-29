@@ -17,6 +17,7 @@ def _et(year, month, day, hour=10, minute=0):
 
 def setup_function():
     orchestrator._market_closed_skips_logged.clear()
+    orchestrator._regular_market_skips_logged.clear()
 
 
 def test_memorial_day_market_job_is_skipped_and_logged_once(caplog):
@@ -39,6 +40,35 @@ def test_memorial_day_market_job_is_skipped_and_logged_once(caplog):
 def test_open_market_day_is_not_skipped():
     assert not orchestrator._skip_closed_market_job(
         "price_monitor", _et(2026, 5, 26)
+    )
+
+
+def test_regular_market_job_skips_before_open_and_logs_once(caplog):
+    premarket = _et(2026, 5, 29, 9, 15)
+
+    with caplog.at_level(logging.INFO):
+        assert orchestrator._skip_outside_regular_market_job("intraday", premarket)
+        assert orchestrator._skip_outside_regular_market_job("intraday", premarket)
+
+    messages = [
+        record.message for record in caplog.records
+        if "REGULAR_MARKET_SKIP" in record.message
+    ]
+    assert messages == [
+        "REGULAR_MARKET_SKIP: job=intraday time=2026-05-29T09:15:00-04:00 "
+        "reason=before_regular_open"
+    ]
+
+
+def test_regular_market_job_runs_at_open():
+    assert not orchestrator._skip_outside_regular_market_job(
+        "intraday", _et(2026, 5, 29, 9, 30)
+    )
+
+
+def test_regular_market_job_skips_after_close():
+    assert orchestrator._skip_outside_regular_market_job(
+        "intraday", _et(2026, 5, 29, 16, 1)
     )
 
 

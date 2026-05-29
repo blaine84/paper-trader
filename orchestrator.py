@@ -60,6 +60,7 @@ LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL_MINUTES", 15))
 
 _engine = None
 _market_closed_skips_logged = set()
+_regular_market_skips_logged = set()
 
 
 def get_engine():
@@ -86,6 +87,37 @@ def _skip_closed_market_job(job_name: str, now_et=None) -> bool:
             now_et.date().isoformat(),
         )
         _market_closed_skips_logged.add(key)
+    return True
+
+
+def _skip_outside_regular_market_job(job_name: str, now_et=None) -> bool:
+    """Return True when a regular-session job should not run outside 9:30-16:00 ET."""
+    if now_et is None:
+        from pytz import timezone
+        now_et = datetime.now(timezone("America/New_York"))
+
+    if _skip_closed_market_job(job_name, now_et):
+        return True
+
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    if market_open <= now_et <= market_close:
+        return False
+
+    if now_et < market_open:
+        reason = "before_regular_open"
+    else:
+        reason = "after_regular_close"
+
+    key = (job_name, now_et.date(), reason)
+    if key not in _regular_market_skips_logged:
+        log.info(
+            "REGULAR_MARKET_SKIP: job=%s time=%s reason=%s",
+            job_name,
+            now_et.isoformat(),
+            reason,
+        )
+        _regular_market_skips_logged.add(key)
     return True
 
 
@@ -409,7 +441,7 @@ def run_pipeline_evaluation():
 
 def run_analyst_refresh():
     """Analyst-only refresh — morning every 15 min, afternoon every 30 min."""
-    if _skip_closed_market_job("analyst_refresh"):
+    if _skip_outside_regular_market_job("analyst_refresh"):
         return
     log.info("=== ANALYST REFRESH ===")
     engine = get_engine()
@@ -452,7 +484,7 @@ def run_analyst_refresh():
 
 def run_intraday():
     """PM decisions + stop checks — runs on the split schedule."""
-    if _skip_closed_market_job("intraday"):
+    if _skip_outside_regular_market_job("intraday"):
         return
     log.info("=== INTRADAY CYCLE ===")
     engine = get_engine()
@@ -724,7 +756,7 @@ def run_daily_review():
 
 def run_shadow_outcomes():
     """Score blocked trade candidates after their outcome windows mature."""
-    if _skip_closed_market_job("shadow_outcomes"):
+    if _skip_outside_regular_market_job("shadow_outcomes"):
         return
     engine = get_engine()
     try:
@@ -1025,7 +1057,7 @@ def run_position_news_poll():
 
 def run_position_timer():
     """Every 5 minutes — check position hold times and enforce exits."""
-    if _skip_closed_market_job("position_timer"):
+    if _skip_outside_regular_market_job("position_timer"):
         return
     engine = get_engine()
     try:
