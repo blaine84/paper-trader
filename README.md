@@ -117,6 +117,38 @@ Two event-driven news checks supplement the scheduled News Monitor:
 See the [User Guide](USER_GUIDE.md#catalyst-freshness-utilscatalyst_freshnesspy) for
 the full data flow diagram, freshness thresholds, confidence mapping, and error isolation details.
 
+### Setup-Aware Exit Governance
+
+Replaces the generic ~90-minute force-close timer with setup-specific lifecycle
+logic. Each setup type has its own alert/revalidate/force-close/extension timing
+defined in a single-source-of-truth registry.
+
+| Component | File | Purpose |
+|---|---|---|
+| Policy Registry | `utils/setup_time_policy.py` | Per-setup timing (alert, revalidate, force-close, extension) |
+| Lifecycle Evaluator | `utils/setup_aware_evaluator.py` | Pure-function deterministic evaluator (no LLM) |
+| Entry Validator | `utils/entry_contract_validator.py` | Validates entry metadata for exit governance eligibility |
+| Case Classifier | `utils/case_memory_classifier.py` | Classifies closed trades into exit categories |
+
+**Key behaviors:**
+- **Thesis-development setups** (news_breakout, news_catalyst, trend_pullback) get
+  revalidation windows and extension eligibility up to 180 minutes
+- **Fast tactical setups** (momentum_fade, orb, short_squeeze) use shorter timers
+  with no extension path
+- Extensions require explicit invalidation criteria (numeric stop or structural level)
+- Revalidation is deterministic: price vs stop/entry/VWAP/target progress
+- Fail-closed on missing/stale market data
+- All existing hard controls (stop-loss, EOD hard wall, overnight auth, 24h news governance)
+  remain supreme overrides
+
+**Shadow mode:** Set `SETUP_AWARE_SHADOW_MODE=true` to log setup-aware decisions
+alongside legacy behavior without altering execution (recommended for 3+ sessions
+before enforcement).
+
+**Env vars:**
+- `SETUP_AWARE_SHADOW_MODE` — `true`/`false` (default: false)
+- `SETUP_AWARE_MAX_MARKET_DATA_STALENESS_SECONDS` — max staleness for revalidation (default: 30)
+
 ### News Catalyst 24h Exit Gate
 
 A hard governance layer (`utils/news_trade_governance.py`) that enforces a 24-hour
@@ -238,6 +270,8 @@ Tables:
 | LOOP_INTERVAL_MINUTES | 15 | Intraday loop frequency |
 | CEO_SLACK_BOT_TOKEN | — | Slack bot token (optional) |
 | CEO_SLACK_CHANNEL_ID | — | Slack channel ID (optional) |
+| SETUP_AWARE_SHADOW_MODE | false | Log setup-aware decisions without executing (shadow mode) |
+| SETUP_AWARE_MAX_MARKET_DATA_STALENESS_SECONDS | 30 | Max staleness for revalidation data |
 | BLOGGER_BLOG_ID | — | Google Blogger blog ID (optional, for narrator) |
 | GOOGLE_CLIENT_ID | — | OAuth2 client ID (optional, for narrator) |
 | GOOGLE_CLIENT_SECRET | — | OAuth2 client secret (optional, for narrator) |

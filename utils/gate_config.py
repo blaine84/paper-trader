@@ -62,6 +62,17 @@ RECOVERY_MIN_ROLLING_CASES: int = ROLLING_WINDOW
 RECOVERY_WIN_RATE_MARGIN: float = 0.15
 REQUIRE_POSITIVE_ROLLING_AVG_PNL_FOR_RECOVERY: bool = True
 
+# Recovery probe sizing — applied when a profile permits bounded recovery
+# probes under rolling underperformance (aggressive unconditional, moderate
+# with high-confirmation only).
+ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER: float = 0.25
+
+if not (0 < ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER < 1.0):
+    raise ValueError(
+        f"ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER must be in (0, 1.0), "
+        f"got {ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER}"
+    )
+
 # ---------------------------------------------------------------------------
 # Pre-Trade Quality Gate
 # ---------------------------------------------------------------------------

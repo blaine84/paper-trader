@@ -6,7 +6,7 @@ performance.  Uses a deterministic first-match-wins evaluation chain:
 1. Insufficient data → allow
 2. Consecutive losses → reject
 3. Historical underperformance (with recovery override check) → reject / allow
-4. Rolling underperformance → reject
+4. Rolling underperformance → profile-aware (reduce_size / reject)
 5. Weak but allowed → downgrade
 6. Otherwise → allow
 
@@ -19,6 +19,7 @@ See: requirements.md §1, design.md §utils/setup_quality_gate.py
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from models.case import Case
@@ -32,9 +33,11 @@ from utils.gate_config import (
     MIN_ROLLING_CASES,
     MIN_WIN_RATE_BY_SETUP,
     MIN_WIN_RATE_BY_SETUP_PROFILE,
+    OVERRIDE_MIN_CONFIDENCE_SCORE,
     RECOVERY_MIN_ROLLING_CASES,
     RECOVERY_WIN_RATE_MARGIN,
     REQUIRE_POSITIVE_ROLLING_AVG_PNL_FOR_RECOVERY,
+    ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
     ROLLING_WINDOW,
 )
 from utils.trade_events import log_trade_event
@@ -142,6 +145,117 @@ def _check_recovery_override(
     return True
 
 
+def _evaluate_rolling_underperformance(
+    profile_key: str | None,
+    confidence_score: float | None,
+    setup_type: str,
+    rolling_wr: float,
+    threshold: float,
+    rolling_sample_size: int,
+    win_rate: float | None,
+    sample_size: int,
+) -> dict:
+    """Profile-aware rolling underperformance evaluation.
+
+    Called only when:
+    - All-time WR >= profile floor (step 3 passed)
+    - Rolling WR < profile floor
+    - Rolling sample >= MIN_ROLLING_CASES
+
+    Returns a result dict with decision, reason_type, optional size_multiplier,
+    and profile field. For moderate probes, includes override_confidence_score.
+    For aggressive probes, does NOT include confidence_score (unused input).
+
+    All branches include a gate_decision_id (UUID4) for correlation.
+    """
+    base = {
+        "setup_type": setup_type,
+        "win_rate": win_rate,
+        "rolling_win_rate": rolling_wr,
+        "sample_size": sample_size,
+        "rolling_sample_size": rolling_sample_size,
+        "threshold": threshold,
+    }
+    gate_decision_id = str(uuid.uuid4())
+
+    if profile_key == "aggressive":
+        return {
+            **base,
+            "decision": "reduce_size",
+            "reason_type": "rolling_underperformance_recovery_probe",
+            "size_multiplier": ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
+            "profile": "aggressive",
+            "gate_decision_id": gate_decision_id,
+            "reason": (
+                f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
+                f"over last {rolling_sample_size} cases; aggressive recovery probe "
+                f"at {ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER:.0%} size."
+            ),
+        }
+
+    elif profile_key == "moderate":
+        if (
+            confidence_score is not None
+            and confidence_score >= OVERRIDE_MIN_CONFIDENCE_SCORE
+        ):
+            return {
+                **base,
+                "decision": "reduce_size",
+                "reason_type": "rolling_underperformance_recovery_probe",
+                "size_multiplier": ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
+                "profile": "moderate",
+                "override_confidence_score": confidence_score,
+                "gate_decision_id": gate_decision_id,
+                "reason": (
+                    f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
+                    f"over last {rolling_sample_size} cases; moderate recovery probe "
+                    f"at {ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER:.0%} size "
+                    f"(override_confidence_score={confidence_score:.1f} >= "
+                    f"{OVERRIDE_MIN_CONFIDENCE_SCORE})."
+                ),
+            }
+        else:
+            return {
+                **base,
+                "decision": "reject",
+                "reason_type": "rolling_underperformance_confirmation_required",
+                "profile": "moderate",
+                "gate_decision_id": gate_decision_id,
+                "reason": (
+                    f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%}; "
+                    f"moderate profile requires override_confidence_score >= "
+                    f"{OVERRIDE_MIN_CONFIDENCE_SCORE} for recovery probe "
+                    f"(got {confidence_score})."
+                ),
+            }
+
+    elif profile_key == "conservative":
+        return {
+            **base,
+            "decision": "reject",
+            "reason_type": "rolling_underperformance_conservative_reject",
+            "profile": "conservative",
+            "gate_decision_id": gate_decision_id,
+            "reason": (
+                f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
+                f"over last {rolling_sample_size} cases; rejecting trade."
+            ),
+        }
+
+    else:
+        # Unknown/None profile — hard reject with existing reason_type
+        return {
+            **base,
+            "decision": "reject",
+            "reason_type": "rolling_underperformance",
+            "gate_decision_id": gate_decision_id,
+            "reason": (
+                f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
+                f"over last {rolling_sample_size} cases; rejecting trade."
+            ),
+        }
+
+
 def _log_gate_event(
     db,
     decision_dict: dict,
@@ -220,6 +334,7 @@ def evaluate_setup_quality(
     symbol: str | None = None,
     profile: str | None = None,
     agent: str = "portfolio_manager",
+    confidence_score: float | None = None,
 ) -> dict:
     """Evaluate whether a setup type should be allowed based on case-library
     performance.
@@ -229,7 +344,7 @@ def evaluate_setup_quality(
     2. Consecutive losses (>= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) → reject
     3. Historical underperformance (all-time WR < threshold) → reject
        UNLESS recovery override criteria are met → allow
-    4. Rolling underperformance (rolling WR < threshold, >= MIN_ROLLING_CASES) → reject
+    4. Rolling underperformance (rolling WR < threshold, >= MIN_ROLLING_CASES) → profile-aware
     5. Weak but allowed (WR >= threshold but < 50%) → downgrade
     6. Otherwise → allow
 
@@ -330,18 +445,21 @@ def evaluate_setup_quality(
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
         return result
 
-    # 4. Rolling underperformance -----------------------------------------
+    # 4. Rolling underperformance — PROFILE-AWARE
     if (
         rolling_wr is not None
         and rolling_sample_size >= MIN_ROLLING_CASES
         and rolling_wr < threshold
     ):
-        result = _result(
-            "reject",
-            "rolling_underperformance",
-            f"Setup '{setup_type}' rolling WR "
-            f"{rolling_wr:.1%} < {threshold:.0%} over last "
-            f"{rolling_sample_size} cases; rejecting trade.",
+        result = _evaluate_rolling_underperformance(
+            profile_key=(profile.lower() if isinstance(profile, str) else None),
+            confidence_score=confidence_score,
+            setup_type=setup_type,
+            rolling_wr=rolling_wr,
+            threshold=threshold,
+            rolling_sample_size=rolling_sample_size,
+            win_rate=win_rate,
+            sample_size=sample_size,
         )
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
         return result

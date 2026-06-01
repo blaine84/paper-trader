@@ -538,6 +538,21 @@ def normalize_pm_entry_decisions(
             "price_repaired_from_live_quote": price_source == "live_quote",
         }
 
+        # Preserve optional override metadata (coerce, validate range, or drop)
+        raw_conf = decision.get("override_confidence_score")
+        if raw_conf is not None:
+            try:
+                score = float(raw_conf)
+                if math.isfinite(score) and 0.0 <= score <= 10.0:
+                    order["override_confidence_score"] = score
+                # else: drop — NaN, inf, negatives, >10.0 are invalid
+            except (TypeError, ValueError):
+                pass  # Drop malformed values — gate receives None (fail-closed)
+
+        raw_reason = decision.get("override_reason")
+        if isinstance(raw_reason, str) and raw_reason.strip():
+            order["override_reason"] = raw_reason.strip()
+
         orders.append(NormalizedOrder(
             ok=True,
             order=order,
@@ -1504,6 +1519,16 @@ def _high_momentum_cooldown_message(db, symbol: str) -> str | None:
     )
 
 
+# Recovery probe contract — injected into SYSTEM_PROMPT_TEMPLATE only for moderate profile
+RECOVERY_PROBE_CONTRACT = (
+    "\n\nRECOVERY PROBE FIELDS (moderate profile only):\n"
+    "- override_confidence_score: optional float (0.0-10.0). "
+    "Provide when entering a setup that is in rolling underperformance for your profile. "
+    "Required for recovery-probe eligibility.\n"
+    "- override_reason: optional string. Brief justification for the override confidence.\n"
+)
+
+
 SYSTEM_PROMPT_TEMPLATE = """You are a portfolio manager for paper day trading.
 Profile: {profile_name} {emoji}
 {personality}
@@ -1596,11 +1621,11 @@ Example — VALID (goes in decisions[]):
 {{"symbol":"AMD","action":"BUY","decision_type":"accept","geometry_candidate_id":"amd_long_support_bounce_1","geometry_candidate_name":"support_bounce","quantity":10,"entry_price":161.0,"stop_loss":152.0,"target":179.0,"setup_type":"news_catalyst_breakout","rationale":"Strong momentum with clear levels"}}
 
 Example — VALID reject (goes in decisions[]):
-{{"symbol":"AMD","action":"PASS","decision_type":"reject","rationale":"R:R below threshold, price extended beyond entry candidates"}}
+{{"symbol":"AMD","action":"BUY","decision_type":"reject","rationale":"R:R below threshold, price extended beyond entry candidates"}}
 
 Example — INVALID (belongs in portfolio_notes, NOT decisions[]):
 {{"symbol":"AMD","action":"BUY","quantity":null,"target":"next resistance","rationale":"AMD looks attractive"}}
-"""
+{recovery_probe_contract}"""
 
 
 MAINTENANCE_REVIEW_PROMPT = """You are a portfolio manager performing a routine maintenance review of open positions.
@@ -2611,17 +2636,40 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     )
     symbol = decision.get("symbol") or signal.get("symbol")
 
+    # Extract override_confidence_score for moderate high-confirmation check
+    confidence_score = None
+    raw_conf = decision.get("override_confidence_score")
+    if raw_conf is not None:
+        try:
+            score = float(raw_conf)
+            if math.isfinite(score) and 0.0 <= score <= 10.0:
+                confidence_score = score
+        except (TypeError, ValueError):
+            confidence_score = None
+
     try:
         setup_result = evaluate_setup_quality(
             engine, db, setup_type, market_regime,
             symbol=symbol, profile=profile_id,
+            confidence_score=confidence_score,
         )
         notes.append({"gate": "setup_quality_gate", **setup_result})
         if setup_result["decision"] == "reject":
             return False, notes, cumulative_multiplier, multiplier_breakdown
         if setup_result.get("size_multiplier") and setup_result["decision"] == "reduce_size":
-            cumulative_multiplier *= setup_result["size_multiplier"]
-            multiplier_breakdown.append({"gate": "setup_quality_gate", "multiplier": setup_result["size_multiplier"]})
+            sqg_multiplier = setup_result["size_multiplier"]
+            # Update working quantity so downstream gates see reduced size
+            original_qty = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
+            reduced_qty = max(1, int(original_qty * sqg_multiplier))
+            log.info(
+                "SETUP QUALITY GATE: %s reduce_size — qty %d → %d "
+                "(multiplier=%.2f, reason_type=%s)",
+                symbol, original_qty, reduced_qty,
+                sqg_multiplier, setup_result.get("reason_type", ""),
+            )
+            decision["quantity"] = reduced_qty
+            cumulative_multiplier *= sqg_multiplier
+            multiplier_breakdown.append({"gate": "setup_quality_gate", "multiplier": sqg_multiplier})
     except Exception as exc:
         log.error("Setup quality gate error (treating as warn): %s", exc)
         log_trade_event(
@@ -2644,8 +2692,19 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
         if quality_result["decision"] == "override_required":
             return False, notes, cumulative_multiplier, multiplier_breakdown
         if quality_result.get("size_multiplier") and quality_result["decision"] == "reduce_size":
-            cumulative_multiplier *= quality_result["size_multiplier"]
-            multiplier_breakdown.append({"gate": "pre_trade_quality_gate", "multiplier": quality_result["size_multiplier"]})
+            ptq_multiplier = quality_result["size_multiplier"]
+            # Update working quantity so downstream gates see reduced size
+            original_qty = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
+            reduced_qty = max(1, int(original_qty * ptq_multiplier))
+            log.info(
+                "PRE-TRADE QUALITY GATE: %s reduce_size — qty %d → %d "
+                "(multiplier=%.2f, reason_type=%s)",
+                symbol, original_qty, reduced_qty,
+                ptq_multiplier, quality_result.get("reason_type", ""),
+            )
+            decision["quantity"] = reduced_qty
+            cumulative_multiplier *= ptq_multiplier
+            multiplier_breakdown.append({"gate": "pre_trade_quality_gate", "multiplier": ptq_multiplier})
     except Exception as exc:
         log.error("Pre-trade quality gate error (treating as warn): %s", exc)
         log_trade_event(
@@ -3107,6 +3166,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
     _gate_notes = []
     _gate_multiplier = 1.0
     _gate_multiplier_breakdown = []
+    _gate_decision_id = None  # Correlation ID from recovery-probe gate decisions
     if action in ("BUY", "SHORT"):
         signal_for_gates = _build_signal_for_symbol(db, symbol, decision)
         proceed, _gate_notes, _gate_multiplier, _gate_multiplier_breakdown = _run_gate_pipeline(
@@ -3180,8 +3240,8 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             return False, f"Gate rejected ({blocked_by}): {gate_rejection_reasons}"
 
         # Apply cumulative size multiplier from gates
+        pre_gate_qty = quantity  # Capture before any gate reduction for sizing invariant
         if _gate_multiplier < 1.0 and quantity > 0:
-            pre_gate_qty = quantity
             quantity = max(1, int(quantity * _gate_multiplier))
             decision["quantity"] = quantity
             log.info(
@@ -3194,11 +3254,22 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         rg_note = next((n for n in _gate_notes if n.get("gate") == "risk_geometry_gate" and n.get("decision") == "adjusted_allowed"), None)
         if rg_note:
             stop = rg_note["stop_price"]
-            quantity = rg_note["quantity"]
+            rg_quantity = rg_note["quantity"]
+            # Sizing invariant: geometry may reduce but never restore above reduced cap
+            reduced_cap = max(1, int(pre_gate_qty * _gate_multiplier)) if _gate_multiplier < 1.0 else pre_gate_qty
+            quantity = min(reduced_cap, rg_quantity)
             decision["stop"] = stop
             decision["stop_loss"] = stop
             decision["stop_price"] = stop
             decision["quantity"] = quantity
+
+        # Extract gate_decision_id from gate_notes for correlation (recovery probes).
+        # The setup_quality_gate note carries gate_decision_id when a recovery-probe
+        # decision was made. This is propagated to entry_filled events downstream.
+        _gate_decision_id = None
+        sqg_note = next((n for n in _gate_notes if n.get("gate") == "setup_quality_gate"), None)
+        if sqg_note:
+            _gate_decision_id = sqg_note.get("gate_decision_id")
 
     # ── Tier-1 pre-validation: similarity → edge score → portfolio risk ──
     # Tracks edge data to store on the Trade record later
@@ -3472,7 +3543,10 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         )
         db.add(trade)
         db.flush()
-        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload={"action": action, "quantity": quantity, "side": "long", "edge": _edge_data})
+        _entry_filled_payload = {"action": action, "quantity": quantity, "side": "long", "edge": _edge_data}
+        if _gate_decision_id is not None:
+            _entry_filled_payload["gate_decision_id"] = _gate_decision_id
+        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
         if stop:
             log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
         if target:
@@ -3515,7 +3589,10 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         )
         db.add(trade)
         db.flush()
-        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload={"action": action, "quantity": quantity, "side": "short", "edge": _edge_data})
+        _entry_filled_payload = {"action": action, "quantity": quantity, "side": "short", "edge": _edge_data}
+        if _gate_decision_id is not None:
+            _entry_filled_payload["gate_decision_id"] = _gate_decision_id
+        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
         if stop:
             log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
         if target:
@@ -3993,6 +4070,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
         avoid_first_minutes=profile["avoid_first_minutes"],
         avoid_last_minutes=profile["avoid_last_minutes"],
         max_daily_loss_pct=int(profile["max_daily_loss_pct"] * 100),
+        recovery_probe_contract=RECOVERY_PROBE_CONTRACT if profile_id == "moderate" else "",
     )
 
     # Pull weekly stance if available (written Sunday, applies Mon–Fri)

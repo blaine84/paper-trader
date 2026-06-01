@@ -75,6 +75,8 @@ All config lives in `.env`. Copy `.env.example` to get started.
 | `GOOGLE_CLIENT_ID` | — | OAuth2 client ID (optional, for narrator) |
 | `GOOGLE_CLIENT_SECRET` | — | OAuth2 client secret (optional, for narrator) |
 | `GOOGLE_REFRESH_TOKEN` | — | OAuth2 refresh token (optional, for narrator) |
+| `SETUP_AWARE_SHADOW_MODE` | `false` | Log setup-aware decisions without executing |
+| `SETUP_AWARE_MAX_MARKET_DATA_STALENESS_SECONDS` | `30` | Max staleness for revalidation data |
 
 ### LLM Tiers
 
@@ -760,11 +762,19 @@ The full lifecycle of a trade from signal to exit:
 
    Position Timer checks (every 5 min):
    ├─ **News Governance (runs first)** — see below
-   ├─ Setup-specific time limits (see below)
-   ├─ Stale trade detection (momentum_fade: <0.5R after 35 min)
-   ├─ Thesis revalidation at 60 min (LLM checks VWAP, volume, structure)
-   ├─ Force close at setup max time
-   └─ Hard wall: ALL intraday positions closed at 3:45 PM ET
+   ├─ **Setup-aware lifecycle evaluator** (replaces generic timer):
+   │    ├─ Looks up per-setup policy (alert/revalidate/force-close/extension timing)
+   │    ├─ Below alert → intraday_ok (no action)
+   │    ├─ Past alert, below revalidation → setup_exit_alert
+   │    ├─ At revalidation boundary (extension-eligible):
+   │    │    ├─ Validates invalidation criteria (numeric stop or structural level)
+   │    │    ├─ Checks market data freshness (< 30s)
+   │    │    ├─ Runs deterministic revalidation decision engine
+   │    │    └─ Produces: hold_valid / close_thesis_invalidated / close_time_expired
+   │    ├─ Non-extension-eligible past force_close → close (setup_time_limit_exceeded)
+   │    └─ Pre-wall buffer (3:30 PM ET) → revoke extension, close
+   ├─ Hard wall: ALL intraday positions closed at 3:45 PM ET
+   └─ Shadow mode: logs both setup-aware and legacy decisions, executes legacy only
 
    Position Health (every hour, local LLM):
    └─ Reviews all positions against current indicators
@@ -803,18 +813,51 @@ The full lifecycle of a trade from signal to exit:
     All feedback written to agent_memory → agents read next cycle
 ```
 
-### Position Time Limits
+### Setup-Aware Exit Governance
 
-| Setup Type | Stale | Alert | Revalidate | Force Close |
-|---|---|---|---|---|
-| momentum_fade | 35 min (<0.5R) | 45 min | 60 min (LLM) | 75 min |
-| gap_and_go | — | 60 min | — | 90 min |
-| vwap_reclaim | — | 60 min | — | 90 min |
-| orb | — | 45 min | — | 75 min |
-| trend_pullback | — | 90 min | — | 120 min |
-| news_catalyst | — | 60 min | — | 90 min |
-| short_squeeze | — | 30 min | — | 60 min |
-| **All intraday** | — | — | — | **3:45 PM ET hard wall** |
+Replaces the generic force-close timer with per-setup lifecycle logic. Each setup
+type has its own timing defined in `utils/setup_time_policy.py`. Thesis-development
+setups can earn extensions via deterministic revalidation; fast tactical setups
+close at their limit with no extension path.
+
+**Thesis-development setups** (extension-eligible, revalidation at each boundary):
+
+| Setup Type | Alert | Revalidate | Force Close | Max Extension | Interval |
+|---|---|---|---|---|---|
+| news_breakout | 60 min | 90 min | 120 min | 180 min | 30 min |
+| news_catalyst | 60 min | 90 min | 120 min | 180 min | 30 min |
+| trend_pullback | 90 min | 120 min | 150 min | 180 min | 30 min |
+
+**Fast tactical setups** (no extension, close at force_close):
+
+| Setup Type | Alert | Force Close |
+|---|---|---|
+| momentum_fade | 35 min | 75 min |
+| orb | 45 min | 75 min |
+| short_squeeze | 30 min | 60 min |
+| gap_and_go | 60 min | 90 min |
+| vwap_reclaim | 60 min | 90 min |
+| **Unknown/default** | 60 min | 90 min |
+
+**All intraday positions**: hard wall at **3:45 PM ET** (pre-wall buffer closes
+extended trades at 3:30 PM ET).
+
+**Extension requirements** — at each revalidation boundary, the evaluator checks:
+1. Valid invalidation criteria (numeric stop on loss side or structural level)
+2. Fresh market data (< 30s staleness)
+3. Positive indicators (price above stop AND one of: price ≥ entry, price ≥ VWAP/support, target progress ≥ 25%)
+
+If any check fails → close. If all pass → hold until next boundary.
+
+**Shadow mode** — set `SETUP_AWARE_SHADOW_MODE=true` to log setup-aware decisions
+alongside legacy behavior without altering execution. Recommended for 3+ sessions
+before enforcement.
+
+**Case-memory exit classification** — each closed trade is classified into exactly one category:
+- `bad_entry` — entry quality was poor
+- `valid_entry_bad_exit_policy` — good entry, timer killed it prematurely
+- `valid_exit_thesis_invalidated` — correct exit by thesis invalidation
+- `forced_exit_missing_metadata` — extension denied due to missing data
 
 ### News Catalyst 24h Exit Gate
 
@@ -909,16 +952,13 @@ The Reviewer automatically converts prose feedback into executable parameters:
 
 ```
 0 min   → Trade opened
-35 min  → If <0.5R achieved → mark STALE
-45 min  → If still stale → ALERT PM
-60 min  → REVALIDATE thesis via LLM:
-           - Still below VWAP?
-           - Volume fading?
-           - Lower highs/lower lows intact?
-           → If invalid → EXIT IMMEDIATELY
-75 min  → FORCE EXIT regardless
+35 min  → ALERT (approaching force-close)
+75 min  → FORCE EXIT (non-extension-eligible, no revalidation)
 3:45 PM → HARD WALL close
 ```
+
+Momentum fade is a fast tactical setup — no extension path, no revalidation.
+The setup-aware evaluator closes it at 75 minutes regardless of price state.
 
 ---
 
