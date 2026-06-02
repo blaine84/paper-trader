@@ -1,0 +1,29 @@
+# config/funnel_config.yaml
+# Premarket Candidate Funnel configuration.
+# Controls schedule, ceilings, budgets, and midday scan behavior for the
+# staged pipeline that discovers and qualifies candidates before market open.
+
+funnel:
+  enabled: true
+
+  schedule:
+    discovery_time: "06:00"          # ET
+    research_time: "06:30"           # ET
+    analysis_time: "07:15"           # ET
+    confirmation_time: "09:35"       # ET
+    confirmation_end: "09:45"        # ET
+
+  ceilings:
+    max_discovery_shortlist: 5
+    max_researcher_promoted: 3
+    max_pm_handoff: 3
+
+  budgets:
+    per_sector_seconds: 15
+    total_pipeline_seconds: 90
+    confirmation_budget_seconds: 45
+    market_hours_confirmation_budget_seconds: 60
+
+  midday_scan:
+    enabled: false                   # Disabled in v1
+    revalidation_only: true          # If re-enabled, only revalidate shortlist

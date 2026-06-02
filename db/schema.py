@@ -4,11 +4,12 @@ Uses SQLite via SQLAlchemy.
 """
 
 from sqlalchemy import (
-    create_engine, Column, Integer, Float, String, 
-    DateTime, Text, Boolean, ForeignKey
+    create_engine, Column, Integer, Float, String,
+    DateTime, Date, Text, Boolean, ForeignKey, Index
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
+import uuid
 
 Base = declarative_base()
 
@@ -201,6 +202,62 @@ class DailyLog(Base):
     daily_pnl = Column(Float)
     daily_pnl_pct = Column(Float)
     notes = Column(Text)
+
+
+class FunnelCandidate(Base):
+    """Persistent premarket candidate funnel record with stage history."""
+    __tablename__ = "funnel_candidates"
+
+    id = Column(Integer, primary_key=True)
+    candidate_id = Column(String(36), nullable=False, default=lambda: str(uuid.uuid4()))
+    date = Column(Date, nullable=False)  # New York trading date (America/New_York)
+    symbol = Column(String(10), nullable=False)
+    discovered_at = Column(DateTime, nullable=False)  # UTC timestamp
+    source_run = Column(String(32), nullable=False)  # premarket|confirmation|manual_intraday
+    selection_mode = Column(String(32), nullable=False)  # chief_scout|deterministic_fallback
+    scout_rank = Column(Integer, nullable=False)
+    scout_score = Column(Float, nullable=False)
+    direction_bias = Column(String(10), nullable=True)  # bullish|bearish|neutral
+    catalyst_evidence = Column(Text, nullable=False)  # JSON
+    selection_reason = Column(Text, nullable=False)
+    primary_risk = Column(Text, nullable=False)
+    sector_context = Column(Text, nullable=True)  # JSON
+    preliminary_setup_type = Column(String(32), nullable=True)
+    authoritative_setup_type = Column(String(32), nullable=True)
+    stage_status = Column(String(32), nullable=False, default="awaiting_research")
+    stage_decisions = Column(Text, nullable=False, default="[]")  # JSON array
+    trade_event_id = Column(Integer, ForeignKey("trade_events.id"), nullable=True)
+    blocked_candidate_id = Column(Integer, nullable=True)
+    expired = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_funnel_date_status", "date", "stage_status"),
+        Index("ix_funnel_date_symbol", "date", "symbol", unique=True),
+        Index("ix_funnel_candidate_id", "candidate_id", unique=True),
+    )
+
+
+class FunnelRunLog(Base):
+    """Operational log for each funnel pipeline execution."""
+    __tablename__ = "funnel_run_logs"
+
+    id = Column(Integer, primary_key=True)
+    date = Column(Date, nullable=False)
+    stage = Column(String(32), nullable=False)  # discovery|research|analysis|confirmation
+    started_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    budget_seconds = Column(Float, nullable=False)
+    result_status = Column(String(32), nullable=False)  # completed|timed_out|degraded|error
+    sectors_completed = Column(Text, nullable=True)  # JSON array
+    sectors_timed_out = Column(Text, nullable=True)  # JSON array
+    candidates_input = Column(Integer, nullable=True)
+    candidates_promoted = Column(Integer, nullable=True)
+    candidates_rejected = Column(Integer, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 def init_db(db_path: str = "db/paper_trader.db"):
