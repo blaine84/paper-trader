@@ -59,9 +59,27 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-WATCHLIST = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD").split(",")]
-SCOUT_CANDIDATES = [s.strip() for s in os.getenv("SCOUT_CANDIDATES", "AAPL,MSFT,META,AMZN,GOOGL,AVGO,SMCI,PLTR,COIN,MSTR,ARM,MU,INTC,NFLX").split(",")]
+def _parse_symbol_list(raw: str) -> list[str]:
+    """Parse a comma-separated symbol list, preserving order and de-duping."""
+    seen = set()
+    symbols = []
+    for item in raw.split(","):
+        sym = item.strip().upper()
+        if sym and sym not in seen:
+            seen.add(sym)
+            symbols.append(sym)
+    return symbols
+
+
+WATCHLIST = _parse_symbol_list(os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD"))
+SCOUT_CANDIDATES = _parse_symbol_list(os.getenv("SCOUT_CANDIDATES", "AAPL,MSFT,META,AMZN,GOOGL,AVGO,SMCI,PLTR,COIN,MSTR,ARM,MU,INTC,NFLX"))
+PM_TRADABLE_SYMBOLS = _parse_symbol_list(os.getenv("PM_TRADABLE_SYMBOLS", "META,MU"))
 LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL_MINUTES", 15))
+
+
+def _pm_base_watchlist() -> list[str]:
+    """Core symbols plus configured non-core names that PM may trade."""
+    return _parse_symbol_list(",".join(WATCHLIST + PM_TRADABLE_SYMBOLS))
 
 
 _engine = None
@@ -760,7 +778,7 @@ def run_analyst_refresh():
     except Exception as e:
         log.error(f"Funnel/expanded watchlist error: {e}", exc_info=True)
 
-    full_watchlist = build_deduplicated_watchlist(WATCHLIST, scout_picks, expanded_symbols)
+    full_watchlist = build_deduplicated_watchlist(_pm_base_watchlist(), scout_picks, expanded_symbols)
 
     try:
         console.print("[bold blue]📊 Analyst refresh...[/bold blue]")
@@ -838,7 +856,7 @@ def _run_intraday_inner(engine):
     except Exception as e:
         log.error(f"Funnel/expanded watchlist error: {e}", exc_info=True)
 
-    full_watchlist = build_deduplicated_watchlist(WATCHLIST, scout_picks, expanded_symbols)
+    full_watchlist = build_deduplicated_watchlist(_pm_base_watchlist(), scout_picks, expanded_symbols)
 
     # Analyst signals are refreshed by the separate run_analyst_refresh job
     # on the same schedule — no need to duplicate here.
@@ -2014,6 +2032,8 @@ def main():
 
     console.print(f"[bold green]🚀 Paper Trader started[/bold green]")
     console.print(f"   Watchlist: {', '.join(WATCHLIST)}")
+    if PM_TRADABLE_SYMBOLS:
+        console.print(f"   PM tradable symbols: {', '.join(PM_TRADABLE_SYMBOLS)}")
     console.print(f"   Loop interval: {LOOP_INTERVAL} min")
     console.print(f"   Schedule: Sun 5PM weekly prep | 8:30 pre-market | 9:30-12 every {LOOP_INTERVAL}min | 12-4 every 30min | 4:15 EOD | 4:30 daily review")
     console.print(f"   Analyst: every {LOOP_INTERVAL}min morning, every 30min afternoon")
