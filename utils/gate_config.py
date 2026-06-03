@@ -224,3 +224,21 @@ CATALYST_SPECIFICITY_SECTOR_SYMPATHY_SIZE_MULTIPLIER: dict[str, float] = {
     "moderate": 0.5,
     "aggressive": 0.5,
 }
+
+# ---------------------------------------------------------------------------
+# Setup-Specific R:R Threshold Overrides
+# ---------------------------------------------------------------------------
+
+QUALIFYING_SETUP_TYPES: list[str] = [
+    "news_breakout",
+    "technical_breakout",
+    "sector_move",
+]
+
+QUALIFYING_MIN_SIGNAL_STRENGTH: float = 7.5
+
+REDUCED_RR_THRESHOLDS_BY_PROFILE: dict[str, float] = {
+    "aggressive": 0.5,
+    "moderate": 0.75,
+    "conservative": 1.0,
+}

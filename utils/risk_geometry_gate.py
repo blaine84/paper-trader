@@ -9,12 +9,16 @@ See: .kiro/specs/risk-geometry-gate/design.md
 
 import logging
 import math
+import os
 import re
 from datetime import datetime, timedelta, timezone
 
 from utils.gate_config import (
     DEFAULT_STOP_DISTANCE_RULE,
     HIGH_BETA_CLUSTER,
+    QUALIFYING_MIN_SIGNAL_STRENGTH,
+    QUALIFYING_SETUP_TYPES,
+    REDUCED_RR_THRESHOLDS_BY_PROFILE,
     STOP_DISTANCE_RULES,
 )
 from utils.symbol_class import classify_symbol
@@ -34,6 +38,59 @@ def _normalize_direction(direction: str) -> str:
     if upper in ("BUY", "LONG"):
         return "LONG"
     return "SHORT"
+
+
+def _is_feature_flag_enabled() -> bool:
+    """Check if the setup-specific R:R thresholds feature flag is enabled.
+
+    Reads os.environ on each call so that flag changes take effect without
+    process restart. Returns True only if the value is case-insensitive "true".
+    """
+    return os.environ.get("SETUP_SPECIFIC_RR_THRESHOLDS", "").strip().lower() == "true"
+
+
+def _is_qualifying_setup(
+    setup_type: str | None,
+    signal_strength: float | None,
+    confidence_level: str | None,
+) -> bool:
+    """Determine if a trade signal qualifies for reduced R:R thresholds.
+
+    Returns True only when ALL criteria are met:
+    1. setup_type (lowercased) is in QUALIFYING_SETUP_TYPES
+    2. signal_strength is a numeric value in [0, 10] and >= QUALIFYING_MIN_SIGNAL_STRENGTH
+    3. confidence_level (lowercased) equals "high"
+
+    Handles None values, non-numeric signal_strength, and out-of-range values
+    gracefully by returning False.
+    """
+    # Check setup_type
+    if setup_type is None or not isinstance(setup_type, str):
+        return False
+    if setup_type.lower() not in QUALIFYING_SETUP_TYPES:
+        return False
+
+    # Check signal_strength — must be numeric, in [0, 10], and >= minimum
+    if signal_strength is None:
+        return False
+    try:
+        strength = float(signal_strength)
+    except (TypeError, ValueError):
+        return False
+    if math.isnan(strength) or math.isinf(strength):
+        return False
+    if strength < 0 or strength > 10:
+        return False
+    if strength < QUALIFYING_MIN_SIGNAL_STRENGTH:
+        return False
+
+    # Check confidence_level
+    if confidence_level is None or not isinstance(confidence_level, str):
+        return False
+    if confidence_level.lower() != "high":
+        return False
+
+    return True
 
 
 def _resolve_rule(symbol: str, setup_type: str | None) -> tuple[dict, str, str]:
@@ -73,18 +130,96 @@ def _resolve_rule(symbol: str, setup_type: str | None) -> tuple[dict, str, str]:
     return DEFAULT_STOP_DISTANCE_RULE, "default", "default"
 
 
-def _min_reward_to_risk(rule: dict, profile: str | None) -> float:
-    """Resolve risk-geometry R:R floor, allowing profile-specific overrides.
+def _build_setup_specific_rr_audit_fields(
+    *,
+    setup_specific_rr_applied: bool,
+    setup_type: str | None,
+    signal_strength: float | None,
+    confidence_level: str | None,
+    reduced_threshold: float | None,
+    default_threshold: float,
+) -> dict:
+    """Build the audit payload fields for setup-specific R:R decisions.
 
-    The gate's job is to enforce executable geometry, not to flatten every PM
-    personality into the same threshold. Unknown profiles fall back to the
-    rule's legacy min_reward_to_risk value.
+    Only called when the feature flag is enabled. Returns a dict of fields
+    to merge into the gate event payload.
     """
+    missing_fields = []
+    if setup_type is None:
+        missing_fields.append("setup_type")
+    if signal_strength is None:
+        missing_fields.append("signal_strength")
+    if confidence_level is None:
+        missing_fields.append("confidence_level")
+
+    return {
+        "setup_specific_rr_applied": setup_specific_rr_applied,
+        "setup_specific_rr_qualifying_criteria": {
+            "setup_type": setup_type,
+            "signal_strength": signal_strength,
+            "confidence_level": confidence_level,
+            "missing_fields": missing_fields,
+        },
+        "setup_specific_rr_reduced_threshold": reduced_threshold if setup_specific_rr_applied else None,
+        "setup_specific_rr_default_threshold": default_threshold,
+    }
+
+
+def _compute_default_rr_threshold(rule: dict, profile: str | None) -> float:
+    """Compute the default R:R threshold that would apply without setup-specific override."""
     by_profile = rule.get("min_reward_to_risk_by_profile") or {}
     profile_key = profile.lower() if isinstance(profile, str) else None
     if profile_key and profile_key in by_profile:
         return float(by_profile[profile_key])
     return float(rule.get("min_reward_to_risk", 2.0))
+
+
+def _min_reward_to_risk(
+    rule: dict,
+    profile: str | None,
+    *,
+    setup_type: str | None = None,
+    signal_strength: float | None = None,
+    confidence_level: str | None = None,
+) -> tuple[float, bool]:
+    """Resolve risk-geometry R:R floor, allowing profile-specific overrides.
+
+    When the setup-specific R:R feature flag is enabled and the trade qualifies
+    (correct setup_type + high signal_strength + high confidence), returns the
+    reduced threshold from REDUCED_RR_THRESHOLDS_BY_PROFILE. Otherwise returns
+    the rule's legacy min_reward_to_risk value.
+
+    Returns:
+        (threshold, setup_specific_rr_applied) — the R:R floor and whether
+        the reduced threshold was used.
+    """
+    # Resolve the default threshold first (always needed as fallback)
+    by_profile = rule.get("min_reward_to_risk_by_profile") or {}
+    profile_key = profile.lower() if isinstance(profile, str) else None
+    if profile_key and profile_key in by_profile:
+        default_threshold = float(by_profile[profile_key])
+    else:
+        default_threshold = float(rule.get("min_reward_to_risk", 2.0))
+
+    # Attempt qualifying override when feature flag is enabled
+    try:
+        if _is_feature_flag_enabled() and _is_qualifying_setup(
+            setup_type, signal_strength, confidence_level
+        ):
+            if profile_key and profile_key in REDUCED_RR_THRESHOLDS_BY_PROFILE:
+                return (REDUCED_RR_THRESHOLDS_BY_PROFILE[profile_key], True)
+            # Profile not in reduced thresholds dict — fall back to default
+            return (default_threshold, False)
+    except Exception:
+        # Fail-open: if anything unexpected happens in qualifying check,
+        # fall through to default threshold without blocking the trade.
+        log.warning(
+            "Unexpected error in setup-specific R:R qualifying check; "
+            "falling back to default threshold",
+            exc_info=True,
+        )
+
+    return (default_threshold, False)
 
 
 def _compute_min_stop_distance(
@@ -436,6 +571,8 @@ def evaluate_risk_geometry(
     agent: str = "portfolio_manager",
     trade_metadata: str | None = None,
     trade_rationale: str | None = None,
+    signal_strength: float | None = None,
+    confidence_level: str | None = None,
 ) -> dict:
     """Evaluate trade geometry and return gate decision.
 
@@ -472,6 +609,8 @@ def evaluate_risk_geometry(
             agent=agent,
             trade_metadata=trade_metadata,
             trade_rationale=trade_rationale,
+            signal_strength=signal_strength,
+            confidence_level=confidence_level,
         )
     except Exception as exc:
         log.error("RiskGeometryGate unexpected error (fail-open): %s", exc)
@@ -546,6 +685,8 @@ def _evaluate_risk_geometry_inner(
     agent: str,
     trade_metadata: str | None = None,
     trade_rationale: str | None = None,
+    signal_strength: float | None = None,
+    confidence_level: str | None = None,
 ) -> dict:
     """Core evaluation logic (may raise on truly unexpected errors)."""
 
@@ -736,8 +877,25 @@ def _evaluate_risk_geometry_inner(
         original_dollar_risk = quantity * stop_distance
 
         # Validate R:R
-        min_rr = _min_reward_to_risk(rule, profile)
+        min_rr, _setup_specific_rr_applied = _min_reward_to_risk(
+            rule, profile,
+            setup_type=setup_type,
+            signal_strength=signal_strength,
+            confidence_level=confidence_level,
+        )
         if original_rr < min_rr:
+            # Build setup-specific R:R audit fields for rejection payload
+            _rr_extra_payload = None
+            if _is_feature_flag_enabled():
+                default_threshold = _compute_default_rr_threshold(rule, profile)
+                _rr_extra_payload = _build_setup_specific_rr_audit_fields(
+                    setup_specific_rr_applied=_setup_specific_rr_applied,
+                    setup_type=setup_type,
+                    signal_strength=signal_strength,
+                    confidence_level=confidence_level,
+                    reduced_threshold=min_rr if _setup_specific_rr_applied else None,
+                    default_threshold=default_threshold,
+                )
             return _build_rejection(
                 reason=f"Reward-to-risk ratio {original_rr:.2f} below minimum {min_rr:.2f}",
                 reason_code="RISK_REWARD_BELOW_THRESHOLD",
@@ -762,6 +920,7 @@ def _evaluate_risk_geometry_inner(
                 original_rr=original_rr,
                 original_dollar_risk=original_dollar_risk,
                 atr_fallback=atr_fallback_used,
+                extra_payload=_rr_extra_payload,
             )
 
         # Validate dollar risk
@@ -819,6 +978,19 @@ def _evaluate_risk_geometry_inner(
             "quantity_policy": quantity_policy,
             "min_reward_to_risk": min_rr,
         }
+
+        # Add setup-specific R:R audit fields when feature flag is enabled
+        if _is_feature_flag_enabled():
+            default_threshold = _compute_default_rr_threshold(rule, profile)
+            result.update(_build_setup_specific_rr_audit_fields(
+                setup_specific_rr_applied=_setup_specific_rr_applied,
+                setup_type=setup_type,
+                signal_strength=signal_strength,
+                confidence_level=confidence_level,
+                reduced_threshold=min_rr if _setup_specific_rr_applied else None,
+                default_threshold=default_threshold,
+            ))
+
         _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
         return result
 
@@ -914,8 +1086,25 @@ def _evaluate_risk_geometry_inner(
             )
 
         # Validate: adjusted R:R
-        min_rr = _min_reward_to_risk(rule, profile)
+        min_rr, _setup_specific_rr_applied = _min_reward_to_risk(
+            rule, profile,
+            setup_type=setup_type,
+            signal_strength=signal_strength,
+            confidence_level=confidence_level,
+        )
         if adjusted_rr < min_rr:
+            # Build setup-specific R:R audit fields for rejection payload
+            _rr_extra_payload = None
+            if _is_feature_flag_enabled():
+                default_threshold = _compute_default_rr_threshold(rule, profile)
+                _rr_extra_payload = _build_setup_specific_rr_audit_fields(
+                    setup_specific_rr_applied=_setup_specific_rr_applied,
+                    setup_type=setup_type,
+                    signal_strength=signal_strength,
+                    confidence_level=confidence_level,
+                    reduced_threshold=min_rr if _setup_specific_rr_applied else None,
+                    default_threshold=default_threshold,
+                )
             return _build_rejection(
                 reason=f"Adjusted R:R {adjusted_rr:.2f} below minimum {min_rr:.2f} after stop adjustment",
                 reason_code="RISK_REWARD_AFTER_STOP_ADJUSTMENT",
@@ -944,6 +1133,7 @@ def _evaluate_risk_geometry_inner(
                 adjusted_dollar_risk=adjusted_dollar_risk,
                 adjusted_rr=adjusted_rr,
                 atr_fallback=atr_fallback_used,
+                extra_payload=_rr_extra_payload,
             )
 
         # Adjusted trade allowed
@@ -973,6 +1163,19 @@ def _evaluate_risk_geometry_inner(
             "quantity_policy": quantity_policy,
             "min_reward_to_risk": min_rr,
         }
+
+        # Add setup-specific R:R audit fields when feature flag is enabled
+        if _is_feature_flag_enabled():
+            default_threshold = _compute_default_rr_threshold(rule, profile)
+            result.update(_build_setup_specific_rr_audit_fields(
+                setup_specific_rr_applied=_setup_specific_rr_applied,
+                setup_type=setup_type,
+                signal_strength=signal_strength,
+                confidence_level=confidence_level,
+                reduced_threshold=min_rr if _setup_specific_rr_applied else None,
+                default_threshold=default_threshold,
+            ))
+
         _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
         return result
 
@@ -1011,6 +1214,7 @@ def _build_rejection(
     adjusted_dollar_risk: float | None = None,
     adjusted_rr: float | None = None,
     atr_fallback: bool = False,
+    extra_payload: dict | None = None,
 ) -> dict:
     """Build a rejection result dict and log the event."""
     # Compute stop_distance if not provided
@@ -1057,6 +1261,9 @@ def _build_rejection(
         "rule_source": rule_source,
         "quantity_policy": quantity_policy,
     }
+
+    if extra_payload:
+        result.update(extra_payload)
 
     _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
     return result
