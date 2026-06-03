@@ -142,6 +142,13 @@ def _validate_action(decision: dict) -> tuple[str, str | None, str | None]:
         normalized_action: uppercase action string, or None if missing/empty
         reason_code: None for "entry"/"non_order", or a rejection reason code
     """
+    decision_type_raw = decision.get("decision_type")
+    if (
+        isinstance(decision_type_raw, str)
+        and decision_type_raw.strip().lower() == "reject"
+    ):
+        return ("non_order", "REJECT", None)
+
     action_raw = decision.get("action")
 
     # Missing, None, or empty action
@@ -166,6 +173,72 @@ def _validate_action(decision: dict) -> tuple[str, str | None, str | None]:
         return ("non_order", normalized, None)
 
     return ("rejected", normalized, "unsupported_action")
+
+
+def _apply_scaffold_geometry_defaults(
+    decisions: list[dict],
+    scaffold_results: dict[str, dict | None],
+) -> list[dict]:
+    """Fill missing executable geometry from the selected scaffold candidate.
+
+    The PM prompt requires accept/adjust decisions to include a
+    geometry_candidate_id. If the model names a scaffold candidate but omits
+    one of the candidate-owned fields, repair only missing values from the
+    deterministic scaffold. Existing PM-adjusted values are preserved.
+    """
+    if not decisions or not scaffold_results:
+        return decisions
+
+    scaffold_lookup = {sym.upper(): result for sym, result in scaffold_results.items()}
+    repaired: list[dict] = []
+
+    for item in decisions:
+        if not isinstance(item, dict):
+            repaired.append(item)
+            continue
+
+        decision = dict(item)
+        decision_type = str(decision.get("decision_type") or "").strip().lower()
+        if decision_type not in {"accept", "adjust"}:
+            repaired.append(decision)
+            continue
+
+        symbol_raw = decision.get("symbol")
+        candidate_id = decision.get("geometry_candidate_id")
+        if not isinstance(symbol_raw, str) or not isinstance(candidate_id, str):
+            repaired.append(decision)
+            continue
+
+        scaffold = scaffold_lookup.get(symbol_raw.strip().upper())
+        if not isinstance(scaffold, dict):
+            repaired.append(decision)
+            continue
+
+        candidates = scaffold.get("candidates")
+        if not isinstance(candidates, list):
+            repaired.append(decision)
+            continue
+
+        selected = None
+        for candidate in candidates:
+            if isinstance(candidate, dict) and candidate.get("candidate_id") == candidate_id:
+                selected = candidate
+                break
+
+        if selected is None:
+            repaired.append(decision)
+            continue
+
+        for field in ("entry_price", "stop_loss", "target"):
+            if decision.get(field) in (None, "") and selected.get(field) not in (None, ""):
+                decision[field] = selected[field]
+
+        if decision.get("geometry_candidate_name") in (None, "") and selected.get("name"):
+            decision["geometry_candidate_name"] = selected["name"]
+
+        repaired.append(decision)
+
+    return repaired
 
 
 def _validate_symbol(
@@ -1581,7 +1654,7 @@ Decide which trades to make. For each:
 }}
 
 DECISION FORMAT RULES:
-- The `decisions` array is for EXECUTABLE NEW ENTRIES ONLY.
+- The `decisions` array is for executable accept/adjust entries and explicit reject records only.
 - Valid actions: BUY or SHORT. No other actions belong in decisions[].
 - Symbols in decisions[] MUST come from the ALLOWED ENTRY SYMBOLS block in the user prompt.
 - Do NOT create trades from breaking news, strategy context, sector themes, baskets, or general market opinions unless that exact ticker is also in ALLOWED ENTRY SYMBOLS.
@@ -1592,7 +1665,7 @@ DECISION FORMAT RULES:
 - decision_type MUST be one of: "accept", "adjust", or "reject".
 - For decision_type "accept" or "adjust": include geometry_candidate_id and geometry_candidate_name from the scaffold candidate you selected.
 - For decision_type "adjust": also include adjustment_rationale explaining what you changed and why.
-- For decision_type "reject": geometry fields (entry_price, stop_loss, target, quantity) are NOT required. Include rationale explaining why no candidate was acceptable.
+- For decision_type "reject": this is a non-executable candidate rejection; geometry fields (entry_price, stop_loss, target, quantity) are NOT required. Include rationale explaining why no candidate was acceptable.
 If no allowed entry symbol has a fully executable setup, return an empty decisions array.
 
 STRICT OUTPUT CONTRACT — READ CAREFULLY
@@ -1620,7 +1693,7 @@ DECISION LOG BREVITY CONTRACT:
 Example — VALID (goes in decisions[]):
 {{"symbol":"AMD","action":"BUY","decision_type":"accept","geometry_candidate_id":"amd_long_support_bounce_1","geometry_candidate_name":"support_bounce","quantity":10,"entry_price":161.0,"stop_loss":152.0,"target":179.0,"setup_type":"news_catalyst_breakout","rationale":"Strong momentum with clear levels"}}
 
-Example — VALID reject (goes in decisions[]):
+Example — VALID non-executable candidate reject (audited, not traded):
 {{"symbol":"AMD","action":"BUY","decision_type":"reject","rationale":"R:R below threshold, price extended beyond entry candidates"}}
 
 Example — INVALID (belongs in portfolio_notes, NOT decisions[]):
@@ -4306,6 +4379,11 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
 
     raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier, purpose=f"pm_entry:{profile_id}")
     result = _enforce_pm_decision_log_contract(parse_json_response(raw))
+    if isinstance(result.get("decisions"), list):
+        result["decisions"] = _apply_scaffold_geometry_defaults(
+            result["decisions"],
+            scaffold_results,
+        )
 
     # ── Entry Normalizer (before behavioral params) ──
     from utils.behavioral_params import apply_params_to_decision
