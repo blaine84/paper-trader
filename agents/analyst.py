@@ -7,6 +7,7 @@ Writes signal recommendations to AgentMemory.
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone as dt_tz
 from utils.finnhub_client import FinnhubClient
 from utils.technicals import compute_indicators
@@ -95,6 +96,28 @@ STRICT OUTPUT CONTRACT:
 - Do NOT return a `decisions` array.
 - Do NOT output BUY, SELL, SHORT, entry_price, stop_loss, target, quantity, or portfolio_notes.
 - You are not the Portfolio Manager. If tempted to propose a trade, express only LONG/SHORT/HOLD signal quality and key levels.
+"""
+
+VETO_REPAIR_SYSTEM_PROMPT = """You repair one Analyst signal contract violation.
+
+The original Analyst returned HOLD while deterministic technical sanity strongly
+favored LONG or SHORT, but did not provide a valid veto.
+
+Return exactly this JSON patch:
+{
+  "signal": "LONG|SHORT|HOLD",
+  "strength": "weak|moderate|strong",
+  "confidence": "low|medium|high",
+  "llm_veto_reason": "specific reason or null",
+  "veto_evidence": ["specific measurable evidence"]
+}
+
+Rules:
+- If concrete evidence invalidates the deterministic direction, keep HOLD and
+  provide both a specific veto reason and at least one evidence item.
+- Otherwise use the deterministic LONG or SHORT direction.
+- Never return the opposite directional signal.
+- Do not provide entry, stop, target, quantity, or portfolio decisions.
 """
 
 
@@ -416,22 +439,156 @@ def enforce_veto_accountability(signal: dict) -> dict:
     veto_evidence = signal.get("veto_evidence")
 
     if llm_signal == "HOLD" and deterministic_bias in {"LONG", "SHORT"}:
-        signal["llm_veto_required"] = True
-        signal["llm_veto_present"] = bool(veto_text)
         if not isinstance(veto_evidence, list):
-            signal["veto_evidence"] = [] if veto_evidence in (None, "") else [str(veto_evidence)]
-        if not veto_text:
+            veto_evidence = [] if veto_evidence in (None, "") else [str(veto_evidence)]
+        veto_evidence = [
+            str(item).strip()
+            for item in veto_evidence
+            if str(item).strip()
+        ]
+        signal["veto_evidence"] = veto_evidence
+
+        has_reason = bool(veto_text) and not veto_text.startswith("MISSING_LLM_VETO_REASON")
+        has_evidence = bool(veto_evidence)
+        signal["llm_veto_required"] = True
+        signal["llm_veto_present"] = has_reason and has_evidence
+        if not has_reason:
             signal["llm_veto_reason"] = (
                 "MISSING_LLM_VETO_REASON: Analyst output HOLD despite deterministic "
                 f"{deterministic_bias} sanity score={sanity.get('score')} without concrete veto evidence."
             )
-            signal["llm_veto_missing"] = True
+            signal["llm_veto_contract_error"] = "missing_veto_reason"
+        elif not has_evidence:
+            signal["llm_veto_contract_error"] = "missing_veto_evidence"
         else:
-            signal["llm_veto_missing"] = False
+            signal.pop("llm_veto_contract_error", None)
+        signal["llm_veto_missing"] = not signal["llm_veto_present"]
     else:
         signal.setdefault("llm_veto_required", False)
 
     return signal
+
+
+def repair_missing_veto_contract(signal: dict, symbol: str) -> dict:
+    """Repair a conflicted HOLD once using the primary model.
+
+    This does not auto-promote deterministic bias into a signal. The primary
+    model must either accept that direction or return a concrete HOLD veto with
+    evidence. Invalid retries remain HOLD and are explicitly quarantined.
+    """
+    if not signal.get("llm_veto_missing"):
+        return signal
+
+    if signal.get("mitigation"):
+        mitigation = signal.get("mitigation") or {}
+        signal["llm_veto_reason"] = (
+            "ACTIVE_REVIEWER_MITIGATION: deterministic feedback throttle converted "
+            f"{signal.get('original_signal', 'directional signal')} to HOLD."
+        )
+        signal["veto_evidence"] = [
+            f"mitigation_level={mitigation.get('level', 'unknown')}",
+            f"setup_type={mitigation.get('setup_type', signal.get('setup_type', 'unknown'))}",
+        ]
+        signal["veto_contract_repair_skipped"] = "active_reviewer_mitigation"
+        return enforce_veto_accountability(signal)
+
+    enabled = os.getenv("ANALYST_VETO_REPAIR_ENABLED", "true").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        signal["veto_contract_repair_skipped"] = "feature_disabled"
+        return signal
+
+    sanity = signal.get("deterministic_sanity")
+    if not isinstance(sanity, dict) or sanity.get("bias") not in {"LONG", "SHORT"}:
+        signal["veto_contract_repair_skipped"] = "missing_directional_sanity"
+        return signal
+
+    repair_context = {
+        "symbol": symbol,
+        "deterministic_sanity": sanity,
+        "original_analyst_output": {
+            "signal": signal.get("signal"),
+            "strength": signal.get("strength"),
+            "confidence": signal.get("confidence"),
+            "setup_type": signal.get("setup_type"),
+            "reasoning": signal.get("reasoning"),
+            "llm_veto_reason": signal.get("llm_veto_reason"),
+            "veto_evidence": signal.get("veto_evidence"),
+            "current_price": signal.get("current_price"),
+            "relative_volume": signal.get("relative_volume"),
+            "key_levels": signal.get("key_levels"),
+            "indicators": signal.get("indicators"),
+        },
+    }
+
+    signal["veto_contract_repair_attempted"] = True
+    try:
+        raw = call_llm(
+            VETO_REPAIR_SYSTEM_PROMPT,
+            json.dumps(repair_context, indent=2, default=str),
+            json_mode=True,
+            tier=os.getenv("ANALYST_VETO_REPAIR_TIER", "high"),
+            purpose=f"analyst_veto_repair:{symbol}",
+        )
+        repair = parse_json_response(raw)
+        if not isinstance(repair, dict):
+            raise ValueError("repair response was not an object")
+
+        repaired_direction = str(repair.get("signal") or "").upper().strip()
+        deterministic_bias = sanity["bias"]
+        if repaired_direction not in {"HOLD", deterministic_bias}:
+            raise ValueError(
+                f"repair direction {repaired_direction!r} must be HOLD or {deterministic_bias}"
+            )
+
+        strength = str(repair.get("strength") or signal.get("strength") or "weak").lower()
+        confidence = str(repair.get("confidence") or signal.get("confidence") or "low").lower()
+        if strength not in {"weak", "moderate", "strong"}:
+            strength = "weak"
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "low"
+
+        evidence = repair.get("veto_evidence")
+        if not isinstance(evidence, list):
+            evidence = [] if evidence in (None, "") else [str(evidence)]
+        evidence = [str(item).strip() for item in evidence if str(item).strip()]
+        veto_reason = str(repair.get("llm_veto_reason") or "").strip()
+
+        if repaired_direction == "HOLD":
+            if len(veto_reason) < 12 or not evidence:
+                raise ValueError("HOLD repair still lacks a concrete reason and evidence")
+            signal["llm_veto_reason"] = veto_reason
+            signal["veto_evidence"] = evidence
+        else:
+            signal["llm_veto_reason"] = None
+            signal["veto_evidence"] = []
+
+        signal["signal"] = repaired_direction
+        signal["strength"] = strength
+        signal["confidence"] = confidence
+        signal["veto_contract_repaired"] = True
+        signal["veto_repair_method"] = "primary_llm"
+        signal.pop("veto_contract_repair_failed", None)
+        signal.pop("analyst_contract_failure", None)
+        signal.pop("veto_repair_error", None)
+
+        updated_sanity = dict(sanity)
+        updated_sanity["llm_signal"] = repaired_direction
+        updated_sanity["conflict"] = repaired_direction == "HOLD"
+        signal["deterministic_sanity"] = updated_sanity
+
+        if repaired_direction == deterministic_bias:
+            signal["llm_veto_required"] = False
+            signal["llm_veto_present"] = False
+            signal["llm_veto_missing"] = False
+            signal.pop("llm_veto_contract_error", None)
+            return signal
+        return enforce_veto_accountability(signal)
+    except Exception as exc:
+        log.warning("Analyst veto contract repair failed for %s: %s", symbol, exc)
+        signal["veto_contract_repair_failed"] = True
+        signal["analyst_contract_failure"] = "missing_veto_after_primary_retry"
+        signal["veto_repair_error"] = str(exc)[:300]
+        return signal
 
 
 def compute_deterministic_signal_sanity(signal: dict, quote: dict, indicators: dict) -> dict:
@@ -788,6 +945,7 @@ Produce your trading signal JSON for {sym}.
                 signal, quote, indicators
             )
             signal = enforce_veto_accountability(signal)
+            signal = repair_missing_veto_contract(signal, sym)
             if signal["deterministic_sanity"].get("conflict"):
                 log.warning(
                     "Analyst sanity conflict for %s: llm=%s deterministic=%s score=%s veto_required=%s veto_present=%s reasons=%s",

@@ -2,6 +2,7 @@ from agents.analyst import (
     build_deterministic_sanity_prompt_context,
     compute_deterministic_signal_sanity,
     enforce_veto_accountability,
+    repair_missing_veto_contract,
     sanitize_analyst_key_levels,
     validate_candle_indicator_alignment,
 )
@@ -78,6 +79,171 @@ def test_enforce_veto_accountability_accepts_concrete_veto_reason():
     assert enforced["llm_veto_required"] is True
     assert enforced["llm_veto_present"] is True
     assert enforced["llm_veto_missing"] is False
+
+
+def test_enforce_veto_accountability_requires_evidence_with_reason():
+    signal = {
+        "signal": "HOLD",
+        "llm_veto_reason": "Price is extended above resistance.",
+        "veto_evidence": [],
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "LONG",
+            "score": 4,
+        },
+    }
+
+    enforced = enforce_veto_accountability(signal)
+
+    assert enforced["llm_veto_required"] is True
+    assert enforced["llm_veto_present"] is False
+    assert enforced["llm_veto_missing"] is True
+    assert enforced["llm_veto_contract_error"] == "missing_veto_evidence"
+
+
+def test_repair_missing_veto_contract_accepts_deterministic_direction(monkeypatch):
+    monkeypatch.setattr(
+        "agents.analyst.call_llm",
+        lambda *args, **kwargs: """
+        {
+          "signal": "LONG",
+          "strength": "moderate",
+          "confidence": "medium",
+          "llm_veto_reason": null,
+          "veto_evidence": []
+        }
+        """,
+    )
+    signal = {
+        "symbol": "TSLA",
+        "signal": "HOLD",
+        "strength": "weak",
+        "confidence": "low",
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "LONG",
+            "score": 5,
+            "reasons": ["price_above_vwap_0.20%", "relative_volume_confirming_3.00x"],
+        },
+        "llm_veto_required": True,
+        "llm_veto_present": False,
+        "llm_veto_missing": True,
+    }
+
+    repaired = repair_missing_veto_contract(signal, "TSLA")
+
+    assert repaired["signal"] == "LONG"
+    assert repaired["strength"] == "moderate"
+    assert repaired["confidence"] == "medium"
+    assert repaired["deterministic_sanity"]["conflict"] is False
+    assert repaired["llm_veto_required"] is False
+    assert repaired["veto_contract_repaired"] is True
+    assert repaired["veto_repair_method"] == "primary_llm"
+
+
+def test_repair_missing_veto_contract_accepts_justified_hold(monkeypatch):
+    monkeypatch.setattr(
+        "agents.analyst.call_llm",
+        lambda *args, **kwargs: """
+        {
+          "signal": "HOLD",
+          "strength": "weak",
+          "confidence": "medium",
+          "llm_veto_reason": "Price is directly below prior-day resistance on thin volume.",
+          "veto_evidence": ["relative_volume=0.42", "distance_to_prior_high=0.10%"]
+        }
+        """,
+    )
+    signal = {
+        "symbol": "SPY",
+        "signal": "HOLD",
+        "strength": "weak",
+        "confidence": "low",
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "LONG",
+            "score": 4,
+            "reasons": ["price_above_vwap_0.30%"],
+        },
+        "llm_veto_required": True,
+        "llm_veto_present": False,
+        "llm_veto_missing": True,
+    }
+
+    repaired = repair_missing_veto_contract(signal, "SPY")
+
+    assert repaired["signal"] == "HOLD"
+    assert repaired["llm_veto_present"] is True
+    assert repaired["llm_veto_missing"] is False
+    assert repaired["veto_contract_repaired"] is True
+
+
+def test_repair_missing_veto_contract_quarantines_invalid_retry(monkeypatch):
+    monkeypatch.setattr(
+        "agents.analyst.call_llm",
+        lambda *args, **kwargs: """
+        {
+          "signal": "HOLD",
+          "strength": "weak",
+          "confidence": "low",
+          "llm_veto_reason": "Still uncertain.",
+          "veto_evidence": []
+        }
+        """,
+    )
+    signal = {
+        "symbol": "MU",
+        "signal": "HOLD",
+        "strength": "weak",
+        "confidence": "low",
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "SHORT",
+            "score": -4,
+            "reasons": ["price_below_vwap_-0.40%"],
+        },
+        "llm_veto_required": True,
+        "llm_veto_present": False,
+        "llm_veto_missing": True,
+    }
+
+    repaired = repair_missing_veto_contract(signal, "MU")
+
+    assert repaired["signal"] == "HOLD"
+    assert repaired["veto_contract_repair_failed"] is True
+    assert repaired["analyst_contract_failure"] == "missing_veto_after_primary_retry"
+    assert repaired["llm_veto_missing"] is True
+
+
+def test_repair_missing_veto_contract_does_not_override_mitigation(monkeypatch):
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("repair LLM should not be called for mitigated signals")
+
+    monkeypatch.setattr("agents.analyst.call_llm", unexpected_call)
+    signal = {
+        "symbol": "AMD",
+        "signal": "HOLD",
+        "original_signal": "LONG",
+        "mitigation": {"setup_type": "news_breakout", "level": 2},
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "LONG",
+            "score": 5,
+        },
+        "llm_veto_required": True,
+        "llm_veto_present": False,
+        "llm_veto_missing": True,
+    }
+
+    repaired = repair_missing_veto_contract(signal, "AMD")
+
+    assert repaired["signal"] == "HOLD"
+    assert repaired["veto_contract_repair_skipped"] == "active_reviewer_mitigation"
 
 
 def test_deterministic_sanity_prompt_context_demands_veto_for_directional_precheck():
