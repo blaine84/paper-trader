@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from utils.gate_config import SHADOW_SCORE_MAX_ENTRY_DEVIATION_PCT
+
 log = logging.getLogger(__name__)
 
 OUTCOME_WINDOWS: tuple[tuple[str, int], ...] = (
@@ -23,6 +25,29 @@ OUTCOME_WINDOWS: tuple[tuple[str, int], ...] = (
     ("60m", 60),
 )
 MARKET_TZ = ZoneInfo("America/New_York")
+
+KNOWN_GATE_NAMES: set[str] = {
+    "setup_quality_gate",
+    "risk_geometry_gate",
+    "catalyst_specificity_gate",
+    "entry_timing_gate",
+    "position_risk_gate",
+    "dollar_risk_gate",
+    "track_record_gate",
+    "alert_cooldown",
+}
+
+
+def classify_candidate_source(blocked_by: str | None) -> str:
+    """Classify whether a blocked candidate is a malformed_decision or gate_rejection.
+
+    Returns: 'malformed_decision' | 'gate_rejection' | 'unknown_source'
+    """
+    if blocked_by == "pm_normalizer":
+        return "malformed_decision"
+    if blocked_by in KNOWN_GATE_NAMES:
+        return "gate_rejection"
+    return "unknown_source"
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -53,6 +78,55 @@ def _num(value: Any) -> float | None:
         return out if out > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def validate_scorability(
+    candidate: dict[str, Any],
+    first_candle_close: float | None,
+    max_deviation_pct: float = SHADOW_SCORE_MAX_ENTRY_DEVIATION_PCT,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    """Check if a candidate can be meaningfully scored.
+
+    Returns:
+        (is_scorable, reason, extra_notes)
+        - is_scorable: True if scoring should proceed
+        - reason: None if scorable, else one of: missing_entry_price,
+          missing_stop_price, missing_target_price, missing_quantity,
+          missing_symbol, entry_price_deviation_exceeded, no_reference_price
+        - extra_notes: Additional context (e.g., deviation_pct) or None
+    """
+    # Check required numeric fields for null/zero
+    entry_price = _num(candidate.get("entry_price"))
+    if entry_price is None:
+        return (False, "missing_entry_price", None)
+
+    stop_price = _num(candidate.get("stop_price"))
+    if stop_price is None:
+        return (False, "missing_stop_price", None)
+
+    target_price = _num(candidate.get("target_price"))
+    if target_price is None:
+        return (False, "missing_target_price", None)
+
+    quantity = _num(candidate.get("quantity"))
+    if quantity is None:
+        return (False, "missing_quantity", None)
+
+    # Check symbol for null
+    symbol = candidate.get("symbol")
+    if not symbol:
+        return (False, "missing_symbol", None)
+
+    # Check reference price availability
+    if first_candle_close is None or first_candle_close == 0:
+        return (False, "no_reference_price", None)
+
+    # Compute entry price deviation
+    deviation_pct = abs(entry_price - first_candle_close) / first_candle_close
+    if deviation_pct > max_deviation_pct:
+        return (False, "entry_price_deviation_exceeded", {"deviation_pct": deviation_pct})
+
+    return (True, None, None)
 
 
 def _direction(row: dict[str, Any]) -> str | None:
@@ -169,13 +243,56 @@ def score_blocked_candidate(
     or None when the candidate cannot be scored yet.
     """
     created_at = _parse_dt(candidate.get("created_at"))
-    entry = _num(candidate.get("entry_price"))
-    direction = _direction(candidate)
-    if created_at is None or entry is None or direction is None:
+    if created_at is None:
         return None
 
     eval_at = created_at + timedelta(minutes=window_minutes)
     window_candles = [c for c in _as_candles(candles) if created_at <= c["timestamp"] <= eval_at]
+
+    # Determine first candle close for scorability validation
+    first_candle_close: float | None = window_candles[0]["close"] if window_candles else None
+
+    # Validate scorability before any P&L calculation
+    is_scorable, reason, extra_notes = validate_scorability(candidate, first_candle_close)
+
+    # Classify candidate source for all outcomes
+    candidate_source_classification = classify_candidate_source(candidate.get("blocked_by"))
+
+    if not is_scorable:
+        # Build notes_json for unscorable outcome
+        notes: dict[str, Any] = {
+            "reason": reason,
+            "candidate_source_classification": candidate_source_classification,
+        }
+        # Include deviation_pct if present in extra_notes
+        if extra_notes and "deviation_pct" in extra_notes:
+            notes["deviation_pct"] = extra_notes["deviation_pct"]
+            notes["entry_price"] = _num(candidate.get("entry_price"))
+            notes["first_candle_close"] = first_candle_close
+
+        return {
+            "blocked_candidate_id": candidate.get("id"),
+            "eval_window": window_label,
+            "evaluated_at": eval_at.replace(tzinfo=None),
+            "eval_price": None,
+            "pnl_pct": None,
+            "mfe_pct": None,
+            "mae_pct": None,
+            "stop_hit": 0,
+            "target_hit": 0,
+            "first_hit": None,
+            "first_hit_at": None,
+            "outcome_label": f"unscorable_{reason}",
+            "gate_verdict": "unscorable",
+            "notes_json": json.dumps(notes),
+        }
+
+    # Scorable path — proceed with P&L calculation
+    entry = _num(candidate.get("entry_price"))
+    direction = _direction(candidate)
+    if entry is None or direction is None:
+        return None
+
     if not window_candles:
         return None
 
@@ -250,7 +367,125 @@ def score_blocked_candidate(
             "target_price": target,
             "direction": direction,
             "candles_scored": len(window_candles),
+            "candidate_source_classification": candidate_source_classification,
         }),
+    }
+
+
+def get_gate_effectiveness_summary(
+    engine,
+    *,
+    gate_name: str | None = None,
+    lookback_days: int = 30,
+) -> dict[str, Any]:
+    """Compute gate effectiveness using only 60-minute opportunity outcomes.
+
+    Excludes:
+    - Candidates with unscorable 60m outcomes
+    - Candidates with no 60m outcome row
+    - Candidates classified as malformed_decision
+
+    Returns:
+        {
+            "gate_name": str,
+            "blocked_winners": int,
+            "saved_us": int,
+            "neutral": int,
+            "unscorable_excluded": int,
+            "malformed_excluded": int,
+            "avg_pnl_pct": float,
+            "period_days": int,
+        }
+    """
+    with engine.connect() as conn:
+        cutoff = f"-{lookback_days} days"
+
+        # --- Count unscorable exclusions ---
+        unscorable_params: dict[str, Any] = {"cutoff": cutoff}
+        unscorable_sql = """
+            SELECT COUNT(*) FROM blocked_trade_candidate_outcomes o
+            JOIN blocked_trade_candidates b ON o.blocked_candidate_id = b.id
+            WHERE o.eval_window = '60m'
+              AND o.gate_verdict = 'unscorable'
+              AND datetime(b.created_at) >= datetime('now', :cutoff)
+        """
+        if gate_name is not None:
+            unscorable_sql += " AND b.blocked_by = :gate_name"
+            unscorable_params["gate_name"] = gate_name
+
+        unscorable_excluded = conn.execute(
+            text(unscorable_sql), unscorable_params
+        ).scalar() or 0
+
+        # --- Count malformed_decision exclusions ---
+        malformed_params: dict[str, Any] = {"cutoff": cutoff}
+        malformed_sql = """
+            SELECT COUNT(*) FROM blocked_trade_candidate_outcomes o
+            JOIN blocked_trade_candidates b ON o.blocked_candidate_id = b.id
+            WHERE o.eval_window = '60m'
+              AND o.gate_verdict != 'unscorable'
+              AND json_extract(o.notes_json, '$.candidate_source_classification') = 'malformed_decision'
+              AND datetime(b.created_at) >= datetime('now', :cutoff)
+        """
+        if gate_name is not None:
+            malformed_sql += " AND b.blocked_by = :gate_name"
+            malformed_params["gate_name"] = gate_name
+
+        malformed_excluded = conn.execute(
+            text(malformed_sql), malformed_params
+        ).scalar() or 0
+
+        # --- Query valid 60m outcomes for effectiveness ---
+        effectiveness_params: dict[str, Any] = {"cutoff": cutoff}
+        effectiveness_sql = """
+            SELECT o.outcome_label, o.gate_verdict, o.pnl_pct
+            FROM blocked_trade_candidate_outcomes o
+            JOIN blocked_trade_candidates b ON o.blocked_candidate_id = b.id
+            WHERE o.eval_window = '60m'
+              AND o.gate_verdict != 'unscorable'
+              AND json_extract(o.notes_json, '$.candidate_source_classification') != 'malformed_decision'
+              AND datetime(b.created_at) >= datetime('now', :cutoff)
+        """
+        if gate_name is not None:
+            effectiveness_sql += " AND b.blocked_by = :gate_name"
+            effectiveness_params["gate_name"] = gate_name
+
+        rows = conn.execute(
+            text(effectiveness_sql), effectiveness_params
+        ).mappings().all()
+
+    # Tally counts
+    blocked_winners = 0
+    saved_us = 0
+    neutral = 0
+    pnl_values: list[float] = []
+
+    for row in rows:
+        outcome_label = row["outcome_label"] or ""
+        gate_verdict = row["gate_verdict"] or ""
+        pnl = row["pnl_pct"]
+
+        if gate_verdict == "blocked_winner" or outcome_label == "blocked_winner":
+            blocked_winners += 1
+        elif gate_verdict == "saved_us":
+            saved_us += 1
+        else:
+            neutral += 1
+
+        if pnl is not None:
+            pnl_values.append(float(pnl))
+
+    avg_pnl_pct = sum(pnl_values) / len(pnl_values) if pnl_values else 0.0
+
+    return {
+        "gate_name": gate_name or "all",
+        "blocked_winners": blocked_winners,
+        "saved_us": saved_us,
+        "neutral": neutral,
+        "unscorable_excluded": unscorable_excluded,
+        "malformed_excluded": malformed_excluded,
+        "avg_pnl_pct": round(avg_pnl_pct, 4),
+        "period_days": lookback_days,
     }
 
 
@@ -277,9 +512,7 @@ def update_blocked_candidate_outcomes(
             text(
                 """
                 SELECT * FROM blocked_trade_candidates
-                WHERE symbol IS NOT NULL
-                  AND entry_price IS NOT NULL
-                  AND action IN ('BUY', 'SHORT')
+                WHERE action IN ('BUY', 'SHORT')
                   AND datetime(created_at) <= datetime(:now, '-15 minutes')
                 ORDER BY created_at DESC
                 LIMIT :limit
@@ -342,15 +575,20 @@ def update_blocked_candidate_outcomes(
             if not regular_session_windows:
                 continue
 
-            max_minutes = max(minutes for _, minutes in regular_session_windows)
-            candles = candle_fetcher(
-                candidate["symbol"],
-                created_at - timedelta(minutes=1),
-                created_at + timedelta(minutes=max_minutes),
-            )
-            if not candles:
-                skipped += len(regular_session_windows)
-                continue
+            # Guard: skip candle fetch for symbol-null candidates — they will
+            # be marked unscorable by validate_scorability() inside the scorer.
+            if not candidate.get("symbol"):
+                candles: list[dict[str, Any]] = []
+            else:
+                max_minutes = max(minutes for _, minutes in regular_session_windows)
+                candles = candle_fetcher(
+                    candidate["symbol"],
+                    created_at - timedelta(minutes=1),
+                    created_at + timedelta(minutes=max_minutes),
+                )
+                if not candles:
+                    skipped += len(regular_session_windows)
+                    continue
 
             for label, minutes in regular_session_windows:
                 scored = score_blocked_candidate(

@@ -33,12 +33,14 @@ from utils.gate_config import (
     MIN_ROLLING_CASES,
     MIN_WIN_RATE_BY_SETUP,
     MIN_WIN_RATE_BY_SETUP_PROFILE,
+    NEAR_MISS_MARGIN_PCT,
     OVERRIDE_MIN_CONFIDENCE_SCORE,
     RECOVERY_MIN_ROLLING_CASES,
     RECOVERY_WIN_RATE_MARGIN,
     REQUIRE_POSITIVE_ROLLING_AVG_PNL_FOR_RECOVERY,
     ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
     ROLLING_WINDOW,
+    is_moderate_near_miss_pilot_active,
 )
 from utils.trade_events import log_trade_event
 
@@ -182,6 +184,7 @@ def _evaluate_rolling_underperformance(
         return {
             **base,
             "decision": "reduce_size",
+            "canonical_decision": "reduce_size",
             "reason_type": "rolling_underperformance_recovery_probe",
             "size_multiplier": ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
             "profile": "aggressive",
@@ -201,6 +204,7 @@ def _evaluate_rolling_underperformance(
             return {
                 **base,
                 "decision": "reduce_size",
+                "canonical_decision": "reduce_size",
                 "reason_type": "rolling_underperformance_recovery_probe",
                 "size_multiplier": ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
                 "profile": "moderate",
@@ -218,6 +222,7 @@ def _evaluate_rolling_underperformance(
             return {
                 **base,
                 "decision": "reject",
+                "canonical_decision": "reject",
                 "reason_type": "rolling_underperformance_confirmation_required",
                 "profile": "moderate",
                 "gate_decision_id": gate_decision_id,
@@ -233,6 +238,7 @@ def _evaluate_rolling_underperformance(
         return {
             **base,
             "decision": "reject",
+            "canonical_decision": "reject",
             "reason_type": "rolling_underperformance_conservative_reject",
             "profile": "conservative",
             "gate_decision_id": gate_decision_id,
@@ -247,6 +253,7 @@ def _evaluate_rolling_underperformance(
         return {
             **base,
             "decision": "reject",
+            "canonical_decision": "reject",
             "reason_type": "rolling_underperformance",
             "gate_decision_id": gate_decision_id,
             "reason": (
@@ -254,6 +261,72 @@ def _evaluate_rolling_underperformance(
                 f"over last {rolling_sample_size} cases; rejecting trade."
             ),
         }
+
+
+def _evaluate_near_miss_pilot(
+    *,
+    win_rate: float,
+    threshold: float,
+    near_miss_margin: float,
+    profile: str,
+    confidence_score: float | None,
+    catalyst_type: str | None,
+    price_above_vwap: bool | None,
+    volume_ratio: float | None,
+) -> dict | None:
+    """Check if a rejection qualifies for near-miss pilot override.
+
+    Returns:
+        Result dict with decision='reduce_size' if qualifies, None otherwise.
+
+    Qualifying conditions:
+    1. Profile is 'moderate'
+    2. Pilot is active (via is_moderate_near_miss_pilot_active())
+    3. Win rate is within margin below threshold: threshold - margin <= win_rate < threshold
+    4. At least one confirming signal present
+    """
+    # 1. Profile must be 'moderate'
+    if not isinstance(profile, str) or profile.lower() != "moderate":
+        return None
+
+    # 2. Pilot must be active
+    if not is_moderate_near_miss_pilot_active():
+        return None
+
+    # 3. Win rate must be within [threshold - near_miss_margin, threshold)
+    lower_bound = threshold - near_miss_margin
+    if not (lower_bound <= win_rate < threshold):
+        return None
+
+    # 4. At least one confirming signal must be present
+    confirming_signals: list[str] = []
+
+    if confidence_score is not None and confidence_score >= 7.0:
+        confirming_signals.append("confidence_score >= 7.0")
+
+    if catalyst_type is not None and catalyst_type.strip():
+        confirming_signals.append(f"catalyst_type: {catalyst_type}")
+
+    if (
+        price_above_vwap is True
+        and volume_ratio is not None
+        and volume_ratio >= 1.5
+    ):
+        confirming_signals.append("price_above_vwap AND volume_ratio >= 1.5")
+
+    if not confirming_signals:
+        return None
+
+    return {
+        "decision": "reduce_size",
+        "canonical_decision": "reduce_size",
+        "size_multiplier": ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
+        "reason_type": "near_miss_pilot_override",
+        "win_rate": win_rate,
+        "threshold": threshold,
+        "margin": near_miss_margin,
+        "confirming_signals": confirming_signals,
+    }
 
 
 def _log_gate_event(
@@ -335,6 +408,9 @@ def evaluate_setup_quality(
     profile: str | None = None,
     agent: str = "portfolio_manager",
     confidence_score: float | None = None,
+    catalyst_type: str | None = None,
+    price_above_vwap: bool | None = None,
+    volume_ratio: float | None = None,
 ) -> dict:
     """Evaluate whether a setup type should be allowed based on case-library
     performance.
@@ -344,6 +420,7 @@ def evaluate_setup_quality(
     2. Consecutive losses (>= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) → reject
     3. Historical underperformance (all-time WR < threshold) → reject
        UNLESS recovery override criteria are met → allow
+       UNLESS near-miss pilot override applies (moderate profile only) → reduce_size
     4. Rolling underperformance (rolling WR < threshold, >= MIN_ROLLING_CASES) → profile-aware
     5. Weak but allowed (WR >= threshold but < 50%) → downgrade
     6. Otherwise → allow
@@ -356,12 +433,17 @@ def evaluate_setup_quality(
         symbol: Optional symbol for event logging context
         profile: Optional PM profile for event logging context
         agent: Agent name for event logging (default: "portfolio_manager")
+        confidence_score: Optional confidence score for near-miss pilot evaluation
+        catalyst_type: Optional catalyst type for near-miss pilot evaluation
+        price_above_vwap: Optional VWAP indicator for near-miss pilot evaluation
+        volume_ratio: Optional volume ratio for near-miss pilot evaluation
 
     Returns:
         Structured dict with decision, reason_type, stats, and threshold.
 
     Side effects:
         Logs exactly one TradeEvent to the provided *db* session.
+        May log an additional pilot override event if near-miss pilot fires.
     """
     threshold = _resolve_threshold(setup_type, profile)
 
@@ -388,6 +470,7 @@ def evaluate_setup_quality(
     ) -> dict:
         return {
             "decision": decision,
+            "canonical_decision": decision,
             "reason_type": reason_type,
             "setup_type": setup_type,
             "win_rate": win_rate,
@@ -435,6 +518,64 @@ def evaluate_setup_quality(
             )
             _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
             return result
+
+        # Check near-miss pilot override before rejecting
+        near_miss_result = _evaluate_near_miss_pilot(
+            win_rate=win_rate,
+            threshold=threshold,
+            near_miss_margin=NEAR_MISS_MARGIN_PCT,
+            profile=profile or "",
+            confidence_score=confidence_score,
+            catalyst_type=catalyst_type,
+            price_above_vwap=price_above_vwap,
+            volume_ratio=volume_ratio,
+        )
+        if near_miss_result is not None:
+            # Build the full gate result with standard fields + pilot override fields
+            pilot_result = {
+                **_result(
+                    "reduce_size",
+                    "near_miss_pilot_override",
+                    f"Setup '{setup_type}' all-time WR "
+                    f"{win_rate:.1%} < {threshold:.0%} but within near-miss margin "
+                    f"({NEAR_MISS_MARGIN_PCT:.0%}); pilot override with "
+                    f"{near_miss_result['size_multiplier']:.0%} size.",
+                ),
+                "size_multiplier": near_miss_result["size_multiplier"],
+                "confirming_signals": near_miss_result["confirming_signals"],
+                "near_miss_margin": near_miss_result["margin"],
+            }
+            # Log standard gate decision event
+            _log_gate_event(db, pilot_result, symbol=symbol, profile=profile, agent=agent)
+            # Log SEPARATE pilot override audit event
+            pilot_event_payload = {
+                "gate_name": "setup_quality_gate",
+                "canonical_decision": "reduce_size",
+                "event_type": GATE_EVENT_TYPES["pilot_override"],
+                "reason_type": "near_miss_pilot_override",
+                "win_rate": win_rate,
+                "threshold": threshold,
+                "margin": NEAR_MISS_MARGIN_PCT,
+                "confirming_signals": near_miss_result["confirming_signals"],
+                "size_multiplier": near_miss_result["size_multiplier"],
+                "pilot_override": True,
+                "pilot_size_multiplier": near_miss_result["size_multiplier"],
+                "setup_type": setup_type,
+            }
+            log_trade_event(
+                db,
+                GATE_EVENT_TYPES["pilot_override"],
+                agent=agent,
+                symbol=symbol,
+                profile=profile,
+                message=(
+                    f"Near-miss pilot override for '{setup_type}': WR {win_rate:.1%} "
+                    f"within {NEAR_MISS_MARGIN_PCT:.0%} of threshold {threshold:.0%}; "
+                    f"signals: {near_miss_result['confirming_signals']}"
+                ),
+                payload=pilot_event_payload,
+            )
+            return pilot_result
 
         result = _result(
             "reject",

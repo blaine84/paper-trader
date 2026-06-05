@@ -15,11 +15,14 @@ from datetime import datetime, timedelta, timezone
 
 from utils.gate_config import (
     DEFAULT_STOP_DISTANCE_RULE,
+    GATE_EVENT_TYPES,
     HIGH_BETA_CLUSTER,
     QUALIFYING_MIN_SIGNAL_STRENGTH,
     QUALIFYING_SETUP_TYPES,
     REDUCED_RR_THRESHOLDS_BY_PROFILE,
+    ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
     STOP_DISTANCE_RULES,
+    is_moderate_near_miss_pilot_active,
 )
 from utils.symbol_class import classify_symbol
 from utils.trade_events import log_trade_event
@@ -461,6 +464,7 @@ def _evaluate_tactical_stop_exception(
         # --- All checks passed: return tactical pass result ---
         return {
             "decision": "passed_unchanged",
+            "canonical_decision": "allow",
             "reason": "Trade geometry validated \u2014 aggressive tactical stop accepted",
             "reason_code": "PASSED_TACTICAL",
             "entry_price": entry_price,
@@ -499,6 +503,40 @@ def _evaluate_tactical_stop_exception(
             entry_price,
         )
         return None
+
+
+def _evaluate_pilot_rr_override(
+    *,
+    original_rr: float,
+    adjusted_rr: float,
+    min_rr: float,
+    profile: str,
+) -> bool:
+    """Determine if a risk geometry rejection qualifies for pilot override.
+
+    Qualifying conditions:
+    1. Profile is 'moderate'
+    2. Pilot is active
+    3. original_rr >= min_rr (pre-adjustment was valid)
+    4. adjusted_rr < min_rr (post-adjustment degraded below threshold)
+
+    Returns True if pilot override should be applied.
+    """
+    if profile != "moderate":
+        return False
+
+    if not is_moderate_near_miss_pilot_active():
+        return False
+
+    # If original R:R is already below threshold, no override (Req 6.5)
+    if original_rr < min_rr:
+        return False
+
+    # Override applies when original was valid but adjustment degraded it
+    if adjusted_rr < min_rr:
+        return True
+
+    return False
 
 
 def _reconstruct_trade(
@@ -638,6 +676,7 @@ def evaluate_risk_geometry(
 
         return {
             "decision": "passed_unchanged",
+            "canonical_decision": "allow",
             "reason": f"Gate failed open due to unexpected error: {exc}",
             "reason_code": "GATE_ERROR_FAIL_OPEN",
             "entry_price": entry_price,
@@ -954,6 +993,7 @@ def _evaluate_risk_geometry_inner(
         # Passed unchanged
         result = {
             "decision": "passed_unchanged",
+            "canonical_decision": "allow",
             "reason": "Trade geometry validated — stop distance adequate",
             "reason_code": "PASSED",
             "entry_price": entry_price,
@@ -1093,6 +1133,76 @@ def _evaluate_risk_geometry_inner(
             confidence_level=confidence_level,
         )
         if adjusted_rr < min_rr:
+            # --- Pilot R:R override check ---
+            # If the original R:R was valid but adjustment degraded it,
+            # moderate profiles with active pilot get a reduced-size pass.
+            if _evaluate_pilot_rr_override(
+                original_rr=original_rr,
+                adjusted_rr=adjusted_rr,
+                min_rr=min_rr,
+                profile=profile or "",
+            ):
+                size_multiplier = ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER
+                # Log separate pilot override audit event
+                pilot_payload = {
+                    "gate_name": "risk_geometry_gate",
+                    "canonical_decision": "reduce_size",
+                    "reason_type": "pilot_rr_override",
+                    "original_rr": original_rr,
+                    "adjusted_rr": adjusted_rr,
+                    "min_rr": min_rr,
+                    "size_multiplier": size_multiplier,
+                    "pilot_override": True,
+                }
+                if db is not None:
+                    try:
+                        log_trade_event(
+                            db,
+                            GATE_EVENT_TYPES["pilot_override"],
+                            agent=agent,
+                            symbol=symbol,
+                            profile=profile,
+                            price=entry_price,
+                            message=f"Pilot R:R override: adjusted_rr={adjusted_rr:.2f} < min_rr={min_rr:.2f}, original_rr={original_rr:.2f}",
+                            payload=pilot_payload,
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to log pilot_rr_override event: %s", exc)
+
+                # Return adjusted_allowed with reduced size multiplier
+                result = {
+                    "decision": "adjusted_allowed",
+                    "canonical_decision": "reduce_size",
+                    "reason": "Trade reconstructed with pilot R:R override",
+                    "reason_code": "ADJUSTED",
+                    "entry_price": entry_price,
+                    "stop_price": adjusted_stop_price,
+                    "target_price": target_price,
+                    "quantity": adjusted_quantity,
+                    "stop_distance": stop_distance,
+                    "min_stop_distance": min_stop_distance,
+                    "adjusted_stop_price": adjusted_stop_price,
+                    "adjusted_quantity": adjusted_quantity,
+                    "original_dollar_risk": original_dollar_risk,
+                    "adjusted_dollar_risk": adjusted_dollar_risk,
+                    "original_rr": original_rr,
+                    "adjusted_rr": adjusted_rr,
+                    "target_distance": target_distance,
+                    "atr_value": atr_5min,
+                    "atr_source": atr_source,
+                    "atr_timestamp": atr_timestamp,
+                    "atr_fallback": atr_fallback_used,
+                    "rule_name": rule_name,
+                    "rule_source": rule_source,
+                    "quantity_policy": quantity_policy,
+                    "min_reward_to_risk": min_rr,
+                    "size_multiplier": size_multiplier,
+                    "pilot_override": True,
+                }
+                _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
+                return result
+
+            # --- Standard rejection (no pilot override) ---
             # Build setup-specific R:R audit fields for rejection payload
             _rr_extra_payload = None
             if _is_feature_flag_enabled():
@@ -1139,6 +1249,7 @@ def _evaluate_risk_geometry_inner(
         # Adjusted trade allowed
         result = {
             "decision": "adjusted_allowed",
+            "canonical_decision": "allow",
             "reason": "Trade reconstructed with valid geometry",
             "reason_code": "ADJUSTED",
             "entry_price": entry_price,
@@ -1238,6 +1349,7 @@ def _build_rejection(
 
     result = {
         "decision": "rejected",
+        "canonical_decision": "reject",
         "reason": reason,
         "reason_code": reason_code,
         "entry_price": entry_price,
