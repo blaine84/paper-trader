@@ -34,7 +34,7 @@ from utils.setup_quality_gate import evaluate_setup_quality, resolve_setup_type
 from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.catalyst_specificity import evaluate_catalyst_specificity
 from utils.stop_authority import apply_stop_update
-from utils.shadow_ledger import record_blocked_candidate
+from utils.shadow_ledger import record_blocked_candidate, write_pilot_counterfactual_row
 
 log = logging.getLogger(__name__)
 
@@ -2720,17 +2720,60 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
         except (TypeError, ValueError):
             confidence_score = None
 
+    # Extract near-miss pilot confirming signal fields from decision/signal
+    catalyst_type = decision.get("catalyst_type") or (
+        signal.get("catalyst_type") if signal else None
+    )
+    price_above_vwap = decision.get("price_above_vwap")
+    if price_above_vwap is None and signal:
+        price_above_vwap = signal.get("price_above_vwap")
+    volume_ratio = None
+    raw_vr = decision.get("volume_ratio") or (
+        signal.get("volume_ratio") if signal else None
+    )
+    if raw_vr is not None:
+        try:
+            volume_ratio = float(raw_vr)
+        except (TypeError, ValueError):
+            volume_ratio = None
+
     try:
         setup_result = evaluate_setup_quality(
             engine, db, setup_type, market_regime,
             symbol=symbol, profile=profile_id,
             confidence_score=confidence_score,
+            catalyst_type=catalyst_type,
+            price_above_vwap=price_above_vwap,
+            volume_ratio=volume_ratio,
         )
         notes.append({"gate": "setup_quality_gate", **setup_result})
         if setup_result["decision"] == "reject":
             return False, notes, cumulative_multiplier, multiplier_breakdown
         if setup_result.get("size_multiplier") and setup_result["decision"] == "reduce_size":
             sqg_multiplier = setup_result["size_multiplier"]
+            # Write pilot counterfactual row if this is a near-miss pilot override
+            if setup_result.get("reason_type") == "near_miss_pilot_override":
+                try:
+                    write_pilot_counterfactual_row(
+                        db,
+                        symbol=symbol,
+                        action=decision.get("action", ""),
+                        blocked_by="setup_quality_gate",
+                        block_reason="historical_underperformance",
+                        direction=decision.get("direction"),
+                        profile=profile_id,
+                        setup_type=setup_type,
+                        entry_price=decision.get("price") or decision.get("entry_price"),
+                        stop_price=decision.get("stop") or decision.get("stop_price"),
+                        target_price=decision.get("target") or decision.get("target_price"),
+                        quantity=_coerce_quantity(decision.get("quantity", 0), symbol=symbol),
+                        gate_result=setup_result,
+                        gate_notes=notes,
+                        signal_snapshot=signal,
+                        agent=f"pm_{profile_id}",
+                    )
+                except Exception as exc:
+                    log.warning("Failed to write pilot counterfactual row for setup_quality_gate: %s", exc)
             # Update working quantity so downstream gates see reduced size
             original_qty = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
             reduced_qty = max(1, int(original_qty * sqg_multiplier))
@@ -2907,6 +2950,29 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
                     return False, notes, cumulative_multiplier, multiplier_breakdown
 
                 if geometry_result["decision"] == "adjusted_allowed":
+                    # Write pilot counterfactual row if this is a pilot R:R override
+                    if geometry_result.get("pilot_override"):
+                        try:
+                            write_pilot_counterfactual_row(
+                                db,
+                                symbol=symbol,
+                                action=decision.get("action", ""),
+                                blocked_by="risk_geometry_gate",
+                                block_reason="rr_degradation",
+                                direction=decision.get("direction"),
+                                profile=profile_id,
+                                setup_type=setup_type,
+                                entry_price=price,
+                                stop_price=stop,
+                                target_price=target,
+                                quantity=quantity,
+                                gate_result=geometry_result,
+                                gate_notes=notes,
+                                signal_snapshot=signal,
+                                agent=f"pm_{profile_id}",
+                            )
+                        except Exception as exc:
+                            log.warning("Failed to write pilot counterfactual row for risk_geometry_gate: %s", exc)
                     # Propagate adjusted params for downstream use
                     decision["stop"] = geometry_result["stop_price"]
                     decision["stop_loss"] = geometry_result["stop_price"]
@@ -3240,6 +3306,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
     _gate_multiplier = 1.0
     _gate_multiplier_breakdown = []
     _gate_decision_id = None  # Correlation ID from recovery-probe gate decisions
+    _pilot_override_info = None  # Pilot override metadata for trade event tagging
     if action in ("BUY", "SHORT"):
         signal_for_gates = _build_signal_for_symbol(db, symbol, decision)
         proceed, _gate_notes, _gate_multiplier, _gate_multiplier_breakdown = _run_gate_pipeline(
@@ -3343,6 +3410,18 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         sqg_note = next((n for n in _gate_notes if n.get("gate") == "setup_quality_gate"), None)
         if sqg_note:
             _gate_decision_id = sqg_note.get("gate_decision_id")
+
+        # Detect pilot override from gate notes for trade event tagging.
+        # If any gate applied a pilot override (near-miss or R:R), propagate
+        # pilot_override: true and pilot_size_multiplier to the entry_filled event.
+        _pilot_override_info = None
+        for _gn in _gate_notes:
+            if _gn.get("pilot_override") is True or _gn.get("reason_type") == "near_miss_pilot_override":
+                _pilot_override_info = {
+                    "pilot_override": True,
+                    "pilot_size_multiplier": _gn.get("size_multiplier", 0.25),
+                }
+                break
 
     # ── Tier-1 pre-validation: similarity → edge score → portfolio risk ──
     # Tracks edge data to store on the Trade record later
@@ -3619,6 +3698,9 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         _entry_filled_payload = {"action": action, "quantity": quantity, "side": "long", "edge": _edge_data}
         if _gate_decision_id is not None:
             _entry_filled_payload["gate_decision_id"] = _gate_decision_id
+        if _pilot_override_info is not None:
+            _entry_filled_payload["pilot_override"] = True
+            _entry_filled_payload["pilot_size_multiplier"] = _pilot_override_info["pilot_size_multiplier"]
         log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
         if stop:
             log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
@@ -3665,6 +3747,9 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         _entry_filled_payload = {"action": action, "quantity": quantity, "side": "short", "edge": _edge_data}
         if _gate_decision_id is not None:
             _entry_filled_payload["gate_decision_id"] = _gate_decision_id
+        if _pilot_override_info is not None:
+            _entry_filled_payload["pilot_override"] = True
+            _entry_filled_payload["pilot_size_multiplier"] = _pilot_override_info["pilot_size_multiplier"]
         log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
         if stop:
             log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})

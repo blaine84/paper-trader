@@ -197,6 +197,7 @@ def evaluate_pre_trade_quality(
     def _result(gate_decision: str, reason_type: str, reason: str) -> dict:
         return {
             "decision": gate_decision,
+            "canonical_decision": gate_decision,
             "reason_type": reason_type,
             "selection_score": selection_score,
             "execution_score": execution_score,

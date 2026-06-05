@@ -31,6 +31,7 @@ def test_score_blocked_candidate_classifies_saved_us_when_stop_hits_first():
         "entry_price": 100.0,
         "stop_price": 99.0,
         "target_price": 105.0,
+        "quantity": 10,
     }
     candles = _candles(created, [100.0, 99.8, 98.9, 99.2])
 

@@ -496,3 +496,107 @@ def record_blocked_candidate(
             exc,
         )
         return None
+
+
+def write_pilot_counterfactual_row(
+    db,
+    *,
+    symbol: str | None,
+    action: str,
+    blocked_by: str,
+    block_reason: str,
+    direction: str | None = None,
+    profile: str | None = None,
+    setup_type: str | None = None,
+    entry_price: float | None = None,
+    stop_price: float | None = None,
+    target_price: float | None = None,
+    quantity: float | None = None,
+    gate_result: dict | None = None,
+    gate_notes: list | None = None,
+    signal_snapshot: dict | str | None = None,
+    agent: str | None = None,
+) -> int | None:
+    """Write a counterfactual shadow ledger row for a pilot override.
+
+    When a gate converts a rejection to `reduce_size` under the pilot,
+    this function records what *would have happened* if the trade had been
+    fully blocked. This enables post-experiment analysis comparing
+    counterfactual outcomes to actual reduced-size trade results.
+
+    The row is written to `blocked_trade_candidates` with
+    `pilot_override_applied: true` and `pilot_trade_link: null` in the
+    `decision_snapshot_json`. The `pilot_trade_link` is filled in later
+    (Task 9.2) when the trade executes.
+
+    Args:
+        db: SQLAlchemy session (caller owns commit).
+        symbol: Trade symbol.
+        action: Trade action (BUY, SHORT, etc.).
+        blocked_by: Gate name that would have blocked the trade.
+        block_reason: Original rejection reason.
+        direction: Trade direction (long/short).
+        profile: PM profile (moderate, aggressive, conservative).
+        setup_type: Setup classification string.
+        entry_price: Entry price of the trade.
+        stop_price: Stop price of the trade.
+        target_price: Target price of the trade.
+        quantity: Original (pre-reduction) quantity.
+        gate_result: Full gate evaluation result dict for context.
+        gate_notes: Gate pipeline notes list.
+        signal_snapshot: Signal data dict for context.
+        agent: Agent name.
+
+    Returns:
+        int: The new row's primary key on successful insert.
+        None: On error or deduplication skip.
+
+    This function is guaranteed not to raise — all exceptions are caught and logged.
+    """
+    try:
+        # Build decision_snapshot with pilot override metadata
+        decision_snapshot = {
+            "pilot_override_applied": True,
+            "pilot_trade_link": None,
+        }
+        if gate_result and isinstance(gate_result, dict):
+            # Include relevant gate result fields for post-experiment analysis
+            decision_snapshot["gate_result_snapshot"] = {
+                k: v for k, v in gate_result.items()
+                if k in (
+                    "decision", "reason_type", "reason", "win_rate", "threshold",
+                    "size_multiplier", "confirming_signals", "near_miss_margin",
+                    "original_rr", "adjusted_rr", "min_reward_to_risk",
+                )
+            }
+
+        # Delegate to the existing record_blocked_candidate function
+        return record_blocked_candidate(
+            db,
+            symbol=symbol,
+            action=action,
+            blocked_by=blocked_by,
+            block_reason=block_reason,
+            direction=direction,
+            profile=profile,
+            setup_type=setup_type,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            quantity=quantity,
+            reason_code="pilot_counterfactual",
+            decision_snapshot=decision_snapshot,
+            signal_snapshot=signal_snapshot,
+            gate_notes=gate_notes,
+            source="pilot_counterfactual",
+            agent=agent,
+        )
+
+    except Exception as exc:
+        log.error(
+            "write_pilot_counterfactual_row: unexpected error for symbol=%s, blocked_by=%s: %s",
+            symbol,
+            blocked_by,
+            exc,
+        )
+        return None
