@@ -4208,7 +4208,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
             engine, signals, profile_id, profile, portfolio, cycle_id
         )
 
-        if registry.is_empty:
+        if registry.is_empty and PM_CANDIDATE_MODE == "enabled":
             notes = "Candidate-ID mode: no eligible candidates for this cycle."
             stored_notes = _store_pm_cycle_note(db, profile_id, notes)
             db.close()
@@ -4218,177 +4218,185 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 "profile": profile_id,
             }
 
-        # Build PM prompt with candidate summaries
-        candidate_summaries = registry.get_offered_summary()
-
-        # Record offered candidates for audit (Requirement 12.1)
-        for summary in candidate_summaries:
-            _record_candidate_event(
-                engine, summary["candidate_id"], cycle_id, profile_id,
-                "offered",
-                {"symbol": summary["symbol"], "direction": summary["direction"], "risk_reward": summary.get("risk_reward")},
+        if registry.is_empty:
+            log.info(
+                "Candidate-ID shadow mode produced no eligible candidates for "
+                "profile=%s; continuing with legacy entry path",
+                profile_id,
             )
 
-        pm_prompt = build_candidate_pm_prompt(
-            candidate_summaries, portfolio_snapshot, profile, profile_id
-        )
+        if not registry.is_empty:
+            # Build PM prompt with candidate summaries
+            candidate_summaries = registry.get_offered_summary()
 
-        # Build dynamic schema for structured output
-        schema = build_decision_schema(registry.get_registered_ids())
+            # Record offered candidates for audit (Requirement 12.1)
+            for summary in candidate_summaries:
+                _record_candidate_event(
+                    engine, summary["candidate_id"], cycle_id, profile_id,
+                    "offered",
+                    {"symbol": summary["symbol"], "direction": summary["direction"], "risk_reward": summary.get("risk_reward")},
+                )
 
-        # Call LLM with candidate prompt
-        candidate_system_prompt = f"You are the {profile['name']} Portfolio Manager. {profile['personality']}"
-        raw = call_llm(
-            candidate_system_prompt,
-            pm_prompt,
-            json_mode=True,
-            tier=tier,
-            purpose=f"pm_candidate_entry:{profile_id}",
-        )
-        raw_response = parse_json_response(raw)
+            pm_prompt = build_candidate_pm_prompt(
+                candidate_summaries, portfolio_snapshot, profile, profile_id
+            )
 
-        # Parse decision contract
-        candidate_metadata = registry.get_candidate_metadata()
-        parse_result = parse_decision_contract(
-            raw_response, registry.get_registered_ids(), candidate_metadata
-        )
+            # Build dynamic schema for structured output
+            schema = build_decision_schema(registry.get_registered_ids())
 
-        # Handle contract retry (at most once)
-        if should_retry_candidate_contract(parse_result):
-            retry_prompt = build_candidate_retry_prompt(parse_result, registry)
-            raw_retry = call_llm(
+            # Call LLM with candidate prompt
+            candidate_system_prompt = f"You are the {profile['name']} Portfolio Manager. {profile['personality']}"
+            raw = call_llm(
                 candidate_system_prompt,
-                retry_prompt,
+                pm_prompt,
                 json_mode=True,
                 tier=tier,
-                purpose=f"pm_candidate_retry:{profile_id}",
+                purpose=f"pm_candidate_entry:{profile_id}",
             )
-            raw_response = parse_json_response(raw_retry)
+            raw_response = parse_json_response(raw)
+
+            # Parse decision contract
+            candidate_metadata = registry.get_candidate_metadata()
             parse_result = parse_decision_contract(
                 raw_response, registry.get_registered_ids(), candidate_metadata
             )
 
-        # Record PM decisions for audit (Requirements 12.2, 12.4)
-        for decision in parse_result.accepted:
-            _record_candidate_event(
-                engine, decision.candidate_id, cycle_id, profile_id,
-                "pm_accept",
-                {"rationale": decision.rationale, "risk_multiplier": decision.risk_multiplier},
-            )
-        for decision in parse_result.rejected:
-            _record_candidate_event(
-                engine, decision.candidate_id, cycle_id, profile_id,
-                "pm_reject",
-                {"rationale": decision.rationale},
-            )
-        for ns_id in parse_result.not_selected_ids:
-            _record_candidate_event(
-                engine, ns_id, cycle_id, profile_id,
-                "pm_not_selected",
-                None,
-            )
+            # Handle contract retry (at most once)
+            if should_retry_candidate_contract(parse_result):
+                retry_prompt = build_candidate_retry_prompt(parse_result, registry)
+                raw_retry = call_llm(
+                    candidate_system_prompt,
+                    retry_prompt,
+                    json_mode=True,
+                    tier=tier,
+                    purpose=f"pm_candidate_retry:{profile_id}",
+                )
+                raw_response = parse_json_response(raw_retry)
+                parse_result = parse_decision_contract(
+                    raw_response, registry.get_registered_ids(), candidate_metadata
+                )
 
-        # Record PM rejection decisions
-        if PM_CANDIDATE_MODE == "enabled":
-            for decision in parse_result.rejected:
-                registry.mark_rejected(decision.candidate_id, decision.rationale)
-
-            # Execute each accepted candidate through the pipeline
+            # Record PM decisions for audit (Requirements 12.2, 12.4)
             for decision in parse_result.accepted:
-                pipeline_result = execute_candidate_pipeline(
-                    db, engine, registry, decision,
-                    portfolio_snapshot, profile, profile_id,
-                    recovery_multiplier=1.0,
-                )
-
-                # Record pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
                 _record_candidate_event(
-                    engine, pipeline_result.candidate_id, cycle_id, profile_id,
-                    f"pipeline_{pipeline_result.outcome}",
-                    {
-                        "outcome": pipeline_result.outcome,
-                        "sizing": {
-                            "quantity": pipeline_result.sizing_result.quantity,
-                            "dollar_risk": pipeline_result.sizing_result.dollar_risk,
-                        } if pipeline_result.sizing_result else None,
-                        "gate_notes": pipeline_result.gate_notes,
-                        "error": pipeline_result.error,
-                    },
+                    engine, decision.candidate_id, cycle_id, profile_id,
+                    "pm_accept",
+                    {"rationale": decision.rationale, "risk_multiplier": decision.risk_multiplier},
+                )
+            for decision in parse_result.rejected:
+                _record_candidate_event(
+                    engine, decision.candidate_id, cycle_id, profile_id,
+                    "pm_reject",
+                    {"rationale": decision.rationale},
+                )
+            for ns_id in parse_result.not_selected_ids:
+                _record_candidate_event(
+                    engine, ns_id, cycle_id, profile_id,
+                    "pm_not_selected",
+                    None,
                 )
 
-                executed.append({
-                    "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else "unknown",
-                    "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else "unknown",
-                    "executed": pipeline_result.outcome == "executed",
-                    "outcome": pipeline_result.outcome,
+            # Record PM rejection decisions
+            if PM_CANDIDATE_MODE == "enabled":
+                for decision in parse_result.rejected:
+                    registry.mark_rejected(decision.candidate_id, decision.rationale)
+
+                # Execute each accepted candidate through the pipeline
+                for decision in parse_result.accepted:
+                    pipeline_result = execute_candidate_pipeline(
+                        db, engine, registry, decision,
+                        portfolio_snapshot, profile, profile_id,
+                        recovery_multiplier=1.0,
+                    )
+
+                    # Record pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
+                    _record_candidate_event(
+                        engine, pipeline_result.candidate_id, cycle_id, profile_id,
+                        f"pipeline_{pipeline_result.outcome}",
+                        {
+                            "outcome": pipeline_result.outcome,
+                            "sizing": {
+                                "quantity": pipeline_result.sizing_result.quantity,
+                                "dollar_risk": pipeline_result.sizing_result.dollar_risk,
+                            } if pipeline_result.sizing_result else None,
+                            "gate_notes": pipeline_result.gate_notes,
+                            "error": pipeline_result.error,
+                        },
+                    )
+
+                    executed.append({
+                        "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else "unknown",
+                        "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else "unknown",
+                        "executed": pipeline_result.outcome == "executed",
+                        "outcome": pipeline_result.outcome,
+                        "profile": profile_id,
+                        "source": "candidate_pipeline",
+                        "candidate_id": pipeline_result.candidate_id,
+                    })
+            else:
+                # Shadow mode: dry-run candidate path, record hypothetical results
+                from utils.trade_events import log_trade_event
+                candidate_results = []
+                for decision in parse_result.accepted:
+                    pipeline_result = dry_run_candidate_pipeline(
+                        db, engine, registry, decision,
+                        portfolio_snapshot, profile, profile_id,
+                        recovery_multiplier=1.0,
+                    )
+
+                    # Record shadow pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
+                    _record_candidate_event(
+                        engine, pipeline_result.candidate_id, cycle_id, profile_id,
+                        f"shadow_pipeline_{pipeline_result.outcome}",
+                        {
+                            "outcome": pipeline_result.outcome,
+                            "sizing": {
+                                "quantity": pipeline_result.sizing_result.quantity,
+                                "dollar_risk": pipeline_result.sizing_result.dollar_risk,
+                            } if pipeline_result.sizing_result else None,
+                            "gate_notes": pipeline_result.gate_notes,
+                            "error": pipeline_result.error,
+                        },
+                    )
+
+                    candidate_results.append({
+                        "candidate_id": pipeline_result.candidate_id,
+                        "outcome": pipeline_result.outcome,
+                        "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else None,
+                        "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else None,
+                        "quantity": pipeline_result.sizing_result.quantity if pipeline_result.sizing_result else None,
+                    })
+
+                # Record hypothetical PM rejections as events (no state mutation)
+                for decision in parse_result.rejected:
+                    log_trade_event(
+                        db,
+                        "pm_reject_hypothetical",
+                        agent=f"pm_{profile_id}",
+                        symbol="candidate_pipeline",
+                        profile=profile_id,
+                        message=f"Shadow mode: PM rejected candidate {decision.candidate_id}: {decision.rationale}",
+                        payload={"candidate_id": decision.candidate_id, "rationale": decision.rationale},
+                    )
+
+                # Store candidate results for shadow comparison after legacy executes
+                _shadow_candidate_results = candidate_results
+                _shadow_parse_result = parse_result
+
+            # Finalize cycle (assign terminal states to remaining candidates)
+            registry.finalize_cycle()
+
+            # In shadow mode, fall through to legacy entry path below
+            if PM_CANDIDATE_MODE == "enabled":
+                notes = f"Candidate-ID mode: processed {len(parse_result.accepted)} accepts, {len(parse_result.rejected)} rejects."
+                stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+                db.close()
+                return {
+                    "decisions": executed,
+                    "portfolio_notes": stored_notes,
                     "profile": profile_id,
-                    "source": "candidate_pipeline",
-                    "candidate_id": pipeline_result.candidate_id,
-                })
-        else:
-            # Shadow mode: dry-run candidate path, record hypothetical results
-            from utils.trade_events import log_trade_event
-            candidate_results = []
-            for decision in parse_result.accepted:
-                pipeline_result = dry_run_candidate_pipeline(
-                    db, engine, registry, decision,
-                    portfolio_snapshot, profile, profile_id,
-                    recovery_multiplier=1.0,
-                )
-
-                # Record shadow pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
-                _record_candidate_event(
-                    engine, pipeline_result.candidate_id, cycle_id, profile_id,
-                    f"shadow_pipeline_{pipeline_result.outcome}",
-                    {
-                        "outcome": pipeline_result.outcome,
-                        "sizing": {
-                            "quantity": pipeline_result.sizing_result.quantity,
-                            "dollar_risk": pipeline_result.sizing_result.dollar_risk,
-                        } if pipeline_result.sizing_result else None,
-                        "gate_notes": pipeline_result.gate_notes,
-                        "error": pipeline_result.error,
-                    },
-                )
-
-                candidate_results.append({
-                    "candidate_id": pipeline_result.candidate_id,
-                    "outcome": pipeline_result.outcome,
-                    "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else None,
-                    "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else None,
-                    "quantity": pipeline_result.sizing_result.quantity if pipeline_result.sizing_result else None,
-                })
-
-            # Record hypothetical PM rejections as events (no state mutation)
-            for decision in parse_result.rejected:
-                log_trade_event(
-                    db,
-                    "pm_reject_hypothetical",
-                    agent=f"pm_{profile_id}",
-                    symbol="candidate_pipeline",
-                    profile=profile_id,
-                    message=f"Shadow mode: PM rejected candidate {decision.candidate_id}: {decision.rationale}",
-                    payload={"candidate_id": decision.candidate_id, "rationale": decision.rationale},
-                )
-
-            # Store candidate results for shadow comparison after legacy executes
-            _shadow_candidate_results = candidate_results
-            _shadow_parse_result = parse_result
-
-        # Finalize cycle (assign terminal states to remaining candidates)
-        registry.finalize_cycle()
-
-        # In shadow mode, fall through to legacy entry path below
-        if PM_CANDIDATE_MODE == "enabled":
-            notes = f"Candidate-ID mode: processed {len(parse_result.accepted)} accepts, {len(parse_result.rejected)} rejects."
-            stored_notes = _store_pm_cycle_note(db, profile_id, notes)
-            db.close()
-            return {
-                "decisions": executed,
-                "portfolio_notes": stored_notes,
-                "profile": profile_id,
-            }
-        # If shadow mode, continue to legacy path below...
+                }
+            # If shadow mode, continue to legacy path below...
 
     # Build profile-specific system prompt for entry decisions
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
