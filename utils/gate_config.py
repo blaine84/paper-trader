@@ -65,6 +65,7 @@ ROLLING_WINDOW: int = 5
 MIN_CASES_FOR_BLOCK: int = 5
 MIN_ROLLING_CASES: int = 3
 CONSECUTIVE_LOSS_PAUSE_THRESHOLD: int = 3
+CONSECUTIVE_LOSS_PAUSE_EXEMPT_SETUPS: set[str] = {"gap_and_go"}
 
 # Recovery override
 # Recovery evaluates the configured rolling window, so this minimum must be

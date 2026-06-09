@@ -25,6 +25,7 @@ from typing import Any
 from models.case import Case
 from db.schema import get_session
 from utils.gate_config import (
+    CONSECUTIVE_LOSS_PAUSE_EXEMPT_SETUPS,
     CONSECUTIVE_LOSS_PAUSE_THRESHOLD,
     DEFAULT_MIN_WIN_RATE,
     DEFAULT_MIN_WIN_RATE_BY_PROFILE,
@@ -493,7 +494,10 @@ def evaluate_setup_quality(
         return result
 
     # 2. Consecutive losses -----------------------------------------------
-    if _check_consecutive_losses(cases, CONSECUTIVE_LOSS_PAUSE_THRESHOLD):
+    if (
+        setup_type not in CONSECUTIVE_LOSS_PAUSE_EXEMPT_SETUPS
+        and _check_consecutive_losses(cases, CONSECUTIVE_LOSS_PAUSE_THRESHOLD)
+    ):
         result = _result(
             "reject",
             "consecutive_losses",
