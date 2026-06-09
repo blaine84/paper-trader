@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -78,6 +79,99 @@ def _num(value: Any) -> float | None:
         return out if out > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _is_positive_number(value: Any) -> bool:
+    """Check if value is a positive finite number."""
+    if value is None:
+        return False
+    try:
+        v = float(value)
+        return v > 0 and math.isfinite(v)
+    except (TypeError, ValueError):
+        return False
+
+
+# Patterns that indicate a placeholder symbol (sector/category/theme concepts)
+_INVALID_SYMBOL_PATTERNS: set[str] = {
+    "sector_",
+    "industry_",
+    "category_",
+    "theme_",
+    "ETF_",
+}
+
+
+def validate_candidate_scorability(
+    candidate: dict[str, Any],
+    engine: Any | None = None,
+) -> tuple[bool, str | None]:
+    """Verify a blocked candidate is scorable before requesting market data.
+
+    Pre-flight checks (Requirements 10.1–10.6):
+    1. Candidate has a valid candidate_id that exists in pm_candidates table
+       (verifies it originated from a registered deterministic candidate).
+       If engine is None, skip this check (backward compatibility).
+    2. Candidate has a valid supported symbol (non-empty string, not a
+       sector/category placeholder).
+    3. Candidate has complete numeric entry, stop, and target fields.
+    4. Candidate has a recognized direction (BUY or SHORT).
+    5. Candidate has a deterministic execution quantity OR we can derive
+       a shadow quantity (non-zero numeric quantity field present).
+
+    Args:
+        candidate: Dict with candidate data (from blocked_trade_candidates table).
+        engine: SQLAlchemy engine for pm_candidates lookup (optional).
+
+    Returns:
+        (is_scorable, reason) — reason is None if scorable.
+    """
+    # Check 1: Candidate registry origin (Requirement 10.1)
+    if engine is not None:
+        candidate_id = candidate.get("geometry_candidate_id") or candidate.get("candidate_id")
+        if candidate_id:
+            from sqlalchemy import text as _text
+
+            try:
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        _text("SELECT 1 FROM pm_candidates WHERE candidate_id = :cid"),
+                        {"cid": candidate_id},
+                    ).fetchone()
+                    if row is None:
+                        return (False, "candidate_not_in_registry")
+            except Exception:
+                # If table doesn't exist yet (pre-migration), skip this check
+                pass
+        # If no candidate_id field at all, this may be a legacy blocked candidate.
+        # Allow through for backward compatibility (legacy path didn't use candidate_ids).
+
+    # Check 2: Valid supported symbol (Requirement 10.2, 10.6)
+    symbol = candidate.get("symbol")
+    if not symbol or not isinstance(symbol, str):
+        return (False, "missing_symbol")
+    # Reject sector/category placeholders
+    if any(symbol.startswith(p) for p in _INVALID_SYMBOL_PATTERNS):
+        return (False, "symbol_is_placeholder")
+
+    # Check 3: Complete numeric geometry (Requirement 10.3)
+    entry = candidate.get("entry_price")
+    stop = candidate.get("stop_price")
+    target = candidate.get("target_price")
+    if not _is_positive_number(entry) or not _is_positive_number(stop) or not _is_positive_number(target):
+        return (False, "incomplete_geometry")
+
+    # Check 4: Recognized direction (Requirement 10.4)
+    action = candidate.get("action") or candidate.get("direction") or ""
+    if str(action).upper() not in ("BUY", "SHORT", "LONG"):
+        return (False, "unrecognized_direction")
+
+    # Check 5: Has quantity (deterministic or shadow) (Requirement 10.3)
+    quantity = candidate.get("quantity")
+    if quantity is None or (isinstance(quantity, (int, float)) and quantity <= 0):
+        return (False, "missing_quantity")
+
+    return (True, None)
 
 
 def validate_scorability(

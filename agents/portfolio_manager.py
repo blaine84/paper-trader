@@ -3840,6 +3840,20 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
     return True, "OK"
 
 
+def _compute_shadow_agreement(candidate_results, legacy_results):
+    """Compute simple agreement summary between candidate and legacy paths."""
+    candidate_symbols = {r["symbol"] for r in candidate_results if r.get("outcome") == "executed"}
+    legacy_symbols = {e.get("symbol") for e in legacy_results if e.get("executed")}
+    common = candidate_symbols & legacy_symbols
+    candidate_only = candidate_symbols - legacy_symbols
+    legacy_only = legacy_symbols - candidate_symbols
+    return json.dumps({
+        "both_executed": sorted(common),
+        "candidate_only": sorted(candidate_only),
+        "legacy_only": sorted(legacy_only),
+    })
+
+
 def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high") -> dict:
     """
     Run a single PM profile for one cycle with two-tier review routing.
@@ -4215,6 +4229,239 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     # ── PHASE 2: Existing entry logic for NEW positions (unchanged) ──
     # Symbols that already have open positions are excluded from new entry consideration.
     held_symbols = {p.symbol for p in db.query(Position).filter_by(profile=profile_id).all()}
+
+    # ── CANDIDATE-ID SELECTION BRANCH ──
+    from utils.gate_config import PM_CANDIDATE_MODE
+
+    def _record_candidate_event(engine, candidate_id, cycle_id, profile_id, event_type, event_data):
+        """Record a single audit event to pm_candidate_events table (Requirement 12)."""
+        from sqlalchemy import text as _sql_text
+        with engine.connect() as conn:
+            conn.execute(
+                _sql_text("""
+                    INSERT INTO pm_candidate_events
+                    (candidate_id, cycle_id, profile_id, event_type, event_data, created_at)
+                    VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at)
+                """),
+                {
+                    "cid": candidate_id,
+                    "cycle_id": cycle_id,
+                    "profile_id": profile_id,
+                    "event_type": event_type,
+                    "event_data": json.dumps(event_data, default=str) if event_data is not None else None,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            )
+            conn.commit()
+
+    if PM_CANDIDATE_MODE in ("enabled", "shadow"):
+        import copy
+        import uuid
+        from utils.candidate_registry import recover_stale_reservations
+        from utils.candidate_builder import build_candidate_set
+        from utils.candidate_prompt_builder import build_candidate_pm_prompt, build_decision_schema
+        from utils.decision_contract import (
+            parse_decision_contract,
+            should_retry_candidate_contract,
+            build_candidate_retry_prompt,
+        )
+        from utils.candidate_pipeline import execute_candidate_pipeline, dry_run_candidate_pipeline
+
+        # Recover any stale reservations from prior cycles/crashes
+        recover_stale_reservations(engine)
+
+        # Generate unique cycle ID
+        cycle_id = f"cycle_{profile_id}_{uuid.uuid4().hex[:12]}"
+
+        # Capture frozen portfolio snapshot for consistent evaluation
+        portfolio_snapshot = copy.deepcopy(portfolio)
+
+        # Build candidate set from eligible signals
+        registry = build_candidate_set(
+            engine, signals, profile_id, profile, portfolio, cycle_id
+        )
+
+        if registry.is_empty:
+            notes = "Candidate-ID mode: no eligible candidates for this cycle."
+            stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+            db.close()
+            return {
+                "decisions": executed,
+                "portfolio_notes": stored_notes,
+                "profile": profile_id,
+            }
+
+        # Build PM prompt with candidate summaries
+        candidate_summaries = registry.get_offered_summary()
+
+        # Record offered candidates for audit (Requirement 12.1)
+        for summary in candidate_summaries:
+            _record_candidate_event(
+                engine, summary["candidate_id"], cycle_id, profile_id,
+                "offered",
+                {"symbol": summary["symbol"], "direction": summary["direction"], "risk_reward": summary.get("risk_reward")},
+            )
+
+        pm_prompt = build_candidate_pm_prompt(
+            candidate_summaries, portfolio_snapshot, profile, profile_id
+        )
+
+        # Build dynamic schema for structured output
+        schema = build_decision_schema(registry.get_registered_ids())
+
+        # Call LLM with candidate prompt
+        candidate_system_prompt = f"You are the {profile['name']} Portfolio Manager. {profile['personality']}"
+        raw = call_llm(
+            candidate_system_prompt,
+            pm_prompt,
+            json_mode=True,
+            tier=tier,
+            purpose=f"pm_candidate_entry:{profile_id}",
+        )
+        raw_response = parse_json_response(raw)
+
+        # Parse decision contract
+        candidate_metadata = registry.get_candidate_metadata()
+        parse_result = parse_decision_contract(
+            raw_response, registry.get_registered_ids(), candidate_metadata
+        )
+
+        # Handle contract retry (at most once)
+        if should_retry_candidate_contract(parse_result):
+            retry_prompt = build_candidate_retry_prompt(parse_result, registry)
+            raw_retry = call_llm(
+                candidate_system_prompt,
+                retry_prompt,
+                json_mode=True,
+                tier=tier,
+                purpose=f"pm_candidate_retry:{profile_id}",
+            )
+            raw_response = parse_json_response(raw_retry)
+            parse_result = parse_decision_contract(
+                raw_response, registry.get_registered_ids(), candidate_metadata
+            )
+
+        # Record PM decisions for audit (Requirements 12.2, 12.4)
+        for decision in parse_result.accepted:
+            _record_candidate_event(
+                engine, decision.candidate_id, cycle_id, profile_id,
+                "pm_accept",
+                {"rationale": decision.rationale, "risk_multiplier": decision.risk_multiplier},
+            )
+        for decision in parse_result.rejected:
+            _record_candidate_event(
+                engine, decision.candidate_id, cycle_id, profile_id,
+                "pm_reject",
+                {"rationale": decision.rationale},
+            )
+        for ns_id in parse_result.not_selected_ids:
+            _record_candidate_event(
+                engine, ns_id, cycle_id, profile_id,
+                "pm_not_selected",
+                None,
+            )
+
+        # Record PM rejection decisions
+        if PM_CANDIDATE_MODE == "enabled":
+            for decision in parse_result.rejected:
+                registry.mark_rejected(decision.candidate_id, decision.rationale)
+
+            # Execute each accepted candidate through the pipeline
+            for decision in parse_result.accepted:
+                pipeline_result = execute_candidate_pipeline(
+                    db, engine, registry, decision,
+                    portfolio_snapshot, profile, profile_id,
+                    recovery_multiplier=1.0,
+                )
+
+                # Record pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
+                _record_candidate_event(
+                    engine, pipeline_result.candidate_id, cycle_id, profile_id,
+                    f"pipeline_{pipeline_result.outcome}",
+                    {
+                        "outcome": pipeline_result.outcome,
+                        "sizing": {
+                            "quantity": pipeline_result.sizing_result.quantity,
+                            "dollar_risk": pipeline_result.sizing_result.dollar_risk,
+                        } if pipeline_result.sizing_result else None,
+                        "gate_notes": pipeline_result.gate_notes,
+                        "error": pipeline_result.error,
+                    },
+                )
+
+                executed.append({
+                    "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else "unknown",
+                    "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else "unknown",
+                    "executed": pipeline_result.outcome == "executed",
+                    "outcome": pipeline_result.outcome,
+                    "profile": profile_id,
+                    "source": "candidate_pipeline",
+                    "candidate_id": pipeline_result.candidate_id,
+                })
+        else:
+            # Shadow mode: dry-run candidate path, record hypothetical results
+            from utils.trade_events import log_trade_event
+            candidate_results = []
+            for decision in parse_result.accepted:
+                pipeline_result = dry_run_candidate_pipeline(
+                    db, engine, registry, decision,
+                    portfolio_snapshot, profile, profile_id,
+                    recovery_multiplier=1.0,
+                )
+
+                # Record shadow pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
+                _record_candidate_event(
+                    engine, pipeline_result.candidate_id, cycle_id, profile_id,
+                    f"shadow_pipeline_{pipeline_result.outcome}",
+                    {
+                        "outcome": pipeline_result.outcome,
+                        "sizing": {
+                            "quantity": pipeline_result.sizing_result.quantity,
+                            "dollar_risk": pipeline_result.sizing_result.dollar_risk,
+                        } if pipeline_result.sizing_result else None,
+                        "gate_notes": pipeline_result.gate_notes,
+                        "error": pipeline_result.error,
+                    },
+                )
+
+                candidate_results.append({
+                    "candidate_id": pipeline_result.candidate_id,
+                    "outcome": pipeline_result.outcome,
+                    "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else None,
+                    "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else None,
+                    "quantity": pipeline_result.sizing_result.quantity if pipeline_result.sizing_result else None,
+                })
+
+            # Record hypothetical PM rejections as events (no state mutation)
+            for decision in parse_result.rejected:
+                log_trade_event(
+                    db,
+                    "pm_reject_hypothetical",
+                    agent=f"pm_{profile_id}",
+                    symbol="candidate_pipeline",
+                    profile=profile_id,
+                    message=f"Shadow mode: PM rejected candidate {decision.candidate_id}: {decision.rationale}",
+                    payload={"candidate_id": decision.candidate_id, "rationale": decision.rationale},
+                )
+
+            # Store candidate results for shadow comparison after legacy executes
+            _shadow_candidate_results = candidate_results
+            _shadow_parse_result = parse_result
+
+        # Finalize cycle (assign terminal states to remaining candidates)
+        registry.finalize_cycle()
+
+        # In shadow mode, fall through to legacy entry path below
+        if PM_CANDIDATE_MODE == "enabled":
+            notes = f"Candidate-ID mode: processed {len(parse_result.accepted)} accepts, {len(parse_result.rejected)} rejects."
+            stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+            db.close()
+            return {
+                "decisions": executed,
+                "portfolio_notes": stored_notes,
+                "profile": profile_id,
+            }
+        # If shadow mode, continue to legacy path below...
 
     # Build profile-specific system prompt for entry decisions
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
@@ -4856,6 +5103,39 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
         stored_notes = _store_pm_cycle_note(db, profile_id, stored_notes)
     else:
         stored_notes = notes
+
+    # ── Shadow comparison recording (if shadow mode was active) ──
+    if PM_CANDIDATE_MODE == "shadow" and '_shadow_candidate_results' in locals():
+        try:
+            from sqlalchemy import text as _text
+            comparison_data = {
+                "candidate_results_json": json.dumps(_shadow_candidate_results, default=str),
+                "legacy_results_json": json.dumps(executed, default=str),
+                "agreement_summary": _compute_shadow_agreement(
+                    _shadow_candidate_results, executed
+                ),
+                "malformed_count": len(_shadow_parse_result.violations) if _shadow_parse_result else 0,
+                "hypothetical_diffs": json.dumps({
+                    "candidate_accepts": len(_shadow_parse_result.accepted) if _shadow_parse_result else 0,
+                    "candidate_rejects": len(_shadow_parse_result.rejected) if _shadow_parse_result else 0,
+                    "legacy_executed": len([e for e in executed if e.get("executed")]),
+                }, default=str),
+            }
+            with engine.connect() as conn:
+                conn.execute(
+                    _text("""
+                        INSERT INTO candidate_shadow_comparison
+                        (cycle_id, profile_id, candidate_results_json, legacy_results_json,
+                         agreement_summary, malformed_count, hypothetical_diffs)
+                        VALUES (:cycle_id, :profile_id, :candidate_results_json,
+                                :legacy_results_json, :agreement_summary,
+                                :malformed_count, :hypothetical_diffs)
+                    """),
+                    {"cycle_id": cycle_id, "profile_id": profile_id, **comparison_data},
+                )
+                conn.commit()
+        except Exception as exc:
+            log.warning("Failed to record shadow comparison: %s", exc)
 
     db.close()
     return {"decisions": executed, "portfolio_notes": stored_notes, "profile": profile_id}

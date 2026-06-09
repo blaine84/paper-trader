@@ -264,6 +264,22 @@ REDUCED_RR_THRESHOLDS_BY_PROFILE: dict[str, float] = {
     "conservative": 1.0,
 }
 
+# ---------------------------------------------------------------------------
+# Candidate-ID Selection Feature Flags
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "shadow" | "enabled"
+PM_CANDIDATE_MODE: str = os.environ.get("PM_CANDIDATE_MODE", "disabled")
+
+# P1 Benchmark Context (independent of P0)
+PM_BENCHMARK_CONTEXT_ENABLED: bool = os.environ.get(
+    "PM_BENCHMARK_CONTEXT_ENABLED", "false"
+).lower() == "true"
+
+# P1 Alignment Policy
+# Values: "disabled" | "log_only" | "enforcing"
+PM_ALIGNMENT_POLICY_MODE: str = os.environ.get("PM_ALIGNMENT_POLICY_MODE", "disabled")
+
 
 # ---------------------------------------------------------------------------
 # Pilot Controller

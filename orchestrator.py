@@ -447,6 +447,135 @@ def _ensure_funnel_tables(engine, inspector):
         log.warning("Schema migration: created funnel_run_logs table")
 
 
+def _ensure_candidate_tables(engine, inspector):
+    """Create pm_candidates, pm_candidate_events, and candidate_shadow_comparison tables if missing.
+
+    Called during check_schema() startup. Non-destructive — only creates
+    tables that are missing. WAL mode is already applied at engine level
+    via the _set_sqlite_pragma event listener in init_db().
+
+    Requirements: 1.3, 12.1, 12.2, 12.5, 13.2
+    """
+    from sqlalchemy import text
+
+    if not inspector.has_table("pm_candidates"):
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS pm_candidates (
+                        id INTEGER PRIMARY KEY,
+                        candidate_id VARCHAR(36) NOT NULL UNIQUE,
+                        cycle_id VARCHAR(64) NOT NULL,
+                        profile_id VARCHAR(64) NOT NULL,
+                        symbol VARCHAR(10) NOT NULL,
+                        direction VARCHAR(10) NOT NULL,
+                        setup_type VARCHAR(64) NOT NULL,
+                        geometry_name VARCHAR(64) NOT NULL,
+                        entry_price REAL NOT NULL,
+                        stop_price REAL NOT NULL,
+                        target_price REAL NOT NULL,
+                        risk_reward REAL NOT NULL,
+                        trigger TEXT,
+                        invalidation_basis TEXT,
+                        target_basis TEXT,
+                        source_signal_id VARCHAR(64) NOT NULL,
+                        signal_snapshot_json TEXT NOT NULL,
+                        state VARCHAR(32) NOT NULL DEFAULT 'registered',
+                        integrity_hash VARCHAR(64) NOT NULL,
+                        execution_key VARCHAR(128),
+                        reserved_at DATETIME,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        expires_at DATETIME NOT NULL,
+                        context_snapshot_json TEXT,
+                        benchmark_mapping_json TEXT,
+                        rejection_reason TEXT
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_pm_candidates_cycle_profile "
+                    "ON pm_candidates (cycle_id, profile_id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_pm_candidates_state "
+                    "ON pm_candidates (state)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_pm_candidates_execution_key "
+                    "ON pm_candidates (execution_key) WHERE execution_key IS NOT NULL"
+                )
+            )
+            conn.commit()
+        log.warning("Schema migration: created pm_candidates table with indexes")
+
+    if not inspector.has_table("pm_candidate_events"):
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS pm_candidate_events (
+                        id INTEGER PRIMARY KEY,
+                        candidate_id VARCHAR(36) NOT NULL,
+                        cycle_id VARCHAR(64) NOT NULL,
+                        profile_id VARCHAR(64) NOT NULL,
+                        event_type VARCHAR(64) NOT NULL,
+                        event_data TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_pm_candidate_events_candidate "
+                    "ON pm_candidate_events (candidate_id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_pm_candidate_events_cycle "
+                    "ON pm_candidate_events (cycle_id, profile_id)"
+                )
+            )
+            conn.commit()
+        log.warning("Schema migration: created pm_candidate_events table with indexes")
+
+    if not inspector.has_table("candidate_shadow_comparison"):
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS candidate_shadow_comparison (
+                        id INTEGER PRIMARY KEY,
+                        cycle_id VARCHAR(64) NOT NULL,
+                        profile_id VARCHAR(64) NOT NULL,
+                        candidate_results_json TEXT NOT NULL,
+                        legacy_results_json TEXT NOT NULL,
+                        agreement_summary TEXT,
+                        malformed_count INTEGER DEFAULT 0,
+                        hypothetical_diffs TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_shadow_comparison_cycle "
+                    "ON candidate_shadow_comparison (cycle_id, profile_id)"
+                )
+            )
+            conn.commit()
+        log.warning("Schema migration: created candidate_shadow_comparison table with indexes")
+
+
 def check_schema(engine):
     """Verify the DB schema has all expected columns. Fail fast if not."""
     import sqlite3
@@ -456,6 +585,9 @@ def check_schema(engine):
 
     # --- Auto-create funnel tables if missing (non-destructive) ---
     _ensure_funnel_tables(engine, inspector)
+
+    # --- Auto-create candidate-ID selection tables if missing (non-destructive) ---
+    _ensure_candidate_tables(engine, inspector)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —
