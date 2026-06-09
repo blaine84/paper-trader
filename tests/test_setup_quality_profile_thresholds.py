@@ -108,6 +108,23 @@ def test_non_profitable_partial_still_counts_toward_consecutive_loss_pause():
     assert result["reason_type"] == "consecutive_losses"
 
 
+def test_gap_and_go_is_exempt_from_consecutive_loss_pause():
+    engine, db = _engine_and_session()
+    _add_cases(
+        db,
+        ["failure", "failure", "failure", "success", "success"],
+        setup_type="gap_and_go",
+    )
+
+    result = evaluate_setup_quality(
+        engine, db, "gap_and_go", profile="moderate", symbol="AMD"
+    )
+
+    assert result["win_rate"] == 0.40
+    assert result["decision"] != "reject"
+    assert result["reason_type"] != "consecutive_losses"
+
+
 def test_recovery_override_can_fire_with_the_configured_rolling_window():
     engine, db = _engine_and_session()
     _add_cases(
