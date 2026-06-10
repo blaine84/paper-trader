@@ -54,6 +54,11 @@ MIN_WIN_RATE_BY_SETUP_PROFILE: dict[str, dict[str, float]] = {
         "moderate": 0.35,
         "aggressive": 0.25,
     },
+    "vwap_reclaim": {
+        "conservative": 0.35,
+        "moderate": 0.30,
+        "aggressive": 0.20,
+    },
 }
 DEFAULT_MIN_WIN_RATE_BY_PROFILE: dict[str, float] = {
     "conservative": DEFAULT_MIN_WIN_RATE,

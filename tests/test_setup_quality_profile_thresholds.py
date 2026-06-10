@@ -75,6 +75,41 @@ def test_conservative_keeps_original_momentum_fade_floor():
     assert conservative["decision"] == "reject"
 
 
+def test_vwap_reclaim_at_thirty_percent_is_allowed_for_moderate():
+    engine, db = _engine_and_session()
+    _add_cases(
+        db,
+        [
+            "success",
+            "failure",
+            "success",
+            "failure",
+            "failure",
+            "success",
+            "failure",
+            "failure",
+            "failure",
+            "failure",
+        ],
+        setup_type="vwap_reclaim",
+    )
+
+    moderate = evaluate_setup_quality(
+        engine, db, "vwap_reclaim", profile="moderate", symbol="AMD"
+    )
+    conservative = evaluate_setup_quality(
+        engine, db, "vwap_reclaim", profile="conservative", symbol="AMD"
+    )
+
+    assert moderate["threshold"] == 0.30
+    assert moderate["decision"] == "downgrade"
+    assert moderate["reason_type"] == "weak_but_allowed"
+
+    assert conservative["threshold"] == 0.35
+    assert conservative["decision"] == "reject"
+    assert conservative["reason_type"] == "historical_underperformance"
+
+
 def test_profitable_partial_breaks_consecutive_loss_pause_without_counting_as_win():
     engine, db = _engine_and_session()
     _add_cases(
