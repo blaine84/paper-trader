@@ -2222,6 +2222,7 @@ def _build_case_stats(db, setup_type: str, market_regime: str = None) -> dict:
 # Higher value = stronger signal. A signal "meets" a threshold when its
 # numeric strength >= the threshold's numeric strength.
 STRENGTH_ORDER = {"weak": 1, "moderate": 2, "strong": 3}
+RISK_GATE_SIGNAL_STRENGTH = {"weak": 3.0, "moderate": 6.0, "strong": 10.0}
 
 
 def _meets_threshold(signal_strength: str, threshold: str) -> bool:
@@ -2942,6 +2943,10 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
                     quantity_policy="whole_share",
                     db=db,
                     profile=profile_id,
+                    signal_strength=RISK_GATE_SIGNAL_STRENGTH.get(
+                        str(signal.get("strength", "")).lower()
+                    ),
+                    confidence_level=signal.get("confidence"),
                 )
 
                 notes.append({"gate": "risk_geometry_gate", **geometry_result})
