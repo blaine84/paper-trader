@@ -96,6 +96,37 @@ def _is_qualifying_setup(
     return True
 
 
+
+def _resolve_rule_from_policy(symbol: str, setup_type: str | None, policy) -> tuple[dict, str, str]:
+    """Resolve the applicable stop-distance rule from a GatePolicyConfig.
+
+    Same logic as _resolve_rule but reads from policy instead of module constants.
+    """
+    upper_symbol = symbol.upper()
+
+    # Priority 1: HIGH_BETA_CLUSTER from policy
+    if upper_symbol in policy.high_beta_cluster:
+        rule_name = "high_beta_mega_cap_intraday"
+        rule = policy.stop_distance_rules.get(rule_name, policy.default_stop_distance_rule)
+        return rule, rule_name, "HIGH_BETA_CLUSTER"
+
+    # Priority 2: broad_etf classification
+    symbol_class = classify_symbol(symbol)
+    if symbol_class == "broad_etf":
+        rule_name = "etf_intraday"
+        rule = policy.stop_distance_rules.get(rule_name, policy.default_stop_distance_rule)
+        return rule, rule_name, "broad_etf"
+
+    # Priority 3: {symbol_class}_{setup_type} override
+    if setup_type:
+        override_key = f"{symbol_class}_{setup_type}"
+        if override_key in policy.stop_distance_rules:
+            return policy.stop_distance_rules[override_key], override_key, override_key
+
+    # Priority 4: Default
+    return policy.default_stop_distance_rule, "default", "default"
+
+
 def _resolve_rule(symbol: str, setup_type: str | None) -> tuple[dict, str, str]:
     """Resolve the applicable stop-distance rule.
 
@@ -223,6 +254,94 @@ def _min_reward_to_risk(
         )
 
     return (default_threshold, False)
+
+
+def _min_reward_to_risk_di(
+    rule: dict,
+    profile: str | None,
+    *,
+    setup_type: str | None = None,
+    signal_strength: float | None = None,
+    confidence_level: str | None = None,
+    policy=None,
+    feature_flag_enabled: bool = False,
+) -> tuple[float, bool]:
+    """Policy-aware version of _min_reward_to_risk.
+
+    When policy is provided, reads reduced R:R thresholds and qualifying
+    criteria from policy instead of module constants. When policy is None,
+    delegates to the original _min_reward_to_risk.
+    """
+    if policy is None:
+        return _min_reward_to_risk(
+            rule, profile,
+            setup_type=setup_type,
+            signal_strength=signal_strength,
+            confidence_level=confidence_level,
+        )
+
+    # Resolve default threshold from rule (same logic as original)
+    by_profile = rule.get("min_reward_to_risk_by_profile") or {}
+    profile_key = profile.lower() if isinstance(profile, str) else None
+    if profile_key and profile_key in by_profile:
+        default_threshold = float(by_profile[profile_key])
+    else:
+        default_threshold = float(rule.get("min_reward_to_risk", 2.0))
+
+    # Attempt qualifying override when feature flag is enabled
+    try:
+        if feature_flag_enabled and _is_qualifying_setup_di(
+            setup_type, signal_strength, confidence_level, policy
+        ):
+            reduced = policy.reduced_rr_thresholds_by_profile
+            if profile_key and profile_key in reduced:
+                return (reduced[profile_key], True)
+            return (default_threshold, False)
+    except Exception:
+        log.warning(
+            "Unexpected error in policy-aware setup-specific R:R qualifying check; "
+            "falling back to default threshold",
+            exc_info=True,
+        )
+
+    return (default_threshold, False)
+
+
+def _is_qualifying_setup_di(
+    setup_type: str | None,
+    signal_strength: float | None,
+    confidence_level: str | None,
+    policy,
+) -> bool:
+    """Policy-aware version of _is_qualifying_setup.
+
+    Reads qualifying_min_signal_strength and qualifying_setup_types from policy.
+    """
+    if setup_type is None or not isinstance(setup_type, str):
+        return False
+    if setup_type.lower() not in policy.qualifying_setup_types:
+        return False
+
+    if signal_strength is None:
+        return False
+    try:
+        strength = float(signal_strength)
+    except (TypeError, ValueError):
+        return False
+    if math.isnan(strength) or math.isinf(strength):
+        return False
+    if strength < 0 or strength > 10:
+        return False
+    if strength < policy.qualifying_min_signal_strength:
+        return False
+
+    if confidence_level is None or not isinstance(confidence_level, str):
+        return False
+    if confidence_level.lower() != "high":
+        return False
+
+    return True
+
 
 
 def _compute_min_stop_distance(
@@ -611,6 +730,10 @@ def evaluate_risk_geometry(
     trade_rationale: str | None = None,
     signal_strength: float | None = None,
     confidence_level: str | None = None,
+    policy=None,
+    event_sink=None,
+    clock=None,
+    id_provider=None,
 ) -> dict:
     """Evaluate trade geometry and return gate decision.
 
@@ -649,6 +772,10 @@ def evaluate_risk_geometry(
             trade_rationale=trade_rationale,
             signal_strength=signal_strength,
             confidence_level=confidence_level,
+            policy=policy,
+            event_sink=event_sink,
+            clock=clock,
+            id_provider=id_provider,
         )
     except Exception as exc:
         log.error("RiskGeometryGate unexpected error (fail-open): %s", exc)
@@ -662,7 +789,8 @@ def evaluate_risk_geometry(
         }
         try:
             if db is not None:
-                log_trade_event(
+                sink = event_sink if event_sink is not None else log_trade_event
+                sink(
                     db,
                     "risk_geometry_gate_evaluated",
                     agent=agent,
@@ -726,17 +854,30 @@ def _evaluate_risk_geometry_inner(
     trade_rationale: str | None = None,
     signal_strength: float | None = None,
     confidence_level: str | None = None,
+    policy=None,
+    event_sink=None,
+    clock=None,
+    id_provider=None,
 ) -> dict:
     """Core evaluation logic (may raise on truly unexpected errors)."""
 
     if trade_timestamp is None:
-        trade_timestamp = datetime.now(timezone.utc)
+        trade_timestamp = clock() if clock is not None else datetime.now(timezone.utc)
 
     # Step 1: Normalize direction
     norm_direction = _normalize_direction(direction)
 
-    # Step 2: Resolve rule
-    rule, rule_name, rule_source = _resolve_rule(symbol, setup_type)
+    # Step 2: Resolve rule (policy-aware)
+    if policy is not None:
+        rule, rule_name, rule_source = _resolve_rule_from_policy(symbol, setup_type, policy)
+    else:
+        rule, rule_name, rule_source = _resolve_rule(symbol, setup_type)
+
+    # Resolve feature flag (policy-aware)
+    if policy is not None:
+        _ff_setup_specific_rr = policy.feature_flags.get("SETUP_SPECIFIC_RR_THRESHOLDS", False)
+    else:
+        _ff_setup_specific_rr = _is_feature_flag_enabled()
 
     # Step 3: Validate stop direction (BEFORE min stop distance computation)
     if norm_direction == "LONG" and stop_price >= entry_price:
@@ -758,6 +899,7 @@ def _evaluate_risk_geometry_inner(
             db=db,
             profile=profile,
             agent=agent,
+            event_sink=event_sink,
         )
     if norm_direction == "SHORT" and stop_price <= entry_price:
         return _build_rejection(
@@ -778,6 +920,7 @@ def _evaluate_risk_geometry_inner(
             db=db,
             profile=profile,
             agent=agent,
+            event_sink=event_sink,
         )
 
     # Step 4: Validate target geometry (BEFORE stop distance comparison)
@@ -800,6 +943,7 @@ def _evaluate_risk_geometry_inner(
             db=db,
             profile=profile,
             agent=agent,
+            event_sink=event_sink,
         )
 
     if norm_direction == "LONG" and target_price <= entry_price:
@@ -821,6 +965,7 @@ def _evaluate_risk_geometry_inner(
             db=db,
             profile=profile,
             agent=agent,
+            event_sink=event_sink,
         )
     if norm_direction == "SHORT" and target_price >= entry_price:
         return _build_rejection(
@@ -841,6 +986,7 @@ def _evaluate_risk_geometry_inner(
             db=db,
             profile=profile,
             agent=agent,
+            event_sink=event_sink,
         )
 
     # Step 4.5: Tactical stop exception check (high-beta aggressive only)
@@ -867,7 +1013,7 @@ def _evaluate_risk_geometry_inner(
             quantity_policy=quantity_policy,
         )
         if tactical_result is not None:
-            _log_gate_event(tactical_result, symbol=symbol, db=db, profile=profile, agent=agent)
+            _log_gate_event(tactical_result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
             return tactical_result
 
     # Step 5: Compute min stop distance
@@ -900,6 +1046,7 @@ def _evaluate_risk_geometry_inner(
             db=db,
             profile=profile,
             agent=agent,
+            event_sink=event_sink,
         )
 
     # Compute proposed stop distance and target distance
@@ -915,17 +1062,19 @@ def _evaluate_risk_geometry_inner(
         original_rr = target_distance / stop_distance if stop_distance > 0 else 0.0
         original_dollar_risk = quantity * stop_distance
 
-        # Validate R:R
-        min_rr, _setup_specific_rr_applied = _min_reward_to_risk(
+        # Validate R:R (policy-aware)
+        min_rr, _setup_specific_rr_applied = _min_reward_to_risk_di(
             rule, profile,
             setup_type=setup_type,
             signal_strength=signal_strength,
             confidence_level=confidence_level,
+            policy=policy,
+            feature_flag_enabled=_ff_setup_specific_rr,
         )
         if original_rr < min_rr:
             # Build setup-specific R:R audit fields for rejection payload
             _rr_extra_payload = None
-            if _is_feature_flag_enabled():
+            if _ff_setup_specific_rr:
                 default_threshold = _compute_default_rr_threshold(rule, profile)
                 _rr_extra_payload = _build_setup_specific_rr_audit_fields(
                     setup_specific_rr_applied=_setup_specific_rr_applied,
@@ -1020,7 +1169,7 @@ def _evaluate_risk_geometry_inner(
         }
 
         # Add setup-specific R:R audit fields when feature flag is enabled
-        if _is_feature_flag_enabled():
+        if _ff_setup_specific_rr:
             default_threshold = _compute_default_rr_threshold(rule, profile)
             result.update(_build_setup_specific_rr_audit_fields(
                 setup_specific_rr_applied=_setup_specific_rr_applied,
@@ -1031,7 +1180,7 @@ def _evaluate_risk_geometry_inner(
                 default_threshold=default_threshold,
             ))
 
-        _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
+        _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     else:
@@ -1126,11 +1275,13 @@ def _evaluate_risk_geometry_inner(
             )
 
         # Validate: adjusted R:R
-        min_rr, _setup_specific_rr_applied = _min_reward_to_risk(
+        min_rr, _setup_specific_rr_applied = _min_reward_to_risk_di(
             rule, profile,
             setup_type=setup_type,
             signal_strength=signal_strength,
             confidence_level=confidence_level,
+            policy=policy,
+            feature_flag_enabled=_ff_setup_specific_rr,
         )
         if adjusted_rr < min_rr:
             # --- Pilot R:R override check ---
@@ -1156,7 +1307,8 @@ def _evaluate_risk_geometry_inner(
                 }
                 if db is not None:
                     try:
-                        log_trade_event(
+                        _pilot_sink = event_sink if event_sink is not None else log_trade_event
+                        _pilot_sink(
                             db,
                             GATE_EVENT_TYPES["pilot_override"],
                             agent=agent,
@@ -1199,13 +1351,13 @@ def _evaluate_risk_geometry_inner(
                     "size_multiplier": size_multiplier,
                     "pilot_override": True,
                 }
-                _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
+                _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
                 return result
 
             # --- Standard rejection (no pilot override) ---
             # Build setup-specific R:R audit fields for rejection payload
             _rr_extra_payload = None
-            if _is_feature_flag_enabled():
+            if _ff_setup_specific_rr:
                 default_threshold = _compute_default_rr_threshold(rule, profile)
                 _rr_extra_payload = _build_setup_specific_rr_audit_fields(
                     setup_specific_rr_applied=_setup_specific_rr_applied,
@@ -1276,7 +1428,7 @@ def _evaluate_risk_geometry_inner(
         }
 
         # Add setup-specific R:R audit fields when feature flag is enabled
-        if _is_feature_flag_enabled():
+        if _ff_setup_specific_rr:
             default_threshold = _compute_default_rr_threshold(rule, profile)
             result.update(_build_setup_specific_rr_audit_fields(
                 setup_specific_rr_applied=_setup_specific_rr_applied,
@@ -1287,7 +1439,7 @@ def _evaluate_risk_geometry_inner(
                 default_threshold=default_threshold,
             ))
 
-        _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
+        _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
 
@@ -1326,6 +1478,7 @@ def _build_rejection(
     adjusted_rr: float | None = None,
     atr_fallback: bool = False,
     extra_payload: dict | None = None,
+    event_sink=None,
 ) -> dict:
     """Build a rejection result dict and log the event."""
     # Compute stop_distance if not provided
@@ -1377,7 +1530,7 @@ def _build_rejection(
     if extra_payload:
         result.update(extra_payload)
 
-    _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent)
+    _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
     return result
 
 
@@ -1388,8 +1541,13 @@ def _log_gate_event(
     db,
     profile: str | None,
     agent: str,
+    event_sink=None,
 ) -> None:
-    """Log exactly one TradeEvent for the gate evaluation."""
+    """Log exactly one TradeEvent for the gate evaluation.
+
+    When *event_sink* is provided, uses it instead of ``log_trade_event``
+    (dependency injection for replay).
+    """
     if db is None:
         return
 
@@ -1399,7 +1557,8 @@ def _log_gate_event(
     }
 
     try:
-        log_trade_event(
+        sink = event_sink if event_sink is not None else log_trade_event
+        sink(
             db,
             "risk_geometry_gate_evaluated",
             agent=agent,

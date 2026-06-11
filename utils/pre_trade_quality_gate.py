@@ -115,6 +115,33 @@ def _check_override(decision: dict) -> bool:
     return confidence >= OVERRIDE_MIN_CONFIDENCE_SCORE
 
 
+def _check_override_di(decision: dict, min_confidence: float) -> bool:
+    """Return ``True`` if the PM decision contains valid override metadata.
+
+    Policy-aware variant that accepts the minimum confidence threshold
+    as a parameter (dependency injection for replay).
+
+    Valid override requires:
+    - ``override_confidence_score >= min_confidence``
+    - non-empty ``override_reason``
+    """
+    confidence = decision.get("override_confidence_score")
+    reason = decision.get("override_reason")
+
+    if confidence is None or reason is None:
+        return False
+
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        return False
+
+    if not isinstance(reason, str) or not reason.strip():
+        return False
+
+    return confidence >= min_confidence
+
+
 def _log_gate_event(
     db,
     decision_dict: dict,
@@ -122,12 +149,16 @@ def _log_gate_event(
     symbol: str | None = None,
     profile: str | None = None,
     agent: str = "portfolio_manager",
+    event_sink=None,
 ) -> None:
     """Log a single TradeEvent for this gate evaluation.
 
     Uses ``GATE_EVENT_TYPES`` to map the decision to an ``event_type``.
     The full *decision_dict* is included in the payload alongside
     gate-specific audit fields.
+
+    When *event_sink* is provided, uses it instead of ``log_trade_event``
+    (dependency injection for replay).
     """
     decision = decision_dict.get("decision", "allow")
     event_type = GATE_EVENT_TYPES.get(decision, GATE_EVENT_TYPES["allow"])
@@ -139,7 +170,8 @@ def _log_gate_event(
         "reason_type": decision_dict.get("reason_type", ""),
     }
 
-    log_trade_event(
+    sink = event_sink if event_sink is not None else log_trade_event
+    sink(
         db,
         event_type,
         agent=agent,
@@ -163,6 +195,10 @@ def evaluate_pre_trade_quality(
     symbol: str | None = None,
     profile: str | None = None,
     agent: str = "portfolio_manager",
+    policy=None,
+    event_sink=None,
+    clock=None,
+    id_provider=None,
 ) -> dict:
     """Evaluate trade quality based on Reviewer selection and execution scores.
 
@@ -176,6 +212,14 @@ def evaluate_pre_trade_quality(
         symbol: Optional symbol for event logging
         profile: Optional PM profile for event logging
         agent: Agent name for event logging
+        policy: Optional GatePolicyConfig; when provided, thresholds are read
+            from it instead of module constants. None = use production defaults.
+        event_sink: Optional callable replacing log_trade_event for logging.
+            None = use production log_trade_event.
+        clock: Optional callable returning datetime; replaces datetime.utcnow().
+            None = use production clock. (Not currently used by this gate.)
+        id_provider: Optional callable returning str; replaces uuid.uuid4().
+            None = use production uuid.uuid4(). (Not currently used by this gate.)
 
     Returns:
         {
@@ -192,6 +236,12 @@ def evaluate_pre_trade_quality(
     # --- Resolve scores via priority chain --------------------------------
     selection_score = _resolve_score("selection_score", decision, signal)
     execution_score = _resolve_score("execution_score", decision, signal)
+
+    # --- Resolve override threshold from policy or module constant ---
+    p_override_min_confidence = (
+        policy.override_min_confidence_score if policy is not None
+        else OVERRIDE_MIN_CONFIDENCE_SCORE
+    )
 
     # --- Helper to build result dict -------------------------------------
     def _result(gate_decision: str, reason_type: str, reason: str) -> dict:
@@ -213,7 +263,7 @@ def evaluate_pre_trade_quality(
             "missing_quality_scores",
             "One or both quality scores are missing; allowing trade with warning.",
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 2. Both scores < 7.0 → reject
@@ -224,7 +274,7 @@ def evaluate_pre_trade_quality(
             f"Both selection ({selection_score:.1f}) and execution "
             f"({execution_score:.1f}) scores are below 7.0; rejecting trade.",
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 3. execution_score < 6.0 AND selection_score < 8.5 → reject
@@ -236,7 +286,7 @@ def evaluate_pre_trade_quality(
             f"selection score ({selection_score:.1f}) is below 8.5; "
             f"rejecting trade.",
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 4. execution_score < 7.0 AND selection_score < 9.0 → override_required
@@ -249,8 +299,8 @@ def evaluate_pre_trade_quality(
             f"override required.",
         )
 
-        # --- Override handling -------------------------------------------
-        if _check_override(decision):
+        # --- Override handling (policy-aware threshold) -------------------
+        if _check_override_di(decision, p_override_min_confidence):
             override_confidence = float(decision["override_confidence_score"])
             override_reason = decision["override_reason"]
 
@@ -270,7 +320,8 @@ def evaluate_pre_trade_quality(
                 "rejection_category": "pre_trade_quality_gate",
                 "reason_type": "override_approved",
             }
-            log_trade_event(
+            sink = event_sink if event_sink is not None else log_trade_event
+            sink(
                 db,
                 GATE_EVENT_TYPES["override_approved"],
                 agent=agent,
@@ -283,7 +334,7 @@ def evaluate_pre_trade_quality(
 
         # No valid override — keep override_required
         _log_gate_event(
-            db, initial_result, symbol=symbol, profile=profile, agent=agent
+            db, initial_result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink
         )
         return initial_result
 
@@ -294,5 +345,5 @@ def evaluate_pre_trade_quality(
         f"Quality scores pass all checks "
         f"(selection={selection_score:.1f}, execution={execution_score:.1f}).",
     )
-    _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+    _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
     return result

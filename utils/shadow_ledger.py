@@ -259,6 +259,7 @@ def record_blocked_candidate(
     geometry_candidate_id: str | None = None,
     geometry_candidate_name: str | None = None,
     scaffold_snapshot: dict | None = None,
+    candidate_lineage_id: str | None = None,
 ) -> int | None:
     """Record a blocked trade candidate in the shadow ledger.
 
@@ -428,46 +429,64 @@ def record_blocked_candidate(
                 return None
 
         # --- Execute INSERT ---
-        result = db.execute(
-            text(
+        # Build INSERT dynamically: include candidate_lineage_id only when
+        # provided (column may not exist on older schemas without migration)
+        _columns = [
+            "symbol", "action", "direction", "profile", "setup_type",
+            "entry_price", "stop_price", "target_price", "quantity",
+            "blocked_by", "block_reason", "reason_code",
+            "gate_notes_json", "decision_snapshot_json", "signal_snapshot_json",
+            "source", "agent", "dedupe_key", "trade_event_id",
+        ]
+        _params = {
+            "symbol": symbol,
+            "action": action,
+            "direction": direction,
+            "profile": profile,
+            "setup_type": setup_type,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "quantity": quantity,
+            "blocked_by": blocked_by,
+            "block_reason": block_reason,
+            "reason_code": reason_code,
+            "gate_notes_json": gate_notes_json,
+            "decision_snapshot_json": decision_snapshot_json,
+            "signal_snapshot_json": signal_snapshot_json,
+            "source": source,
+            "agent": agent,
+            "dedupe_key": dedupe_key,
+            "trade_event_id": trade_event_id,
+        }
+        if candidate_lineage_id is not None:
+            _columns.append("candidate_lineage_id")
+            _params["candidate_lineage_id"] = candidate_lineage_id
+
+        _col_list = ", ".join(_columns)
+        _val_list = ", ".join(f":{c}" for c in _columns)
+        _insert_sql = f"""
+            INSERT INTO blocked_trade_candidates ({_col_list})
+            VALUES ({_val_list})
+        """
+
+        try:
+            result = db.execute(text(_insert_sql), _params)
+        except Exception as _ins_exc:
+            # Fallback: if candidate_lineage_id column doesn't exist yet,
+            # retry without it (handles pre-migration schemas)
+            if candidate_lineage_id is not None and "candidate_lineage_id" in str(_ins_exc):
+                _columns.remove("candidate_lineage_id")
+                del _params["candidate_lineage_id"]
+                _col_list = ", ".join(_columns)
+                _val_list = ", ".join(f":{c}" for c in _columns)
+                _insert_sql = f"""
+                    INSERT INTO blocked_trade_candidates ({_col_list})
+                    VALUES ({_val_list})
                 """
-                INSERT INTO blocked_trade_candidates (
-                    symbol, action, direction, profile, setup_type,
-                    entry_price, stop_price, target_price, quantity,
-                    blocked_by, block_reason, reason_code,
-                    gate_notes_json, decision_snapshot_json, signal_snapshot_json,
-                    source, agent, dedupe_key, trade_event_id
-                ) VALUES (
-                    :symbol, :action, :direction, :profile, :setup_type,
-                    :entry_price, :stop_price, :target_price, :quantity,
-                    :blocked_by, :block_reason, :reason_code,
-                    :gate_notes_json, :decision_snapshot_json, :signal_snapshot_json,
-                    :source, :agent, :dedupe_key, :trade_event_id
-                )
-                """
-            ),
-            {
-                "symbol": symbol,
-                "action": action,
-                "direction": direction,
-                "profile": profile,
-                "setup_type": setup_type,
-                "entry_price": entry_price,
-                "stop_price": stop_price,
-                "target_price": target_price,
-                "quantity": quantity,
-                "blocked_by": blocked_by,
-                "block_reason": block_reason,
-                "reason_code": reason_code,
-                "gate_notes_json": gate_notes_json,
-                "decision_snapshot_json": decision_snapshot_json,
-                "signal_snapshot_json": signal_snapshot_json,
-                "source": source,
-                "agent": agent,
-                "dedupe_key": dedupe_key,
-                "trade_event_id": trade_event_id,
-            },
-        )
+                result = db.execute(text(_insert_sql), _params)
+            else:
+                raise
         db.flush()
         return result.lastrowid
 

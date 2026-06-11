@@ -156,6 +156,9 @@ def _evaluate_rolling_underperformance(
     rolling_sample_size: int,
     win_rate: float | None,
     sample_size: int,
+    id_provider=None,
+    override_min_confidence: float | None = None,
+    probe_size_multiplier: float | None = None,
 ) -> dict:
     """Profile-aware rolling underperformance evaluation.
 
@@ -178,7 +181,9 @@ def _evaluate_rolling_underperformance(
         "rolling_sample_size": rolling_sample_size,
         "threshold": threshold,
     }
-    gate_decision_id = str(uuid.uuid4())
+    gate_decision_id = id_provider() if id_provider is not None else str(uuid.uuid4())
+    p_override_min_confidence = override_min_confidence if override_min_confidence is not None else OVERRIDE_MIN_CONFIDENCE_SCORE
+    p_probe_size_mult = probe_size_multiplier if probe_size_multiplier is not None else ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER
 
     if profile_key == "aggressive":
         return {
@@ -186,36 +191,36 @@ def _evaluate_rolling_underperformance(
             "decision": "reduce_size",
             "canonical_decision": "reduce_size",
             "reason_type": "rolling_underperformance_recovery_probe",
-            "size_multiplier": ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
+            "size_multiplier": p_probe_size_mult,
             "profile": "aggressive",
             "gate_decision_id": gate_decision_id,
             "reason": (
                 f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
                 f"over last {rolling_sample_size} cases; aggressive recovery probe "
-                f"at {ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER:.0%} size."
+                f"at {p_probe_size_mult:.0%} size."
             ),
         }
 
     elif profile_key == "moderate":
         if (
             confidence_score is not None
-            and confidence_score >= OVERRIDE_MIN_CONFIDENCE_SCORE
+            and confidence_score >= p_override_min_confidence
         ):
             return {
                 **base,
                 "decision": "reduce_size",
                 "canonical_decision": "reduce_size",
                 "reason_type": "rolling_underperformance_recovery_probe",
-                "size_multiplier": ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER,
+                "size_multiplier": p_probe_size_mult,
                 "profile": "moderate",
                 "override_confidence_score": confidence_score,
                 "gate_decision_id": gate_decision_id,
                 "reason": (
                     f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
                     f"over last {rolling_sample_size} cases; moderate recovery probe "
-                    f"at {ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER:.0%} size "
+                    f"at {p_probe_size_mult:.0%} size "
                     f"(override_confidence_score={confidence_score:.1f} >= "
-                    f"{OVERRIDE_MIN_CONFIDENCE_SCORE})."
+                    f"{p_override_min_confidence})."
                 ),
             }
         else:
@@ -229,7 +234,7 @@ def _evaluate_rolling_underperformance(
                 "reason": (
                     f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%}; "
                     f"moderate profile requires override_confidence_score >= "
-                    f"{OVERRIDE_MIN_CONFIDENCE_SCORE} for recovery probe "
+                    f"{p_override_min_confidence} for recovery probe "
                     f"(got {confidence_score})."
                 ),
             }
@@ -336,12 +341,16 @@ def _log_gate_event(
     symbol: str | None = None,
     profile: str | None = None,
     agent: str = "portfolio_manager",
+    event_sink=None,
 ) -> None:
     """Log a single TradeEvent for this gate evaluation.
 
     Uses ``GATE_EVENT_TYPES`` to map the decision to an ``event_type``.
     The full *decision_dict* is included in the payload alongside
     gate-specific audit fields.
+
+    When *event_sink* is provided, uses it instead of ``log_trade_event``
+    (dependency injection for replay).
     """
     decision = decision_dict.get("decision", "allow")
     event_type = GATE_EVENT_TYPES.get(decision, GATE_EVENT_TYPES["allow"])
@@ -353,7 +362,8 @@ def _log_gate_event(
         "reason_type": decision_dict.get("reason_type", ""),
     }
 
-    log_trade_event(
+    sink = event_sink if event_sink is not None else log_trade_event
+    sink(
         db,
         event_type,
         agent=agent,
@@ -411,6 +421,10 @@ def evaluate_setup_quality(
     catalyst_type: str | None = None,
     price_above_vwap: bool | None = None,
     volume_ratio: float | None = None,
+    policy=None,
+    event_sink=None,
+    clock=None,
+    id_provider=None,
 ) -> dict:
     """Evaluate whether a setup type should be allowed based on case-library
     performance.
@@ -437,6 +451,14 @@ def evaluate_setup_quality(
         catalyst_type: Optional catalyst type for near-miss pilot evaluation
         price_above_vwap: Optional VWAP indicator for near-miss pilot evaluation
         volume_ratio: Optional volume ratio for near-miss pilot evaluation
+        policy: Optional GatePolicyConfig; when provided, thresholds are read
+            from it instead of module constants. None = use production defaults.
+        event_sink: Optional callable replacing log_trade_event for logging.
+            None = use production log_trade_event.
+        clock: Optional callable returning datetime; replaces datetime.utcnow().
+            None = use production clock. (Not currently used by this gate.)
+        id_provider: Optional callable returning str; replaces uuid.uuid4().
+            None = use production uuid.uuid4().
 
     Returns:
         Structured dict with decision, reason_type, stats, and threshold.
@@ -445,7 +467,42 @@ def evaluate_setup_quality(
         Logs exactly one TradeEvent to the provided *db* session.
         May log an additional pilot override event if near-miss pilot fires.
     """
-    threshold = _resolve_threshold(setup_type, profile)
+    # --- Resolve thresholds from policy or module constants ---
+    if policy is not None:
+        p_min_cases_for_block = policy.min_cases_for_block
+        p_consecutive_loss_pause = policy.consecutive_loss_pause_threshold
+        p_rolling_window = policy.rolling_window
+        p_min_rolling_cases = policy.min_rolling_cases
+        p_recovery_min_rolling_cases = policy.recovery_min_rolling_cases
+        p_recovery_wr_margin = policy.recovery_win_rate_margin
+        p_require_positive_pnl = policy.require_positive_rolling_avg_pnl_for_recovery
+        p_probe_size_mult = policy.rolling_recovery_probe_size_multiplier
+        p_near_miss_margin = policy.near_miss_margin_pct
+        p_override_min_confidence = policy.override_min_confidence_score
+    else:
+        p_min_cases_for_block = MIN_CASES_FOR_BLOCK
+        p_consecutive_loss_pause = CONSECUTIVE_LOSS_PAUSE_THRESHOLD
+        p_rolling_window = ROLLING_WINDOW
+        p_min_rolling_cases = MIN_ROLLING_CASES
+        p_recovery_min_rolling_cases = RECOVERY_MIN_ROLLING_CASES
+        p_recovery_wr_margin = RECOVERY_WIN_RATE_MARGIN
+        p_require_positive_pnl = REQUIRE_POSITIVE_ROLLING_AVG_PNL_FOR_RECOVERY
+        p_probe_size_mult = ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER
+        p_near_miss_margin = NEAR_MISS_MARGIN_PCT
+        p_override_min_confidence = OVERRIDE_MIN_CONFIDENCE_SCORE
+
+    # --- Resolve threshold (profile-aware) ---
+    if policy is not None:
+        profile_key = profile.lower() if isinstance(profile, str) else None
+        setup_profile_thresholds = policy.min_win_rate_by_setup_profile.get(setup_type, {})
+        if profile_key and profile_key in setup_profile_thresholds:
+            threshold = float(setup_profile_thresholds[profile_key])
+        elif profile_key and profile_key in policy.default_min_win_rate_by_profile:
+            threshold = float(policy.default_min_win_rate_by_profile[profile_key])
+        else:
+            threshold = float(policy.min_win_rate_by_setup.get(setup_type, policy.default_min_win_rate))
+    else:
+        threshold = _resolve_threshold(setup_type, profile)
 
     # Fetch case history --------------------------------------------------
     cases = _get_cases_for_setup(engine, setup_type)
@@ -459,7 +516,7 @@ def evaluate_setup_quality(
         win_rate = None
 
     rolling_wr, avg_rolling_pnl, rolling_sample_size = _compute_rolling_stats(
-        cases, ROLLING_WINDOW
+        cases, p_rolling_window
     )
 
     # Build base result dict (fields filled in by each branch) ------------
@@ -482,33 +539,40 @@ def evaluate_setup_quality(
         }
 
     # 1. Insufficient data ------------------------------------------------
-    if sample_size < MIN_CASES_FOR_BLOCK:
+    if sample_size < p_min_cases_for_block:
         result = _result(
             "allow",
             "insufficient_data",
             f"Only {sample_size} cases for setup '{setup_type}' "
-            f"(need {MIN_CASES_FOR_BLOCK}); allowing trade.",
+            f"(need {p_min_cases_for_block}); allowing trade.",
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 2. Consecutive losses -----------------------------------------------
-    if _check_consecutive_losses(cases, CONSECUTIVE_LOSS_PAUSE_THRESHOLD):
+    if _check_consecutive_losses(cases, p_consecutive_loss_pause):
         result = _result(
             "reject",
             "consecutive_losses",
-            f"Last {CONSECUTIVE_LOSS_PAUSE_THRESHOLD} cases for "
+            f"Last {p_consecutive_loss_pause} cases for "
             f"'{setup_type}' are all losses; pausing setup.",
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 3. Historical underperformance (with recovery check) ----------------
     if win_rate is not None and win_rate < threshold:
-        # Check recovery override
-        if _check_recovery_override(
-            win_rate, threshold, rolling_wr, avg_rolling_pnl, rolling_sample_size
-        ):
+        # Check recovery override (policy-aware)
+        recovery_met = False
+        if rolling_sample_size >= p_recovery_min_rolling_cases:
+            if rolling_wr is not None and rolling_wr > threshold + p_recovery_wr_margin:
+                if p_require_positive_pnl:
+                    if avg_rolling_pnl is not None and avg_rolling_pnl > 0:
+                        recovery_met = True
+                else:
+                    recovery_met = True
+
+        if recovery_met:
             result = _result(
                 "allow",
                 "recovery_override",
@@ -516,14 +580,14 @@ def evaluate_setup_quality(
                 f"{win_rate:.1%} < {threshold:.0%} but recovery criteria met "
                 f"(rolling WR {rolling_wr:.1%}, avg PnL {avg_rolling_pnl:+.2f}%).",
             )
-            _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+            _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
             return result
 
         # Check near-miss pilot override before rejecting
         near_miss_result = _evaluate_near_miss_pilot(
             win_rate=win_rate,
             threshold=threshold,
-            near_miss_margin=NEAR_MISS_MARGIN_PCT,
+            near_miss_margin=p_near_miss_margin,
             profile=profile or "",
             confidence_score=confidence_score,
             catalyst_type=catalyst_type,
@@ -538,7 +602,7 @@ def evaluate_setup_quality(
                     "near_miss_pilot_override",
                     f"Setup '{setup_type}' all-time WR "
                     f"{win_rate:.1%} < {threshold:.0%} but within near-miss margin "
-                    f"({NEAR_MISS_MARGIN_PCT:.0%}); pilot override with "
+                    f"({p_near_miss_margin:.0%}); pilot override with "
                     f"{near_miss_result['size_multiplier']:.0%} size.",
                 ),
                 "size_multiplier": near_miss_result["size_multiplier"],
@@ -546,7 +610,7 @@ def evaluate_setup_quality(
                 "near_miss_margin": near_miss_result["margin"],
             }
             # Log standard gate decision event
-            _log_gate_event(db, pilot_result, symbol=symbol, profile=profile, agent=agent)
+            _log_gate_event(db, pilot_result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
             # Log SEPARATE pilot override audit event
             pilot_event_payload = {
                 "gate_name": "setup_quality_gate",
@@ -555,14 +619,15 @@ def evaluate_setup_quality(
                 "reason_type": "near_miss_pilot_override",
                 "win_rate": win_rate,
                 "threshold": threshold,
-                "margin": NEAR_MISS_MARGIN_PCT,
+                "margin": p_near_miss_margin,
                 "confirming_signals": near_miss_result["confirming_signals"],
                 "size_multiplier": near_miss_result["size_multiplier"],
                 "pilot_override": True,
                 "pilot_size_multiplier": near_miss_result["size_multiplier"],
                 "setup_type": setup_type,
             }
-            log_trade_event(
+            sink = event_sink if event_sink is not None else log_trade_event
+            sink(
                 db,
                 GATE_EVENT_TYPES["pilot_override"],
                 agent=agent,
@@ -570,7 +635,7 @@ def evaluate_setup_quality(
                 profile=profile,
                 message=(
                     f"Near-miss pilot override for '{setup_type}': WR {win_rate:.1%} "
-                    f"within {NEAR_MISS_MARGIN_PCT:.0%} of threshold {threshold:.0%}; "
+                    f"within {p_near_miss_margin:.0%} of threshold {threshold:.0%}; "
                     f"signals: {near_miss_result['confirming_signals']}"
                 ),
                 payload=pilot_event_payload,
@@ -583,13 +648,13 @@ def evaluate_setup_quality(
             f"Setup '{setup_type}' all-time WR "
             f"{win_rate:.1%} < {threshold:.0%}; rejecting trade.",
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 4. Rolling underperformance — PROFILE-AWARE
     if (
         rolling_wr is not None
-        and rolling_sample_size >= MIN_ROLLING_CASES
+        and rolling_sample_size >= p_min_rolling_cases
         and rolling_wr < threshold
     ):
         result = _evaluate_rolling_underperformance(
@@ -601,8 +666,11 @@ def evaluate_setup_quality(
             rolling_sample_size=rolling_sample_size,
             win_rate=win_rate,
             sample_size=sample_size,
+            id_provider=id_provider,
+            override_min_confidence=p_override_min_confidence,
+            probe_size_multiplier=p_probe_size_mult,
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 5. Weak but allowed -------------------------------------------------
@@ -613,7 +681,7 @@ def evaluate_setup_quality(
             f"Setup '{setup_type}' WR {win_rate:.1%} is above "
             f"block threshold ({threshold:.0%}) but below 50%; downgrading.",
         )
-        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
     # 6. Pass — all checks cleared ----------------------------------------
@@ -623,5 +691,5 @@ def evaluate_setup_quality(
         f"Setup '{setup_type}' passes all quality checks "
         f"(WR {win_rate:.1%}, {sample_size} cases).",
     )
-    _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent)
+    _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
     return result

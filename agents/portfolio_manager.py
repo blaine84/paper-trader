@@ -3234,8 +3234,109 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
     _gate_multiplier_breakdown = []
     _gate_decision_id = None  # Correlation ID from recovery-probe gate decisions
     _pilot_override_info = None  # Pilot override metadata for trade event tagging
+    _candidate_lineage_id = None  # Replay lineage ID propagated to downstream tables
     if action in ("BUY", "SHORT"):
         signal_for_gates = _build_signal_for_symbol(db, symbol, decision)
+
+        # ── Decision Snapshot: persist BEFORE gates (Requirement 3.1, 3.6) ──
+        try:
+            from utils.decision_snapshot import (
+                build_and_persist_snapshot,
+                generate_candidate_lineage_id,
+                SnapshotPersistenceError,
+            )
+
+            _candidate_lineage_id = generate_candidate_lineage_id()
+
+            # Compute account equity for snapshot
+            _snap_positions = db.query(Position).filter_by(profile=profile_id).all()
+            _snap_pos_value = sum(p.quantity * p.avg_cost for p in _snap_positions)
+            _snap_equity = cash + _snap_pos_value
+            _snap_open_positions = [
+                {
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "avg_cost": float(p.avg_cost),
+                    "direction": p.direction if hasattr(p, "direction") else "long",
+                }
+                for p in _snap_positions
+            ]
+
+            # Collect gate config and feature flags for snapshot
+            _snap_gate_config = {}
+            _snap_feature_flags = {}
+            try:
+                from core.replay.policy_version import build_current_policy_version
+                _snap_policy_version = build_current_policy_version()
+                _snap_policy_version_id = f"{_snap_policy_version.gate_revision}:{_snap_policy_version.config_digest[:16]}"
+                _snap_feature_flags = _snap_policy_version.feature_flags
+
+                # Capture gate config values for snapshot
+                from utils import gate_config as _gc
+                _snap_gate_config = {
+                    "min_win_rate_by_setup": _gc.MIN_WIN_RATE_BY_SETUP,
+                    "default_min_win_rate": _gc.DEFAULT_MIN_WIN_RATE,
+                    "stop_distance_rules": getattr(_gc, "STOP_DISTANCE_RULES", {}),
+                    "default_stop_distance_rule": getattr(_gc, "DEFAULT_STOP_DISTANCE_RULE", {}),
+                    "reduced_rr_thresholds_by_profile": getattr(_gc, "REDUCED_RR_THRESHOLDS_BY_PROFILE", {}),
+                    "qualifying_min_signal_strength": getattr(_gc, "QUALIFYING_MIN_SIGNAL_STRENGTH", 0),
+                    "qualifying_setup_types": list(getattr(_gc, "QUALIFYING_SETUP_TYPES", set())),
+                    "override_min_confidence_score": getattr(_gc, "OVERRIDE_MIN_CONFIDENCE_SCORE", 0),
+                }
+            except Exception as _pv_exc:
+                log.debug("Could not build policy version for snapshot: %s", _pv_exc)
+                _snap_policy_version_id = "unknown"
+
+            build_and_persist_snapshot(
+                engine=db.bind,
+                candidate_lineage_id=_candidate_lineage_id,
+                decision=decision,
+                signal=signal_for_gates,
+                profile_id=profile_id,
+                account_equity=_snap_equity,
+                available_cash=cash,
+                open_positions=_snap_open_positions,
+                gate_config=_snap_gate_config,
+                feature_flags=_snap_feature_flags,
+                policy_version_id=_snap_policy_version_id,
+            )
+        except SnapshotPersistenceError as _snap_err:
+            # Requirement 3.6: If snapshot persistence fails, BLOCK gate evaluation
+            # UNLESS the table simply doesn't exist yet (migration not applied)
+            _err_str = str(_snap_err)
+            if "no such table" in _err_str:
+                # Table doesn't exist — schema not migrated yet. Non-blocking.
+                log.warning(
+                    "Decision snapshot table not available for %s (schema migration pending): %s",
+                    symbol, _snap_err,
+                )
+            else:
+                log.error(
+                    "DECISION SNAPSHOT FAILED for %s — gate evaluation BLOCKED: %s",
+                    symbol, _snap_err,
+                )
+                log_trade_event(
+                    db,
+                    "snapshot_persistence_failed",
+                    agent=f"pm_{profile_id}",
+                    symbol=symbol,
+                    profile=profile_id,
+                    message=f"Decision snapshot persistence failed: {_snap_err}",
+                    payload={"error": str(_snap_err), "candidate_lineage_id": _candidate_lineage_id},
+                )
+                return False, f"Snapshot persistence failed — gate evaluation blocked: {_snap_err}"
+        except Exception as _snap_exc:
+            # Non-fatal: log but allow gate pipeline to proceed
+            # This handles cases where imports fail, table doesn't exist, etc.
+            log.warning(
+                "Decision snapshot creation failed (non-blocking) for %s: %s",
+                symbol, _snap_exc,
+            )
+
+        # Store lineage ID on decision for downstream propagation
+        if _candidate_lineage_id:
+            decision["candidate_lineage_id"] = _candidate_lineage_id
+
         proceed, _gate_notes, _gate_multiplier, _gate_multiplier_breakdown = _run_gate_pipeline(
             db, db.bind, decision, signal_for_gates, profile_id,
         )
@@ -3251,7 +3352,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 profile=profile_id,
                 price=price,
                 message=f"Trade rejected by gate pipeline: {gate_rejection_reasons}",
-                payload={"gate_notes": _gate_notes},
+                payload={"gate_notes": _gate_notes, "candidate_lineage_id": _candidate_lineage_id},
             )
             db.flush()  # ensure trade_event.id is populated for shadow ledger linkage
 
@@ -3298,6 +3399,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 trade_event_id=trade_event.id if trade_event else None,
                 geometry_candidate_id=decision.get("geometry_candidate_id"),
                 geometry_candidate_name=decision.get("geometry_candidate_name"),
+                candidate_lineage_id=_candidate_lineage_id,
             )
 
             log.warning(
