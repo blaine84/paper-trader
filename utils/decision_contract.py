@@ -376,3 +376,79 @@ def build_candidate_retry_prompt(
     )
 
     return prompt
+
+
+def record_parse_provenance(
+    chain: 'ProvenanceChain',
+    parse_result: ParseResult,
+    raw_response: dict | None,
+    stage_version: str = "1.0",
+) -> None:
+    """Record provenance events for the parse/normalization stage.
+
+    Called by portfolio_manager AFTER parse_decision_contract() completes.
+    Guarded by PM_PROVENANCE_MODE check at call site.
+
+    For accepted decisions: records a provenance event with geometry before/after.
+    For unrecoverable parse failures: records a terminal event.
+
+    Fail-open: all provenance operations are wrapped in try/except to never
+    block the pipeline.
+
+    Requirements: 3.1, 3.2, 4.5
+    """
+    from utils.geometry_calculator import compute_geometry
+    from utils.provenance_capture import ProvenanceChain  # noqa: F811 — runtime import
+
+    try:
+        # If parse failed completely (no accepted, violations present)
+        if not parse_result.accepted and parse_result.violations:
+            chain.record_terminal(
+                stage_name="parsed_pm_decision",
+                stage_version=stage_version,
+                reason="parse_failure",
+            )
+            return
+
+        # For each accepted decision, record a provenance event
+        for decision in parse_result.accepted:
+            # Input contract: truncated raw response for auditability
+            input_contract = {
+                "raw_response": str(raw_response)[:500] if raw_response else "",
+            }
+
+            # Output contract: the parsed decision fields
+            output_contract = {
+                "candidate_id": decision.candidate_id,
+                "decision": decision.decision,
+                "risk_multiplier": decision.risk_multiplier,
+                "rationale": decision.rationale,
+            }
+
+            # Geometry is not fully available at parse stage in candidate-ID mode
+            # (prices come from candidate registry, not PM output).
+            # Record with incomplete geometry — downstream stages will populate full geometry.
+            geometry_before = compute_geometry(None, None, None, None, None)
+            geometry_after = compute_geometry(None, None, None, None, None)
+
+            chain.record_event(
+                stage_name="parsed_pm_decision",
+                stage_version=stage_version,
+                input_contract=input_contract,
+                output_contract=output_contract,
+                fields_changed=["candidate_id", "decision", "risk_multiplier"],
+                mutation_reason_code="parse_normalization",
+                rule_id=None,
+                geometry_before=geometry_before,
+                geometry_after=geometry_after,
+            )
+    except Exception:
+        # Fail-open: provenance must never block the pipeline
+        logger.error(
+            "Failed to record parse provenance: raw_response_type=%s, "
+            "accepted=%d, violations=%d",
+            type(raw_response).__name__ if raw_response is not None else "None",
+            len(parse_result.accepted),
+            len(parse_result.violations),
+            exc_info=True,
+        )
