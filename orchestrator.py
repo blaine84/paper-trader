@@ -45,6 +45,7 @@ from utils.funnel_discovery import run_funnel_discovery
 from utils.funnel_researcher import run_funnel_qualification
 from utils.funnel_analyst import run_funnel_analysis
 from utils.funnel_confirmation import run_opening_confirmation, run_confirmation_retry
+from db.provenance_schema import init_provenance_schema
 
 console = Console()
 logging.basicConfig(
@@ -570,6 +571,9 @@ def check_schema(engine):
 
     # --- Auto-create candidate-ID selection tables if missing (non-destructive) ---
     _ensure_candidate_tables(engine, inspector)
+
+    # --- Auto-create provenance tables if missing (non-destructive) ---
+    init_provenance_schema(engine)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —

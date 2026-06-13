@@ -280,6 +280,27 @@ PM_BENCHMARK_CONTEXT_ENABLED: bool = os.environ.get(
 # Values: "disabled" | "log_only" | "enforcing"
 PM_ALIGNMENT_POLICY_MODE: str = os.environ.get("PM_ALIGNMENT_POLICY_MODE", "disabled")
 
+# ---------------------------------------------------------------------------
+# PM Decision Provenance Feature Flags
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enforcing"
+PM_PROVENANCE_MODE: str = os.environ.get("PM_PROVENANCE_MODE", "disabled")
+
+# Controls detail level for provenance payload storage.
+# "full" persists raw response body, full input bundles, and all geometry snapshots.
+# "minimal" disables nonessential payload detail while preserving deterministic
+# geometry validation, first-invalid-stage attribution, and coverage metrics.
+# Values: "full" | "minimal"
+PM_PROVENANCE_DETAIL: str = os.environ.get("PM_PROVENANCE_DETAIL", "full")
+
+# Maximum allowed end-to-end latency (in milliseconds) for provenance persistence
+# within the market-hours PM candidate processing cycle. Actual added latency is
+# recorded per candidate for monitoring.
+PM_PROVENANCE_LATENCY_BUDGET_MS: int = int(
+    os.environ.get("PM_PROVENANCE_LATENCY_BUDGET_MS", "200")
+)
+
 
 # ---------------------------------------------------------------------------
 # Pilot Controller

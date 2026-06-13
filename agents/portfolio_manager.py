@@ -35,6 +35,13 @@ from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.catalyst_specificity import evaluate_catalyst_specificity
 from utils.stop_authority import apply_stop_update
 from utils.shadow_ledger import record_blocked_candidate, write_pilot_counterfactual_row
+from utils.gate_config import PM_PROVENANCE_MODE
+from utils.raw_pm_capture import (
+    capture_raw_pm_response,
+    link_response_to_lineages,
+    persist_raw_response,
+    persist_lineage_links,
+)
 
 log = logging.getLogger(__name__)
 
@@ -4349,6 +4356,27 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
         )
         raw_response = parse_json_response(raw)
 
+        # ── Provenance: capture raw PM response (candidate-ID mode, attempt 1) ──
+        _prov_attempt_ordinal = 1
+        _prov_raw_response_obj = None
+        if PM_PROVENANCE_MODE != "disabled":
+            try:
+                _prov_model_id = f"{os.getenv('LLM_PROVIDER', 'unknown')}:{tier}"
+                _prov_candidate_ids = registry.get_registered_ids()
+                _prov_raw_response_obj = capture_raw_pm_response(
+                    pm_cycle_id=cycle_id,
+                    profile=profile_id,
+                    model_id=_prov_model_id,
+                    prompt_version_id=f"candidate_entry:{profile_id}",
+                    candidate_ids_supplied=_prov_candidate_ids,
+                    raw_payload=raw,
+                    parse_status="parse_not_attempted",
+                    attempt_ordinal=_prov_attempt_ordinal,
+                )
+                persist_raw_response(engine, _prov_raw_response_obj)
+            except Exception as _prov_exc:
+                log.error("Provenance raw capture failed (candidate-ID attempt %d): %s", _prov_attempt_ordinal, _prov_exc)
+
         # Parse decision contract
         candidate_metadata = registry.get_candidate_metadata()
         parse_result = parse_decision_contract(
@@ -4357,6 +4385,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
 
         # Handle contract retry (at most once)
         if should_retry_candidate_contract(parse_result):
+            _prov_attempt_ordinal = 2
             retry_prompt = build_candidate_retry_prompt(parse_result, registry)
             raw_retry = call_llm(
                 candidate_system_prompt,
@@ -4365,12 +4394,52 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                 tier=tier,
                 purpose=f"pm_candidate_retry:{profile_id}",
             )
+
+            # ── Provenance: capture retry raw response (candidate-ID mode, attempt 2) ──
+            if PM_PROVENANCE_MODE != "disabled":
+                try:
+                    _prov_raw_response_obj = capture_raw_pm_response(
+                        pm_cycle_id=cycle_id,
+                        profile=profile_id,
+                        model_id=_prov_model_id,
+                        prompt_version_id=f"candidate_retry:{profile_id}",
+                        candidate_ids_supplied=_prov_candidate_ids,
+                        raw_payload=raw_retry,
+                        parse_status="parse_not_attempted",
+                        attempt_ordinal=_prov_attempt_ordinal,
+                    )
+                    persist_raw_response(engine, _prov_raw_response_obj)
+                except Exception as _prov_exc:
+                    log.error("Provenance raw capture failed (candidate-ID attempt %d): %s", _prov_attempt_ordinal, _prov_exc)
+
             raw_response = parse_json_response(raw_retry)
             parse_result = parse_decision_contract(
                 raw_response, registry.get_registered_ids(), candidate_metadata
             )
 
         # Record PM decisions for audit (Requirements 12.2, 12.4)
+        # ── Provenance: link response to lineages (candidate-ID mode) ──
+        # In candidate-ID mode, candidate_id IS the lineage_id.
+        if PM_PROVENANCE_MODE != "disabled" and _prov_raw_response_obj is not None:
+            try:
+                _prov_all_lineage_ids = (
+                    [d.candidate_id for d in parse_result.accepted]
+                    + [d.candidate_id for d in parse_result.rejected]
+                )
+                _prov_all_candidate_ids = _prov_all_lineage_ids[:]  # same in candidate-ID mode
+                if _prov_all_lineage_ids:
+                    _prov_links = link_response_to_lineages(
+                        response_id=_prov_raw_response_obj.response_id,
+                        lineage_ids=_prov_all_lineage_ids,
+                        candidate_ids=_prov_all_candidate_ids,
+                    )
+                    persist_lineage_links(engine, _prov_links)
+            except Exception as _prov_exc:
+                log.error(
+                    "Provenance lineage linking failed (candidate-ID mode, cycle=%s): %s",
+                    cycle_id, _prov_exc,
+                )
+
         for decision in parse_result.accepted:
             _record_candidate_event(
                 engine, decision.candidate_id, cycle_id, profile_id,
@@ -4741,6 +4810,29 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
     raw = call_llm(system_prompt, user_prompt, json_mode=True, tier=tier, purpose=f"pm_entry:{profile_id}")
     result = _enforce_pm_decision_log_contract(parse_json_response(raw))
 
+    # ── Provenance: capture raw PM response (legacy mode, attempt 1) ──
+    _prov_legacy_attempt = 1
+    _prov_legacy_cycle_id = None
+    _prov_legacy_raw_resp = None
+    _prov_legacy_model_id = f"{os.getenv('LLM_PROVIDER', 'unknown')}:{tier}"
+    if PM_PROVENANCE_MODE != "disabled":
+        try:
+            import uuid as _uuid_mod
+            _prov_legacy_cycle_id = f"cycle_{profile_id}_{_uuid_mod.uuid4().hex[:12]}"
+            _prov_legacy_raw_resp = capture_raw_pm_response(
+                pm_cycle_id=_prov_legacy_cycle_id,
+                profile=profile_id,
+                model_id=_prov_legacy_model_id,
+                prompt_version_id=f"pm_entry:{profile_id}",
+                candidate_ids_supplied=[],  # legacy mode: no candidate IDs supplied
+                raw_payload=raw,
+                parse_status="parse_not_attempted",
+                attempt_ordinal=_prov_legacy_attempt,
+            )
+            persist_raw_response(engine, _prov_legacy_raw_resp)
+        except Exception as _prov_exc:
+            log.error("Provenance raw capture failed (legacy attempt %d): %s", _prov_legacy_attempt, _prov_exc)
+
     # ── Entry Normalizer (before behavioral params) ──
     from utils.behavioral_params import apply_params_to_decision
 
@@ -4782,6 +4874,25 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
                 json_mode=True, tier=tier,
                 purpose=f"pm_contract_retry:{profile_id}",
             )
+
+            # ── Provenance: capture retry raw response (legacy mode, attempt 2) ──
+            _prov_legacy_attempt = 2
+            if PM_PROVENANCE_MODE != "disabled" and _prov_legacy_cycle_id is not None:
+                try:
+                    _prov_legacy_raw_resp = capture_raw_pm_response(
+                        pm_cycle_id=_prov_legacy_cycle_id,
+                        profile=profile_id,
+                        model_id=_prov_legacy_model_id,
+                        prompt_version_id=f"pm_contract_retry:{profile_id}",
+                        candidate_ids_supplied=[],
+                        raw_payload=retry_raw,
+                        parse_status="parse_not_attempted",
+                        attempt_ordinal=_prov_legacy_attempt,
+                    )
+                    persist_raw_response(engine, _prov_legacy_raw_resp)
+                except Exception as _prov_exc:
+                    log.error("Provenance raw capture failed (legacy attempt %d): %s", _prov_legacy_attempt, _prov_exc)
+
             retry_result = parse_json_response(retry_raw)
             retry_decisions = retry_result.get("decisions", [])
             retry_norm_result = normalize_pm_entry_decisions(
@@ -4882,6 +4993,32 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
 
     for rejection in corrected_rejections:
         _log_pm_decision_corrected(db, rejection, profile_id)
+
+    # ── Provenance: generate lineage IDs and link to response (legacy mode) ──
+    # In legacy mode, generate UUID4 per parsed decision (not before parsing).
+    if PM_PROVENANCE_MODE != "disabled" and _prov_legacy_raw_resp is not None and final_orders:
+        try:
+            import uuid as _uuid_mod
+            _prov_legacy_lineage_ids = []
+            for norm_order in final_orders:
+                lineage_id = str(_uuid_mod.uuid4())
+                # Attach lineage_id to the order for downstream stages to reference
+                if norm_order.order is not None:
+                    norm_order.order["_lineage_id"] = lineage_id
+                _prov_legacy_lineage_ids.append(lineage_id)
+
+            if _prov_legacy_lineage_ids:
+                _prov_links = link_response_to_lineages(
+                    response_id=_prov_legacy_raw_resp.response_id,
+                    lineage_ids=_prov_legacy_lineage_ids,
+                    candidate_ids=[None] * len(_prov_legacy_lineage_ids),  # no candidate IDs in legacy mode
+                )
+                persist_lineage_links(engine, _prov_links)
+        except Exception as _prov_exc:
+            log.error(
+                "Provenance lineage linking failed (legacy mode, cycle=%s): %s",
+                _prov_legacy_cycle_id, _prov_exc,
+            )
 
     # Execute entry decisions — only final_orders proceed
     for norm_order in final_orders:
