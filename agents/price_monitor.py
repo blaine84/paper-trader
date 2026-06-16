@@ -53,144 +53,145 @@ def get_batch_quotes(symbols: list[str]) -> dict:
 def check_stops_and_targets(engine) -> list[dict]:
     """Check open trades against their stop/target levels."""
     db = get_session(engine)
-    open_trades = db.query(Trade).filter_by(status="open").all()
-    if not open_trades:
-        db.close()
-        return []
+    try:
+        open_trades = db.query(Trade).filter_by(status="open").all()
+        if not open_trades:
+            return []
 
-    symbols = list(set(t.symbol for t in open_trades))
-    quotes = get_batch_quotes(symbols)
-    triggers = []
+        symbols = list(set(t.symbol for t in open_trades))
+        quotes = get_batch_quotes(symbols)
+        triggers = []
 
-    for trade in open_trades:
-        price = quotes.get(trade.symbol)
-        if not price:
-            continue
+        for trade in open_trades:
+            price = quotes.get(trade.symbol)
+            if not price:
+                continue
 
-        # Determine side from the trade's direction field
-        side = "short" if trade.direction == "SHORT" else "long"
+            # Determine side from the trade's direction field
+            side = "short" if trade.direction == "SHORT" else "long"
 
-        # Stop loss check — delegated to StopAuthority for unified trigger logic
-        if trade.stop_price:
-            result = should_stop_trigger(
-                side=side,
-                entry_price=trade.entry_price,
-                current_price=price,
-                stop_price=trade.stop_price,
-                stop_role=getattr(trade, "stop_role", None) or "initial",
-                db=db,
-                trade_id=trade.id,
-                symbol=trade.symbol,
-                profile=trade.profile,
-                source_agent="price_monitor",
-            )
-            if result.triggered:
-                trigger = {
-                    "type": "stop_loss",
-                    "symbol": trade.symbol,
-                    "profile": trade.profile,
-                    "price": price,
-                    "level": trade.stop_price,
-                    "side": side,
-                    "trade_id": trade.id,
-                }
-                triggers.append(trigger)
-                log_trade_event(
-                    db, "stop_triggered", trade_id=trade.id, agent="price_monitor",
-                    symbol=trade.symbol, profile=trade.profile, price=price,
-                    message=f"Stop triggered at {price} vs level {trade.stop_price}",
-                    payload=trigger,
+            # Stop loss check — delegated to StopAuthority for unified trigger logic
+            if trade.stop_price:
+                result = should_stop_trigger(
+                    side=side,
+                    entry_price=trade.entry_price,
+                    current_price=price,
+                    stop_price=trade.stop_price,
+                    stop_role=getattr(trade, "stop_role", None) or "initial",
+                    db=db,
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    profile=trade.profile,
+                    source_agent="price_monitor",
                 )
-            elif not result.geometry_valid:
-                log.warning(
-                    f"⚠️ {trade.symbol} ({trade.profile}): Stop geometry invalid — skipping stop check"
-                )
-
-        # Target check — verify target is on the correct side before triggering
-        if trade.target_price:
-            # Sanity: for long, target should be above entry; for short, below
-            target_valid = True
-            if side == "long" and trade.target_price <= trade.entry_price:
-                target_valid = False
-                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): LONG target {trade.target_price} is below entry {trade.entry_price} — skipping target check")
-            elif side == "short" and trade.target_price >= trade.entry_price:
-                target_valid = False
-                log.warning(f"⚠️ {trade.symbol} ({trade.profile}): SHORT target {trade.target_price} is above entry {trade.entry_price} — skipping target check")
-
-            if target_valid:
-                hit = (side == "long" and price >= trade.target_price) or \
-                      (side == "short" and price <= trade.target_price)
-                if hit:
+                if result.triggered:
                     trigger = {
-                        "type": "target_hit",
+                        "type": "stop_loss",
                         "symbol": trade.symbol,
                         "profile": trade.profile,
                         "price": price,
-                        "level": trade.target_price,
+                        "level": trade.stop_price,
                         "side": side,
                         "trade_id": trade.id,
                     }
                     triggers.append(trigger)
                     log_trade_event(
-                        db, "target_triggered", trade_id=trade.id, agent="price_monitor",
+                        db, "stop_triggered", trade_id=trade.id, agent="price_monitor",
                         symbol=trade.symbol, profile=trade.profile, price=price,
-                        message=f"Target triggered at {price} vs level {trade.target_price}",
+                        message=f"Stop triggered at {price} vs level {trade.stop_price}",
                         payload=trigger,
                     )
+                elif not result.geometry_valid:
+                    log.warning(
+                        f"⚠️ {trade.symbol} ({trade.profile}): Stop geometry invalid — skipping stop check"
+                    )
 
-        # Thesis invalidator evaluation — check structured invalidation conditions
-        if getattr(trade, "invalidators", None):
-            breached = evaluate_invalidators(trade, price)
-            for inv in breached:
-                now = datetime.utcnow()
-                trigger = {
-                    "type": "thesis_invalidation",
-                    "symbol": trade.symbol,
-                    "profile": trade.profile,
-                    "trade_id": trade.id,
-                    "price": price,
-                    "invalidator": inv,
-                    "timestamp": now.isoformat() + "Z",
-                }
-                triggers.append(trigger)
-                log_trade_event(
-                    db, "thesis_invalidated", trade_id=trade.id, agent="price_monitor",
-                    symbol=trade.symbol, profile=trade.profile, price=price,
-                    message=f"Thesis invalidator breached: {inv.get('type')}@{inv.get('reference')}",
-                    payload=trigger,
-                    timestamp=now,
-                )
-                # Store in AgentMemory for PM to read during Reversal/Close Review
-                db.add(AgentMemory(
-                    agent="price_monitor",
-                    symbol=trade.symbol,
-                    key="thesis_invalidation",
-                    value=json.dumps(trigger),
-                    timestamp=now,
-                ))
-                log.warning(
-                    f"⚡ THESIS INVALIDATION: {trade.symbol} ({trade.profile}) "
-                    f"trade_id={trade.id} price={price} "
-                    f"invalidator={inv.get('type')}@{inv.get('reference')}"
-                )
-            if breached:
-                db.commit()
+            # Target check — verify target is on the correct side before triggering
+            if trade.target_price:
+                # Sanity: for long, target should be above entry; for short, below
+                target_valid = True
+                if side == "long" and trade.target_price <= trade.entry_price:
+                    target_valid = False
+                    log.warning(f"⚠️ {trade.symbol} ({trade.profile}): LONG target {trade.target_price} is below entry {trade.entry_price} — skipping target check")
+                elif side == "short" and trade.target_price >= trade.entry_price:
+                    target_valid = False
+                    log.warning(f"⚠️ {trade.symbol} ({trade.profile}): SHORT target {trade.target_price} is above entry {trade.entry_price} — skipping target check")
 
-    if triggers:
-        db.commit()
+                if target_valid:
+                    hit = (side == "long" and price >= trade.target_price) or \
+                          (side == "short" and price <= trade.target_price)
+                    if hit:
+                        trigger = {
+                            "type": "target_hit",
+                            "symbol": trade.symbol,
+                            "profile": trade.profile,
+                            "price": price,
+                            "level": trade.target_price,
+                            "side": side,
+                            "trade_id": trade.id,
+                        }
+                        triggers.append(trigger)
+                        log_trade_event(
+                            db, "target_triggered", trade_id=trade.id, agent="price_monitor",
+                            symbol=trade.symbol, profile=trade.profile, price=price,
+                            message=f"Target triggered at {price} vs level {trade.target_price}",
+                            payload=trigger,
+                        )
 
-    # Run profit management on all open trades
-    from agents.profit_manager import run as run_profit
-    trades_and_prices = []
-    for trade in open_trades:
-        price = quotes.get(trade.symbol)
-        if price:
-            trades_and_prices.append((trade, price))
-    if trades_and_prices:
-        run_profit(engine, trades_and_prices)
+            # Thesis invalidator evaluation — check structured invalidation conditions
+            if getattr(trade, "invalidators", None):
+                breached = evaluate_invalidators(trade, price)
+                for inv in breached:
+                    now = datetime.utcnow()
+                    trigger = {
+                        "type": "thesis_invalidation",
+                        "symbol": trade.symbol,
+                        "profile": trade.profile,
+                        "trade_id": trade.id,
+                        "price": price,
+                        "invalidator": inv,
+                        "timestamp": now.isoformat() + "Z",
+                    }
+                    triggers.append(trigger)
+                    log_trade_event(
+                        db, "thesis_invalidated", trade_id=trade.id, agent="price_monitor",
+                        symbol=trade.symbol, profile=trade.profile, price=price,
+                        message=f"Thesis invalidator breached: {inv.get('type')}@{inv.get('reference')}",
+                        payload=trigger,
+                        timestamp=now,
+                    )
+                    # Store in AgentMemory for PM to read during Reversal/Close Review
+                    db.add(AgentMemory(
+                        agent="price_monitor",
+                        symbol=trade.symbol,
+                        key="thesis_invalidation",
+                        value=json.dumps(trigger),
+                        timestamp=now,
+                    ))
+                    log.warning(
+                        f"⚡ THESIS INVALIDATION: {trade.symbol} ({trade.profile}) "
+                        f"trade_id={trade.id} price={price} "
+                        f"invalidator={inv.get('type')}@{inv.get('reference')}"
+                    )
+                if breached:
+                    db.commit()
 
-    db.close()
-    return triggers
+        if triggers:
+            db.commit()
+
+        # Run profit management on all open trades
+        from agents.profit_manager import run as run_profit
+        trades_and_prices = []
+        for trade in open_trades:
+            price = quotes.get(trade.symbol)
+            if price:
+                trades_and_prices.append((trade, price))
+        if trades_and_prices:
+            run_profit(engine, trades_and_prices)
+
+        return triggers
+    finally:
+        db.close()
 
 
 def _resolve_reference(reference: str, current_price: float, candle_data: dict | None = None) -> float | None:

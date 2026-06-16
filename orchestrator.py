@@ -593,6 +593,10 @@ def check_schema(engine):
     # --- Auto-create provenance tables if missing (non-destructive) ---
     init_provenance_schema(engine)
 
+    # --- Auto-create decision replay tables and lineage columns if missing ---
+    from db.replay_schema import init_replay_db
+    init_replay_db(engine)
+
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —
     # better to catch it here with a clear message and auto-fix.
