@@ -251,7 +251,7 @@ def _apply_scaffold_geometry_defaults(
 def _validate_symbol(
     symbol_raw: Any, entry_signals: dict[str, dict]
 ) -> tuple[bool, str | None, str | None, dict | None]:
-    """Validate and normalize symbol against allowed set.
+    """Validate and normalize symbol against this cycle's offered symbols.
 
     Returns (valid, canonical_symbol, reason_code, details).
     """
@@ -272,8 +272,10 @@ def _validate_symbol(
     if canonical is not None:
         return (True, canonical, None, None)
 
-    # Not a member — provide extra detail if it looks like a concept
-    if "/" in stripped or " " in stripped:
+    # Malformed/concept strings are not valid executable ticker symbols.
+    # Keep single ticker-like tokens (e.g. XLU) separate from composites and
+    # prose placeholders (e.g. XLE|XLB, QQQ/SPY, "Specific names or XLI").
+    if not stripped.replace(".", "").replace("-", "").isalnum():
         return (
             False,
             None,
@@ -281,7 +283,20 @@ def _validate_symbol(
             {"symbol": stripped, "note": "appears to be a concept rather than a ticker"},
         )
 
-    return (False, None, "unsupported_symbol", {"symbol": stripped})
+    # A syntactically plausible ticker can still be out-of-scope for this PM
+    # cycle. Keep this distinct from unsupported_symbol: these names may exist,
+    # but they were not in the analyst/scaffold candidate set the PM was allowed
+    # to trade.
+    return (
+        False,
+        None,
+        "symbol_not_in_entry_signals",
+        {
+            "symbol": stripped,
+            "allowed_symbols": sorted(entry_signals.keys()),
+            "note": "symbol was not offered as an entry candidate for this PM cycle",
+        },
+    )
 
 
 def _validate_quantity(quantity_raw: Any) -> tuple[bool, int | None, str | None]:
