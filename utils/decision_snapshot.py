@@ -270,16 +270,76 @@ def _tick_normalize(price: Decimal, tick_size: Decimal) -> Decimal:
     return price.quantize(tick_size, rounding=ROUND_HALF_UP)
 
 
-def persist_snapshot(engine, snapshot: DecisionSnapshot) -> None:
+def _snapshot_insert_params(snapshot: DecisionSnapshot) -> dict:
+    """Return SQL parameters for inserting a decision snapshot."""
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "schema_version": snapshot.schema_version,
+        "candidate_lineage_id": snapshot.candidate_lineage_id,
+        "timestamp": snapshot.timestamp.isoformat(),
+        "symbol": snapshot.symbol,
+        "profile": snapshot.profile,
+        "direction": snapshot.direction,
+        "setup_type": snapshot.setup_type,
+        "analyst_signal_json": _safe_json(snapshot.analyst_signal_payload),
+        "signal_strength": snapshot.signal_strength,
+        "confidence_value": snapshot.confidence_value,
+        "decision_payload_json": _safe_json(snapshot.decision_payload),
+        "entry_price": str(snapshot.entry_price),
+        "stop_price": str(snapshot.stop_price),
+        "target_price": str(snapshot.target_price),
+        "quantity": str(snapshot.quantity),
+        "atr_value": snapshot.atr_value,
+        "atr_bar_timestamps_json": _safe_json(snapshot.atr_bar_timestamps),
+        "account_equity": str(snapshot.account_equity),
+        "available_cash": str(snapshot.available_cash),
+        "open_position_context_json": _safe_json(snapshot.open_position_context),
+        "case_library_stats_json": _safe_json(snapshot.case_library_stats),
+        "gate_config_json": _safe_json(snapshot.gate_config),
+        "feature_flags_json": _safe_json(snapshot.feature_flags),
+        "policy_version_id": snapshot.policy_version_id,
+        "geometry_hash": snapshot.geometry_hash,
+    }
+
+
+_INSERT_SNAPSHOT_SQL = text("""
+    INSERT INTO decision_snapshots (
+        snapshot_id, schema_version, candidate_lineage_id,
+        timestamp, symbol, profile, direction, setup_type,
+        analyst_signal_json, signal_strength, confidence_value,
+        decision_payload_json, entry_price, stop_price,
+        target_price, quantity, atr_value, atr_bar_timestamps_json,
+        account_equity, available_cash,
+        open_position_context_json, case_library_stats_json,
+        gate_config_json, feature_flags_json,
+        policy_version_id, geometry_hash
+    ) VALUES (
+        :snapshot_id, :schema_version, :candidate_lineage_id,
+        :timestamp, :symbol, :profile, :direction, :setup_type,
+        :analyst_signal_json, :signal_strength, :confidence_value,
+        :decision_payload_json, :entry_price, :stop_price,
+        :target_price, :quantity, :atr_value, :atr_bar_timestamps_json,
+        :account_equity, :available_cash,
+        :open_position_context_json, :case_library_stats_json,
+        :gate_config_json, :feature_flags_json,
+        :policy_version_id, :geometry_hash
+    )
+""")
+
+
+def persist_snapshot(engine, snapshot: DecisionSnapshot, *, session=None) -> None:
     """Persist a DecisionSnapshot to the decision_snapshots table.
 
     This MUST be called within the same transaction boundary as gate evaluation.
-    If persistence fails, raises SnapshotPersistenceError to block gate evaluation
-    for that candidate (Requirement 3.6).
+    Pass the active SQLAlchemy session from the PM pipeline whenever one exists.
+    Using the PM session avoids self-locking SQLite by opening a second writer
+    connection while the PM session already has pending trade_events.
+    If persistence fails, raises SnapshotPersistenceError to block gate
+    evaluation for that candidate (Requirement 3.6).
 
     The caller should use this in a transactional context:
         try:
-            persist_snapshot(engine, snapshot)
+            persist_snapshot(engine, snapshot, session=db)
         except SnapshotPersistenceError:
             # Gate evaluation is BLOCKED — record failure and skip candidate
             ...
@@ -294,61 +354,12 @@ def persist_snapshot(engine, snapshot: DecisionSnapshot) -> None:
         )
 
     try:
-        with engine.connect() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO decision_snapshots (
-                        snapshot_id, schema_version, candidate_lineage_id,
-                        timestamp, symbol, profile, direction, setup_type,
-                        analyst_signal_json, signal_strength, confidence_value,
-                        decision_payload_json, entry_price, stop_price,
-                        target_price, quantity, atr_value, atr_bar_timestamps_json,
-                        account_equity, available_cash,
-                        open_position_context_json, case_library_stats_json,
-                        gate_config_json, feature_flags_json,
-                        policy_version_id, geometry_hash
-                    ) VALUES (
-                        :snapshot_id, :schema_version, :candidate_lineage_id,
-                        :timestamp, :symbol, :profile, :direction, :setup_type,
-                        :analyst_signal_json, :signal_strength, :confidence_value,
-                        :decision_payload_json, :entry_price, :stop_price,
-                        :target_price, :quantity, :atr_value, :atr_bar_timestamps_json,
-                        :account_equity, :available_cash,
-                        :open_position_context_json, :case_library_stats_json,
-                        :gate_config_json, :feature_flags_json,
-                        :policy_version_id, :geometry_hash
-                    )
-                """),
-                {
-                    "snapshot_id": snapshot.snapshot_id,
-                    "schema_version": snapshot.schema_version,
-                    "candidate_lineage_id": snapshot.candidate_lineage_id,
-                    "timestamp": snapshot.timestamp.isoformat(),
-                    "symbol": snapshot.symbol,
-                    "profile": snapshot.profile,
-                    "direction": snapshot.direction,
-                    "setup_type": snapshot.setup_type,
-                    "analyst_signal_json": _safe_json(snapshot.analyst_signal_payload),
-                    "signal_strength": snapshot.signal_strength,
-                    "confidence_value": snapshot.confidence_value,
-                    "decision_payload_json": _safe_json(snapshot.decision_payload),
-                    "entry_price": str(snapshot.entry_price),
-                    "stop_price": str(snapshot.stop_price),
-                    "target_price": str(snapshot.target_price),
-                    "quantity": str(snapshot.quantity),
-                    "atr_value": snapshot.atr_value,
-                    "atr_bar_timestamps_json": _safe_json(snapshot.atr_bar_timestamps),
-                    "account_equity": str(snapshot.account_equity),
-                    "available_cash": str(snapshot.available_cash),
-                    "open_position_context_json": _safe_json(snapshot.open_position_context),
-                    "case_library_stats_json": _safe_json(snapshot.case_library_stats),
-                    "gate_config_json": _safe_json(snapshot.gate_config),
-                    "feature_flags_json": _safe_json(snapshot.feature_flags),
-                    "policy_version_id": snapshot.policy_version_id,
-                    "geometry_hash": snapshot.geometry_hash,
-                },
-            )
-            conn.commit()
+        if session is not None:
+            session.execute(_INSERT_SNAPSHOT_SQL, _snapshot_insert_params(snapshot))
+        else:
+            with engine.connect() as conn:
+                conn.execute(_INSERT_SNAPSHOT_SQL, _snapshot_insert_params(snapshot))
+                conn.commit()
     except SnapshotPersistenceError:
         raise
     except Exception as exc:
@@ -379,6 +390,7 @@ def generate_candidate_lineage_id() -> str:
 def build_and_persist_snapshot(
     engine,
     *,
+    session=None,
     candidate_lineage_id: str,
     decision: dict,
     signal: dict | None,
@@ -403,6 +415,8 @@ def build_and_persist_snapshot(
 
     Args:
         engine: SQLAlchemy engine
+        session: Optional active SQLAlchemy session. Production PM calls should
+            pass this so snapshot persistence shares the gate transaction.
         candidate_lineage_id: Pre-generated lineage ID for this candidate
         decision: The normalized decision dict from PM
         signal: The analyst signal for this symbol (may be None)
@@ -486,7 +500,7 @@ def build_and_persist_snapshot(
         policy_version_id=policy_version_id,
     )
 
-    persist_snapshot(engine, snapshot)
+    persist_snapshot(engine, snapshot, session=session)
     return snapshot
 
 

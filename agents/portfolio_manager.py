@@ -3374,6 +3374,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
 
             build_and_persist_snapshot(
                 engine=db.bind,
+                session=db,
                 candidate_lineage_id=_candidate_lineage_id,
                 decision=decision,
                 signal=signal_for_gates,
