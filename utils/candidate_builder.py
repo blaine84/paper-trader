@@ -102,9 +102,7 @@ def build_candidate_set(
     default_expires_at = cycle_expires_at or (now + timedelta(hours=1))
 
     for symbol, signal in eligible_signals.items():
-        scaffold = build_entry_geometry_scaffold(
-            signal, profile_id=profile_id, profile_context=profile
-        )
+        scaffold = build_entry_geometry_scaffold(signal, profile_id=profile_id)
 
         # Only process scaffolds with status == "ok" and non-empty candidates
         if scaffold.get("status") != "ok":
