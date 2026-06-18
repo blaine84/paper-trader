@@ -9,6 +9,7 @@ import json
 import signal
 import logging
 import logging.handlers
+import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -90,6 +91,8 @@ _regular_market_skips_logged = set()
 # An in-progress premarket job may complete within its budget, but no NEW funnel
 # jobs should start until the PM cycle finishes. (Requirement 7.5)
 _pm_cycle_active = False
+_pm_cycle_owner = None
+_pm_cycle_lock = threading.Lock()
 
 
 def get_engine():
@@ -336,6 +339,65 @@ def _set_pm_cycle_active(active: bool) -> None:
     """Set the PM cycle blocking state."""
     global _pm_cycle_active
     _pm_cycle_active = active
+
+
+def _try_begin_pm_cycle(owner: str) -> bool:
+    """Try to begin a new-entry PM cycle without overlapping another one."""
+    global _pm_cycle_active, _pm_cycle_owner
+    if not _pm_cycle_lock.acquire(blocking=False):
+        log.info(
+            "PM_CYCLE_SKIP: owner=%s reason=pm_cycle_already_active active_owner=%s",
+            owner,
+            _pm_cycle_owner,
+        )
+        return False
+
+    _pm_cycle_active = True
+    _pm_cycle_owner = owner
+    return True
+
+
+def _end_pm_cycle(owner: str) -> None:
+    """End a PM cycle started by _try_begin_pm_cycle()."""
+    global _pm_cycle_active, _pm_cycle_owner
+    if _pm_cycle_owner not in (None, owner):
+        log.warning(
+            "PM_CYCLE_OWNER_MISMATCH: ending_owner=%s active_owner=%s",
+            owner,
+            _pm_cycle_owner,
+        )
+    _pm_cycle_active = False
+    _pm_cycle_owner = None
+    if _pm_cycle_lock.locked():
+        _pm_cycle_lock.release()
+
+
+def _candidate_mode_requires_serial_pm_profiles() -> bool:
+    """Return True when PM profiles should not run concurrently."""
+    try:
+        from utils.gate_config import PM_CANDIDATE_MODE
+        return PM_CANDIDATE_MODE in ("enabled", "shadow")
+    except Exception:
+        return False
+
+
+def _run_pm_profile_jobs(profile_ids, run_one_profile):
+    """Run profile jobs, serializing them when candidate mode writes registries."""
+    profile_ids = list(profile_ids)
+    if _candidate_mode_requires_serial_pm_profiles():
+        log.info(
+            "PM_PROFILE_EXECUTION: mode=serial reason=candidate_mode profiles=%s",
+            profile_ids,
+        )
+        for profile_id in profile_ids:
+            run_one_profile(profile_id)
+        return
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=len(profile_ids) or 1) as executor:
+        futures = [executor.submit(run_one_profile, pid) for pid in profile_ids]
+        for f in as_completed(futures):
+            pass
 
 
 def ensure_initial_balance(engine):
@@ -802,16 +864,17 @@ def run_intraday():
     """PM decisions + stop checks — runs on the split schedule."""
     if _skip_outside_regular_market_job("intraday"):
         return
+    if not _try_begin_pm_cycle("intraday"):
+        return
     log.info("=== INTRADAY CYCLE ===")
     engine = get_engine()
 
     # Block new funnel jobs while PM cycle is active (Requirement 7.5).
     # In-progress premarket jobs can still complete within their budget.
-    _set_pm_cycle_active(True)
     try:
         _run_intraday_inner(engine)
     finally:
-        _set_pm_cycle_active(False)
+        _end_pm_cycle("intraday")
 
 
 def _run_intraday_inner(engine):
@@ -861,9 +924,9 @@ def _run_intraday_inner(engine):
     # Analyst signals are refreshed by the separate run_analyst_refresh job
     # on the same schedule — no need to duplicate here.
 
-    # PM profiles decide — each independently, in parallel
+    # PM profiles decide. Candidate-ID mode writes a registry per profile, so
+    # those profiles run serially to avoid SQLite writer contention.
     console.print("[bold green]🧠 Portfolio Managers deciding...[/bold green]")
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def _run_pm(profile_id):
         try:
@@ -902,10 +965,7 @@ def _run_intraday_inner(engine):
         except Exception as e:
             log.error(f"PM {profile_id} error: {e}", exc_info=True)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(_run_pm, pid) for pid in pm.ACTIVE_PROFILES]
-        for f in as_completed(futures):
-            pass
+    _run_pm_profile_jobs(pm.ACTIVE_PROFILES, _run_pm)
 
     # Dashboard
     try:
@@ -1578,18 +1638,27 @@ def run_price_monitor():
 
             action_symbols = list(set(actionable_symbols))
             if action_symbols:
+                if not _try_begin_pm_cycle("price_monitor"):
+                    log.info(
+                        "Price monitor: PM trigger skipped because another PM cycle is active for %s",
+                        action_symbols,
+                    )
+                    return
                 log.info(f"Price monitor: triggering PM (local LLM) for {action_symbols}")
-                import threading
                 def _run_pm_async(syms):
-                    eng = get_engine()
-                    for pid in pm.ACTIVE_PROFILES:
-                        try:
-                            pm_result = pm.run_profile(eng, WATCHLIST + syms, pid, tier="medium")
-                            for d in pm_result.get("decisions", []):
-                                if d.get("executed"):
-                                    log.info(f"  ⚡ [{pid}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
-                        except Exception as e:
-                            log.error(f"Price monitor PM {pid} error: {e}")
+                    try:
+                        eng = get_engine()
+                        def _run_pm(pid):
+                            try:
+                                pm_result = pm.run_profile(eng, WATCHLIST + syms, pid, tier="medium")
+                                for d in pm_result.get("decisions", []):
+                                    if d.get("executed"):
+                                        log.info(f"  ⚡ [{pid}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
+                            except Exception as e:
+                                log.error(f"Price monitor PM {pid} error: {e}")
+                        _run_pm_profile_jobs(pm.ACTIVE_PROFILES, _run_pm)
+                    finally:
+                        _end_pm_cycle("price_monitor")
                 threading.Thread(target=_run_pm_async, args=(action_symbols,), daemon=True).start()
 
     except Exception as e:
