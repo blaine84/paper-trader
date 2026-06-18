@@ -717,7 +717,7 @@ def recover_stale_reservations(
                     text("""
                         SELECT 1 FROM trade_events
                         WHERE event_type = 'entry_filled'
-                          AND payload LIKE :key_pattern
+                          AND payload_json LIKE :key_pattern
                         LIMIT 1
                     """),
                     {"key_pattern": f"%{execution_key}%"},
