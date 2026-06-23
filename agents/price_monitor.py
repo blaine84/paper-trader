@@ -11,9 +11,11 @@ Checks:
 
 import json
 import logging
-import yfinance as yf
+import os
+import time
 from datetime import datetime, timedelta, timezone
 from db.schema import Trade, Position, AgentMemory, get_session
+from utils.finnhub_client import FinnhubClient
 from utils.stop_authority import should_stop_trigger
 from utils.trade_events import log_trade_event
 
@@ -22,31 +24,61 @@ log = logging.getLogger(__name__)
 
 MAX_ANALYST_SIGNAL_AGE_MINUTES = 90
 _logged_stale_signal_symbols = set()
+_QUOTE_CACHE_SECONDS = int(os.getenv("PRICE_MONITOR_QUOTE_CACHE_SECONDS", "20"))
+_quote_cache: dict[str, tuple[float, float]] = {}
 
 
 def get_batch_quotes(symbols: list[str]) -> dict:
-    """Get current prices for multiple symbols via yfinance — batch fetch."""
+    """Get current prices for symbols via Finnhub, falling back to yfinance."""
     quotes = {}
+    now = time.time()
+    missing = []
+    for sym in dict.fromkeys(symbols):
+        cached = _quote_cache.get(sym)
+        if cached and now - cached[0] < _QUOTE_CACHE_SECONDS:
+            quotes[sym] = cached[1]
+        else:
+            missing.append(sym)
+
+    if not missing:
+        return quotes
+
+    finnhub_missing = []
+    try:
+        fh = FinnhubClient()
+        for sym in missing:
+            try:
+                q = fh.get_quote(sym)
+                price = round(float(q.get("price", 0)), 2)
+                if price > 0:
+                    quotes[sym] = price
+                    _quote_cache[sym] = (now, price)
+                else:
+                    finnhub_missing.append(sym)
+            except Exception as e:
+                log.warning("Finnhub quote failed for %s; trying yfinance fallback: %s", sym, e)
+                finnhub_missing.append(sym)
+    except Exception as e:
+        log.warning("Finnhub quote client unavailable; trying yfinance fallback for batch: %s", e)
+        finnhub_missing = missing
+
+    if not finnhub_missing:
+        return quotes
+
     try:
         import yfinance as yf
-        tickers = yf.Tickers(" ".join(symbols))
-        for sym in symbols:
+        tickers = yf.Tickers(" ".join(finnhub_missing))
+        for sym in finnhub_missing:
             try:
                 price = tickers.tickers[sym].fast_info.get("lastPrice")
-                if price:
+                if price and float(price) > 0:
                     quotes[sym] = round(float(price), 2)
-            except Exception:
-                pass
-    except Exception:
-        # Fallback to individual fetches
-        for sym in symbols:
-            try:
-                t = yf.Ticker(sym)
-                price = t.fast_info.get("lastPrice")
-                if price:
-                    quotes[sym] = round(float(price), 2)
-            except Exception:
-                pass
+                    _quote_cache[sym] = (now, quotes[sym])
+            except Exception as e:
+                log.warning("yfinance quote fallback failed for %s: %s", sym, e)
+    except Exception as e:
+        log.warning("yfinance batch quote fallback failed: %s", e)
+
     return quotes
 
 
