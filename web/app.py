@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,21 +38,58 @@ app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
 ensure_shadow_ledger_schema(engine)
 
+_QUOTE_CACHE_SECONDS = int(os.getenv("DASHBOARD_QUOTE_CACHE_SECONDS", "25"))
+_quote_cache: dict[str, tuple[float, dict]] = {}
+
 
 def get_quotes(symbols: list[str]) -> dict:
-    """Get current prices via yfinance (no rate limit, saves Finnhub quota for agents)."""
+    """Get current prices via Finnhub, falling back to yfinance if Finnhub fails."""
     import yfinance as yf
     quotes = {}
+    finnhub = None
+    yfinance_available = True
+    now = time.time()
     for sym in symbols:
+        cached = _quote_cache.get(sym)
+        if cached and now - cached[0] < _QUOTE_CACHE_SECONDS:
+            quotes[sym] = cached[1]
+            continue
+
         try:
-            t = yf.Ticker(sym)
-            info = t.fast_info
-            price = float(info.get("lastPrice", 0))
-            prev = float(info.get("previousClose", price))
-            change_pct = round((price - prev) / prev * 100, 2) if prev else 0
-            quotes[sym] = {"price": round(price, 2), "change_pct": change_pct}
-        except Exception:
-            quotes[sym] = {"price": 0, "change_pct": 0}
+            if finnhub is None:
+                finnhub = FinnhubClient()
+            q = finnhub.get_quote(sym)
+            price = round(float(q.get("price", 0)), 2)
+            if price <= 0:
+                raise ValueError(f"Finnhub returned non-positive price for {sym}: {price}")
+            quote = {
+                "price": price,
+                "change_pct": float(q.get("change_pct", 0)),
+            }
+            quotes[sym] = quote
+            _quote_cache[sym] = (now, quote)
+            continue
+        except Exception as e:
+            log.warning("Finnhub quote failed for %s; trying yfinance fallback: %s", sym, e)
+
+        if yfinance_available:
+            try:
+                t = yf.Ticker(sym)
+                info = t.fast_info
+                price = float(info.get("lastPrice", 0))
+                prev = float(info.get("previousClose", price))
+                if price <= 0:
+                    raise ValueError(f"yfinance returned non-positive price for {sym}: {price}")
+                change_pct = round((price - prev) / prev * 100, 2) if prev else 0
+                quote = {"price": round(price, 2), "change_pct": change_pct}
+                quotes[sym] = quote
+                _quote_cache[sym] = (now, quote)
+                continue
+            except Exception as e:
+                yfinance_available = False
+                log.warning("yfinance quote fallback failed for %s; disabling for this batch: %s", sym, e)
+
+        quotes[sym] = {"price": 0, "change_pct": 0}
     return quotes
 
 

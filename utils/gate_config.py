@@ -7,6 +7,17 @@ to prevent divergent defaults.
 See: requirements.md §Default Configuration, design.md §utils/gate_config.py
 """
 
+from __future__ import annotations
+
+import logging
+import os
+from datetime import date, timedelta
+
+logger = logging.getLogger(__name__)
+
+# Module-level flag to ensure pilot expiration is logged only once per process.
+_pilot_expiration_logged: bool = False
+
 # ---------------------------------------------------------------------------
 # Setup Quality Gate
 # ---------------------------------------------------------------------------
@@ -72,6 +83,15 @@ REQUIRE_POSITIVE_ROLLING_AVG_PNL_FOR_RECOVERY: bool = True
 # probes under rolling underperformance (aggressive unconditional, moderate
 # with high-confirmation only).
 ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER: float = 0.25
+
+# Shadow scoring — maximum allowable entry price deviation percentage.
+# Candidates with entry-price-to-first-candle deviation above this threshold
+# are marked unscorable.
+SHADOW_SCORE_MAX_ENTRY_DEVIATION_PCT: float = 0.20
+
+# Near-miss margin for threshold softening — moderate-profile candidates
+# within this margin below the rejection threshold qualify for pilot override.
+NEAR_MISS_MARGIN_PCT: float = 0.05
 
 if not (0 < ROLLING_RECOVERY_PROBE_SIZE_MULTIPLIER < 1.0):
     raise ValueError(
@@ -192,6 +212,7 @@ GATE_EVENT_TYPES: dict[str, str] = {
     "reduce_size": "gate_size_reduced",
     "override_required": "gate_override_required",
     "override_approved": "gate_override_approved",
+    "pilot_override": "gate_pilot_override",
     "risk_geometry_gate_evaluated": "risk_geometry_gate_evaluated",
     "catalyst_specificity_gate_evaluated": "catalyst_specificity_gate_evaluated",
 }
@@ -248,3 +269,118 @@ REDUCED_RR_THRESHOLDS_BY_PROFILE: dict[str, float] = {
     "moderate": 0.75,
     "conservative": 1.0,
 }
+
+# ---------------------------------------------------------------------------
+# Candidate-ID Selection Feature Flags
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "shadow" | "enabled"
+PM_CANDIDATE_MODE: str = os.environ.get("PM_CANDIDATE_MODE", "disabled")
+
+# P1 Benchmark Context (independent of P0)
+PM_BENCHMARK_CONTEXT_ENABLED: bool = os.environ.get(
+    "PM_BENCHMARK_CONTEXT_ENABLED", "false"
+).lower() == "true"
+
+# P1 Alignment Policy
+# Values: "disabled" | "log_only" | "enforcing"
+PM_ALIGNMENT_POLICY_MODE: str = os.environ.get("PM_ALIGNMENT_POLICY_MODE", "disabled")
+
+# ---------------------------------------------------------------------------
+# PM Decision Provenance Feature Flags
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enforcing"
+PM_PROVENANCE_MODE: str = os.environ.get("PM_PROVENANCE_MODE", "disabled")
+
+# Controls detail level for provenance payload storage.
+# "full" persists raw response body, full input bundles, and all geometry snapshots.
+# "minimal" disables nonessential payload detail while preserving deterministic
+# geometry validation, first-invalid-stage attribution, and coverage metrics.
+# Values: "full" | "minimal"
+PM_PROVENANCE_DETAIL: str = os.environ.get("PM_PROVENANCE_DETAIL", "full")
+
+# Maximum allowed end-to-end latency (in milliseconds) for provenance persistence
+# within the market-hours PM candidate processing cycle. Actual added latency is
+# recorded per candidate for monitoring.
+PM_PROVENANCE_LATENCY_BUDGET_MS: int = int(
+    os.environ.get("PM_PROVENANCE_LATENCY_BUDGET_MS", "200")
+)
+
+
+# ---------------------------------------------------------------------------
+# Pilot Controller
+# ---------------------------------------------------------------------------
+
+
+def is_moderate_near_miss_pilot_active(now: date | None = None) -> bool:
+    """Check if the moderate near-miss pilot is currently active.
+
+    Args:
+        now: Override for current date (for testability). Defaults to date.today().
+
+    Conditions for active:
+    1. MODERATE_NEAR_MISS_PILOT env var == 'true' (case-insensitive)
+    2. MODERATE_NEAR_MISS_PILOT_START_DATE is parseable ISO date
+    3. Current date <= start_date + duration_days
+
+    Logs warning if flag enabled but start date missing/unparseable.
+    Logs info ONCE per process lifecycle if pilot has expired (uses a
+    module-level flag ``_pilot_expiration_logged`` to avoid log spam on
+    every gate evaluation).
+    """
+    global _pilot_expiration_logged
+
+    flag = os.environ.get("MODERATE_NEAR_MISS_PILOT", "")
+    if flag.lower() != "true":
+        return False
+
+    # Flag is enabled — parse start date
+    start_date_raw = os.environ.get("MODERATE_NEAR_MISS_PILOT_START_DATE", "")
+    if not start_date_raw:
+        logger.warning(
+            "MODERATE_NEAR_MISS_PILOT is enabled but MODERATE_NEAR_MISS_PILOT_START_DATE "
+            "is missing; treating pilot as disabled."
+        )
+        return False
+
+    try:
+        start_date = date.fromisoformat(start_date_raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "MODERATE_NEAR_MISS_PILOT_START_DATE is unparseable ('%s'); "
+            "treating pilot as disabled.",
+            start_date_raw,
+        )
+        return False
+
+    # Parse duration (default 7 days)
+    duration_raw = os.environ.get("MODERATE_NEAR_MISS_PILOT_DURATION_DAYS", "7")
+    try:
+        duration_days = int(duration_raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "MODERATE_NEAR_MISS_PILOT_DURATION_DAYS is not a valid integer ('%s'); "
+            "using default of 7 days.",
+            duration_raw,
+        )
+        duration_days = 7
+
+    current_date = now if now is not None else date.today()
+    expiration_date = start_date + timedelta(days=duration_days)
+
+    if current_date <= expiration_date:
+        return True
+
+    # Pilot has expired — log once
+    if not _pilot_expiration_logged:
+        logger.info(
+            "Moderate near-miss pilot has expired. start_date=%s, duration_days=%d, "
+            "expiration_date=%s.",
+            start_date.isoformat(),
+            duration_days,
+            expiration_date.isoformat(),
+        )
+        _pilot_expiration_logged = True
+
+    return False

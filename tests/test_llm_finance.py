@@ -110,6 +110,7 @@ class TestCallOllamaFinance:
     def test_success_returns_response_and_model(self, mock_ollama, monkeypatch):
         """On success, returns (response, 'ollama', requested_model)."""
         monkeypatch.setenv("OLLAMA_FINANCE_TIMEOUT", "120")
+        monkeypatch.setenv("OLLAMA_FINANCE_NUM_CTX", "8192")
 
         mock_ollama.return_value = '{"analysis": "bullish"}'
 
@@ -122,6 +123,31 @@ class TestCallOllamaFinance:
         assert model == "fin-llama3.1:8b-finance"
         # Verify timeout was passed
         assert mock_ollama.call_args[1]["timeout"] == 120
+        assert mock_ollama.call_args[1]["num_ctx"] == 8192
+
+    @patch("utils.llm._call_ollama")
+    def test_num_ctx_defaults_to_ollama_num_ctx(self, mock_ollama, monkeypatch):
+        """Finance tier uses OLLAMA_NUM_CTX when finance-specific context is not set."""
+        monkeypatch.delenv("OLLAMA_FINANCE_NUM_CTX", raising=False)
+        monkeypatch.setenv("OLLAMA_NUM_CTX", "6144")
+
+        mock_ollama.return_value = '{"ok": true}'
+
+        _call_ollama_finance("system", "user", model="fin-llama", purpose="test")
+
+        assert mock_ollama.call_args[1]["num_ctx"] == 6144
+
+    @patch("utils.llm._call_ollama")
+    def test_num_ctx_defaults_to_8192_when_unset(self, mock_ollama, monkeypatch):
+        """Finance tier explicitly requests enough context for analyst prompts by default."""
+        monkeypatch.delenv("OLLAMA_FINANCE_NUM_CTX", raising=False)
+        monkeypatch.delenv("OLLAMA_NUM_CTX", raising=False)
+
+        mock_ollama.return_value = '{"ok": true}'
+
+        _call_ollama_finance("system", "user", model="fin-llama", purpose="test")
+
+        assert mock_ollama.call_args[1]["num_ctx"] == 8192
 
     @patch("utils.llm._call_ollama")
     def test_fallback_on_exception(self, mock_ollama, monkeypatch, caplog):

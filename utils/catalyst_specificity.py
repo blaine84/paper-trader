@@ -866,6 +866,11 @@ def evaluate_catalyst_specificity(
     signal: dict | None = None,
     profile: str = "moderate",
     db=None,
+    *,
+    policy=None,
+    event_sink=None,
+    clock=None,
+    id_provider=None,
 ) -> dict:
     """Evaluate a trade candidate through the catalyst specificity gate.
 
@@ -878,13 +883,26 @@ def evaluate_catalyst_specificity(
                 catalyst freshness, key_levels.
         profile: One of "conservative", "moderate", "aggressive".
         db: Optional SQLAlchemy session for trade event logging.
+        policy: Optional GatePolicyConfig; when provided, gate mode/enabled and
+            thresholds are read from it instead of os.environ/module constants.
+            None = use production defaults.
+        event_sink: Optional callable replacing log_trade_event for logging.
+            None = use production log_trade_event.
+        clock: Optional callable returning datetime; replaces datetime.utcnow().
+            None = use production clock. (Not currently used by this gate.)
+        id_provider: Optional callable returning str; replaces uuid.uuid4().
+            None = use production uuid.uuid4(). (Not currently used by this gate.)
 
     Returns:
         Dict matching the Gate Result Schema with decision, score, evidence, etc.
     """
-    # --- Read environment configuration ---
-    gate_enabled = os.environ.get("CATALYST_SPECIFICITY_GATE_ENABLED", "true").lower()
-    mode = os.environ.get("CATALYST_SPECIFICITY_GATE_MODE", "log_only").lower()
+    # --- Read environment configuration (policy-aware) ---
+    if policy is not None:
+        gate_enabled = str(policy.feature_flags.get("CATALYST_SPECIFICITY_GATE_ENABLED", True)).lower()
+        mode = str(policy.feature_flags.get("CATALYST_SPECIFICITY_GATE_MODE", "log_only")).lower()
+    else:
+        gate_enabled = os.environ.get("CATALYST_SPECIFICITY_GATE_ENABLED", "true").lower()
+        mode = os.environ.get("CATALYST_SPECIFICITY_GATE_MODE", "log_only").lower()
     if mode not in ("enforce", "log_only"):
         mode = "log_only"
 
@@ -1037,8 +1055,10 @@ def evaluate_catalyst_specificity(
         if quantity_after is not None:
             event_payload["quantity_after"] = quantity_after
 
+        sink = event_sink if event_sink is not None else log_trade_event
+
         # Always log "catalyst_specificity_gate_evaluated" for every evaluation
-        log_trade_event(
+        sink(
             db,
             "catalyst_specificity_gate_evaluated",
             symbol=symbol,
@@ -1049,7 +1069,7 @@ def evaluate_catalyst_specificity(
         # Log "gate_rejected" ONLY when decision=="block" AND mode=="enforce"
         # NEVER emit gate_rejected in log_only mode, even if intended_decision is "block"
         if gate_decision == "block" and mode == "enforce":
-            log_trade_event(
+            sink(
                 db,
                 "gate_rejected",
                 symbol=symbol,

@@ -5,6 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from db.schema import init_db
 from utils.shadow_ledger import ensure_shadow_ledger_schema, record_blocked_candidate
+from utils import shadow_outcomes
 from utils.shadow_outcomes import score_blocked_candidate, update_blocked_candidate_outcomes
 
 
@@ -20,6 +21,41 @@ def _candles(start, closes):
     return rows
 
 
+def test_provider_candle_fetcher_uses_shared_candle_client(monkeypatch):
+    start = datetime(2026, 6, 23, 14, 30, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=15)
+    calls = []
+
+    class FakeFinnhubClient:
+        def get_candles(self, symbol, resolution, days):
+            calls.append((symbol, resolution, days))
+            return {
+                "symbol": symbol,
+                "resolution": resolution,
+                "timestamps": [
+                    int((start - timedelta(minutes=1)).timestamp()),
+                    int(start.timestamp()),
+                    int((start + timedelta(minutes=5)).timestamp()),
+                    int((end + timedelta(minutes=3)).timestamp()),
+                ],
+                "open": [99.0, 100.0, 101.0, 102.0],
+                "high": [99.5, 100.5, 101.5, 102.5],
+                "low": [98.5, 99.5, 100.5, 101.5],
+                "close": [99.2, 100.2, 101.2, 102.2],
+                "volume": [100, 200, 300, 400],
+                "source": "alpaca",
+            }
+
+    monkeypatch.setattr("utils.finnhub_client.FinnhubClient", FakeFinnhubClient)
+
+    candles = shadow_outcomes._fetch_provider_candles("SPY", start, end)
+
+    assert calls
+    assert calls[0][0] == "SPY"
+    assert calls[0][1] == "1"
+    assert [c["close"] for c in candles] == [100.2, 101.2]
+
+
 def test_score_blocked_candidate_classifies_saved_us_when_stop_hits_first():
     created = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
     candidate = {
@@ -31,6 +67,7 @@ def test_score_blocked_candidate_classifies_saved_us_when_stop_hits_first():
         "entry_price": 100.0,
         "stop_price": 99.0,
         "target_price": 105.0,
+        "quantity": 10,
     }
     candles = _candles(created, [100.0, 99.8, 98.9, 99.2])
 

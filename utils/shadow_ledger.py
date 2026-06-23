@@ -259,6 +259,7 @@ def record_blocked_candidate(
     geometry_candidate_id: str | None = None,
     geometry_candidate_name: str | None = None,
     scaffold_snapshot: dict | None = None,
+    candidate_lineage_id: str | None = None,
 ) -> int | None:
     """Record a blocked trade candidate in the shadow ledger.
 
@@ -428,46 +429,64 @@ def record_blocked_candidate(
                 return None
 
         # --- Execute INSERT ---
-        result = db.execute(
-            text(
+        # Build INSERT dynamically: include candidate_lineage_id only when
+        # provided (column may not exist on older schemas without migration)
+        _columns = [
+            "symbol", "action", "direction", "profile", "setup_type",
+            "entry_price", "stop_price", "target_price", "quantity",
+            "blocked_by", "block_reason", "reason_code",
+            "gate_notes_json", "decision_snapshot_json", "signal_snapshot_json",
+            "source", "agent", "dedupe_key", "trade_event_id",
+        ]
+        _params = {
+            "symbol": symbol,
+            "action": action,
+            "direction": direction,
+            "profile": profile,
+            "setup_type": setup_type,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "quantity": quantity,
+            "blocked_by": blocked_by,
+            "block_reason": block_reason,
+            "reason_code": reason_code,
+            "gate_notes_json": gate_notes_json,
+            "decision_snapshot_json": decision_snapshot_json,
+            "signal_snapshot_json": signal_snapshot_json,
+            "source": source,
+            "agent": agent,
+            "dedupe_key": dedupe_key,
+            "trade_event_id": trade_event_id,
+        }
+        if candidate_lineage_id is not None:
+            _columns.append("candidate_lineage_id")
+            _params["candidate_lineage_id"] = candidate_lineage_id
+
+        _col_list = ", ".join(_columns)
+        _val_list = ", ".join(f":{c}" for c in _columns)
+        _insert_sql = f"""
+            INSERT INTO blocked_trade_candidates ({_col_list})
+            VALUES ({_val_list})
+        """
+
+        try:
+            result = db.execute(text(_insert_sql), _params)
+        except Exception as _ins_exc:
+            # Fallback: if candidate_lineage_id column doesn't exist yet,
+            # retry without it (handles pre-migration schemas)
+            if candidate_lineage_id is not None and "candidate_lineage_id" in str(_ins_exc):
+                _columns.remove("candidate_lineage_id")
+                del _params["candidate_lineage_id"]
+                _col_list = ", ".join(_columns)
+                _val_list = ", ".join(f":{c}" for c in _columns)
+                _insert_sql = f"""
+                    INSERT INTO blocked_trade_candidates ({_col_list})
+                    VALUES ({_val_list})
                 """
-                INSERT INTO blocked_trade_candidates (
-                    symbol, action, direction, profile, setup_type,
-                    entry_price, stop_price, target_price, quantity,
-                    blocked_by, block_reason, reason_code,
-                    gate_notes_json, decision_snapshot_json, signal_snapshot_json,
-                    source, agent, dedupe_key, trade_event_id
-                ) VALUES (
-                    :symbol, :action, :direction, :profile, :setup_type,
-                    :entry_price, :stop_price, :target_price, :quantity,
-                    :blocked_by, :block_reason, :reason_code,
-                    :gate_notes_json, :decision_snapshot_json, :signal_snapshot_json,
-                    :source, :agent, :dedupe_key, :trade_event_id
-                )
-                """
-            ),
-            {
-                "symbol": symbol,
-                "action": action,
-                "direction": direction,
-                "profile": profile,
-                "setup_type": setup_type,
-                "entry_price": entry_price,
-                "stop_price": stop_price,
-                "target_price": target_price,
-                "quantity": quantity,
-                "blocked_by": blocked_by,
-                "block_reason": block_reason,
-                "reason_code": reason_code,
-                "gate_notes_json": gate_notes_json,
-                "decision_snapshot_json": decision_snapshot_json,
-                "signal_snapshot_json": signal_snapshot_json,
-                "source": source,
-                "agent": agent,
-                "dedupe_key": dedupe_key,
-                "trade_event_id": trade_event_id,
-            },
-        )
+                result = db.execute(text(_insert_sql), _params)
+            else:
+                raise
         db.flush()
         return result.lastrowid
 
@@ -491,6 +510,110 @@ def record_blocked_candidate(
     except Exception as exc:
         log.error(
             "record_blocked_candidate: unexpected error for symbol=%s, blocked_by=%s: %s",
+            symbol,
+            blocked_by,
+            exc,
+        )
+        return None
+
+
+def write_pilot_counterfactual_row(
+    db,
+    *,
+    symbol: str | None,
+    action: str,
+    blocked_by: str,
+    block_reason: str,
+    direction: str | None = None,
+    profile: str | None = None,
+    setup_type: str | None = None,
+    entry_price: float | None = None,
+    stop_price: float | None = None,
+    target_price: float | None = None,
+    quantity: float | None = None,
+    gate_result: dict | None = None,
+    gate_notes: list | None = None,
+    signal_snapshot: dict | str | None = None,
+    agent: str | None = None,
+) -> int | None:
+    """Write a counterfactual shadow ledger row for a pilot override.
+
+    When a gate converts a rejection to `reduce_size` under the pilot,
+    this function records what *would have happened* if the trade had been
+    fully blocked. This enables post-experiment analysis comparing
+    counterfactual outcomes to actual reduced-size trade results.
+
+    The row is written to `blocked_trade_candidates` with
+    `pilot_override_applied: true` and `pilot_trade_link: null` in the
+    `decision_snapshot_json`. The `pilot_trade_link` is filled in later
+    (Task 9.2) when the trade executes.
+
+    Args:
+        db: SQLAlchemy session (caller owns commit).
+        symbol: Trade symbol.
+        action: Trade action (BUY, SHORT, etc.).
+        blocked_by: Gate name that would have blocked the trade.
+        block_reason: Original rejection reason.
+        direction: Trade direction (long/short).
+        profile: PM profile (moderate, aggressive, conservative).
+        setup_type: Setup classification string.
+        entry_price: Entry price of the trade.
+        stop_price: Stop price of the trade.
+        target_price: Target price of the trade.
+        quantity: Original (pre-reduction) quantity.
+        gate_result: Full gate evaluation result dict for context.
+        gate_notes: Gate pipeline notes list.
+        signal_snapshot: Signal data dict for context.
+        agent: Agent name.
+
+    Returns:
+        int: The new row's primary key on successful insert.
+        None: On error or deduplication skip.
+
+    This function is guaranteed not to raise — all exceptions are caught and logged.
+    """
+    try:
+        # Build decision_snapshot with pilot override metadata
+        decision_snapshot = {
+            "pilot_override_applied": True,
+            "pilot_trade_link": None,
+        }
+        if gate_result and isinstance(gate_result, dict):
+            # Include relevant gate result fields for post-experiment analysis
+            decision_snapshot["gate_result_snapshot"] = {
+                k: v for k, v in gate_result.items()
+                if k in (
+                    "decision", "reason_type", "reason", "win_rate", "threshold",
+                    "size_multiplier", "confirming_signals", "near_miss_margin",
+                    "original_rr", "adjusted_rr", "min_reward_to_risk",
+                )
+            }
+
+        # Delegate to the existing record_blocked_candidate function
+        return record_blocked_candidate(
+            db,
+            symbol=symbol,
+            action=action,
+            blocked_by=blocked_by,
+            block_reason=block_reason,
+            direction=direction,
+            profile=profile,
+            setup_type=setup_type,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            quantity=quantity,
+            reason_code="pilot_counterfactual",
+            decision_snapshot=decision_snapshot,
+            signal_snapshot=signal_snapshot,
+            gate_notes=gate_notes,
+            source="pilot_counterfactual",
+            agent=agent,
+        )
+
+    except Exception as exc:
+        log.error(
+            "write_pilot_counterfactual_row: unexpected error for symbol=%s, blocked_by=%s: %s",
             symbol,
             blocked_by,
             exc,

@@ -1,5 +1,6 @@
 from agents.portfolio_manager import (
     _apply_scaffold_geometry_defaults,
+    _validate_symbol,
     normalize_pm_entry_decisions,
 )
 
@@ -35,6 +36,38 @@ def test_decision_type_reject_is_non_order_not_malformed_buy():
     assert len(result.non_orders) == 1
     assert result.non_orders[0].action == "REJECT"
     assert result.non_orders[0].symbol == "AMD"
+
+
+def test_real_ticker_outside_entry_signals_has_specific_reason_code():
+    result = normalize_pm_entry_decisions(
+        [
+            {
+                "action": "BUY",
+                "symbol": "XLU",
+                "quantity": 10,
+                "entry_price": 50.0,
+                "stop": 49.0,
+                "target": 52.0,
+            }
+        ],
+        {"XLK": {}, "XLF": {}},
+    )
+
+    assert result.orders == []
+    assert len(result.rejections) == 1
+    rejection = result.rejections[0]
+    assert rejection.reason_code == "symbol_not_in_entry_signals"
+    assert rejection.details["symbol"] == "XLU"
+    assert rejection.details["allowed_symbols"] == ["XLF", "XLK"]
+
+
+def test_concept_symbol_is_still_unsupported_symbol():
+    valid, canonical, reason, details = _validate_symbol("XLE|XLB", {"XLE": {}})
+
+    assert valid is False
+    assert canonical is None
+    assert reason == "unsupported_symbol"
+    assert details["symbol"] == "XLE|XLB"
 
 
 def test_scaffold_geometry_defaults_fill_missing_candidate_fields():

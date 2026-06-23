@@ -34,7 +34,14 @@ from utils.setup_quality_gate import evaluate_setup_quality, resolve_setup_type
 from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.catalyst_specificity import evaluate_catalyst_specificity
 from utils.stop_authority import apply_stop_update
-from utils.shadow_ledger import record_blocked_candidate
+from utils.shadow_ledger import record_blocked_candidate, write_pilot_counterfactual_row
+from utils.gate_config import PM_PROVENANCE_MODE
+from utils.raw_pm_capture import (
+    capture_raw_pm_response,
+    link_response_to_lineages,
+    persist_raw_response,
+    persist_lineage_links,
+)
 
 log = logging.getLogger(__name__)
 
@@ -244,7 +251,7 @@ def _apply_scaffold_geometry_defaults(
 def _validate_symbol(
     symbol_raw: Any, entry_signals: dict[str, dict]
 ) -> tuple[bool, str | None, str | None, dict | None]:
-    """Validate and normalize symbol against allowed set.
+    """Validate and normalize symbol against this cycle's offered symbols.
 
     Returns (valid, canonical_symbol, reason_code, details).
     """
@@ -265,8 +272,10 @@ def _validate_symbol(
     if canonical is not None:
         return (True, canonical, None, None)
 
-    # Not a member — provide extra detail if it looks like a concept
-    if "/" in stripped or " " in stripped:
+    # Malformed/concept strings are not valid executable ticker symbols.
+    # Keep single ticker-like tokens (e.g. XLU) separate from composites and
+    # prose placeholders (e.g. XLE|XLB, QQQ/SPY, "Specific names or XLI").
+    if not stripped.replace(".", "").replace("-", "").isalnum():
         return (
             False,
             None,
@@ -274,7 +283,20 @@ def _validate_symbol(
             {"symbol": stripped, "note": "appears to be a concept rather than a ticker"},
         )
 
-    return (False, None, "unsupported_symbol", {"symbol": stripped})
+    # A syntactically plausible ticker can still be out-of-scope for this PM
+    # cycle. Keep this distinct from unsupported_symbol: these names may exist,
+    # but they were not in the analyst/scaffold candidate set the PM was allowed
+    # to trade.
+    return (
+        False,
+        None,
+        "symbol_not_in_entry_signals",
+        {
+            "symbol": stripped,
+            "allowed_symbols": sorted(entry_signals.keys()),
+            "note": "symbol was not offered as an entry candidate for this PM cycle",
+        },
+    )
 
 
 def _validate_quantity(quantity_raw: Any) -> tuple[bool, int | None, str | None]:
@@ -2721,17 +2743,60 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
         except (TypeError, ValueError):
             confidence_score = None
 
+    # Extract near-miss pilot confirming signal fields from decision/signal
+    catalyst_type = decision.get("catalyst_type") or (
+        signal.get("catalyst_type") if signal else None
+    )
+    price_above_vwap = decision.get("price_above_vwap")
+    if price_above_vwap is None and signal:
+        price_above_vwap = signal.get("price_above_vwap")
+    volume_ratio = None
+    raw_vr = decision.get("volume_ratio") or (
+        signal.get("volume_ratio") if signal else None
+    )
+    if raw_vr is not None:
+        try:
+            volume_ratio = float(raw_vr)
+        except (TypeError, ValueError):
+            volume_ratio = None
+
     try:
         setup_result = evaluate_setup_quality(
             engine, db, setup_type, market_regime,
             symbol=symbol, profile=profile_id,
             confidence_score=confidence_score,
+            catalyst_type=catalyst_type,
+            price_above_vwap=price_above_vwap,
+            volume_ratio=volume_ratio,
         )
         notes.append({"gate": "setup_quality_gate", **setup_result})
         if setup_result["decision"] == "reject":
             return False, notes, cumulative_multiplier, multiplier_breakdown
         if setup_result.get("size_multiplier") and setup_result["decision"] == "reduce_size":
             sqg_multiplier = setup_result["size_multiplier"]
+            # Write pilot counterfactual row if this is a near-miss pilot override
+            if setup_result.get("reason_type") == "near_miss_pilot_override":
+                try:
+                    write_pilot_counterfactual_row(
+                        db,
+                        symbol=symbol,
+                        action=decision.get("action", ""),
+                        blocked_by="setup_quality_gate",
+                        block_reason="historical_underperformance",
+                        direction=decision.get("direction"),
+                        profile=profile_id,
+                        setup_type=setup_type,
+                        entry_price=decision.get("price") or decision.get("entry_price"),
+                        stop_price=decision.get("stop") or decision.get("stop_price"),
+                        target_price=decision.get("target") or decision.get("target_price"),
+                        quantity=_coerce_quantity(decision.get("quantity", 0), symbol=symbol),
+                        gate_result=setup_result,
+                        gate_notes=notes,
+                        signal_snapshot=signal,
+                        agent=f"pm_{profile_id}",
+                    )
+                except Exception as exc:
+                    log.warning("Failed to write pilot counterfactual row for setup_quality_gate: %s", exc)
             # Update working quantity so downstream gates see reduced size
             original_qty = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
             reduced_qty = max(1, int(original_qty * sqg_multiplier))
@@ -2912,6 +2977,29 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
                     return False, notes, cumulative_multiplier, multiplier_breakdown
 
                 if geometry_result["decision"] == "adjusted_allowed":
+                    # Write pilot counterfactual row if this is a pilot R:R override
+                    if geometry_result.get("pilot_override"):
+                        try:
+                            write_pilot_counterfactual_row(
+                                db,
+                                symbol=symbol,
+                                action=decision.get("action", ""),
+                                blocked_by="risk_geometry_gate",
+                                block_reason="rr_degradation",
+                                direction=decision.get("direction"),
+                                profile=profile_id,
+                                setup_type=setup_type,
+                                entry_price=price,
+                                stop_price=stop,
+                                target_price=target,
+                                quantity=quantity,
+                                gate_result=geometry_result,
+                                gate_notes=notes,
+                                signal_snapshot=signal,
+                                agent=f"pm_{profile_id}",
+                            )
+                        except Exception as exc:
+                            log.warning("Failed to write pilot counterfactual row for risk_geometry_gate: %s", exc)
                     # Propagate adjusted params for downstream use
                     decision["stop"] = geometry_result["stop_price"]
                     decision["stop_loss"] = geometry_result["stop_price"]
@@ -3245,8 +3333,111 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
     _gate_multiplier = 1.0
     _gate_multiplier_breakdown = []
     _gate_decision_id = None  # Correlation ID from recovery-probe gate decisions
+    _pilot_override_info = None  # Pilot override metadata for trade event tagging
+    _candidate_lineage_id = None  # Replay lineage ID propagated to downstream tables
     if action in ("BUY", "SHORT"):
         signal_for_gates = _build_signal_for_symbol(db, symbol, decision)
+
+        # ── Decision Snapshot: persist BEFORE gates (Requirement 3.1, 3.6) ──
+        try:
+            from utils.decision_snapshot import (
+                build_and_persist_snapshot,
+                generate_candidate_lineage_id,
+                SnapshotPersistenceError,
+            )
+
+            _candidate_lineage_id = generate_candidate_lineage_id()
+
+            # Compute account equity for snapshot
+            _snap_positions = db.query(Position).filter_by(profile=profile_id).all()
+            _snap_pos_value = sum(p.quantity * p.avg_cost for p in _snap_positions)
+            _snap_equity = cash + _snap_pos_value
+            _snap_open_positions = [
+                {
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "avg_cost": float(p.avg_cost),
+                    "direction": p.direction if hasattr(p, "direction") else "long",
+                }
+                for p in _snap_positions
+            ]
+
+            # Collect gate config and feature flags for snapshot
+            _snap_gate_config = {}
+            _snap_feature_flags = {}
+            try:
+                from core.replay.policy_version import build_current_policy_version
+                _snap_policy_version = build_current_policy_version()
+                _snap_policy_version_id = f"{_snap_policy_version.gate_revision}:{_snap_policy_version.config_digest[:16]}"
+                _snap_feature_flags = _snap_policy_version.feature_flags
+
+                # Capture gate config values for snapshot
+                from utils import gate_config as _gc
+                _snap_gate_config = {
+                    "min_win_rate_by_setup": _gc.MIN_WIN_RATE_BY_SETUP,
+                    "default_min_win_rate": _gc.DEFAULT_MIN_WIN_RATE,
+                    "stop_distance_rules": getattr(_gc, "STOP_DISTANCE_RULES", {}),
+                    "default_stop_distance_rule": getattr(_gc, "DEFAULT_STOP_DISTANCE_RULE", {}),
+                    "reduced_rr_thresholds_by_profile": getattr(_gc, "REDUCED_RR_THRESHOLDS_BY_PROFILE", {}),
+                    "qualifying_min_signal_strength": getattr(_gc, "QUALIFYING_MIN_SIGNAL_STRENGTH", 0),
+                    "qualifying_setup_types": list(getattr(_gc, "QUALIFYING_SETUP_TYPES", set())),
+                    "override_min_confidence_score": getattr(_gc, "OVERRIDE_MIN_CONFIDENCE_SCORE", 0),
+                }
+            except Exception as _pv_exc:
+                log.debug("Could not build policy version for snapshot: %s", _pv_exc)
+                _snap_policy_version_id = "unknown"
+
+            build_and_persist_snapshot(
+                engine=db.bind,
+                session=db,
+                candidate_lineage_id=_candidate_lineage_id,
+                decision=decision,
+                signal=signal_for_gates,
+                profile_id=profile_id,
+                account_equity=_snap_equity,
+                available_cash=cash,
+                open_positions=_snap_open_positions,
+                gate_config=_snap_gate_config,
+                feature_flags=_snap_feature_flags,
+                policy_version_id=_snap_policy_version_id,
+            )
+        except SnapshotPersistenceError as _snap_err:
+            # Requirement 3.6: If snapshot persistence fails, BLOCK gate evaluation
+            # UNLESS the table simply doesn't exist yet (migration not applied)
+            _err_str = str(_snap_err)
+            if "no such table" in _err_str:
+                # Table doesn't exist — schema not migrated yet. Non-blocking.
+                log.warning(
+                    "Decision snapshot table not available for %s (schema migration pending): %s",
+                    symbol, _snap_err,
+                )
+            else:
+                log.error(
+                    "DECISION SNAPSHOT FAILED for %s — gate evaluation BLOCKED: %s",
+                    symbol, _snap_err,
+                )
+                log_trade_event(
+                    db,
+                    "snapshot_persistence_failed",
+                    agent=f"pm_{profile_id}",
+                    symbol=symbol,
+                    profile=profile_id,
+                    message=f"Decision snapshot persistence failed: {_snap_err}",
+                    payload={"error": str(_snap_err), "candidate_lineage_id": _candidate_lineage_id},
+                )
+                return False, f"Snapshot persistence failed — gate evaluation blocked: {_snap_err}"
+        except Exception as _snap_exc:
+            # Non-fatal: log but allow gate pipeline to proceed
+            # This handles cases where imports fail, table doesn't exist, etc.
+            log.warning(
+                "Decision snapshot creation failed (non-blocking) for %s: %s",
+                symbol, _snap_exc,
+            )
+
+        # Store lineage ID on decision for downstream propagation
+        if _candidate_lineage_id:
+            decision["candidate_lineage_id"] = _candidate_lineage_id
+
         proceed, _gate_notes, _gate_multiplier, _gate_multiplier_breakdown = _run_gate_pipeline(
             db, db.bind, decision, signal_for_gates, profile_id,
         )
@@ -3262,7 +3453,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 profile=profile_id,
                 price=price,
                 message=f"Trade rejected by gate pipeline: {gate_rejection_reasons}",
-                payload={"gate_notes": _gate_notes},
+                payload={"gate_notes": _gate_notes, "candidate_lineage_id": _candidate_lineage_id},
             )
             db.flush()  # ensure trade_event.id is populated for shadow ledger linkage
 
@@ -3309,6 +3500,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 trade_event_id=trade_event.id if trade_event else None,
                 geometry_candidate_id=decision.get("geometry_candidate_id"),
                 geometry_candidate_name=decision.get("geometry_candidate_name"),
+                candidate_lineage_id=_candidate_lineage_id,
             )
 
             log.warning(
@@ -3348,6 +3540,18 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         sqg_note = next((n for n in _gate_notes if n.get("gate") == "setup_quality_gate"), None)
         if sqg_note:
             _gate_decision_id = sqg_note.get("gate_decision_id")
+
+        # Detect pilot override from gate notes for trade event tagging.
+        # If any gate applied a pilot override (near-miss or R:R), propagate
+        # pilot_override: true and pilot_size_multiplier to the entry_filled event.
+        _pilot_override_info = None
+        for _gn in _gate_notes:
+            if _gn.get("pilot_override") is True or _gn.get("reason_type") == "near_miss_pilot_override":
+                _pilot_override_info = {
+                    "pilot_override": True,
+                    "pilot_size_multiplier": _gn.get("size_multiplier", 0.25),
+                }
+                break
 
     # ── Tier-1 pre-validation: similarity → edge score → portfolio risk ──
     # Tracks edge data to store on the Trade record later
@@ -3624,6 +3828,9 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         _entry_filled_payload = {"action": action, "quantity": quantity, "side": "long", "edge": _edge_data}
         if _gate_decision_id is not None:
             _entry_filled_payload["gate_decision_id"] = _gate_decision_id
+        if _pilot_override_info is not None:
+            _entry_filled_payload["pilot_override"] = True
+            _entry_filled_payload["pilot_size_multiplier"] = _pilot_override_info["pilot_size_multiplier"]
         log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
         if stop:
             log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
@@ -3670,6 +3877,9 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         _entry_filled_payload = {"action": action, "quantity": quantity, "side": "short", "edge": _edge_data}
         if _gate_decision_id is not None:
             _entry_filled_payload["gate_decision_id"] = _gate_decision_id
+        if _pilot_override_info is not None:
+            _entry_filled_payload["pilot_override"] = True
+            _entry_filled_payload["pilot_size_multiplier"] = _pilot_override_info["pilot_size_multiplier"]
         log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
         if stop:
             log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
@@ -3758,6 +3968,20 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
 
     db.commit()
     return True, "OK"
+
+
+def _compute_shadow_agreement(candidate_results, legacy_results):
+    """Compute simple agreement summary between candidate and legacy paths."""
+    candidate_symbols = {r["symbol"] for r in candidate_results if r.get("outcome") == "executed"}
+    legacy_symbols = {e.get("symbol") for e in legacy_results if e.get("executed")}
+    common = candidate_symbols & legacy_symbols
+    candidate_only = candidate_symbols - legacy_symbols
+    legacy_only = legacy_symbols - candidate_symbols
+    return json.dumps({
+        "both_executed": sorted(common),
+        "candidate_only": sorted(candidate_only),
+        "legacy_only": sorted(legacy_only),
+    })
 
 
 def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high") -> dict:
@@ -4136,6 +4360,314 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     # Symbols that already have open positions are excluded from new entry consideration.
     held_symbols = {p.symbol for p in db.query(Position).filter_by(profile=profile_id).all()}
 
+    # ── CANDIDATE-ID SELECTION BRANCH ──
+    from utils.gate_config import PM_CANDIDATE_MODE
+
+    def _record_candidate_event(engine, candidate_id, cycle_id, profile_id, event_type, event_data):
+        """Record a single audit event to pm_candidate_events table (Requirement 12)."""
+        from sqlalchemy import text as _sql_text
+        with engine.connect() as conn:
+            conn.execute(
+                _sql_text("""
+                    INSERT INTO pm_candidate_events
+                    (candidate_id, cycle_id, profile_id, event_type, event_data, created_at)
+                    VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at)
+                """),
+                {
+                    "cid": candidate_id,
+                    "cycle_id": cycle_id,
+                    "profile_id": profile_id,
+                    "event_type": event_type,
+                    "event_data": json.dumps(event_data, default=str) if event_data is not None else None,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            )
+            conn.commit()
+
+    if PM_CANDIDATE_MODE in ("enabled", "shadow"):
+        import copy
+        import uuid
+        from utils.candidate_registry import recover_stale_reservations
+        from utils.candidate_builder import build_candidate_set
+        from utils.candidate_prompt_builder import build_candidate_pm_prompt, build_decision_schema
+        from utils.decision_contract import (
+            parse_decision_contract,
+            should_retry_candidate_contract,
+            build_candidate_retry_prompt,
+        )
+        from utils.candidate_pipeline import execute_candidate_pipeline, dry_run_candidate_pipeline
+
+        # Recover any stale reservations from prior cycles/crashes
+        recover_stale_reservations(engine)
+
+        # Generate unique cycle ID
+        cycle_id = f"cycle_{profile_id}_{uuid.uuid4().hex[:12]}"
+
+        # Capture frozen portfolio snapshot for consistent evaluation
+        portfolio_snapshot = copy.deepcopy(portfolio)
+
+        # Build candidate set from eligible signals
+        registry = build_candidate_set(
+            engine, signals, profile_id, profile, portfolio, cycle_id
+        )
+
+        if registry.is_empty and PM_CANDIDATE_MODE == "enabled":
+            notes = "Candidate-ID mode: no eligible candidates for this cycle."
+            stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+            db.close()
+            return {
+                "decisions": executed,
+                "portfolio_notes": stored_notes,
+                "profile": profile_id,
+            }
+
+        if registry.is_empty:
+            log.info(
+                "Candidate-ID shadow mode produced no eligible candidates for "
+                "profile=%s; continuing with legacy entry path",
+                profile_id,
+            )
+
+        if not registry.is_empty:
+            # Build PM prompt with candidate summaries
+            candidate_summaries = registry.get_offered_summary()
+
+            # Record offered candidates for audit (Requirement 12.1)
+            for summary in candidate_summaries:
+                _record_candidate_event(
+                    engine, summary["candidate_id"], cycle_id, profile_id,
+                    "offered",
+                    {"symbol": summary["symbol"], "direction": summary["direction"], "risk_reward": summary.get("risk_reward")},
+                )
+
+            pm_prompt = build_candidate_pm_prompt(
+                candidate_summaries, portfolio_snapshot, profile, profile_id
+            )
+
+            # Build dynamic schema for structured output
+            schema = build_decision_schema(registry.get_registered_ids())
+
+            # Call LLM with candidate prompt
+            candidate_system_prompt = f"You are the {profile['name']} Portfolio Manager. {profile['personality']}"
+            raw = call_llm(
+                candidate_system_prompt,
+                pm_prompt,
+                json_mode=True,
+                tier=tier,
+                purpose=f"pm_candidate_entry:{profile_id}",
+            )
+            raw_response = parse_json_response(raw)
+
+            # Capture the raw candidate-mode response before contract parsing.
+            _prov_attempt_ordinal = 1
+            _prov_raw_response_obj = None
+            if PM_PROVENANCE_MODE != "disabled":
+                try:
+                    _prov_model_id = f"{os.getenv('LLM_PROVIDER', 'unknown')}:{tier}"
+                    _prov_candidate_ids = registry.get_registered_ids()
+                    _prov_raw_response_obj = capture_raw_pm_response(
+                        pm_cycle_id=cycle_id,
+                        profile=profile_id,
+                        model_id=_prov_model_id,
+                        prompt_version_id=f"candidate_entry:{profile_id}",
+                        candidate_ids_supplied=_prov_candidate_ids,
+                        raw_payload=raw,
+                        parse_status="parse_not_attempted",
+                        attempt_ordinal=_prov_attempt_ordinal,
+                    )
+                    persist_raw_response(engine, _prov_raw_response_obj)
+                except Exception as _prov_exc:
+                    log.error(
+                        "Provenance raw capture failed (candidate-ID attempt %d): %s",
+                        _prov_attempt_ordinal,
+                        _prov_exc,
+                    )
+
+            # Parse decision contract
+            candidate_metadata = registry.get_candidate_metadata()
+            parse_result = parse_decision_contract(
+                raw_response, registry.get_registered_ids(), candidate_metadata
+            )
+
+            # Handle contract retry (at most once)
+            if should_retry_candidate_contract(parse_result):
+                _prov_attempt_ordinal = 2
+                retry_prompt = build_candidate_retry_prompt(parse_result, registry)
+                raw_retry = call_llm(
+                    candidate_system_prompt,
+                    retry_prompt,
+                    json_mode=True,
+                    tier=tier,
+                    purpose=f"pm_candidate_retry:{profile_id}",
+                )
+
+                if PM_PROVENANCE_MODE != "disabled":
+                    try:
+                        _prov_raw_response_obj = capture_raw_pm_response(
+                            pm_cycle_id=cycle_id,
+                            profile=profile_id,
+                            model_id=_prov_model_id,
+                            prompt_version_id=f"candidate_retry:{profile_id}",
+                            candidate_ids_supplied=_prov_candidate_ids,
+                            raw_payload=raw_retry,
+                            parse_status="parse_not_attempted",
+                            attempt_ordinal=_prov_attempt_ordinal,
+                        )
+                        persist_raw_response(engine, _prov_raw_response_obj)
+                    except Exception as _prov_exc:
+                        log.error(
+                            "Provenance raw capture failed (candidate-ID attempt %d): %s",
+                            _prov_attempt_ordinal,
+                            _prov_exc,
+                        )
+
+                raw_response = parse_json_response(raw_retry)
+                parse_result = parse_decision_contract(
+                    raw_response, registry.get_registered_ids(), candidate_metadata
+                )
+
+            # Record PM decisions for audit (Requirements 12.2, 12.4)
+            if PM_PROVENANCE_MODE != "disabled" and _prov_raw_response_obj is not None:
+                try:
+                    _prov_all_lineage_ids = (
+                        [d.candidate_id for d in parse_result.accepted]
+                        + [d.candidate_id for d in parse_result.rejected]
+                    )
+                    if _prov_all_lineage_ids:
+                        _prov_links = link_response_to_lineages(
+                            response_id=_prov_raw_response_obj.response_id,
+                            lineage_ids=_prov_all_lineage_ids,
+                            candidate_ids=_prov_all_lineage_ids,
+                        )
+                        persist_lineage_links(engine, _prov_links)
+                except Exception as _prov_exc:
+                    log.error(
+                        "Provenance lineage linking failed (candidate-ID mode, cycle=%s): %s",
+                        cycle_id,
+                        _prov_exc,
+                    )
+
+            for decision in parse_result.accepted:
+                _record_candidate_event(
+                    engine, decision.candidate_id, cycle_id, profile_id,
+                    "pm_accept",
+                    {"rationale": decision.rationale, "risk_multiplier": decision.risk_multiplier},
+                )
+            for decision in parse_result.rejected:
+                _record_candidate_event(
+                    engine, decision.candidate_id, cycle_id, profile_id,
+                    "pm_reject",
+                    {"rationale": decision.rationale},
+                )
+            for ns_id in parse_result.not_selected_ids:
+                _record_candidate_event(
+                    engine, ns_id, cycle_id, profile_id,
+                    "pm_not_selected",
+                    None,
+                )
+
+            # Record PM rejection decisions
+            if PM_CANDIDATE_MODE == "enabled":
+                for decision in parse_result.rejected:
+                    registry.mark_rejected(decision.candidate_id, decision.rationale)
+
+                # Execute each accepted candidate through the pipeline
+                for decision in parse_result.accepted:
+                    pipeline_result = execute_candidate_pipeline(
+                        db, engine, registry, decision,
+                        portfolio_snapshot, profile, profile_id,
+                        recovery_multiplier=1.0,
+                    )
+
+                    # Record pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
+                    _record_candidate_event(
+                        engine, pipeline_result.candidate_id, cycle_id, profile_id,
+                        f"pipeline_{pipeline_result.outcome}",
+                        {
+                            "outcome": pipeline_result.outcome,
+                            "sizing": {
+                                "quantity": pipeline_result.sizing_result.quantity,
+                                "dollar_risk": pipeline_result.sizing_result.dollar_risk,
+                            } if pipeline_result.sizing_result else None,
+                            "gate_notes": pipeline_result.gate_notes,
+                            "error": pipeline_result.error,
+                        },
+                    )
+
+                    executed.append({
+                        "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else "unknown",
+                        "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else "unknown",
+                        "executed": pipeline_result.outcome == "executed",
+                        "outcome": pipeline_result.outcome,
+                        "profile": profile_id,
+                        "source": "candidate_pipeline",
+                        "candidate_id": pipeline_result.candidate_id,
+                    })
+            else:
+                # Shadow mode: dry-run candidate path, record hypothetical results
+                from utils.trade_events import log_trade_event
+                candidate_results = []
+                for decision in parse_result.accepted:
+                    pipeline_result = dry_run_candidate_pipeline(
+                        db, engine, registry, decision,
+                        portfolio_snapshot, profile, profile_id,
+                        recovery_multiplier=1.0,
+                    )
+
+                    # Record shadow pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
+                    _record_candidate_event(
+                        engine, pipeline_result.candidate_id, cycle_id, profile_id,
+                        f"shadow_pipeline_{pipeline_result.outcome}",
+                        {
+                            "outcome": pipeline_result.outcome,
+                            "sizing": {
+                                "quantity": pipeline_result.sizing_result.quantity,
+                                "dollar_risk": pipeline_result.sizing_result.dollar_risk,
+                            } if pipeline_result.sizing_result else None,
+                            "gate_notes": pipeline_result.gate_notes,
+                            "error": pipeline_result.error,
+                        },
+                    )
+
+                    candidate_results.append({
+                        "candidate_id": pipeline_result.candidate_id,
+                        "outcome": pipeline_result.outcome,
+                        "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else None,
+                        "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else None,
+                        "quantity": pipeline_result.sizing_result.quantity if pipeline_result.sizing_result else None,
+                    })
+
+                # Record hypothetical PM rejections as events (no state mutation)
+                for decision in parse_result.rejected:
+                    log_trade_event(
+                        db,
+                        "pm_reject_hypothetical",
+                        agent=f"pm_{profile_id}",
+                        symbol="candidate_pipeline",
+                        profile=profile_id,
+                        message=f"Shadow mode: PM rejected candidate {decision.candidate_id}: {decision.rationale}",
+                        payload={"candidate_id": decision.candidate_id, "rationale": decision.rationale},
+                    )
+
+                # Store candidate results for shadow comparison after legacy executes
+                _shadow_candidate_results = candidate_results
+                _shadow_parse_result = parse_result
+
+            # Finalize cycle (assign terminal states to remaining candidates)
+            registry.finalize_cycle()
+
+            # In shadow mode, fall through to legacy entry path below
+            if PM_CANDIDATE_MODE == "enabled":
+                notes = f"Candidate-ID mode: processed {len(parse_result.accepted)} accepts, {len(parse_result.rejected)} rejects."
+                stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+                db.close()
+                return {
+                    "decisions": executed,
+                    "portfolio_notes": stored_notes,
+                    "profile": profile_id,
+                }
+            # If shadow mode, continue to legacy path below...
+
     # Build profile-specific system prompt for entry decisions
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         profile_name=profile["name"],
@@ -4390,6 +4922,34 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
             scaffold_results,
         )
 
+    # Capture the raw legacy-mode response before normalization.
+    _prov_legacy_attempt = 1
+    _prov_legacy_cycle_id = None
+    _prov_legacy_raw_resp = None
+    _prov_legacy_model_id = f"{os.getenv('LLM_PROVIDER', 'unknown')}:{tier}"
+    if PM_PROVENANCE_MODE != "disabled":
+        try:
+            import uuid as _uuid_mod
+
+            _prov_legacy_cycle_id = f"cycle_{profile_id}_{_uuid_mod.uuid4().hex[:12]}"
+            _prov_legacy_raw_resp = capture_raw_pm_response(
+                pm_cycle_id=_prov_legacy_cycle_id,
+                profile=profile_id,
+                model_id=_prov_legacy_model_id,
+                prompt_version_id=f"pm_entry:{profile_id}",
+                candidate_ids_supplied=[],
+                raw_payload=raw,
+                parse_status="parse_not_attempted",
+                attempt_ordinal=_prov_legacy_attempt,
+            )
+            persist_raw_response(engine, _prov_legacy_raw_resp)
+        except Exception as _prov_exc:
+            log.error(
+                "Provenance raw capture failed (legacy attempt %d): %s",
+                _prov_legacy_attempt,
+                _prov_exc,
+            )
+
     # ── Entry Normalizer (before behavioral params) ──
     from utils.behavioral_params import apply_params_to_decision
 
@@ -4431,6 +4991,25 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
                 json_mode=True, tier=tier,
                 purpose=f"pm_contract_retry:{profile_id}",
             )
+
+            # ── Provenance: capture retry raw response (legacy mode, attempt 2) ──
+            _prov_legacy_attempt = 2
+            if PM_PROVENANCE_MODE != "disabled" and _prov_legacy_cycle_id is not None:
+                try:
+                    _prov_legacy_raw_resp = capture_raw_pm_response(
+                        pm_cycle_id=_prov_legacy_cycle_id,
+                        profile=profile_id,
+                        model_id=_prov_legacy_model_id,
+                        prompt_version_id=f"pm_contract_retry:{profile_id}",
+                        candidate_ids_supplied=[],
+                        raw_payload=retry_raw,
+                        parse_status="parse_not_attempted",
+                        attempt_ordinal=_prov_legacy_attempt,
+                    )
+                    persist_raw_response(engine, _prov_legacy_raw_resp)
+                except Exception as _prov_exc:
+                    log.error("Provenance raw capture failed (legacy attempt %d): %s", _prov_legacy_attempt, _prov_exc)
+
             retry_result = parse_json_response(retry_raw)
             retry_decisions = retry_result.get("decisions", [])
             retry_norm_result = normalize_pm_entry_decisions(
@@ -4531,6 +5110,32 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
 
     for rejection in corrected_rejections:
         _log_pm_decision_corrected(db, rejection, profile_id)
+
+    # ── Provenance: generate lineage IDs and link to response (legacy mode) ──
+    # In legacy mode, generate UUID4 per parsed decision (not before parsing).
+    if PM_PROVENANCE_MODE != "disabled" and _prov_legacy_raw_resp is not None and final_orders:
+        try:
+            import uuid as _uuid_mod
+            _prov_legacy_lineage_ids = []
+            for norm_order in final_orders:
+                lineage_id = str(_uuid_mod.uuid4())
+                # Attach lineage_id to the order for downstream stages to reference
+                if norm_order.order is not None:
+                    norm_order.order["_lineage_id"] = lineage_id
+                _prov_legacy_lineage_ids.append(lineage_id)
+
+            if _prov_legacy_lineage_ids:
+                _prov_links = link_response_to_lineages(
+                    response_id=_prov_legacy_raw_resp.response_id,
+                    lineage_ids=_prov_legacy_lineage_ids,
+                    candidate_ids=[None] * len(_prov_legacy_lineage_ids),  # no candidate IDs in legacy mode
+                )
+                persist_lineage_links(engine, _prov_links)
+        except Exception as _prov_exc:
+            log.error(
+                "Provenance lineage linking failed (legacy mode, cycle=%s): %s",
+                _prov_legacy_cycle_id, _prov_exc,
+            )
 
     # Execute entry decisions — only final_orders proceed
     for norm_order in final_orders:
@@ -4776,6 +5381,39 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
         stored_notes = _store_pm_cycle_note(db, profile_id, stored_notes)
     else:
         stored_notes = notes
+
+    # ── Shadow comparison recording (if shadow mode was active) ──
+    if PM_CANDIDATE_MODE == "shadow" and '_shadow_candidate_results' in locals():
+        try:
+            from sqlalchemy import text as _text
+            comparison_data = {
+                "candidate_results_json": json.dumps(_shadow_candidate_results, default=str),
+                "legacy_results_json": json.dumps(executed, default=str),
+                "agreement_summary": _compute_shadow_agreement(
+                    _shadow_candidate_results, executed
+                ),
+                "malformed_count": len(_shadow_parse_result.violations) if _shadow_parse_result else 0,
+                "hypothetical_diffs": json.dumps({
+                    "candidate_accepts": len(_shadow_parse_result.accepted) if _shadow_parse_result else 0,
+                    "candidate_rejects": len(_shadow_parse_result.rejected) if _shadow_parse_result else 0,
+                    "legacy_executed": len([e for e in executed if e.get("executed")]),
+                }, default=str),
+            }
+            with engine.connect() as conn:
+                conn.execute(
+                    _text("""
+                        INSERT INTO candidate_shadow_comparison
+                        (cycle_id, profile_id, candidate_results_json, legacy_results_json,
+                         agreement_summary, malformed_count, hypothetical_diffs)
+                        VALUES (:cycle_id, :profile_id, :candidate_results_json,
+                                :legacy_results_json, :agreement_summary,
+                                :malformed_count, :hypothetical_diffs)
+                    """),
+                    {"cycle_id": cycle_id, "profile_id": profile_id, **comparison_data},
+                )
+                conn.commit()
+        except Exception as exc:
+            log.warning("Failed to record shadow comparison: %s", exc)
 
     db.close()
     return {"decisions": executed, "portfolio_notes": stored_notes, "profile": profile_id}
