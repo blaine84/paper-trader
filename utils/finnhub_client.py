@@ -9,6 +9,7 @@ import time
 import logging
 import threading
 import finnhub
+import requests
 from datetime import datetime, timedelta
 
 log = logging.getLogger(__name__)
@@ -71,17 +72,22 @@ class FinnhubClient:
         OHLCV candles.
         resolution: 1, 5, 15, 30, 60, D, W, M
 
-        For sub-daily resolutions (1, 5, 15, 30, 60): yfinance first, Finnhub fallback.
+        For sub-daily resolutions (1, 5, 15, 30, 60): Alpaca first, yfinance fallback, Finnhub fallback.
         For daily+ resolutions (D, W, M): Finnhub first, yfinance fallback (unchanged).
 
         Returns dict with keys: symbol, resolution, timestamps, open, high, low, close, volume, source.
-        The 'source' field is "yfinance" or "finnhub" indicating which provider supplied the data.
+        The 'source' field identifies which provider supplied the data.
         Returns empty dict {} when both sources fail.
         """
         SUB_DAILY = {"1", "5", "15", "30", "60"}
 
         if resolution in SUB_DAILY:
-            # yfinance primary for intraday
+            # Alpaca primary for intraday aggregate bars.
+            result = self._get_candles_alpaca(symbol, resolution, days)
+            if result:
+                result["source"] = "alpaca"
+                return result
+            # yfinance fallback for intraday
             result = self._get_candles_yfinance(symbol, resolution, days)
             if result:
                 result["source"] = "yfinance"
@@ -102,6 +108,90 @@ class FinnhubClient:
             if result:
                 result["source"] = "yfinance"
                 return result
+            return {}
+
+    def _get_candles_alpaca(self, symbol: str, resolution: str, days: int) -> dict:
+        """Alpaca Market Data candle fetch for intraday aggregate bars."""
+        api_key = os.getenv("ALPACA_API_KEY")
+        secret_key = os.getenv("ALPACA_SECRET_KEY")
+        if not api_key or not secret_key:
+            return {}
+
+        timeframe_map = {
+            "1": "1Min",
+            "5": "5Min",
+            "15": "15Min",
+            "30": "30Min",
+            "60": "1Hour",
+        }
+        timeframe = timeframe_map.get(resolution)
+        if not timeframe:
+            return {}
+
+        end = datetime.utcnow()
+        start = end - timedelta(days=days)
+        base_url = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
+        params = {
+            "symbols": symbol,
+            "timeframe": timeframe,
+            "start": start.replace(microsecond=0).isoformat() + "Z",
+            "end": end.replace(microsecond=0).isoformat() + "Z",
+            "limit": 10000,
+            "adjustment": os.getenv("ALPACA_ADJUSTMENT", "raw"),
+            "feed": os.getenv("ALPACA_DATA_FEED", "iex"),
+            "sort": "asc",
+        }
+        headers = {
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+        }
+
+        try:
+            resp = requests.get(
+                f"{base_url}/v2/stocks/bars",
+                params=params,
+                headers=headers,
+                timeout=float(os.getenv("ALPACA_TIMEOUT_SECONDS", "10")),
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            bars = (payload.get("bars") or {}).get(symbol) or []
+            if not bars:
+                return {}
+
+            timestamps = []
+            opens = []
+            highs = []
+            lows = []
+            closes = []
+            volumes = []
+            for bar in bars:
+                ts_raw = bar.get("t")
+                if not ts_raw:
+                    continue
+                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                timestamps.append(int(ts.timestamp()))
+                opens.append(bar.get("o"))
+                highs.append(bar.get("h"))
+                lows.append(bar.get("l"))
+                closes.append(bar.get("c"))
+                volumes.append(bar.get("v", 0))
+
+            if not timestamps:
+                return {}
+
+            return {
+                "symbol": symbol,
+                "resolution": resolution,
+                "timestamps": timestamps,
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": volumes,
+            }
+        except Exception as e:
+            log.warning(f"Alpaca candle fetch failed for {symbol}: {e}")
             return {}
 
     def _get_candles_finnhub(self, symbol: str, resolution: str, days: int) -> dict:
