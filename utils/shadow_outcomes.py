@@ -324,6 +324,38 @@ def _fetch_yfinance_candles(symbol: str, start: datetime, end: datetime) -> list
         return []
 
 
+def _fetch_provider_candles(symbol: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    """Fetch one-minute candles through the shared market-data provider ladder."""
+    try:
+        from utils.finnhub_client import FinnhubClient
+
+        now_utc = datetime.now(timezone.utc)
+        days = max(1, int((now_utc - start.astimezone(timezone.utc)).total_seconds() // 86400) + 2)
+        data = FinnhubClient().get_candles(symbol, resolution="1", days=days)
+        if not data:
+            return []
+
+        records: list[dict[str, Any]] = []
+        for ts, high, low, close in zip(
+            data.get("timestamps", []),
+            data.get("high", []),
+            data.get("low", []),
+            data.get("close", []),
+        ):
+            candle_ts = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            if start.astimezone(timezone.utc) <= candle_ts <= end.astimezone(timezone.utc) + timedelta(minutes=2):
+                records.append({
+                    "timestamp": candle_ts,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                })
+        return _as_candles(records)
+    except Exception as exc:
+        log.warning("Shadow outcome: provider candles failed for %s: %s", symbol, exc)
+        return []
+
+
 def score_blocked_candidate(
     candidate: dict[str, Any],
     *,
@@ -588,7 +620,7 @@ def update_blocked_candidate_outcomes(
     *,
     now: datetime | None = None,
     max_rows: int = 50,
-    candle_fetcher=_fetch_yfinance_candles,
+    candle_fetcher=_fetch_provider_candles,
 ) -> dict[str, int]:
     """Score due blocked candidates and insert companion outcome rows."""
     now_utc = now or datetime.now(timezone.utc)
