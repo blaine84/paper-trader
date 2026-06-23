@@ -172,8 +172,16 @@ def _call_ollama_finance(system_prompt: str, user_prompt: str, model: str = None
     caller can log the real model that served the response.
     """
     timeout = int(os.getenv("OLLAMA_FINANCE_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", 600)))
+    num_ctx = int(os.getenv("OLLAMA_FINANCE_NUM_CTX", os.getenv("OLLAMA_NUM_CTX", 8192)))
     try:
-        result = _call_ollama(system_prompt, user_prompt, model, purpose=purpose, timeout=timeout)
+        result = _call_ollama(
+            system_prompt,
+            user_prompt,
+            model,
+            purpose=purpose,
+            timeout=timeout,
+            num_ctx=num_ctx,
+        )
         return (result, "ollama", model)
     except Exception as e:
         med_model = os.getenv("LLM_MED_MODEL", os.getenv("LLM_LOW_MODEL", None))
@@ -185,11 +193,19 @@ def _call_ollama_finance(system_prompt: str, user_prompt: str, model: str = None
         return (result, "ollama", med_model)
 
 
-def _call_ollama(system_prompt: str, user_prompt: str, model: str = None, purpose: str = "unlabeled", timeout: int = None) -> str:
+def _call_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = None,
+    purpose: str = "unlabeled",
+    timeout: int = None,
+    num_ctx: int = None,
+) -> str:
     import requests
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
     timeout = timeout or int(os.getenv("OLLAMA_TIMEOUT", 600))
+    num_ctx = num_ctx or int(os.getenv("OLLAMA_NUM_CTX", 8192))
 
     json_instruction = "\n\nYou MUST respond with valid JSON only. No markdown, no explanation, no preamble."
     system_content = system_prompt + json_instruction
@@ -209,15 +225,20 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None, purpos
         ],
         "stream": False,
         "format": "json",
+        "options": {
+            "num_ctx": num_ctx,
+            "temperature": 0.2,
+        },
     }
 
     log.info(
-        "Ollama request starting: purpose=%s model=%s base_url=%s timeout=%ss prompt_chars=%s "
+        "Ollama request starting: purpose=%s model=%s base_url=%s timeout=%ss num_ctx=%s prompt_chars=%s "
         "system_chars=%s user_chars=%s approx_tokens=%s",
         purpose,
         model,
         base_url,
         timeout,
+        num_ctx,
         total_chars,
         system_chars,
         user_chars,
@@ -253,15 +274,19 @@ def _call_ollama(system_prompt: str, user_prompt: str, model: str = None, purpos
         elapsed = time.monotonic() - started
         fallback_model = os.getenv("OLLAMA_FALLBACK_MODEL", "claude-haiku-4-5")
         fallback_provider = os.getenv("OLLAMA_FALLBACK_PROVIDER", "anthropic")
+        response_text = getattr(getattr(e, "response", None), "text", "")
         log.warning(
-            "Ollama failed after %.1fs: purpose=%s model=%s prompt_chars=%s approx_tokens=%s error=%s; "
+            "Ollama failed after %.1fs: purpose=%s model=%s num_ctx=%s prompt_chars=%s approx_tokens=%s "
+            "error=%s response=%s; "
             "falling back to %s/%s",
             elapsed,
             purpose,
             model,
+            num_ctx,
             total_chars,
             approx_tokens,
             e,
+            response_text[:500],
             fallback_provider,
             fallback_model,
         )
