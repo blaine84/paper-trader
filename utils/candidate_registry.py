@@ -22,6 +22,8 @@ from typing import Any
 
 from sqlalchemy import text
 
+from utils.db_retry import with_lock_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -123,53 +125,9 @@ class CandidateRegistry:
         Fails closed if INSERT fails (raises CandidateRegistryError).
         """
         try:
-            with self._db.connect() as conn:
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO pm_candidates (
-                            candidate_id, cycle_id, profile_id, symbol, direction,
-                            setup_type, geometry_name, entry_price, stop_price,
-                            target_price, risk_reward, trigger, invalidation_basis,
-                            target_basis, source_signal_id, signal_snapshot_json,
-                            state, integrity_hash, created_at, expires_at,
-                            context_snapshot_json, benchmark_mapping_json
-                        ) VALUES (
-                            :candidate_id, :cycle_id, :profile_id, :symbol, :direction,
-                            :setup_type, :geometry_name, :entry_price, :stop_price,
-                            :target_price, :risk_reward, :trigger, :invalidation_basis,
-                            :target_basis, :source_signal_id, :signal_snapshot_json,
-                            :state, :integrity_hash, :created_at, :expires_at,
-                            :context_snapshot_json, :benchmark_mapping_json
-                        )
-                        """
-                    ),
-                    {
-                        "candidate_id": candidate.candidate_id,
-                        "cycle_id": candidate.cycle_id,
-                        "profile_id": candidate.profile_id,
-                        "symbol": candidate.symbol,
-                        "direction": candidate.direction,
-                        "setup_type": candidate.setup_type,
-                        "geometry_name": candidate.geometry_name,
-                        "entry_price": candidate.entry_price,
-                        "stop_price": candidate.stop_price,
-                        "target_price": candidate.target_price,
-                        "risk_reward": candidate.risk_reward,
-                        "trigger": candidate.trigger,
-                        "invalidation_basis": candidate.invalidation_basis,
-                        "target_basis": candidate.target_basis,
-                        "source_signal_id": candidate.source_signal_id,
-                        "signal_snapshot_json": candidate.signal_snapshot_json,
-                        "state": CandidateState.REGISTERED.value,
-                        "integrity_hash": candidate.integrity_hash,
-                        "created_at": candidate.created_at.isoformat(),
-                        "expires_at": candidate.expires_at.isoformat(),
-                        "context_snapshot_json": candidate.context_snapshot_json,
-                        "benchmark_mapping_json": candidate.benchmark_mapping_json,
-                    },
-                )
-                conn.commit()
+            self._execute_register_write(candidate)
+        except CandidateRegistryError:
+            raise
         except Exception as e:
             logger.error(
                 "Failed to register candidate %s: %s",
@@ -179,6 +137,57 @@ class CandidateRegistry:
             raise CandidateRegistryError(
                 f"Failed to register candidate {candidate.candidate_id}: {e}"
             ) from e
+
+    @with_lock_retry
+    def _execute_register_write(self, candidate: CandidateRecord) -> None:
+        """Execute the DB INSERT for candidate registration. Retried on lock contention."""
+        with self._db.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO pm_candidates (
+                        candidate_id, cycle_id, profile_id, symbol, direction,
+                        setup_type, geometry_name, entry_price, stop_price,
+                        target_price, risk_reward, trigger, invalidation_basis,
+                        target_basis, source_signal_id, signal_snapshot_json,
+                        state, integrity_hash, created_at, expires_at,
+                        context_snapshot_json, benchmark_mapping_json
+                    ) VALUES (
+                        :candidate_id, :cycle_id, :profile_id, :symbol, :direction,
+                        :setup_type, :geometry_name, :entry_price, :stop_price,
+                        :target_price, :risk_reward, :trigger, :invalidation_basis,
+                        :target_basis, :source_signal_id, :signal_snapshot_json,
+                        :state, :integrity_hash, :created_at, :expires_at,
+                        :context_snapshot_json, :benchmark_mapping_json
+                    )
+                    """
+                ),
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "cycle_id": candidate.cycle_id,
+                    "profile_id": candidate.profile_id,
+                    "symbol": candidate.symbol,
+                    "direction": candidate.direction,
+                    "setup_type": candidate.setup_type,
+                    "geometry_name": candidate.geometry_name,
+                    "entry_price": candidate.entry_price,
+                    "stop_price": candidate.stop_price,
+                    "target_price": candidate.target_price,
+                    "risk_reward": candidate.risk_reward,
+                    "trigger": candidate.trigger,
+                    "invalidation_basis": candidate.invalidation_basis,
+                    "target_basis": candidate.target_basis,
+                    "source_signal_id": candidate.source_signal_id,
+                    "signal_snapshot_json": candidate.signal_snapshot_json,
+                    "state": CandidateState.REGISTERED.value,
+                    "integrity_hash": candidate.integrity_hash,
+                    "created_at": candidate.created_at.isoformat(),
+                    "expires_at": candidate.expires_at.isoformat(),
+                    "context_snapshot_json": candidate.context_snapshot_json,
+                    "benchmark_mapping_json": candidate.benchmark_mapping_json,
+                },
+            )
+            conn.commit()
 
     def reserve(
         self, candidate_id: str, execution_key: str
@@ -586,48 +595,17 @@ class CandidateRegistry:
     ) -> None:
         """Execute a CAS state transition. Fails closed if rowcount != 1."""
         try:
-            with self._db.connect() as conn:
-                params: dict[str, Any] = {
-                    "new_state": to_state.value,
-                    "candidate_id": candidate_id,
-                    "expected_state": from_state.value,
-                }
-
-                if rejection_reason is not None:
-                    result = conn.execute(
-                        text(
-                            """
-                            UPDATE pm_candidates
-                            SET state = :new_state,
-                                rejection_reason = :rejection_reason
-                            WHERE candidate_id = :candidate_id
-                              AND state = :expected_state
-                            """
-                        ),
-                        {**params, "rejection_reason": rejection_reason},
-                    )
-                else:
-                    result = conn.execute(
-                        text(
-                            """
-                            UPDATE pm_candidates
-                            SET state = :new_state
-                            WHERE candidate_id = :candidate_id
-                              AND state = :expected_state
-                            """
-                        ),
-                        params,
-                    )
-                conn.commit()
-
-                if result.rowcount != 1:
-                    msg = (
-                        f"CAS transition failed for candidate {candidate_id}: "
-                        f"{from_state.value} → {to_state.value}, "
-                        f"rowcount={result.rowcount}"
-                    )
-                    logger.error(msg)
-                    raise CandidateRegistryError(msg)
+            rowcount = self._execute_state_write(
+                candidate_id, from_state, to_state, rejection_reason
+            )
+            if rowcount != 1:
+                msg = (
+                    f"CAS transition failed for candidate {candidate_id}: "
+                    f"{from_state.value} → {to_state.value}, "
+                    f"rowcount={rowcount}"
+                )
+                logger.error(msg)
+                raise CandidateRegistryError(msg)
         except CandidateRegistryError:
             raise
         except Exception as e:
@@ -637,6 +615,53 @@ class CandidateRegistry:
             )
             logger.error(msg)
             raise CandidateRegistryError(msg) from e
+
+    @with_lock_retry
+    def _execute_state_write(
+        self,
+        candidate_id: str,
+        from_state: CandidateState,
+        to_state: CandidateState,
+        rejection_reason: str | None,
+    ) -> int:
+        """Execute the DB write for a state transition. Retried on lock contention.
+
+        Returns rowcount so the caller can verify CAS success.
+        """
+        with self._db.connect() as conn:
+            params: dict[str, Any] = {
+                "new_state": to_state.value,
+                "candidate_id": candidate_id,
+                "expected_state": from_state.value,
+            }
+
+            if rejection_reason is not None:
+                result = conn.execute(
+                    text(
+                        """
+                        UPDATE pm_candidates
+                        SET state = :new_state,
+                            rejection_reason = :rejection_reason
+                        WHERE candidate_id = :candidate_id
+                          AND state = :expected_state
+                        """
+                    ),
+                    {**params, "rejection_reason": rejection_reason},
+                )
+            else:
+                result = conn.execute(
+                    text(
+                        """
+                        UPDATE pm_candidates
+                        SET state = :new_state
+                        WHERE candidate_id = :candidate_id
+                          AND state = :expected_state
+                        """
+                    ),
+                    params,
+                )
+            conn.commit()
+            return result.rowcount
 
 
 def _parse_datetime(value: Any) -> datetime:

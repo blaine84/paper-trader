@@ -22,6 +22,7 @@ from utils.position_sizer import SizingResult, calculate_position_size
 
 if TYPE_CHECKING:
     from typing import Any
+    from utils.checkpoint_logger import CheckpointLogger
     from utils.provenance_capture import ProvenanceChain
 
 logger = logging.getLogger(__name__)
@@ -683,6 +684,8 @@ def execute_candidate_pipeline(
     *,
     recovery_multiplier: float = 1.0,
     provenance_chain: ProvenanceChain | None = None,
+    parse_violations: list[dict] | None = None,
+    checkpoint_logger: 'CheckpointLogger | None' = None,
 ) -> PipelineResult:
     """Authoritative single-pass execution pipeline.
 
@@ -696,6 +699,79 @@ def execute_candidate_pipeline(
     Returns PipelineResult with outcome and all intermediate data.
     """
     candidate_id = decision.candidate_id
+
+    # ── Step 0: ADJUSTMENT DEFERRAL ──
+    # Valid "adjust" decisions are logged and rejected — adjustment execution
+    # is deferred to a follow-up phase (Requirements 5.1, 5.3).
+    if decision.decision == "adjust":
+        adj_type = None
+        if isinstance(decision.adjustment_request, dict):
+            adj_type = decision.adjustment_request.get("type")
+        logger.info(
+            "Adjustment request deferred for candidate %s: type=%s, "
+            "reason=adjustment_not_yet_enabled",
+            candidate_id,
+            adj_type,
+        )
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("pm_accepted_and_gate_rejected", CheckpointEvent(
+                    stage="pm_candidate_rejected",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    decision="rejected",
+                    reason_code="adjustment_deferred",
+                    metadata={"adjustment_type": adj_type},
+                ))
+            except Exception:
+                logger.error(
+                    "Checkpoint emission failed at adjustment_deferred for %s",
+                    candidate_id,
+                    exc_info=True,
+                )
+        return PipelineResult(
+            candidate_id=candidate_id,
+            outcome="adjustment_deferred",
+            error="adjustment_not_yet_enabled",
+        )
+
+    # ── Step 0b: CONTRACT VIOLATION CHECK ──
+    # If upstream parsing detected prohibited fields for this candidate,
+    # reject immediately (Requirements 1.3, 3.3).
+    if parse_violations:
+        matching = [
+            v for v in parse_violations
+            if v.get("type") == "PROHIBITED_FIELD"
+            and v.get("candidate_id") == candidate_id
+        ]
+        if matching:
+            fields = [v.get("field") for v in matching]
+            error_msg = f"Contract violation: prohibited fields {fields}"
+            logger.warning(
+                "Pipeline rejected %s: contract violation, prohibited fields=%s",
+                candidate_id,
+                fields,
+            )
+            if checkpoint_logger is not None:
+                try:
+                    from utils.checkpoint_logger import CheckpointEvent
+                    checkpoint_logger.emit_outcome("pm_contract_violation", CheckpointEvent(
+                        stage="order_rejected",
+                        cycle_id=registry.cycle_id,
+                        profile=profile_id,
+                        candidate_id=candidate_id,
+                        decision="reject",
+                        reason_code=f"prohibited_fields:{fields}",
+                    ))
+                except Exception:
+                    logger.error("Checkpoint emission failed at contract_violation for %s", candidate_id, exc_info=True)
+            return PipelineResult(
+                candidate_id=candidate_id,
+                outcome="contract_violation",
+                error=error_msg,
+            )
 
     # ── Step 1: RESOLVE ──
     candidate, error = _resolve_candidate(registry, decision, profile_id)
@@ -718,6 +794,20 @@ def execute_candidate_pipeline(
                     candidate_id,
                     exc_info=True,
                 )
+
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("invalid_stale_candidate_id", CheckpointEvent(
+                    stage="order_rejected",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    decision="reject",
+                    reason_code=error or "candidate_not_found",
+                ))
+            except Exception:
+                logger.error("Checkpoint emission failed at reservation_failed for %s", candidate_id, exc_info=True)
 
         return PipelineResult(
             candidate_id=candidate_id,
@@ -827,6 +917,40 @@ def execute_candidate_pipeline(
                 exc_info=True,
             )
 
+    # ── Audit: PM geometry discrepancy logging (Requirement 2.3) ──
+    if parse_violations:
+        pm_geometry_violations = [
+            v for v in parse_violations
+            if v.get("type") == "PROHIBITED_FIELD"
+            and v.get("candidate_id") == candidate_id
+            and v.get("pm_value") is not None
+        ]
+        if pm_geometry_violations:
+            # Map prohibited field names to registry field names
+            _FIELD_MAP = {
+                "entry_price": "entry_price",
+                "stop": "stop_price",
+                "stop_loss": "stop_price",
+                "target": "target_price",
+                "target_price": "target_price",
+                "symbol": "symbol",
+                "quantity": None,  # no direct registry equivalent
+            }
+            for v in pm_geometry_violations:
+                field = v["field"]
+                pm_val = v["pm_value"]
+                registry_field = _FIELD_MAP.get(field)
+                if registry_field:
+                    registry_val = getattr(candidate, registry_field, None)
+                    if registry_val is not None and str(pm_val) != str(registry_val):
+                        logger.info(
+                            "PM geometry discrepancy: candidate=%s field=%s pm_value=%s registry_value=%s",
+                            candidate_id,
+                            field,
+                            pm_val,
+                            registry_val,
+                        )
+
     # ── Step 2: RESERVE ──
     execution_key = _generate_execution_key(
         candidate_id, registry.cycle_id, profile_id
@@ -837,6 +961,21 @@ def execute_candidate_pipeline(
         logger.warning(
             "Pipeline reservation failed for %s: %s", candidate_id, reason
         )
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("invalid_stale_candidate_id", CheckpointEvent(
+                    stage="order_rejected",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    symbol=candidate.symbol,
+                    setup_type=candidate.setup_type,
+                    decision="reject",
+                    reason_code=reason or "reservation_failed",
+                ))
+            except Exception:
+                logger.error("Checkpoint emission failed at reservation_failed for %s", candidate_id, exc_info=True)
         return PipelineResult(
             candidate_id=candidate_id,
             outcome="reservation_failed",
@@ -863,6 +1002,21 @@ def execute_candidate_pipeline(
             candidate_id,
             sizing_result.rejection_reason,
         )
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("pm_accepted_and_gate_rejected", CheckpointEvent(
+                    stage="order_rejected",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    symbol=candidate.symbol,
+                    setup_type=candidate.setup_type,
+                    decision="reject",
+                    reason_code=sizing_result.rejection_reason,
+                ))
+            except Exception:
+                logger.error("Checkpoint emission failed at sizing_rejected for %s", candidate_id, exc_info=True)
         return PipelineResult(
             candidate_id=candidate_id,
             outcome="sizing_rejected",
@@ -870,6 +1024,22 @@ def execute_candidate_pipeline(
             sizing_result=sizing_result,
             error=sizing_result.rejection_reason,
         )
+
+    # ── Checkpoint: order_materialized — sizing succeeded (Req 11.1, 11.3) ──
+    if checkpoint_logger is not None:
+        try:
+            from utils.checkpoint_logger import CheckpointEvent
+            checkpoint_logger.emit(CheckpointEvent(
+                stage="order_materialized",
+                cycle_id=registry.cycle_id,
+                profile=profile_id,
+                candidate_id=candidate_id,
+                symbol=candidate.symbol,
+                setup_type=candidate.setup_type,
+                decision="advance",
+            ))
+        except Exception:
+            logger.error("Checkpoint emission failed at order_materialized for %s", candidate_id, exc_info=True)
 
     # ── Provenance: behavioral adjustment (risk_multiplier application) ──
     if PM_PROVENANCE_MODE != "disabled":
@@ -953,6 +1123,21 @@ def execute_candidate_pipeline(
         error_msg = f"Gate pipeline error: {exc}"
         logger.error("Pipeline gate error for %s: %s", candidate_id, exc)
         registry.mark_gate_rejected(candidate_id, error_msg)
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("pm_accepted_and_gate_rejected", CheckpointEvent(
+                    stage="gate_evaluated",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    symbol=candidate.symbol,
+                    setup_type=candidate.setup_type,
+                    decision="reject",
+                    reason_code=error_msg,
+                ))
+            except Exception:
+                logger.error("Checkpoint emission failed at gate_evaluated for %s", candidate_id, exc_info=True)
         return PipelineResult(
             candidate_id=candidate_id,
             outcome="gate_rejected",
@@ -974,6 +1159,21 @@ def execute_candidate_pipeline(
         logger.info(
             "Pipeline gate rejected for %s: %s", candidate_id, gate_notes_str
         )
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("pm_accepted_and_gate_rejected", CheckpointEvent(
+                    stage="gate_evaluated",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    symbol=candidate.symbol,
+                    setup_type=candidate.setup_type,
+                    decision="reject",
+                    reason_code=gate_notes_str,
+                ))
+            except Exception:
+                logger.error("Checkpoint emission failed at gate_evaluated for %s", candidate_id, exc_info=True)
         return PipelineResult(
             candidate_id=candidate_id,
             outcome="gate_rejected",
@@ -987,6 +1187,22 @@ def execute_candidate_pipeline(
     if gate_multiplier < 1.0 and final_quantity > 0:
         final_quantity = max(1, int(final_quantity * gate_multiplier))
         gate_decision["quantity"] = final_quantity
+
+    # ── Checkpoint: gate_evaluated — gates passed (Req 11.1, 11.3) ──
+    if checkpoint_logger is not None:
+        try:
+            from utils.checkpoint_logger import CheckpointEvent
+            checkpoint_logger.emit(CheckpointEvent(
+                stage="gate_evaluated",
+                cycle_id=registry.cycle_id,
+                profile=profile_id,
+                candidate_id=candidate_id,
+                symbol=candidate.symbol,
+                setup_type=candidate.setup_type,
+                decision="advance",
+            ))
+        except Exception:
+            logger.error("Checkpoint emission failed at gate_evaluated for %s", candidate_id, exc_info=True)
 
     # ── Provenance: gate reconstruction (append-only, post-gate — Req 11.1) ──
     if PM_PROVENANCE_MODE != "disabled" and provenance_chain is not None:
@@ -1022,6 +1238,21 @@ def execute_candidate_pipeline(
     except Exception as exc:
         error_msg = f"Execution error: {exc}"
         logger.error("Pipeline execution error for %s: %s", candidate_id, exc)
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("pm_accepted_and_gate_rejected", CheckpointEvent(
+                    stage="order_rejected",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    symbol=candidate.symbol,
+                    setup_type=candidate.setup_type,
+                    decision="reject",
+                    reason_code=error_msg,
+                ))
+            except Exception:
+                logger.error("Checkpoint emission failed at execution_failed for %s", candidate_id, exc_info=True)
         return PipelineResult(
             candidate_id=candidate_id,
             outcome="execution_failed",
@@ -1034,6 +1265,21 @@ def execute_candidate_pipeline(
         logger.warning(
             "Pipeline execution failed for %s: %s", candidate_id, exec_msg
         )
+        if checkpoint_logger is not None:
+            try:
+                from utils.checkpoint_logger import CheckpointEvent
+                checkpoint_logger.emit_outcome("pm_accepted_and_gate_rejected", CheckpointEvent(
+                    stage="order_rejected",
+                    cycle_id=registry.cycle_id,
+                    profile=profile_id,
+                    candidate_id=candidate_id,
+                    symbol=candidate.symbol,
+                    setup_type=candidate.setup_type,
+                    decision="reject",
+                    reason_code=exec_msg,
+                ))
+            except Exception:
+                logger.error("Checkpoint emission failed at execution_failed for %s", candidate_id, exc_info=True)
         return PipelineResult(
             candidate_id=candidate_id,
             outcome="execution_failed",
@@ -1045,6 +1291,22 @@ def execute_candidate_pipeline(
     # Success — mark executed in registry
     registry.mark_executed(candidate_id)
     logger.info("Pipeline executed candidate %s successfully", candidate_id)
+
+    # ── Checkpoint: order_fired — execution succeeded (Req 11.1, 11.3, 9.1) ──
+    if checkpoint_logger is not None:
+        try:
+            from utils.checkpoint_logger import CheckpointEvent
+            checkpoint_logger.emit_outcome("pm_accepted_and_executed", CheckpointEvent(
+                stage="order_fired",
+                cycle_id=registry.cycle_id,
+                profile=profile_id,
+                candidate_id=candidate_id,
+                symbol=candidate.symbol,
+                setup_type=candidate.setup_type,
+                decision="executed",
+            ))
+        except Exception:
+            logger.error("Checkpoint emission failed at order_fired for %s", candidate_id, exc_info=True)
 
     return PipelineResult(
         candidate_id=candidate_id,

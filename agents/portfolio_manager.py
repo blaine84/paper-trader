@@ -4397,6 +4397,14 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
         )
         from utils.candidate_pipeline import execute_candidate_pipeline, dry_run_candidate_pipeline
 
+        # Instantiate checkpoint logger (fail-open, Requirements 11.1, 11.3)
+        try:
+            from utils.checkpoint_logger import CheckpointLogger, CheckpointEvent
+            _checkpoint_logger = CheckpointLogger(engine)
+        except Exception:
+            log.error("Failed to instantiate CheckpointLogger", exc_info=True)
+            _checkpoint_logger = None
+
         # Recover any stale reservations from prior cycles/crashes
         recover_stale_reservations(engine)
 
@@ -4443,6 +4451,19 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
             pm_prompt = build_candidate_pm_prompt(
                 candidate_summaries, portfolio_snapshot, profile, profile_id
             )
+
+            # Emit candidate_offered_to_pm checkpoint (fail-open, Req 11.1)
+            if _checkpoint_logger:
+                try:
+                    for _cid in registry.get_registered_ids():
+                        _checkpoint_logger.emit(CheckpointEvent(
+                            stage="candidate_offered_to_pm",
+                            cycle_id=cycle_id,
+                            profile=profile_id,
+                            candidate_id=_cid,
+                        ))
+                except Exception:
+                    log.error("Checkpoint emission failed: candidate_offered_to_pm", exc_info=True)
 
             # Build dynamic schema for structured output
             schema = build_decision_schema(registry.get_registered_ids())
@@ -4547,6 +4568,38 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                         _prov_exc,
                     )
 
+            # Emit checkpoint events for parse results (fail-open, Req 11.1, 11.3)
+            if _checkpoint_logger:
+                try:
+                    for decision in parse_result.accepted:
+                        _checkpoint_logger.emit(CheckpointEvent(
+                            stage="pm_candidate_accepted",
+                            cycle_id=cycle_id,
+                            profile=profile_id,
+                            candidate_id=decision.candidate_id,
+                            decision="accept",
+                        ))
+                    for decision in parse_result.rejected:
+                        _checkpoint_logger.emit(CheckpointEvent(
+                            stage="pm_candidate_rejected",
+                            cycle_id=cycle_id,
+                            profile=profile_id,
+                            candidate_id=decision.candidate_id,
+                            decision="reject",
+                            reason_code=decision.rationale[:64] if decision.rationale else None,
+                        ))
+                    for _v in parse_result.violations:
+                        if _v.get("type") == "PROHIBITED_FIELD":
+                            _checkpoint_logger.emit(CheckpointEvent(
+                                stage="pm_contract_violation",
+                                cycle_id=cycle_id,
+                                profile=profile_id,
+                                candidate_id=_v.get("candidate_id"),
+                                reason_code=f"prohibited_field:{_v.get('field')}",
+                            ))
+                except Exception:
+                    log.error("Checkpoint emission failed: parse results", exc_info=True)
+
             for decision in parse_result.accepted:
                 _record_candidate_event(
                     engine, decision.candidate_id, cycle_id, profile_id,
@@ -4577,6 +4630,8 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                         db, engine, registry, decision,
                         portfolio_snapshot, profile, profile_id,
                         recovery_multiplier=1.0,
+                        parse_violations=parse_result.violations,
+                        checkpoint_logger=_checkpoint_logger,
                     )
 
                     # Record pipeline result for audit (Requirements 12.3, 12.5, 12.6, 12.7)
@@ -4667,6 +4722,27 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                     "profile": profile_id,
                 }
             # If shadow mode, continue to legacy path below...
+
+    # ── LEGACY FREEFORM BLOCKING (safety net) ──
+    # When PM_CANDIDATE_MODE == "enabled", legacy freeform output must not create live trades.
+    # This is a defensive guard — normally the candidate-ID branch returns early above.
+    # Requirements: 6.1, 6.2, 6.3
+    from utils.gate_config import PM_CANDIDATE_MODE as _pm_mode_check
+    if _pm_mode_check == "enabled":
+        log.info(
+            "legacy_freeform_ignored: PM_CANDIDATE_MODE=enabled, "
+            "legacy entry path reached unexpectedly for profile=%s. "
+            "No live trades will be created from legacy output.",
+            profile_id,
+        )
+        notes = "Legacy freeform path blocked: PM_CANDIDATE_MODE=enabled."
+        stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+        db.close()
+        return {
+            "decisions": [],
+            "portfolio_notes": stored_notes,
+            "profile": profile_id,
+        }
 
     # Build profile-specific system prompt for entry decisions
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(

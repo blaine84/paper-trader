@@ -639,10 +639,72 @@ def _ensure_candidate_tables(engine, inspector):
         log.warning("Schema migration: created candidate_shadow_comparison table with indexes")
 
 
+def _ensure_checkpoint_tables(engine, inspector):
+    """Create checkpoint_events table if missing.
+
+    Stores structured funnel events for every entry-opportunity stage transition.
+    Used by CheckpointLogger for observability into candidate flow.
+    Called during check_schema() startup. Non-destructive.
+
+    Requirements: 11.1
+    """
+    from sqlalchemy import text
+
+    if inspector.has_table("checkpoint_events"):
+        return
+
+    with engine.connect() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS checkpoint_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stage VARCHAR(64) NOT NULL,
+                    outcome_category VARCHAR(64),
+                    cycle_id VARCHAR(36) NOT NULL,
+                    candidate_id VARCHAR(36),
+                    lineage_id VARCHAR(36),
+                    profile VARCHAR(36) NOT NULL,
+                    symbol VARCHAR(10),
+                    setup_type VARCHAR(64),
+                    decision VARCHAR(32),
+                    reason_code VARCHAR(64),
+                    metadata_json TEXT,
+                    created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_checkpoint_events_cycle "
+                "ON checkpoint_events (cycle_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_checkpoint_events_candidate "
+                "ON checkpoint_events (candidate_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_checkpoint_events_stage "
+                "ON checkpoint_events (stage)"
+            )
+        )
+        conn.commit()
+    log.warning("Schema migration: created checkpoint_events table with indexes")
+
+
 def check_schema(engine):
     """Verify the DB schema has all expected columns. Fail fast if not."""
     import sqlite3
     from sqlalchemy import inspect as sa_inspect, text
+
+    # --- Verify WAL mode and busy_timeout (non-destructive) ---
+    from db.schema import verify_wal_mode
+    verify_wal_mode(engine)
 
     inspector = sa_inspect(engine)
 
@@ -651,6 +713,9 @@ def check_schema(engine):
 
     # --- Auto-create candidate-ID selection tables if missing (non-destructive) ---
     _ensure_candidate_tables(engine, inspector)
+
+    # --- Auto-create checkpoint funnel logging tables if missing (non-destructive) ---
+    _ensure_checkpoint_tables(engine, inspector)
 
     # --- Auto-create provenance tables if missing (non-destructive) ---
     init_provenance_schema(engine)

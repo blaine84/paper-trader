@@ -3,6 +3,8 @@ Database schema and initialization.
 Uses SQLite via SQLAlchemy.
 """
 
+import logging
+
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,
     DateTime, Date, Text, Boolean, ForeignKey, Index
@@ -10,6 +12,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import uuid
+
+logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
@@ -286,3 +290,42 @@ def init_db(db_path: str = "db/paper_trader.db"):
 def get_session(engine):
     Session = sessionmaker(bind=engine)
     return Session()
+
+
+def verify_wal_mode(engine) -> bool:
+    """Verify WAL mode and busy_timeout are configured on the SQLite database.
+
+    Checks PRAGMA journal_mode and busy_timeout. If either is not set correctly,
+    applies the correct settings and logs a warning.
+
+    Returns True if settings were already correct, False if corrections were made.
+
+    Requirements: 12.1, 12.2
+    """
+    from sqlalchemy import text
+
+    corrections_made = False
+
+    with engine.connect() as conn:
+        # Check journal_mode
+        result = conn.execute(text("PRAGMA journal_mode")).scalar()
+        if result and result.lower() != "wal":
+            conn.execute(text("PRAGMA journal_mode=WAL"))
+            logger.warning(
+                "WAL mode correction: journal_mode was '%s', set to WAL",
+                result,
+            )
+            corrections_made = True
+
+        # Check busy_timeout
+        timeout = conn.execute(text("PRAGMA busy_timeout")).scalar()
+        if timeout is not None and int(timeout) == 0:
+            conn.execute(text("PRAGMA busy_timeout=30000"))
+            logger.warning(
+                "WAL mode correction: busy_timeout was 0, set to 30000",
+            )
+            corrections_made = True
+
+        conn.commit()
+
+    return not corrections_made

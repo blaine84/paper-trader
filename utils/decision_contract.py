@@ -20,10 +20,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Valid fields in a single decision entry
-_VALID_DECISION_FIELDS = {"candidate_id", "decision", "risk_multiplier", "rationale"}
+_VALID_DECISION_FIELDS = {"candidate_id", "decision", "risk_multiplier", "rationale", "adjustment_request"}
 
-# Valid decision values (P0: accept/reject only, no "adjust")
-_VALID_DECISIONS = {"accept", "reject"}
+# Valid decision values
+_VALID_DECISIONS = {"accept", "reject", "adjust"}
+
+# Supported bounded adjustment types (PM cannot directly emit geometry)
+_SUPPORTED_ADJUSTMENTS = frozenset({"wider_stop_lower_size", "smaller_size", "wait_for_retest", "reject_until_next_cycle"})
+
+# Prohibited executable fields — PM must not supply geometry or sizing
+_PROHIBITED_FIELDS = {
+    "symbol", "entry_price", "stop", "stop_loss",
+    "target", "target_price", "quantity",
+}
 
 
 @dataclass
@@ -31,9 +40,10 @@ class CandidateDecision:
     """A single parsed PM decision for one candidate."""
 
     candidate_id: str
-    decision: str  # "accept" | "reject"
+    decision: str  # "accept" | "reject" | "adjust"
     risk_multiplier: float | None = None  # 0.0 < x <= 1.0 (downward only)
     rationale: str = ""
+    adjustment_request: dict | None = None  # supported adjustment types only
 
 
 @dataclass
@@ -42,6 +52,7 @@ class ParseResult:
 
     accepted: list[CandidateDecision] = field(default_factory=list)
     rejected: list[CandidateDecision] = field(default_factory=list)
+    adjusted: list[CandidateDecision] = field(default_factory=list)
     not_selected_ids: set[str] = field(default_factory=set)
     violations: list[dict] = field(default_factory=list)
     duplicate_ids: set[str] = field(default_factory=set)
@@ -57,22 +68,26 @@ def parse_decision_contract(
 
     Args:
         raw_response: Raw LLM output (JSON-parsed). Expected format:
-            {"decisions": [{"candidate_id": "...", "decision": "accept"|"reject",
-                           "risk_multiplier": 0.5, "rationale": "..."}]}
+            {"decisions": [{"candidate_id": "...", "decision": "accept"|"reject"|"adjust",
+                           "risk_multiplier": 0.5, "rationale": "...",
+                           "adjustment_request": {"type": "..."}}]}
         valid_candidate_ids: Set of IDs offered this cycle (REGISTERED state).
         candidate_metadata: Immutable map of {candidate_id: {symbol, source_signal_id, profile_id}}
             used to enforce one-accept-per-(symbol, signal, profile) deduplication.
 
     Validations:
         1. candidate_id must be in valid_candidate_ids
-        2. decision must be "accept" or "reject" (P0: no "adjust")
+        2. decision must be "accept", "reject", or "adjust"
         3. risk_multiplier must be None or in (0.0, 1.0]
         4. duplicate candidate_ids → reject ALL entries for that ID
         5. extra fields → log violation, strip from execution
         6. at most one accept per (symbol, source_signal_id, profile_id)
+        7. "adjust" decisions require a valid adjustment_request dict
+        8. adjustment_request must have a 'type' key in _SUPPORTED_ADJUSTMENTS
+        9. adjustment_request must NOT contain entry_price, stop_price, or target_price
 
     Returns:
-        ParseResult with accepted/rejected decisions, violations, and metadata.
+        ParseResult with accepted/rejected/adjusted decisions, violations, and metadata.
     """
     result = ParseResult()
 
@@ -162,6 +177,22 @@ def parse_decision_contract(
 
         mentioned_ids.add(candidate_id)
 
+        # 5a-pre: Detect and strip prohibited executable fields
+        prohibited_found = set(entry.keys()) & _PROHIBITED_FIELDS
+        if prohibited_found:
+            for pf in sorted(prohibited_found):
+                result.violations.append(
+                    {
+                        "type": "PROHIBITED_FIELD",
+                        "candidate_id": candidate_id,
+                        "field": pf,
+                        "pm_value": entry[pf],  # Record PM-supplied value for audit
+                    }
+                )
+            # Strip prohibited fields from entry before further processing
+            for pf in prohibited_found:
+                del entry[pf]
+
         # 5a: Check for extra fields and log violation (strip them)
         extra_fields = set(entry.keys()) - _VALID_DECISION_FIELDS
         if extra_fields:
@@ -225,7 +256,45 @@ def parse_decision_contract(
                 )
                 continue
 
-        # 5f: Create CandidateDecision from valid fields
+        # 5f: Adjustment request validation (for "adjust" decisions)
+        adjustment_request = entry.get("adjustment_request")
+        if decision == "adjust":
+            # adjustment_request is required for "adjust" decisions
+            if not isinstance(adjustment_request, dict):
+                result.violations.append(
+                    {
+                        "type": "UNSUPPORTED_ADJUSTMENT",
+                        "candidate_id": candidate_id,
+                        "reason": "adjustment_request must be a dict",
+                    }
+                )
+                continue
+
+            adj_type = adjustment_request.get("type")
+            if adj_type not in _SUPPORTED_ADJUSTMENTS:
+                result.violations.append(
+                    {
+                        "type": "UNSUPPORTED_ADJUSTMENT",
+                        "candidate_id": candidate_id,
+                        "reason": f"unsupported adjustment type: {adj_type!r}",
+                    }
+                )
+                continue
+
+            # adjustment_request must NOT contain geometry fields
+            _PROHIBITED_ADJUSTMENT_KEYS = {"entry_price", "stop_price", "target_price"}
+            prohibited_in_adj = set(adjustment_request.keys()) & _PROHIBITED_ADJUSTMENT_KEYS
+            if prohibited_in_adj:
+                result.violations.append(
+                    {
+                        "type": "UNSUPPORTED_ADJUSTMENT",
+                        "candidate_id": candidate_id,
+                        "reason": f"adjustment_request contains prohibited geometry fields: {sorted(prohibited_in_adj)}",
+                    }
+                )
+                continue
+
+        # 5g: Create CandidateDecision from valid fields
         rationale = entry.get("rationale", "")
         if not isinstance(rationale, str):
             rationale = str(rationale)
@@ -235,11 +304,14 @@ def parse_decision_contract(
             decision=decision,
             risk_multiplier=risk_multiplier,
             rationale=rationale,
+            adjustment_request=adjustment_request if isinstance(adjustment_request, dict) else None,
         )
 
-        # 5g: Route to accepted or rejected list
+        # 5h: Route to accepted, rejected, or adjusted list
         if decision == "accept":
             result.accepted.append(candidate_decision)
+        elif decision == "adjust":
+            result.adjusted.append(candidate_decision)
         else:
             result.rejected.append(candidate_decision)
 
@@ -297,9 +369,9 @@ def should_retry_candidate_contract(parse_result: ParseResult) -> bool:
 
     Returns True if retry is warranted, False otherwise.
     """
-    # If there are any accepted or rejected decisions, the response had
+    # If there are any accepted, rejected, or adjusted decisions, the response had
     # some valid content — no retry needed
-    if parse_result.accepted or parse_result.rejected:
+    if parse_result.accepted or parse_result.rejected or parse_result.adjusted:
         return False
 
     # Check for malformed response violations (schema-level failures)
@@ -350,7 +422,7 @@ def build_candidate_retry_prompt(
         elif vtype == "UNKNOWN_CANDIDATE":
             error_descriptions.append("Unknown candidate_id referenced")
         elif vtype == "INVALID_DECISION":
-            error_descriptions.append("Invalid decision value (must be 'accept' or 'reject')")
+            error_descriptions.append("Invalid decision value (must be 'accept', 'reject', or 'adjust')")
         elif vtype == "INVALID_RISK_MULTIPLIER":
             error_descriptions.append("Invalid risk_multiplier (must be > 0.0 and <= 1.0)")
         else:
@@ -367,9 +439,9 @@ def build_candidate_retry_prompt(
         "Please provide a corrected response using ONLY these valid candidate IDs:\n"
         f"{id_list}\n\n"
         "Requirements:\n"
-        "- Each decision must have: candidate_id, decision ('accept' or 'reject')\n"
-        "- Optional: risk_multiplier (number > 0.0 and <= 1.0), rationale (string)\n"
-        "- Response format: {\"decisions\": [{\"candidate_id\": \"...\", \"decision\": \"accept\"|\"reject\"}]}\n"
+        "- Each decision must have: candidate_id, decision ('accept', 'reject', or 'adjust')\n"
+        "- Optional: risk_multiplier (number > 0.0 and <= 1.0), rationale (string), adjustment_request (dict with 'type' key)\n"
+        "- Response format: {\"decisions\": [{\"candidate_id\": \"...\", \"decision\": \"accept\"|\"reject\"|\"adjust\"}]}\n"
         "- An empty decisions list [] is a valid response (no trades is acceptable)\n"
         "- Do NOT guess or invent candidate IDs — use only the IDs listed above\n"
         "- Do NOT replace symbols or suggest alternative candidates\n"
