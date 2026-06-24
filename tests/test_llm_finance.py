@@ -13,7 +13,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from utils.llm import call_llm, _call_ollama_finance
+from utils.llm import call_llm, _call_ollama, _call_ollama_finance, _OLLAMA_REQUEST_LOCK
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +329,54 @@ class TestTierLevelLogging:
         elapsed_str = msg.split("elapsed=")[1].split("s")[0]
         elapsed = float(elapsed_str)
         assert elapsed >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Local Ollama serialization
+# ---------------------------------------------------------------------------
+
+class TestOllamaSerialization:
+    """Verify local Ollama calls are serialized before hitting the server."""
+
+    @patch("utils.llm.requests.post")
+    def test_ollama_call_uses_serialized_slot_and_releases_it(self, mock_post, monkeypatch):
+        monkeypatch.setenv("OLLAMA_SERIALIZE_REQUESTS", "true")
+        monkeypatch.setenv("OLLAMA_TIMEOUT", "5")
+        monkeypatch.setenv("OLLAMA_QUEUE_TIMEOUT", "1")
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"message": {"content": '{"ok": true}'}}
+        mock_post.return_value = mock_response
+
+        result = _call_ollama("system", "user", model="qwen2.5:7b", purpose="test_serial")
+
+        assert result == '{"ok": true}'
+        assert mock_post.call_count == 1
+        assert _OLLAMA_REQUEST_LOCK.acquire(timeout=0.1)
+        _OLLAMA_REQUEST_LOCK.release()
+
+    @patch("utils.llm._call_anthropic")
+    @patch("utils.llm.requests.post")
+    def test_ollama_queue_timeout_falls_back_without_local_request(
+        self, mock_post, mock_anthropic, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_SERIALIZE_REQUESTS", "true")
+        monkeypatch.setenv("OLLAMA_QUEUE_TIMEOUT", "0")
+        monkeypatch.setenv("OLLAMA_FALLBACK_PROVIDER", "anthropic")
+        monkeypatch.setenv("OLLAMA_FALLBACK_MODEL", "claude-haiku-4-5")
+        mock_anthropic.return_value = '{"fallback": true}'
+
+        assert _OLLAMA_REQUEST_LOCK.acquire(timeout=0.1)
+        try:
+            result = _call_ollama(
+                "system",
+                "user",
+                model="qwen2.5:7b",
+                purpose="test_queue_timeout",
+            )
+        finally:
+            _OLLAMA_REQUEST_LOCK.release()
+
+        assert result == '{"fallback": true}'
+        mock_post.assert_not_called()
+        mock_anthropic.assert_called_once()

@@ -18,11 +18,45 @@ import os
 import json
 import time
 import logging
+import threading
+import requests
 
 log = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 10  # seconds
+_OLLAMA_REQUEST_LOCK = threading.Lock()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _acquire_ollama_slot(purpose: str, model: str) -> tuple[bool, float]:
+    """Serialize local Ollama calls so scheduler jobs do not stampede one model server."""
+    if not _env_bool("OLLAMA_SERIALIZE_REQUESTS", True):
+        return False, 0.0
+
+    queue_timeout = float(os.getenv("OLLAMA_QUEUE_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", "300")))
+    wait_started = time.monotonic()
+    acquired = _OLLAMA_REQUEST_LOCK.acquire(timeout=max(queue_timeout, 0.0))
+    waited = time.monotonic() - wait_started
+    if not acquired:
+        raise TimeoutError(
+            f"Ollama queue timeout after {waited:.1f}s "
+            f"(purpose={purpose}, model={model}, queue_timeout={queue_timeout})"
+        )
+    if waited >= 1.0:
+        log.info(
+            "Ollama queue acquired after %.1fs: purpose=%s model=%s",
+            waited,
+            purpose,
+            model,
+        )
+    return True, waited
 
 
 def _with_retry(fn):
@@ -201,7 +235,6 @@ def _call_ollama(
     timeout: int = None,
     num_ctx: int = None,
 ) -> str:
-    import requests
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
     timeout = timeout or int(os.getenv("OLLAMA_TIMEOUT", 600))
@@ -256,8 +289,17 @@ def _call_ollama(
             chunk_threshold,
         )
     started = time.monotonic()
+    lock_acquired = False
 
     try:
+        lock_acquired, queue_wait_seconds = _acquire_ollama_slot(purpose, model)
+        if queue_wait_seconds:
+            log.info(
+                "Ollama request dequeued: purpose=%s model=%s queue_wait=%.1fs",
+                purpose,
+                model,
+                queue_wait_seconds,
+            )
         resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
         elapsed = time.monotonic() - started
         resp.raise_for_status()
@@ -296,6 +338,9 @@ def _call_ollama(
             return _call_openai(system_prompt, user_prompt, False, fallback_model)
         else:
             raise
+    finally:
+        if lock_acquired:
+            _OLLAMA_REQUEST_LOCK.release()
 
 
 _JSON_REPAIR_PROMPT = """You are a JSON extraction assistant. The following text is an LLM response that should have been JSON but came back as prose. Extract the trading decisions from it and return ONLY valid JSON.
