@@ -4361,7 +4361,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     held_symbols = {p.symbol for p in db.query(Position).filter_by(profile=profile_id).all()}
 
     # ── CANDIDATE-ID SELECTION BRANCH ──
-    from utils.gate_config import PM_CANDIDATE_MODE
+    from utils.gate_config import PM_CANDIDATE_MODE, PM_SHADOW_RUN_LEGACY_ENTRY
 
     def _record_candidate_event(engine, candidate_id, cycle_id, profile_id, event_type, event_data):
         """Record a single audit event to pm_candidate_events table (Requirement 12)."""
@@ -4711,7 +4711,6 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
             # Finalize cycle (assign terminal states to remaining candidates)
             registry.finalize_cycle()
 
-            # In shadow mode, fall through to legacy entry path below
             if PM_CANDIDATE_MODE == "enabled":
                 notes = f"Candidate-ID mode: processed {len(parse_result.accepted)} accepts, {len(parse_result.rejected)} rejects."
                 stored_notes = _store_pm_cycle_note(db, profile_id, notes)
@@ -4721,7 +4720,67 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
                     "portfolio_notes": stored_notes,
                     "profile": profile_id,
                 }
-            # If shadow mode, continue to legacy path below...
+
+            if PM_CANDIDATE_MODE == "shadow" and not PM_SHADOW_RUN_LEGACY_ENTRY:
+                # Candidate shadow mode is used to validate deterministic
+                # candidate selection. The legacy freeform PM call is expensive
+                # and can saturate local Ollama, so skip it unless explicitly
+                # enabled for a short A/B comparison window.
+                try:
+                    from sqlalchemy import text as _text
+                    candidate_executed_symbols = {
+                        r["symbol"]
+                        for r in _shadow_candidate_results
+                        if r.get("outcome") == "executed" and r.get("symbol")
+                    }
+                    comparison_data = {
+                        "candidate_results_json": json.dumps(_shadow_candidate_results, default=str),
+                        "legacy_results_json": "[]",
+                        "agreement_summary": json.dumps({
+                            "both_executed": [],
+                            "candidate_only": sorted(candidate_executed_symbols),
+                            "legacy_only": [],
+                            "legacy_skipped": True,
+                            "reason": "PM_SHADOW_RUN_LEGACY_ENTRY=false",
+                        }),
+                        "malformed_count": len(parse_result.violations),
+                        "hypothetical_diffs": json.dumps({
+                            "candidate_accepts": len(parse_result.accepted),
+                            "candidate_rejects": len(parse_result.rejected),
+                            "legacy_executed": 0,
+                            "legacy_skipped": True,
+                        }, default=str),
+                    }
+                    with engine.connect() as conn:
+                        conn.execute(
+                            _text("""
+                                INSERT INTO candidate_shadow_comparison
+                                (cycle_id, profile_id, candidate_results_json, legacy_results_json,
+                                 agreement_summary, malformed_count, hypothetical_diffs)
+                                VALUES (:cycle_id, :profile_id, :candidate_results_json,
+                                        :legacy_results_json, :agreement_summary,
+                                        :malformed_count, :hypothetical_diffs)
+                            """),
+                            {"cycle_id": cycle_id, "profile_id": profile_id, **comparison_data},
+                        )
+                        conn.commit()
+                except Exception as exc:
+                    log.warning("Failed to record skipped legacy shadow comparison: %s", exc)
+
+                notes = (
+                    f"Candidate-ID shadow mode: processed {len(parse_result.accepted)} accepts, "
+                    f"{len(parse_result.rejected)} rejects; skipped legacy freeform entry comparison."
+                )
+                stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+                db.close()
+                return {
+                    "decisions": [],
+                    "portfolio_notes": stored_notes,
+                    "profile": profile_id,
+                }
+
+            # If shadow mode and PM_SHADOW_RUN_LEGACY_ENTRY=true, continue to
+            # legacy path below for a deliberate short A/B comparison window.
 
     # ── LEGACY FREEFORM BLOCKING (safety net) ──
     # When PM_CANDIDATE_MODE == "enabled", legacy freeform output must not create live trades.

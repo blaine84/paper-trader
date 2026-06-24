@@ -277,6 +277,13 @@ REDUCED_RR_THRESHOLDS_BY_PROFILE: dict[str, float] = {
 # Values: "disabled" | "shadow" | "enabled"
 PM_CANDIDATE_MODE: str = os.environ.get("PM_CANDIDATE_MODE", "disabled")
 
+# When false, candidate shadow mode records candidate-path telemetry and skips
+# the expensive legacy freeform PM entry call. Set true only for deliberate
+# short A/B comparison windows.
+PM_SHADOW_RUN_LEGACY_ENTRY: bool = os.environ.get(
+    "PM_SHADOW_RUN_LEGACY_ENTRY", "false"
+).lower() == "true"
+
 # P1 Benchmark Context (independent of P0)
 PM_BENCHMARK_CONTEXT_ENABLED: bool = os.environ.get(
     "PM_BENCHMARK_CONTEXT_ENABLED", "false"
