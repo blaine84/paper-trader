@@ -139,8 +139,26 @@ def test_non_profitable_partial_still_counts_toward_consecutive_loss_pause():
         engine, db, "news_breakout", profile="aggressive", symbol="AMD"
     )
 
-    assert result["decision"] == "reject"
+    assert result["decision"] == "warn"
     assert result["reason_type"] == "consecutive_losses"
+
+
+def test_consecutive_loss_pause_warns_without_rejecting():
+    engine, db = _engine_and_session()
+    _add_cases(
+        db,
+        ["failure", "failure", "failure", "success", "success"],
+        setup_type="technical_breakout",
+    )
+
+    result = evaluate_setup_quality(
+        engine, db, "technical_breakout", profile="moderate", symbol="XLK"
+    )
+
+    assert result["decision"] == "warn"
+    assert result["canonical_decision"] == "warn"
+    assert result["reason_type"] == "consecutive_losses"
+    assert "warning only" in result["reason"]
 
 
 def test_gap_and_go_is_exempt_from_consecutive_loss_pause():

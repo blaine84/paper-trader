@@ -4,7 +4,7 @@ Evaluates whether a setup type should be allowed based on case-library
 performance.  Uses a deterministic first-match-wins evaluation chain:
 
 1. Insufficient data → allow
-2. Consecutive losses → reject
+2. Consecutive losses → warn
 3. Historical underperformance (with recovery override check) → reject / allow
 4. Rolling underperformance → profile-aware (reduce_size / reject)
 5. Weak but allowed → downgrade
@@ -432,7 +432,7 @@ def evaluate_setup_quality(
 
     Evaluation order (first match wins):
     1. Insufficient data (< MIN_CASES_FOR_BLOCK) → allow
-    2. Consecutive losses (>= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) → reject
+    2. Consecutive losses (>= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) → warn
     3. Historical underperformance (all-time WR < threshold) → reject
        UNLESS recovery override criteria are met → allow
        UNLESS near-miss pilot override applies (moderate profile only) → reduce_size
@@ -556,10 +556,10 @@ def evaluate_setup_quality(
         and _check_consecutive_losses(cases, p_consecutive_loss_pause)
     ):
         result = _result(
-            "reject",
+            "warn",
             "consecutive_losses",
             f"Last {p_consecutive_loss_pause} cases for "
-            f"'{setup_type}' are all losses; pausing setup.",
+            f"'{setup_type}' are all losses; warning only.",
         )
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
