@@ -181,7 +181,7 @@ class TestValidCandidatePolicyReplay:
         assert gate_config.qualifying_min_signal_strength == 6.0
 
     def test_candidate_policy_thresholds_used_in_gate_evaluation(self):
-        """When candidate_policy uses a stricter R:R threshold, the gate rejects."""
+        """When candidate_policy uses a stricter R:R threshold, the gate warns/allows."""
         # Make a candidate policy with stricter default R:R (2.0 instead of 1.25)
         candidate_policy = _make_valid_candidate_policy(
             thresholds={
@@ -215,9 +215,9 @@ class TestValidCandidatePolicyReplay:
             diagnostic_mode=False,
         )
 
-        # Should reject because R:R 1.11 < candidate's 2.0
-        assert trace.final_decision == "reject"
-        assert trace.final_gate == "risk_geometry_gate"
+        # R:R 1.11 < candidate's 2.0, but risk geometry is currently soft.
+        assert trace.final_decision == "allow"
+        assert trace.final_gate is None
 
     def test_candidate_policy_lenient_threshold_allows(self):
         """When candidate_policy uses a more lenient threshold, the gate allows."""
@@ -291,9 +291,9 @@ class TestValidCandidatePolicyReplay:
             diagnostic_mode=False,
         )
 
-        # With SETUP_SPECIFIC_RR_THRESHOLDS=False, uses default 1.25 threshold
-        # R:R 1.11 < 1.25 → should reject
-        assert trace.final_decision == "reject"
+        # With SETUP_SPECIFIC_RR_THRESHOLDS=False, uses default 1.25 threshold.
+        # R:R 1.11 < 1.25, but risk geometry is currently soft.
+        assert trace.final_decision == "allow"
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +583,7 @@ class TestDeltaAttributionForCandidatePolicy:
             adapter_version="1.0.0",
         )
 
-        # Replay with candidate policy (strict): R:R 1.11 < 2.0 → reject
+        # Replay with candidate policy (strict): R:R 1.11 < 2.0 → soft warning
         candidate_trace = replay_gates(
             context=context,
             policy_config=candidate_config,
@@ -592,9 +592,9 @@ class TestDeltaAttributionForCandidatePolicy:
             candidate_id="test_attrib",
             cutoff=cutoff,
         )
-        assert candidate_trace.final_decision == "reject"
+        assert candidate_trace.final_decision == "allow"
 
-        # Classify the delta: current allows, candidate rejects
+        # Classify the delta: both allow because risk geometry is currently soft
         delta = classify_delta(
             original_decision="allow",
             original_gate=None,
@@ -609,10 +609,8 @@ class TestDeltaAttributionForCandidatePolicy:
             replay_classification="exact",
         )
 
-        # The delta should identify replay_rejects_original_allow
-        assert delta.classification == "replay_rejects_original_allow"
-        # First diverging gate should be risk_geometry_gate
-        assert delta.first_diverging_gate == "risk_geometry_gate"
+        assert delta.classification == "same_direction_different_size_and_geometry"
+        assert delta.first_diverging_gate is None
 
     def test_delta_attributed_to_feature_flag_difference(self):
         """When candidate disables a feature flag, delta identifies the divergence."""
@@ -645,7 +643,7 @@ class TestDeltaAttributionForCandidatePolicy:
         )
         assert enabled_trace.final_decision == "allow"
 
-        # With flag DISABLED: uses default threshold 1.25, rejects R:R 1.11
+        # With flag DISABLED: uses default threshold 1.25, warning/allows R:R 1.11
         disabled_policy = _make_valid_candidate_policy(
             feature_flags={"SETUP_SPECIFIC_RR_THRESHOLDS": False, "MODERATE_NEAR_MISS_PILOT": False},
         )
@@ -669,10 +667,10 @@ class TestDeltaAttributionForCandidatePolicy:
             candidate_id="test_flag",
             cutoff=cutoff,
         )
-        assert disabled_trace.final_decision == "reject"
-        assert disabled_trace.final_gate == "risk_geometry_gate"
+        assert disabled_trace.final_decision == "allow"
+        assert disabled_trace.final_gate is None
 
-        # Classify delta: enabled allows, disabled rejects
+        # Classify delta: both allow because risk geometry is currently soft
         delta = classify_delta(
             original_decision="allow",
             original_gate=None,
@@ -687,8 +685,8 @@ class TestDeltaAttributionForCandidatePolicy:
             replay_classification="exact",
         )
 
-        assert delta.classification == "replay_rejects_original_allow"
-        assert delta.first_diverging_gate == "risk_geometry_gate"
+        assert delta.classification == "same_direction_different_size_and_geometry"
+        assert delta.first_diverging_gate is None
 
     def test_same_policy_produces_no_decision_divergence(self):
         """Same candidate_policy as current produces no decision direction change."""

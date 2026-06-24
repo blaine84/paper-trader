@@ -21,13 +21,17 @@ def _evaluate(profile: str, *, stop_price: float = 99.8):
 
 def test_high_beta_adjusted_rr_is_profile_aware():
     # NVDA high-beta floor widens stop to 1.5%, making adjusted R:R 1.30.
-    # Moderate should still reject, but aggressive should be allowed.
+    # Moderate is warned/allowed while risk geometry is running as a soft gate;
+    # aggressive should be allowed outright.
     moderate = _evaluate("moderate")
     aggressive = _evaluate("aggressive")
 
-    assert moderate["decision"] == "rejected"
+    assert moderate["decision"] == "adjusted_allowed"
+    assert moderate["canonical_decision"] == "warn"
     assert moderate["reason_code"] == "RISK_REWARD_AFTER_STOP_ADJUSTMENT"
     assert "below minimum 1.50" in moderate["reason"]
+    assert moderate["risk_geometry_soft_gate"] is True
+    assert moderate["adjusted_rr"] == pytest.approx(1.3)
 
     assert aggressive["decision"] == "adjusted_allowed"
     assert aggressive["adjusted_rr"] == pytest.approx(1.3)
@@ -40,9 +44,11 @@ def test_high_beta_unchanged_rr_is_profile_aware():
     moderate = _evaluate("moderate", stop_price=98.5)
     aggressive = _evaluate("aggressive", stop_price=98.5)
 
-    assert moderate["decision"] == "rejected"
+    assert moderate["decision"] == "warn"
+    assert moderate["canonical_decision"] == "warn"
     assert moderate["reason_code"] == "RISK_REWARD_BELOW_THRESHOLD"
     assert "below minimum 1.50" in moderate["reason"]
+    assert moderate["risk_geometry_soft_gate"] is True
 
     assert aggressive["decision"] == "passed_unchanged"
     assert aggressive["original_rr"] == pytest.approx(1.3)

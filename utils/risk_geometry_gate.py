@@ -1084,7 +1084,7 @@ def _evaluate_risk_geometry_inner(
                     reduced_threshold=min_rr if _setup_specific_rr_applied else None,
                     default_threshold=default_threshold,
                 )
-            return _build_rejection(
+            return _build_soft_warning(
                 reason=f"Reward-to-risk ratio {original_rr:.2f} below minimum {min_rr:.2f}",
                 reason_code="RISK_REWARD_BELOW_THRESHOLD",
                 entry_price=entry_price,
@@ -1354,8 +1354,8 @@ def _evaluate_risk_geometry_inner(
                 _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
                 return result
 
-            # --- Standard rejection (no pilot override) ---
-            # Build setup-specific R:R audit fields for rejection payload
+            # --- Standard soft warning (no pilot override) ---
+            # Build setup-specific R:R audit fields for warning payload
             _rr_extra_payload = None
             if _ff_setup_specific_rr:
                 default_threshold = _compute_default_rr_threshold(rule, profile)
@@ -1367,13 +1367,13 @@ def _evaluate_risk_geometry_inner(
                     reduced_threshold=min_rr if _setup_specific_rr_applied else None,
                     default_threshold=default_threshold,
                 )
-            return _build_rejection(
+            result = _build_soft_warning(
                 reason=f"Adjusted R:R {adjusted_rr:.2f} below minimum {min_rr:.2f} after stop adjustment",
                 reason_code="RISK_REWARD_AFTER_STOP_ADJUSTMENT",
                 entry_price=entry_price,
-                stop_price=stop_price,
+                stop_price=adjusted_stop_price,
                 target_price=target_price,
-                quantity=quantity,
+                quantity=adjusted_quantity,
                 direction=norm_direction,
                 symbol=symbol,
                 atr_5min=atr_5min,
@@ -1397,6 +1397,10 @@ def _evaluate_risk_geometry_inner(
                 atr_fallback=atr_fallback_used,
                 extra_payload=_rr_extra_payload,
             )
+            result["decision"] = "adjusted_allowed"
+            result["canonical_decision"] = "warn"
+            result["risk_geometry_soft_gate"] = True
+            return result
 
         # Adjusted trade allowed
         result = {
@@ -1530,6 +1534,77 @@ def _build_rejection(
     if extra_payload:
         result.update(extra_payload)
 
+    _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
+    return result
+
+
+def _build_soft_warning(
+    *,
+    reason: str,
+    reason_code: str,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    quantity: int | float,
+    direction: str,
+    symbol: str,
+    atr_5min: float | None,
+    atr_source: str | None,
+    atr_timestamp: datetime | None,
+    rule_name: str,
+    rule_source: str,
+    quantity_policy: str,
+    db,
+    profile: str | None,
+    agent: str,
+    stop_distance: float = 0.0,
+    min_stop_distance: float = 0.0,
+    target_distance: float = 0.0,
+    original_rr: float = 0.0,
+    original_dollar_risk: float = 0.0,
+    adjusted_stop_price: float | None = None,
+    adjusted_quantity: int | float | None = None,
+    adjusted_dollar_risk: float | None = None,
+    adjusted_rr: float | None = None,
+    atr_fallback: bool = False,
+    extra_payload: dict | None = None,
+    event_sink=None,
+) -> dict:
+    """Build a soft risk-geometry warning result and log the event."""
+    result = _build_rejection(
+        reason=reason,
+        reason_code=reason_code,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        quantity=quantity,
+        direction=direction,
+        symbol=symbol,
+        atr_5min=atr_5min,
+        atr_source=atr_source,
+        atr_timestamp=atr_timestamp,
+        rule_name=rule_name,
+        rule_source=rule_source,
+        quantity_policy=quantity_policy,
+        db=None,
+        profile=profile,
+        agent=agent,
+        stop_distance=stop_distance,
+        min_stop_distance=min_stop_distance,
+        target_distance=target_distance,
+        original_rr=original_rr,
+        original_dollar_risk=original_dollar_risk,
+        adjusted_stop_price=adjusted_stop_price,
+        adjusted_quantity=adjusted_quantity,
+        adjusted_dollar_risk=adjusted_dollar_risk,
+        adjusted_rr=adjusted_rr,
+        atr_fallback=atr_fallback,
+        extra_payload=extra_payload,
+        event_sink=event_sink,
+    )
+    result["decision"] = "warn"
+    result["canonical_decision"] = "warn"
+    result["risk_geometry_soft_gate"] = True
     _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
     return result
 

@@ -62,22 +62,26 @@ class TestJune1MsftReplay:
         assert result["setup_specific_rr_default_threshold"] == pytest.approx(1.50)
 
     def test_flag_disabled_rejects(self, monkeypatch):
-        """Validates Requirement 7.3: same trade rejected with flag disabled."""
+        """Same trade warns with flag disabled while risk geometry is soft."""
         monkeypatch.delenv("SETUP_SPECIFIC_RR_THRESHOLDS", raising=False)
 
         result = evaluate_risk_geometry(**self.TRADE_PARAMS)
 
-        assert result["decision"] == "rejected"
+        assert result["decision"] == "warn"
+        assert result["canonical_decision"] == "warn"
         assert result["reason_code"] == "RISK_REWARD_BELOW_THRESHOLD"
+        assert result["risk_geometry_soft_gate"] is True
 
     def test_flag_disabled_explicit_false(self, monkeypatch):
-        """Validates Requirement 7.3: explicit 'false' flag also rejects."""
+        """Explicit 'false' flag also warns while risk geometry is soft."""
         monkeypatch.setenv("SETUP_SPECIFIC_RR_THRESHOLDS", "false")
 
         result = evaluate_risk_geometry(**self.TRADE_PARAMS)
 
-        assert result["decision"] == "rejected"
+        assert result["decision"] == "warn"
+        assert result["canonical_decision"] == "warn"
         assert result["reason_code"] == "RISK_REWARD_BELOW_THRESHOLD"
+        assert result["risk_geometry_soft_gate"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -128,22 +132,26 @@ class TestJune2AmdReplay:
         assert result["setup_specific_rr_default_threshold"] == pytest.approx(1.25)
 
     def test_flag_disabled_rejects(self, monkeypatch):
-        """Validates Requirement 7.3: same trade rejected with flag disabled."""
+        """Same trade warns with flag disabled while risk geometry is soft."""
         monkeypatch.delenv("SETUP_SPECIFIC_RR_THRESHOLDS", raising=False)
 
         result = evaluate_risk_geometry(**self.TRADE_PARAMS)
 
-        assert result["decision"] == "rejected"
+        assert result["decision"] == "warn"
+        assert result["canonical_decision"] == "warn"
         assert result["reason_code"] == "RISK_REWARD_BELOW_THRESHOLD"
+        assert result["risk_geometry_soft_gate"] is True
 
     def test_flag_disabled_explicit_false(self, monkeypatch):
-        """Validates Requirement 7.3: explicit 'false' flag also rejects."""
+        """Explicit 'false' flag also warns while risk geometry is soft."""
         monkeypatch.setenv("SETUP_SPECIFIC_RR_THRESHOLDS", "false")
 
         result = evaluate_risk_geometry(**self.TRADE_PARAMS)
 
-        assert result["decision"] == "rejected"
+        assert result["decision"] == "warn"
+        assert result["canonical_decision"] == "warn"
         assert result["reason_code"] == "RISK_REWARD_BELOW_THRESHOLD"
+        assert result["risk_geometry_soft_gate"] is True
 
 
 # ---------------------------------------------------------------------------
