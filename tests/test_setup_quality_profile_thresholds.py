@@ -57,7 +57,7 @@ def test_momentum_fade_setup_quality_is_profile_aware():
     aggressive = evaluate_setup_quality(engine, db, "momentum_fade", profile="aggressive", symbol="NVDA")
 
     assert moderate["threshold"] == 0.30
-    assert moderate["decision"] == "reject"
+    assert moderate["decision"] == "warn"
     assert moderate["reason_type"] == "historical_underperformance"
 
     assert aggressive["threshold"] == 0.20
@@ -72,7 +72,8 @@ def test_conservative_keeps_original_momentum_fade_floor():
     conservative = evaluate_setup_quality(engine, db, "momentum_fade", profile="conservative", symbol="NVDA")
 
     assert conservative["threshold"] == 0.35
-    assert conservative["decision"] == "reject"
+    assert conservative["decision"] == "warn"
+    assert conservative["reason_type"] == "historical_underperformance"
 
 
 def test_vwap_reclaim_at_thirty_percent_is_allowed_for_moderate():
@@ -106,7 +107,7 @@ def test_vwap_reclaim_at_thirty_percent_is_allowed_for_moderate():
     assert moderate["reason_type"] == "weak_but_allowed"
 
     assert conservative["threshold"] == 0.35
-    assert conservative["decision"] == "reject"
+    assert conservative["decision"] == "warn"
     assert conservative["reason_type"] == "historical_underperformance"
 
 

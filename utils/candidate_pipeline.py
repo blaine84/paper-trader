@@ -227,6 +227,110 @@ def _build_gate_decision(resolved_order: ResolvedOrder, quantity: int) -> dict:
     }
 
 
+def _extract_rejecting_gate(gate_notes: list[dict] | None) -> tuple[str, str | None]:
+    """Return the first hard-blocking gate name and reason code from gate notes."""
+    if not gate_notes:
+        return "gate_pipeline", None
+
+    for note in gate_notes:
+        if not isinstance(note, dict):
+            continue
+        if note.get("decision") in ("reject", "rejected", "override_required", "block"):
+            return (
+                note.get("gate") or note.get("gate_name") or "gate_pipeline",
+                note.get("reason_type") or note.get("reason_code"),
+            )
+
+    return "gate_pipeline", None
+
+
+def _commit_candidate_pipeline_session(db, candidate_id: str, context: str) -> None:
+    """Release the ORM session before registry writes on a separate connection."""
+    try:
+        db.commit()
+    except Exception:
+        logger.error(
+            "Candidate pipeline session commit failed for %s during %s",
+            candidate_id,
+            context,
+            exc_info=True,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            logger.error(
+                "Candidate pipeline session rollback failed for %s during %s",
+                candidate_id,
+                context,
+                exc_info=True,
+            )
+
+
+def _record_pipeline_shadow_block(
+    db,
+    resolved_order: ResolvedOrder,
+    sizing_result: SizingResult | None,
+    *,
+    outcome: str,
+    block_reason: str,
+    blocked_by: str,
+    reason_code: str | None = None,
+    gate_notes: list[dict] | str | None = None,
+) -> None:
+    """Mirror candidate-ID terminal rejects into the shadow ledger."""
+    try:
+        from utils.shadow_ledger import record_blocked_candidate
+
+        decision_snapshot = {
+            "candidate_id": resolved_order.candidate_id,
+            "execution_key": resolved_order.execution_key,
+            "pipeline_outcome": outcome,
+            "geometry_name": resolved_order.geometry_name,
+            "risk_reward": resolved_order.risk_reward,
+            "risk_multiplier": resolved_order.risk_multiplier,
+            "pm_rationale": resolved_order.pm_rationale,
+            "rejection_reason": block_reason,
+            "rejected_by": blocked_by,
+        }
+        if sizing_result is not None:
+            decision_snapshot["sizing"] = {
+                "quantity": sizing_result.quantity,
+                "dollar_risk": sizing_result.dollar_risk,
+                "position_value": sizing_result.position_value,
+                "sizing_method": sizing_result.sizing_method,
+                "applied_multiplier": sizing_result.applied_multiplier,
+                "rejection_reason": sizing_result.rejection_reason,
+            }
+
+        record_blocked_candidate(
+            db,
+            resolved_order.symbol,
+            resolved_order.action,
+            blocked_by,
+            block_reason,
+            profile=resolved_order.profile_id,
+            setup_type=resolved_order.setup_type,
+            entry_price=resolved_order.entry_price,
+            stop_price=resolved_order.stop_price,
+            target_price=resolved_order.target_price,
+            quantity=(sizing_result.quantity if sizing_result is not None else None),
+            reason_code=reason_code or outcome,
+            decision_snapshot=decision_snapshot,
+            signal_snapshot=resolved_order.source_signal,
+            gate_notes=gate_notes,
+            source="candidate_id_pipeline",
+            agent="portfolio_manager",
+            geometry_candidate_id=resolved_order.candidate_id,
+            geometry_candidate_name=resolved_order.geometry_name,
+        )
+    except Exception:
+        logger.error(
+            "Failed to record candidate pipeline shadow block for %s",
+            resolved_order.candidate_id,
+            exc_info=True,
+        )
+
+
 def record_behavioral_adjustment_provenance(
     chain: 'ProvenanceChain | None',
     resolved_order: ResolvedOrder,
@@ -996,6 +1100,16 @@ def execute_candidate_pipeline(
     )
 
     if sizing_result.rejected:
+        _record_pipeline_shadow_block(
+            db,
+            resolved_order,
+            sizing_result,
+            outcome="sizing_rejected",
+            block_reason=sizing_result.rejection_reason or "Position sizing rejected",
+            blocked_by="position_sizer",
+            reason_code="sizing_rejected",
+        )
+        _commit_candidate_pipeline_session(db, candidate_id, "sizing_rejected")
         registry.mark_sizing_rejected(candidate_id, sizing_result.rejection_reason)
         logger.info(
             "Pipeline sizing rejected for %s: %s",
@@ -1054,6 +1168,16 @@ def execute_candidate_pipeline(
             if not geometry_valid:
                 # Behavioral adjustment created invalid geometry — do NOT advance (Req 8.6)
                 error_msg = "behavioral_adjustment_invalid"
+                _record_pipeline_shadow_block(
+                    db,
+                    resolved_order,
+                    sizing_result,
+                    outcome="sizing_rejected",
+                    block_reason=error_msg,
+                    blocked_by="behavioral_adjustment",
+                    reason_code="behavioral_adjustment_invalid",
+                )
+                _commit_candidate_pipeline_session(db, candidate_id, "behavioral_adjustment_invalid")
                 registry.mark_sizing_rejected(candidate_id, error_msg)
                 logger.warning(
                     "Pipeline behavioral adjustment invalid for %s: "
@@ -1087,6 +1211,16 @@ def execute_candidate_pipeline(
             )
             if not is_structurally_valid:
                 error_msg = "pre_gate_contract_invalid"
+                _record_pipeline_shadow_block(
+                    db,
+                    resolved_order,
+                    sizing_result,
+                    outcome="gate_rejected",
+                    block_reason=error_msg,
+                    blocked_by="pre_gate_contract",
+                    reason_code="pre_gate_contract_invalid",
+                )
+                _commit_candidate_pipeline_session(db, candidate_id, "pre_gate_contract_invalid")
                 registry.mark_gate_rejected(candidate_id, error_msg)
                 logger.warning(
                     "Pipeline pre-gate contract invalid for %s: "
@@ -1122,6 +1256,17 @@ def execute_candidate_pipeline(
         # Gate pipeline failure — fail closed
         error_msg = f"Gate pipeline error: {exc}"
         logger.error("Pipeline gate error for %s: %s", candidate_id, exc)
+        _record_pipeline_shadow_block(
+            db,
+            resolved_order,
+            sizing_result,
+            outcome="gate_rejected",
+            block_reason=error_msg,
+            blocked_by="gate_pipeline",
+            reason_code="gate_pipeline_error",
+            gate_notes=error_msg,
+        )
+        _commit_candidate_pipeline_session(db, candidate_id, "gate_pipeline_error")
         registry.mark_gate_rejected(candidate_id, error_msg)
         if checkpoint_logger is not None:
             try:
@@ -1155,6 +1300,18 @@ def execute_candidate_pipeline(
             if n.get("decision") in ("reject", "rejected", "override_required", "block")
         )
         gate_notes_str = rejection_reasons or "Gate pipeline rejected"
+        blocked_by, reason_code = _extract_rejecting_gate(gate_notes_list)
+        _record_pipeline_shadow_block(
+            db,
+            resolved_order,
+            sizing_result,
+            outcome="gate_rejected",
+            block_reason=gate_notes_str,
+            blocked_by=blocked_by,
+            reason_code=reason_code or "gate_rejected",
+            gate_notes=gate_notes_list,
+        )
+        _commit_candidate_pipeline_session(db, candidate_id, "gate_rejected")
         registry.mark_gate_rejected(candidate_id, gate_notes_str)
         logger.info(
             "Pipeline gate rejected for %s: %s", candidate_id, gate_notes_str

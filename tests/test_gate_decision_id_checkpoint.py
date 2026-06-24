@@ -86,7 +86,7 @@ def test_moderate_recovery_probe_has_gate_decision_id():
     assert parsed.version == 4
 
 
-def test_moderate_reject_has_gate_decision_id():
+def test_moderate_warning_has_gate_decision_id():
     engine, db = _engine_and_session()
     _seed_rolling_underperformance(db)
 
@@ -95,14 +95,14 @@ def test_moderate_reject_has_gate_decision_id():
         confidence_score=5.0,
     )
 
-    assert result["decision"] == "reject"
+    assert result["decision"] == "warn"
     assert result["reason_type"] == "rolling_underperformance_confirmation_required"
     assert "gate_decision_id" in result
     parsed = uuid.UUID(result["gate_decision_id"])
     assert parsed.version == 4
 
 
-def test_conservative_reject_has_gate_decision_id():
+def test_conservative_warning_has_gate_decision_id():
     engine, db = _engine_and_session()
     _seed_rolling_underperformance(db)
 
@@ -110,14 +110,14 @@ def test_conservative_reject_has_gate_decision_id():
         engine, db, "test_setup", profile="conservative", symbol="TEST"
     )
 
-    assert result["decision"] == "reject"
+    assert result["decision"] == "warn"
     assert result["reason_type"] == "rolling_underperformance_conservative_reject"
     assert "gate_decision_id" in result
     parsed = uuid.UUID(result["gate_decision_id"])
     assert parsed.version == 4
 
 
-def test_unknown_profile_reject_has_gate_decision_id():
+def test_unknown_profile_warning_has_gate_decision_id():
     engine, db = _engine_and_session()
     _seed_rolling_underperformance(db)
 
@@ -125,7 +125,7 @@ def test_unknown_profile_reject_has_gate_decision_id():
         engine, db, "test_setup", profile=None, symbol="TEST"
     )
 
-    assert result["decision"] == "reject"
+    assert result["decision"] == "warn"
     assert result["reason_type"] == "rolling_underperformance"
     assert "gate_decision_id" in result
     parsed = uuid.UUID(result["gate_decision_id"])

@@ -227,14 +227,15 @@ def _evaluate_rolling_underperformance(
         else:
             return {
                 **base,
-                "decision": "reject",
-                "canonical_decision": "reject",
+                "decision": "warn",
+                "canonical_decision": "warn",
                 "reason_type": "rolling_underperformance_confirmation_required",
                 "profile": "moderate",
                 "gate_decision_id": gate_decision_id,
                 "reason": (
                     f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%}; "
-                    f"moderate profile requires override_confidence_score >= "
+                    f"warning only and allowing trade. Moderate profile would require "
+                    f"override_confidence_score >= "
                     f"{p_override_min_confidence} for recovery probe "
                     f"(got {confidence_score})."
                 ),
@@ -243,28 +244,28 @@ def _evaluate_rolling_underperformance(
     elif profile_key == "conservative":
         return {
             **base,
-            "decision": "reject",
-            "canonical_decision": "reject",
+            "decision": "warn",
+            "canonical_decision": "warn",
             "reason_type": "rolling_underperformance_conservative_reject",
             "profile": "conservative",
             "gate_decision_id": gate_decision_id,
             "reason": (
                 f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
-                f"over last {rolling_sample_size} cases; rejecting trade."
+                f"over last {rolling_sample_size} cases; warning only and allowing trade."
             ),
         }
 
     else:
-        # Unknown/None profile — hard reject with existing reason_type
+        # Unknown/None profile — warn with existing reason_type
         return {
             **base,
-            "decision": "reject",
-            "canonical_decision": "reject",
+            "decision": "warn",
+            "canonical_decision": "warn",
             "reason_type": "rolling_underperformance",
             "gate_decision_id": gate_decision_id,
             "reason": (
                 f"Setup '{setup_type}' rolling WR {rolling_wr:.1%} < {threshold:.0%} "
-                f"over last {rolling_sample_size} cases; rejecting trade."
+                f"over last {rolling_sample_size} cases; warning only and allowing trade."
             ),
         }
 
@@ -433,7 +434,7 @@ def evaluate_setup_quality(
     Evaluation order (first match wins):
     1. Insufficient data (< MIN_CASES_FOR_BLOCK) → allow
     2. Consecutive losses (>= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) → warn
-    3. Historical underperformance (all-time WR < threshold) → reject
+    3. Historical underperformance (all-time WR < threshold) → warn
        UNLESS recovery override criteria are met → allow
        UNLESS near-miss pilot override applies (moderate profile only) → reduce_size
     4. Rolling underperformance (rolling WR < threshold, >= MIN_ROLLING_CASES) → profile-aware
@@ -647,10 +648,10 @@ def evaluate_setup_quality(
             return pilot_result
 
         result = _result(
-            "reject",
+            "warn",
             "historical_underperformance",
             f"Setup '{setup_type}' all-time WR "
-            f"{win_rate:.1%} < {threshold:.0%}; rejecting trade.",
+            f"{win_rate:.1%} < {threshold:.0%}; warning only and allowing trade.",
         )
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
