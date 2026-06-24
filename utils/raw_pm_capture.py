@@ -276,6 +276,7 @@ def persist_raw_response(engine, response: RawPMResponse) -> None:
     Handles IntegrityError (duplicate response_id or cycle+attempt) gracefully.
     Fail-open: catches all exceptions, logs error, does not block pipeline.
     """
+    candidate_ids_supplied = sorted(str(cid) for cid in response.candidate_ids_supplied)
     try:
         with engine.connect() as conn:
             conn.execute(
@@ -287,9 +288,7 @@ def persist_raw_response(engine, response: RawPMResponse) -> None:
                     "model_id": response.model_id,
                     "timestamp": response.timestamp.isoformat(),
                     "prompt_version_id": response.prompt_version_id,
-                    "candidate_ids_supplied_json": json.dumps(
-                        response.candidate_ids_supplied
-                    ),
+                    "candidate_ids_supplied_json": json.dumps(candidate_ids_supplied),
                     "raw_payload": response.raw_payload,
                     "original_payload_hash": response.original_payload_hash,
                     "stored_payload_hash": response.stored_payload_hash,
