@@ -316,6 +316,40 @@ PM_PROVENANCE_LATENCY_BUDGET_MS: int = int(
 
 
 # ---------------------------------------------------------------------------
+# Price Alert PM Dispatcher
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enabled"
+PM_ALERT_DISPATCH_MODE: str = os.environ.get("PM_ALERT_DISPATCH_MODE", "disabled")
+
+# Cooldown configuration
+PM_ALERT_SYMBOL_COOLDOWN_MINUTES: int = int(
+    os.environ.get("PM_ALERT_SYMBOL_COOLDOWN_MINUTES", "15")
+)
+PM_ALERT_GLOBAL_COOLDOWN_MINUTES: int = int(
+    os.environ.get("PM_ALERT_GLOBAL_COOLDOWN_MINUTES", "10")
+)
+PM_ALERT_DISPATCHER_INTERVAL_SECONDS: int = int(
+    os.environ.get("PM_ALERT_DISPATCHER_INTERVAL_SECONDS", "30")
+)
+
+# Classification batch limits
+PM_ALERT_CLASSIFY_MAX_PER_PASS: int = int(
+    os.environ.get("PM_ALERT_CLASSIFY_MAX_PER_PASS", "5")
+)
+PM_ALERT_CLASSIFY_TIMEOUT_SECONDS: int = int(
+    os.environ.get("PM_ALERT_CLASSIFY_TIMEOUT_SECONDS", "10")
+)
+
+# Crash recovery: stale dispatch timeout
+PM_ALERT_DISPATCH_STALE_MINUTES: int = int(
+    os.environ.get("PM_ALERT_DISPATCH_STALE_MINUTES", "10")
+)
+PM_ALERT_SCHEDULED_MAX_RUNTIME_MINUTES: int = int(
+    os.environ.get("PM_ALERT_SCHEDULED_MAX_RUNTIME_MINUTES", "15")
+)
+
+# ---------------------------------------------------------------------------
 # Pilot Controller
 # ---------------------------------------------------------------------------
 

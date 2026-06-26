@@ -95,6 +95,9 @@ _pm_cycle_active = False
 _pm_cycle_owner = None
 _pm_cycle_lock = threading.Lock()
 
+# Alert dispatcher instance (constructed in main() when PM_ALERT_DISPATCH_MODE != "disabled")
+_alert_dispatcher = None
+
 
 def get_engine():
     global _engine
@@ -1126,6 +1129,25 @@ def _run_intraday_inner(engine):
 
     full_watchlist = build_deduplicated_watchlist(_pm_base_watchlist(), scout_picks, expanded_symbols)
 
+    # ─── Alert intent scheduled consumption ────────────────────────────
+    _alert_intent_ids = []
+    from utils.gate_config import PM_ALERT_DISPATCH_MODE
+    if PM_ALERT_DISPATCH_MODE != "disabled" and _alert_dispatcher is not None:
+        try:
+            extra_symbols, _alert_intent_ids = _alert_dispatcher.consume_for_scheduled_cycle()
+            if extra_symbols:
+                # Add intent symbols to the watchlist (deduplicating)
+                for sym in extra_symbols:
+                    if sym not in full_watchlist:
+                        full_watchlist.append(sym)
+                log.info(
+                    "INTRADAY_ALERT_CONSUME: added %d intent symbols to watchlist: %s",
+                    len(extra_symbols), extra_symbols,
+                )
+        except Exception as e:
+            log.error(f"Alert intent consumption error: {e}", exc_info=True)
+            _alert_intent_ids = []
+
     # Analyst signals are refreshed by the separate run_analyst_refresh job
     # on the same schedule — no need to duplicate here.
 
@@ -1170,7 +1192,23 @@ def _run_intraday_inner(engine):
         except Exception as e:
             log.error(f"PM {profile_id} error: {e}", exc_info=True)
 
-    _run_pm_profile_jobs(pm.ACTIVE_PROFILES, _run_pm)
+    try:
+        _run_pm_profile_jobs(pm.ACTIVE_PROFILES, _run_pm)
+    except Exception as e:
+        # ─── Revert alert intent claim on PM failure ───────────────────
+        if _alert_intent_ids and _alert_dispatcher is not None:
+            try:
+                _alert_dispatcher.revert_scheduled_claim(_alert_intent_ids, str(e))
+            except Exception as revert_err:
+                log.error(f"Alert intent revert error: {revert_err}", exc_info=True)
+        raise
+    else:
+        # ─── Confirm alert intent consumption on PM success ────────────
+        if _alert_intent_ids and _alert_dispatcher is not None:
+            try:
+                _alert_dispatcher.confirm_scheduled_consumption(_alert_intent_ids)
+            except Exception as e:
+                log.error(f"Alert intent confirm error: {e}", exc_info=True)
 
     # Dashboard
     try:
@@ -1822,49 +1860,58 @@ def run_price_monitor():
             except Exception as e:
                 log.error(f"Price monitor close error: {e}")
 
-        # For entry triggers or rapid moves, filter with local LLM then queue PM
+        # For entry triggers or rapid moves, route based on dispatch mode
         entry_triggers = result.get("entry_triggers", [])
         momentum_alerts = [a for a in result.get("momentum_alerts", []) if a["type"] == "rapid_move"]
         all_alerts = entry_triggers + momentum_alerts
 
         if all_alerts:
-            from agents.price_monitor import filter_alert_with_llm
-            actionable_symbols = []
-            for alert in all_alerts:
-                try:
-                    assessment = filter_alert_with_llm(alert, engine)
-                    if assessment.get("actionable"):
-                        actionable_symbols.append(alert["symbol"])
-                        log.info(f"  Alert ACTIONABLE: {alert['symbol']} — {assessment.get('reasoning', '')}")
-                    else:
-                        log.info(f"  Alert filtered out: {alert['symbol']} — {assessment.get('reasoning', '')}")
-                except Exception as e:
-                    actionable_symbols.append(alert["symbol"])  # pass through on error
+            from utils.gate_config import PM_ALERT_DISPATCH_MODE
 
-            action_symbols = list(set(actionable_symbols))
-            if action_symbols:
-                if not _try_begin_pm_cycle("price_monitor"):
-                    log.info(
-                        "Price monitor: PM trigger skipped because another PM cycle is active for %s",
-                        action_symbols,
-                    )
-                    return
-                log.info(f"Price monitor: triggering PM (local LLM) for {action_symbols}")
-                def _run_pm_async(syms):
+            if PM_ALERT_DISPATCH_MODE != "disabled":
+                # New path: record durable alert intents for deferred dispatch
+                from agents.price_monitor import record_alert_intent
+                for alert in all_alerts:
+                    record_alert_intent(engine, alert)
+            else:
+                # Legacy path: inline LLM filter + PM spawn (preserved when disabled)
+                from agents.price_monitor import filter_alert_with_llm
+                actionable_symbols = []
+                for alert in all_alerts:
                     try:
-                        eng = get_engine()
-                        def _run_pm(pid):
-                            try:
-                                pm_result = pm.run_profile(eng, WATCHLIST + syms, pid, tier="medium")
-                                for d in pm_result.get("decisions", []):
-                                    if d.get("executed"):
-                                        log.info(f"  ⚡ [{pid}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
-                            except Exception as e:
-                                log.error(f"Price monitor PM {pid} error: {e}")
-                        _run_pm_profile_jobs(pm.ACTIVE_PROFILES, _run_pm)
-                    finally:
-                        _end_pm_cycle("price_monitor")
-                threading.Thread(target=_run_pm_async, args=(action_symbols,), daemon=True).start()
+                        assessment = filter_alert_with_llm(alert, engine)
+                        if assessment.get("actionable"):
+                            actionable_symbols.append(alert["symbol"])
+                            log.info(f"  Alert ACTIONABLE: {alert['symbol']} — {assessment.get('reasoning', '')}")
+                        else:
+                            log.info(f"  Alert filtered out: {alert['symbol']} — {assessment.get('reasoning', '')}")
+                    except Exception as e:
+                        actionable_symbols.append(alert["symbol"])  # pass through on error
+
+                action_symbols = list(set(actionable_symbols))
+                if action_symbols:
+                    if not _try_begin_pm_cycle("price_monitor"):
+                        log.info(
+                            "Price monitor: PM trigger skipped because another PM cycle is active for %s",
+                            action_symbols,
+                        )
+                        return
+                    log.info(f"Price monitor: triggering PM (local LLM) for {action_symbols}")
+                    def _run_pm_async(syms):
+                        try:
+                            eng = get_engine()
+                            def _run_pm(pid):
+                                try:
+                                    pm_result = pm.run_profile(eng, WATCHLIST + syms, pid, tier="medium")
+                                    for d in pm_result.get("decisions", []):
+                                        if d.get("executed"):
+                                            log.info(f"  ⚡ [{pid}] {d['action']} {d.get('quantity','')} {d['symbol']} @ ${d.get('price',0):.2f}")
+                                except Exception as e:
+                                    log.error(f"Price monitor PM {pid} error: {e}")
+                            _run_pm_profile_jobs(pm.ACTIVE_PROFILES, _run_pm)
+                        finally:
+                            _end_pm_cycle("price_monitor")
+                    threading.Thread(target=_run_pm_async, args=(action_symbols,), daemon=True).start()
 
     except Exception as e:
         log.error(f"Price monitor error: {e}", exc_info=True)
@@ -2004,11 +2051,34 @@ def main():
     ensure_initial_balance(engine)
     check_schema(engine)
     ensure_shadow_ledger_schema(engine)
+
+    # Initialize alert dispatch schema (idempotent IF NOT EXISTS DDL)
+    from utils.alert_dispatch_schema import init_alert_dispatch_schema
+    init_alert_dispatch_schema(engine)
+
     check_llm_connectivity()
 
     # Detect and log any funnel jobs that were missed due to late startup (Req 12.7)
     funnel_config = load_funnel_config()
     _check_missed_funnel_jobs(engine, funnel_config)
+
+    # ─── Alert Dispatcher Construction ─────────────────────────────────
+    global _alert_dispatcher
+    from utils.gate_config import PM_ALERT_DISPATCH_MODE, PM_ALERT_DISPATCHER_INTERVAL_SECONDS
+
+    if PM_ALERT_DISPATCH_MODE != "disabled":
+        from utils.alert_intent_store import AlertIntentStore
+        from utils.alert_dispatcher import AlertDispatcher
+
+        _alert_intent_store = AlertIntentStore(engine)
+        _alert_dispatcher = AlertDispatcher(
+            engine=engine,
+            intent_store=_alert_intent_store,
+            begin_pm_cycle=_try_begin_pm_cycle,
+            end_pm_cycle=_end_pm_cycle,
+        )
+        # Startup crash recovery
+        _alert_dispatcher._recover_stale_intents()
 
     scheduler = BlockingScheduler(timezone="America/New_York")
 
@@ -2125,6 +2195,31 @@ def main():
         max_instances=1,
         coalesce=True,
     )
+
+    # Alert dispatcher: every N seconds during market hours (configurable)
+    if PM_ALERT_DISPATCH_MODE != "disabled":
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        def run_alert_dispatcher():
+            """Wrapper to invoke the alert dispatcher with market-hours guard."""
+            from pytz import timezone as pytz_tz
+            et_now = datetime.now(pytz_tz("America/New_York"))
+            # Only run during market hours (Mon-Fri, 09:30-16:00 ET)
+            if et_now.weekday() > 4:
+                return
+            market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
+            if not (market_open <= et_now <= market_close):
+                return
+            _alert_dispatcher.evaluate_and_dispatch()
+
+        scheduler.add_job(
+            run_alert_dispatcher,
+            IntervalTrigger(seconds=PM_ALERT_DISPATCHER_INTERVAL_SECONDS),
+            id="alert_dispatcher",
+            max_instances=1,
+            coalesce=True,
+        )
 
     # Sector Scout confirmation scan: 10:00 AM ET — NOW bounded shortlist retry
     # (Replaces former broad sector scan per requirement 12.5)

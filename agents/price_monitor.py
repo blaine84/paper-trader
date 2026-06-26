@@ -719,3 +719,84 @@ Is this alert actionable? Should the PM be notified?
     except Exception as e:
         log.warning(f"Alert filter LLM failed: {e}")
         return {"actionable": True, "reasoning": "filter failed, passing through"}
+
+
+def record_alert_intent(engine, alert: dict) -> None:
+    """Record a durable alert intent for deferred dispatch evaluation.
+
+    Builds intent data from a raw alert observation and persists it via
+    AlertIntentStore. Fail-open: errors are logged and do not block the
+    price monitor loop.
+
+    Requirements: 1.1, 1.5, 1.6, 2.2, 2.3, 2.5, 11.1, 12.2, 12.3
+    """
+    try:
+        from utils.alert_intent_store import AlertIntentStore, build_dedupe_key
+        import pytz
+
+        now = datetime.utcnow()
+        symbol = alert.get("symbol", "")
+        alert_type = alert.get("type", "entry_alert")
+        if alert_type not in ("entry_alert", "rapid_move"):
+            alert_type = "entry_alert"
+
+        direction = alert.get("direction") or alert.get("signal")
+        if direction and direction not in ("long", "short"):
+            direction_lower = direction.lower()
+            if direction_lower in ("buy", "long"):
+                direction = "long"
+            elif direction_lower in ("sell", "short"):
+                direction = "short"
+            else:
+                direction = None
+
+        trigger_price = str(alert.get("price", alert.get("trigger_price", "0")))
+        source_level = alert.get("level_name", alert.get("source_level", ""))
+        reason = alert.get("reasoning", alert.get("reason", ""))[:500]
+
+        # Build setup_condition for dedupe_key
+        setup_condition = f"{alert_type}_{direction or 'unknown'}_{source_level}"
+        dedupe_key = build_dedupe_key(symbol, alert_type, setup_condition)
+
+        # Compute expiration: earlier of market close or first_seen + 4 hours
+        et = pytz.timezone("America/New_York")
+        now_et = now.replace(tzinfo=pytz.utc).astimezone(et)
+        market_close_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        if now_et >= market_close_et:
+            # After market close — use 4 hours from now as fallback
+            market_close_utc = now + timedelta(hours=4)
+        else:
+            market_close_utc = market_close_et.astimezone(pytz.utc).replace(tzinfo=None)
+
+        four_hours_from_now = now + timedelta(hours=4)
+        expiration_at = min(market_close_utc, four_hours_from_now)
+
+        # Format timestamps as ISO8601
+        iso_fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
+        intent_data = {
+            "symbol": symbol,
+            "alert_type": alert_type,
+            "direction": direction,
+            "trigger_price": trigger_price,
+            "source_level": source_level or None,
+            "urgency": "medium",
+            "reason": reason or None,
+            "dedupe_key": dedupe_key,
+            "filter_status": "unclassified",
+            "first_seen_at": now.strftime(iso_fmt),
+            "last_seen_at": now.strftime(iso_fmt),
+            "expiration_at": expiration_at.strftime(iso_fmt),
+        }
+
+        store = AlertIntentStore(engine)
+        store.record_or_update_intent(intent_data)
+
+        log.info(
+            "alert_intent_created: %s",
+            json.dumps({"symbol": symbol, "alert_type": alert_type, "dedupe_key": dedupe_key}),
+        )
+    except Exception as exc:
+        log.error(
+            "Failed to record alert intent: symbol=%s error=%s",
+            alert.get("symbol", "?"), str(exc),
+        )

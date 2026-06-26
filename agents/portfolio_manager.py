@@ -3984,7 +3984,7 @@ def _compute_shadow_agreement(candidate_results, legacy_results):
     })
 
 
-def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high") -> dict:
+def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high", cycle_trigger_type: str = "scheduled", alert_intent_ids: list[str] | None = None) -> dict:
     """
     Run a single PM profile for one cycle with two-tier review routing.
 
@@ -4001,6 +4001,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high")
     tier controls which LLM is used.
     """
     profile = PM_PROFILES[profile_id]
+    log.info(f"run_profile started: profile={profile_id}, cycle_trigger_type={cycle_trigger_type}, alert_intent_ids={alert_intent_ids}")
     fh = FinnhubClient()
     db = get_session(engine)
 
