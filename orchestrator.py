@@ -1132,7 +1132,7 @@ def _run_intraday_inner(engine):
     # ─── Alert intent scheduled consumption ────────────────────────────
     _alert_intent_ids = []
     from utils.gate_config import PM_ALERT_DISPATCH_MODE
-    if PM_ALERT_DISPATCH_MODE != "disabled" and _alert_dispatcher is not None:
+    if PM_ALERT_DISPATCH_MODE == "enabled" and _alert_dispatcher is not None:
         try:
             extra_symbols, _alert_intent_ids = _alert_dispatcher.consume_for_scheduled_cycle()
             if extra_symbols:

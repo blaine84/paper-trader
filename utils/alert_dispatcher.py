@@ -452,7 +452,7 @@ class AlertDispatcher:
         """
         from utils.gate_config import PM_ALERT_DISPATCH_MODE
 
-        if PM_ALERT_DISPATCH_MODE == "disabled":
+        if PM_ALERT_DISPATCH_MODE != "enabled":
             return [], []
 
         now = datetime.utcnow()
