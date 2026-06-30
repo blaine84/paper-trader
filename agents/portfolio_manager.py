@@ -11,7 +11,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
 from db.schema import AgentMemory, Position, Balance, Trade, DynamicStrategy, get_session
@@ -3984,7 +3984,7 @@ def _compute_shadow_agreement(candidate_results, legacy_results):
     })
 
 
-def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high", cycle_trigger_type: str = "scheduled", alert_intent_ids: list[str] | None = None) -> dict:
+def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high", cycle_trigger_type: str = "scheduled", alert_intent_ids: list[str] | None = None, alert_contexts: list[dict] | None = None) -> dict:
     """
     Run a single PM profile for one cycle with two-tier review routing.
 
@@ -3999,9 +3999,13 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
     7. Log each cycle whether signals were used in advisory or authoritative capacity
 
     tier controls which LLM is used.
+
+    alert_contexts: When cycle_trigger_type=="alert", a list of dicts with keys
+        alert_intent_id, symbol, alert_type. Each context is claimed before LLM
+        evaluation; duplicates are skipped via PM-side idempotency (Req 5.1, 5.4).
     """
     profile = PM_PROFILES[profile_id]
-    log.info(f"run_profile started: profile={profile_id}, cycle_trigger_type={cycle_trigger_type}, alert_intent_ids={alert_intent_ids}")
+    log.info(f"run_profile started: profile={profile_id}, cycle_trigger_type={cycle_trigger_type}, alert_intent_ids={alert_intent_ids}, alert_contexts={alert_contexts}")
     fh = FinnhubClient()
     db = get_session(engine)
 
@@ -4049,6 +4053,21 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
     max_loss = portfolio["starting_balance"] * profile["max_daily_loss_pct"]
     if abs(portfolio["daily_pnl"]) >= max_loss and portfolio["daily_pnl"] < 0:
         notes = f"Daily loss limit hit (${portfolio['daily_pnl']:,.2f}). No more trades today."
+        # If alert-triggered, claim and immediately complete to avoid orphan states
+        if cycle_trigger_type == "alert" and alert_contexts:
+            for ctx in alert_contexts:
+                try:
+                    claim_result = claim_alert_for_processing(
+                        engine, ctx["alert_intent_id"], ctx["symbol"],
+                        ctx["alert_type"], profile_id,
+                    )
+                    if claim_result is None:
+                        complete_alert_claim(engine, ctx["alert_intent_id"], "rejected", profile_id)
+                except Exception as exc:
+                    log.error(
+                        "ALERT_CLAIM_DAILY_LOSS_ERROR: alert_intent_id=%s error=%s",
+                        ctx.get("alert_intent_id"), exc,
+                    )
         stored_notes = _store_pm_cycle_note(db, profile_id, notes)
         db.close()
         return {"decisions": [], "portfolio_notes": stored_notes, "profile": profile_id}
@@ -4357,6 +4376,97 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             "profile": profile_id, "source": "two_tier_review",
         })
 
+    # ── ALERT-TRIGGERED CYCLE: PM-side idempotency claims (Req 5.1, 5.4, 6.5) ──
+    # When cycle_trigger_type == "alert" and alert_contexts is provided, claim each
+    # alert before LLM evaluation. Duplicates are skipped; non-duplicates proceed
+    # through the existing gate pipeline unchanged.
+    _alert_claimed_contexts = []  # contexts that passed idempotency check
+    _alert_skipped_contexts = []  # contexts skipped as duplicate_noop
+    if cycle_trigger_type == "alert" and alert_contexts:
+        for ctx in alert_contexts:
+            try:
+                claim_result = claim_alert_for_processing(
+                    engine,
+                    ctx["alert_intent_id"],
+                    ctx["symbol"],
+                    ctx["alert_type"],
+                    profile_id,
+                )
+                if claim_result is not None:
+                    # duplicate_noop — skip this alert context
+                    log.info(
+                        "ALERT_CLAIM_SKIP: alert_intent_id=%s symbol=%s profile=%s reason=duplicate_noop",
+                        ctx["alert_intent_id"], ctx["symbol"], profile_id,
+                    )
+                    _alert_skipped_contexts.append(ctx)
+                else:
+                    # Claim succeeded — proceed with evaluation
+                    _alert_claimed_contexts.append(ctx)
+            except Exception as exc:
+                log.error(
+                    "ALERT_CLAIM_ERROR: alert_intent_id=%s symbol=%s profile=%s error=%s",
+                    ctx.get("alert_intent_id"), ctx.get("symbol"), profile_id, exc,
+                )
+                # Fail-open: treat claim error as "skip" to avoid blocking pipeline
+                _alert_skipped_contexts.append(ctx)
+
+        if not _alert_claimed_contexts:
+            # All alerts were duplicates or errored — nothing to evaluate
+            log.info(
+                "ALERT_CYCLE_ALL_SKIPPED: profile=%s total=%d skipped=%d",
+                profile_id, len(alert_contexts), len(_alert_skipped_contexts),
+            )
+            notes = f"Alert-triggered cycle: all {len(alert_contexts)} alerts skipped (duplicate/error)."
+            stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+            db.close()
+            return {"decisions": executed, "portfolio_notes": stored_notes, "profile": profile_id}
+
+        # Filter symbols to only those with successful claims
+        claimed_symbols = {ctx["symbol"] for ctx in _alert_claimed_contexts}
+        symbols = [s for s in symbols if s in claimed_symbols]
+        log.info(
+            "ALERT_CYCLE_CLAIMED: profile=%s claimed=%d skipped=%d symbols=%s",
+            profile_id, len(_alert_claimed_contexts), len(_alert_skipped_contexts),
+            ",".join(symbols),
+        )
+
+    def _complete_alert_claims_for_cycle(executed_decisions: list, outcome_override: str | None = None):
+        """Complete all claimed alert contexts with appropriate outcome.
+
+        Maps execution results to alert claim outcomes:
+        - If a symbol was executed (trade created) → "accepted"
+        - If a symbol was in executed but not executed (gate_rejected, etc.) → "gate_rejected"
+        - If no decision for the symbol → "no_candidate" or outcome_override
+        - outcome_override allows forcing a specific outcome for all claims (e.g. "error")
+
+        Gate pipeline executes unchanged for alert-originated candidates (Req 6.5).
+        """
+        if not _alert_claimed_contexts:
+            return
+        # Build symbol → outcome mapping from executed decisions
+        symbol_outcomes: dict[str, str] = {}
+        for dec in executed_decisions:
+            sym = dec.get("symbol", "")
+            if dec.get("executed"):
+                symbol_outcomes[sym] = "accepted"
+            elif dec.get("outcome") == "gate_rejected" or "gate" in str(dec.get("message", "")).lower():
+                symbol_outcomes[sym] = "gate_rejected"
+            elif dec.get("outcome") == "sizing_rejected":
+                symbol_outcomes[sym] = "sizing_rejected"
+            elif not dec.get("executed"):
+                # Some other rejection reason
+                symbol_outcomes.setdefault(sym, "rejected")
+
+        for ctx in _alert_claimed_contexts:
+            outcome = outcome_override or symbol_outcomes.get(ctx["symbol"], "no_candidate")
+            try:
+                complete_alert_claim(engine, ctx["alert_intent_id"], outcome, profile_id)
+            except Exception as exc:
+                log.error(
+                    "ALERT_CLAIM_COMPLETE_ERROR: alert_intent_id=%s symbol=%s outcome=%s error=%s",
+                    ctx["alert_intent_id"], ctx["symbol"], outcome, exc,
+                )
+
     # ── PHASE 2: Existing entry logic for NEW positions (unchanged) ──
     # Symbols that already have open positions are excluded from new entry consideration.
     held_symbols = {p.symbol for p in db.query(Position).filter_by(profile=profile_id).all()}
@@ -4423,6 +4533,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
         if registry.is_empty and PM_CANDIDATE_MODE == "enabled":
             notes = "Candidate-ID mode: no eligible candidates for this cycle."
             stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+            _complete_alert_claims_for_cycle(executed, outcome_override="no_candidate")
             db.close()
             return {
                 "decisions": executed,
@@ -4715,6 +4826,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             if PM_CANDIDATE_MODE == "enabled":
                 notes = f"Candidate-ID mode: processed {len(parse_result.accepted)} accepts, {len(parse_result.rejected)} rejects."
                 stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+                _complete_alert_claims_for_cycle(executed)
                 db.close()
                 return {
                     "decisions": executed,
@@ -4773,6 +4885,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                     f"{len(parse_result.rejected)} rejects; skipped legacy freeform entry comparison."
                 )
                 stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+                _complete_alert_claims_for_cycle([], outcome_override="no_candidate")
                 db.close()
                 return {
                     "decisions": [],
@@ -4797,6 +4910,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
         )
         notes = "Legacy freeform path blocked: PM_CANDIDATE_MODE=enabled."
         stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+        _complete_alert_claims_for_cycle([], outcome_override="no_candidate")
         db.close()
         return {
             "decisions": [],
@@ -4897,6 +5011,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             f"Filter summary: {summary_text}"
         )
         stored_notes = _store_pm_cycle_note(db, profile_id, notes)
+        _complete_alert_claims_for_cycle([], outcome_override="no_candidate")
         db.close()
         return {
             "decisions": [],
@@ -5551,6 +5666,7 @@ NOTE: Open positions are managed by the two-tier review system. Only consider NE
         except Exception as exc:
             log.warning("Failed to record shadow comparison: %s", exc)
 
+    _complete_alert_claims_for_cycle(executed)
     db.close()
     return {"decisions": executed, "portfolio_notes": stored_notes, "profile": profile_id}
 
@@ -5561,3 +5677,216 @@ def run(engine, symbols: list[str]) -> dict:
     for profile_id in ACTIVE_PROFILES:
         all_results[profile_id] = run_profile(engine, symbols, profile_id)
     return all_results
+
+
+# ── PM Alert Idempotency Functions ────────────────────────────────────────────
+
+
+def record_alert_event(
+    engine,
+    alert_intent_id: str,
+    event_type: str,
+    symbol: str = "",
+    alert_type: str = "",
+    profile_id: str = "",
+    **extra_data,
+) -> None:
+    """Insert an immutable event row into pm_alert_events (fail-open).
+
+    Wraps in try/except so audit failures never block the dispatch pipeline.
+    Extra keyword arguments are serialized into the event_data JSON column.
+
+    Requirements: 5.3, 7.5
+    """
+    from sqlalchemy import text as _text
+
+    now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    event_data = json.dumps(extra_data, default=str) if extra_data else None
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(_text("""
+                INSERT INTO pm_alert_events
+                    (alert_intent_id, event_type, symbol, alert_type, profile_id, event_at, event_data)
+                VALUES (:aid, :event_type, :symbol, :alert_type, :profile_id, :event_at, :event_data)
+            """), {
+                "aid": alert_intent_id,
+                "event_type": event_type,
+                "symbol": symbol,
+                "alert_type": alert_type,
+                "profile_id": profile_id,
+                "event_at": now_str,
+                "event_data": event_data,
+            })
+    except Exception as exc:
+        log.error(
+            "PM_ALERT_EVENT_WRITE_FAILED: alert_intent_id=%s event_type=%s error=%s",
+            alert_intent_id, event_type, exc,
+        )
+
+
+def complete_alert_claim(
+    engine, alert_intent_id: str, outcome: str, profile_id: str
+) -> None:
+    """Update the claim row to 'completed' (or 'error') and record detailed outcome.
+
+    The claim table tracks lifecycle only: claimed → completed | error.
+    The rich outcome (accepted, rejected, no_candidate, gate_rejected, skipped_stale)
+    is recorded in pm_alert_events.event_data on the 'completed' event.
+
+    Requirements: 5.3
+    """
+    from sqlalchemy import text as _text
+
+    now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    claim_status = "error" if outcome == "error" else "completed"
+    with engine.begin() as conn:
+        conn.execute(_text("""
+            UPDATE pm_alert_claims
+            SET status = :status, completed_at = :completed_at
+            WHERE alert_intent_id = :aid AND profile_id = :profile_id
+        """), {
+            "aid": alert_intent_id,
+            "status": claim_status,
+            "completed_at": now_str,
+            "profile_id": profile_id,
+        })
+    record_alert_event(
+        engine, alert_intent_id, "completed", profile_id=profile_id, outcome=outcome
+    )
+
+
+def claim_alert_for_processing(
+    engine, alert_intent_id: str, symbol: str, alert_type: str, profile_id: str
+) -> Optional[dict]:
+    """Atomically claim an alert_intent_id+profile_id for processing via INSERT.
+
+    Uses UNIQUE constraint on pm_alert_claims(alert_intent_id, profile_id):
+    - If INSERT succeeds → this profile owns the claim. Return None (proceed).
+    - If INSERT fails (UNIQUE violation) → check existing row:
+      - status='error' (stale-recovered) → attempt reclaim via UPDATE.
+        rowcount=1 means reclaim succeeded, return None (proceed).
+        rowcount=0 means another worker beat us, return duplicate_noop.
+      - status='claimed'/'accepted'/'rejected'/'completed' → legitimately owned.
+        Return duplicate_noop.
+
+    This is race-free: two concurrent dispatches for the same (intent, profile)
+    will have exactly one succeed at the INSERT and one fail.
+    Different profiles can independently claim the same alert_intent_id.
+
+    Requirements: 5.1, 5.2, 5.4
+    """
+    from sqlalchemy import text as _text
+    from sqlalchemy.exc import IntegrityError
+
+    now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(_text("""
+                INSERT INTO pm_alert_claims
+                    (alert_intent_id, symbol, alert_type, profile_id, status, claimed_at)
+                VALUES (:aid, :symbol, :alert_type, :profile_id, 'claimed', :claimed_at)
+            """), {
+                "aid": alert_intent_id,
+                "symbol": symbol,
+                "alert_type": alert_type,
+                "profile_id": profile_id,
+                "claimed_at": now_str,
+            })
+        # Claim succeeded — record event and proceed with LLM evaluation
+        record_alert_event(engine, alert_intent_id, "claimed", symbol, alert_type, profile_id)
+        return None  # proceed with evaluation
+
+    except IntegrityError:
+        # UNIQUE violation — row already exists for this (intent, profile).
+        # Check if it's a stale-recovered 'error' that we can reclaim.
+        with engine.connect() as conn:
+            row = conn.execute(_text("""
+                SELECT status, claimed_at, completed_at FROM pm_alert_claims
+                WHERE alert_intent_id = :aid AND profile_id = :profile_id LIMIT 1
+            """), {"aid": alert_intent_id, "profile_id": profile_id}).fetchone()
+
+        if row and row[0] == "error":
+            # Stale-recovered claim — attempt reclaim via UPDATE.
+            # After stale-claim recovery marks a row as 'error', UNIQUE blocks
+            # re-INSERT. We UPDATE instead.
+            with engine.begin() as conn:
+                result = conn.execute(_text("""
+                    UPDATE pm_alert_claims
+                    SET status = 'claimed', claimed_at = :now, completed_at = NULL
+                    WHERE alert_intent_id = :aid
+                        AND profile_id = :profile_id
+                        AND status = 'error'
+                """), {"aid": alert_intent_id, "profile_id": profile_id, "now": now_str})
+
+            if result.rowcount == 1:
+                # Reclaim succeeded — proceed with evaluation
+                record_alert_event(
+                    engine, alert_intent_id, "reclaimed", symbol, alert_type, profile_id,
+                    previous_status="error",
+                )
+                log.info(
+                    "PM_ALERT_RECLAIMED: alert_intent_id=%s profile_id=%s (was error)",
+                    alert_intent_id, profile_id,
+                )
+                return None  # proceed with evaluation
+            # else: another worker reclaimed between SELECT and UPDATE — fall through
+
+        # Legitimately claimed/completed, or race-lost reclaim — return duplicate_noop
+        record_alert_event(
+            engine, alert_intent_id, "duplicate_noop", symbol, alert_type, profile_id,
+            original_status=row[0] if row else "unknown",
+            original_claimed_at=row[1] if row else None,
+        )
+
+        log.info(
+            "PM_ALERT_IDEMPOTENT_NOOP: alert_intent_id=%s profile_id=%s symbol=%s original_status=%s",
+            alert_intent_id, profile_id, symbol, row[0] if row else "unknown",
+        )
+        return {
+            "outcome": "duplicate_noop",
+            "original_claimed_at": row[1] if row else None,
+            "original_status": row[0] if row else "unknown",
+        }
+
+
+def recover_stale_claims(engine, stale_minutes: int = 10) -> int:
+    """Recover claims stuck in 'claimed' status beyond timeout.
+
+    A crash during LLM evaluation can leave a claim in 'claimed' permanently,
+    blocking all retries for that (alert_intent_id, profile_id). This sweep
+    marks stale claims as 'error' so the dispatcher can retry.
+
+    Called from AlertDispatcher._recover_stale_intents() alongside the
+    existing intent recovery sweep.
+
+    Returns count of recovered claims.
+
+    Requirements: 5.4
+    """
+    from sqlalchemy import text as _text
+
+    now = datetime.utcnow()
+    cutoff = (now - timedelta(minutes=stale_minutes)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    with engine.begin() as conn:
+        result = conn.execute(_text("""
+            UPDATE pm_alert_claims
+            SET status = 'error', completed_at = :now
+            WHERE status = 'claimed' AND claimed_at < :cutoff
+        """), {"now": now_str, "cutoff": cutoff})
+
+    count = result.rowcount
+    if count > 0:
+        log.warning("STALE_CLAIM_RECOVERY: marked %d stale claims as error", count)
+        # Record stale_reclaim events for each recovered claim
+        with engine.connect() as conn:
+            rows = conn.execute(_text("""
+                SELECT alert_intent_id, profile_id FROM pm_alert_claims
+                WHERE status = 'error' AND completed_at = :now
+            """), {"now": now_str}).fetchall()
+        for row in rows:
+            record_alert_event(engine, row[0], "stale_reclaim", profile_id=row[1])
+    return count

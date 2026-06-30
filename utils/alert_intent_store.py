@@ -48,6 +48,7 @@ class AlertIntent:
     dispatch_reason: Optional[str]  # suppression reason
     dispatched_at: Optional[datetime]
     deferred_until: Optional[datetime]  # cooldown re-eligibility time
+    occurrence_count_at_deferral: int  # snapshot at deferral time for material change detection
     dispatch_attempt_count: int    # default 0, max 3
     last_dispatch_error: Optional[str]  # error text from last PM failure
 
@@ -78,6 +79,10 @@ def build_dedupe_key(symbol: str, alert_type: str, setup_condition: str) -> str:
 
 
 _GLOBAL_SENTINEL = "__GLOBAL__"
+
+# Terminal lifecycle states — once reached, no further transitions are permitted.
+# Requirements: 9.6
+TERMINAL_STATES = frozenset({"consumed", "expired", "suppressed", "dispatch_failed"})
 
 # ISO8601 format for writing datetimes to SQLite.
 # SQLite strftime('%Y-%m-%dT%H:%M:%fZ', 'now') produces 'YYYY-MM-DDTHH:MM:SS.SSSZ'
@@ -142,16 +147,34 @@ class AlertIntentStore:
         cooldown_remaining_seconds: Optional[float] = None,
         cycle_trigger_type: Optional[str] = None,
         dispatch_attempt_count: Optional[int] = None,
+        freshness_age_seconds: Optional[float] = None,
+        first_seen_age_seconds: Optional[float] = None,
+        configured_mode: Optional[str] = None,
+        dedupe_key: Optional[str] = None,
+        trigger_price=None,
+        occurrence_count: Optional[int] = None,
+        dispatch_batch_symbols: Optional[str] = None,
     ) -> None:
-        """Append an audit record to alert_dispatch_log. Fail-open on write failure."""
+        """Append an audit record to alert_dispatch_log. Fail-open on write failure.
+
+        Requirements: 7.1, 7.2, 7.5
+        """
         try:
             with self._engine.begin() as conn:
                 conn.execute(text("""
                     INSERT INTO alert_dispatch_log
                         (alert_intent_id, symbol, alert_type, urgency, dispatch_status,
-                         reason, cooldown_remaining_seconds, cycle_trigger_type, dispatch_attempt_count)
+                         reason, cooldown_remaining_seconds, cycle_trigger_type,
+                         dispatch_attempt_count, freshness_age_seconds,
+                         first_seen_age_seconds, configured_mode,
+                         dedupe_key, trigger_price, occurrence_count,
+                         dispatch_batch_symbols)
                     VALUES (:alert_intent_id, :symbol, :alert_type, :urgency, :dispatch_status,
-                            :reason, :cooldown_remaining_seconds, :cycle_trigger_type, :dispatch_attempt_count)
+                            :reason, :cooldown_remaining_seconds, :cycle_trigger_type,
+                            :dispatch_attempt_count, :freshness_age_seconds,
+                            :first_seen_age_seconds, :configured_mode,
+                            :dedupe_key, :trigger_price, :occurrence_count,
+                            :dispatch_batch_symbols)
                 """), {
                     "alert_intent_id": alert_intent_id,
                     "symbol": symbol,
@@ -162,6 +185,13 @@ class AlertIntentStore:
                     "cooldown_remaining_seconds": cooldown_remaining_seconds,
                     "cycle_trigger_type": cycle_trigger_type,
                     "dispatch_attempt_count": dispatch_attempt_count,
+                    "freshness_age_seconds": freshness_age_seconds,
+                    "first_seen_age_seconds": first_seen_age_seconds,
+                    "configured_mode": configured_mode,
+                    "dedupe_key": dedupe_key,
+                    "trigger_price": str(trigger_price) if trigger_price is not None else None,
+                    "occurrence_count": occurrence_count,
+                    "dispatch_batch_symbols": dispatch_batch_symbols,
                 })
             # Structured log at INFO level (Requirement 10.1)
             payload = {
@@ -381,6 +411,7 @@ class AlertIntentStore:
             dispatch_reason=row.dispatch_reason,
             dispatched_at=_parse_iso_dt(row.dispatched_at),
             deferred_until=_parse_iso_dt(row.deferred_until),
+            occurrence_count_at_deferral=row.occurrence_count_at_deferral if hasattr(row, 'occurrence_count_at_deferral') else 0,
             dispatch_attempt_count=row.dispatch_attempt_count,
             last_dispatch_error=row.last_dispatch_error,
         )
@@ -426,7 +457,10 @@ class AlertIntentStore:
                 DO UPDATE SET
                     last_seen_at = excluded.last_seen_at,
                     occurrence_count = occurrence_count + 1,
-                    expiration_at = MAX(expiration_at, excluded.expiration_at)
+                    expiration_at = MAX(expiration_at, excluded.expiration_at),
+                    trigger_price = excluded.trigger_price,
+                    direction = excluded.direction,
+                    source_level = excluded.source_level
             """), {
                 "alert_intent_id": alert_intent_id,
                 "symbol": intent_data["symbol"],
@@ -449,7 +483,8 @@ class AlertIntentStore:
                     trigger_price, source_level, urgency, reason, dedupe_key,
                     filter_status, first_seen_at, last_seen_at, occurrence_count,
                     expiration_at, dispatch_status, dispatch_reason, dispatched_at,
-                    deferred_until, dispatch_attempt_count, last_dispatch_error
+                    deferred_until, occurrence_count_at_deferral,
+                    dispatch_attempt_count, last_dispatch_error
                 FROM alert_intents
                 WHERE dedupe_key = :dedupe_key
                     AND dispatch_status IN ('pending', 'dispatched', 'claimed_by_scheduled')
@@ -463,36 +498,96 @@ class AlertIntentStore:
 
     @with_lock_retry
     def mark_dispatched(self, intent_ids: list[int], dispatch_ts: datetime) -> int:
-        """Mark intents as dispatched with timestamp. Returns count of rows updated."""
+        """Mark intents as dispatched with timestamp. Returns count of rows updated.
+
+        Terminal-state intents (consumed, expired, suppressed, dispatch_failed) are
+        excluded from the update. A WARNING is logged if any intents were skipped.
+
+        Requirements: 9.3, 9.6
+        """
         if not intent_ids:
             return 0
         with self._engine.begin() as conn:
             placeholders = ", ".join(f":id_{i}" for i in range(len(intent_ids)))
             params = {f"id_{i}": id_ for i, id_ in enumerate(intent_ids)}
             params["dispatch_ts"] = dispatch_ts.strftime(_ISO_FMT)
+
+            # Query symbol/alert_type for logging (only pending rows will transition)
+            info_rows = conn.execute(text(f"""
+                SELECT id, symbol, alert_type FROM alert_intents
+                WHERE id IN ({placeholders}) AND dispatch_status = 'pending'
+            """), params).fetchall()
+
             result = conn.execute(text(f"""
                 UPDATE alert_intents
                 SET dispatch_status = 'dispatched', dispatched_at = :dispatch_ts
                 WHERE id IN ({placeholders})
                     AND dispatch_status = 'pending'
             """), params)
-        return result.rowcount
+        updated = result.rowcount
+        skipped = len(intent_ids) - updated
+        if skipped > 0:
+            logger.warning(
+                "mark_dispatched: %d of %d intents skipped (already in terminal or "
+                "non-pending state, attempted transition to dispatched)",
+                skipped, len(intent_ids),
+            )
+
+        # Emit structured state transition logs (Requirement 9.3)
+        for info_row in info_rows:
+            logger.info(
+                "ALERT_STATE_TRANSITION: symbol=%s alert_type=%s old_status=%s new_status=%s reason=%s",
+                info_row[1], info_row[2], "pending", "dispatched", "dispatch_batch",
+            )
+
+        return updated
 
     @with_lock_retry
     def mark_consumed(self, intent_ids: list[int]) -> int:
-        """Mark intents as consumed (terminal state). Returns count of rows updated."""
+        """Mark intents as consumed (terminal state). Returns count of rows updated.
+
+        Only transitions intents in dispatched or claimed_by_scheduled states.
+        Terminal-state intents (consumed, expired, suppressed, dispatch_failed) are
+        excluded from the update. A WARNING is logged if any intents were skipped.
+
+        Requirements: 9.3, 9.6
+        """
         if not intent_ids:
             return 0
         with self._engine.begin() as conn:
             placeholders = ", ".join(f":id_{i}" for i in range(len(intent_ids)))
             params = {f"id_{i}": id_ for i, id_ in enumerate(intent_ids)}
+
+            # Query symbol/alert_type/old_status for logging before UPDATE
+            info_rows = conn.execute(text(f"""
+                SELECT id, symbol, alert_type, dispatch_status FROM alert_intents
+                WHERE id IN ({placeholders})
+                    AND dispatch_status IN ('dispatched', 'claimed_by_scheduled')
+            """), params).fetchall()
+
             result = conn.execute(text(f"""
                 UPDATE alert_intents
                 SET dispatch_status = 'consumed'
                 WHERE id IN ({placeholders})
                     AND dispatch_status IN ('dispatched', 'claimed_by_scheduled')
             """), params)
-        return result.rowcount
+        updated = result.rowcount
+        skipped = len(intent_ids) - updated
+        if skipped > 0:
+            logger.warning(
+                "mark_consumed: %d of %d intents skipped (already in terminal or "
+                "ineligible state, attempted transition to consumed)",
+                skipped, len(intent_ids),
+            )
+
+        # Emit structured state transition logs (Requirement 9.3)
+        for info_row in info_rows:
+            logger.info(
+                "ALERT_STATE_TRANSITION: symbol=%s alert_type=%s old_status=%s new_status=%s reason=%s",
+                info_row[1], info_row[2], info_row[3], "consumed", "pm_processing_complete",
+            )
+
+        return updated
 
     @with_lock_retry
     def mark_expired(self, *, now: datetime) -> int:
@@ -507,21 +602,131 @@ class AlertIntentStore:
         return result.rowcount
 
     @with_lock_retry
-    def mark_suppressed(self, intent_id: int, reason: str) -> None:
-        """Mark intent as suppressed (terminal state) with reason."""
+    def query_active_past_expiration(self, *, now: datetime) -> list[AlertIntent]:
+        """Query active intents whose expiration_at has passed.
+
+        Returns intents in active states (pending, dispatched, claimed_by_scheduled)
+        where expiration_at < now. Used by the dispatcher to individually expire
+        intents with audit records and PM-cycle protection.
+
+        Requirements: 4.1, 4.3
+        """
         with self._engine.begin() as conn:
-            conn.execute(text("""
+            rows = conn.execute(text("""
+                SELECT id, alert_intent_id, symbol, alert_type, direction,
+                    trigger_price, source_level, urgency, reason, dedupe_key,
+                    filter_status, first_seen_at, last_seen_at, occurrence_count,
+                    expiration_at, dispatch_status, dispatch_reason, dispatched_at,
+                    deferred_until, occurrence_count_at_deferral,
+                    dispatch_attempt_count, last_dispatch_error
+                FROM alert_intents
+                WHERE expiration_at < :now
+                    AND dispatch_status IN ('pending', 'dispatched', 'claimed_by_scheduled')
+                ORDER BY expiration_at ASC
+            """), {"now": now.strftime(_ISO_FMT)}).fetchall()
+        return [self._row_to_intent(row) for row in rows]
+
+    @with_lock_retry
+    def mark_suppressed(self, intent_id: int, reason: str) -> None:
+        """Mark intent as suppressed (terminal state) with reason.
+
+        Only transitions intents in pending state. Terminal-state intents
+        (consumed, expired, suppressed, dispatch_failed) are excluded.
+        A WARNING is logged if the intent was skipped due to terminal state.
+
+        Requirements: 9.3, 9.6
+        """
+        with self._engine.begin() as conn:
+            # Query symbol/alert_type/old_status for logging before UPDATE
+            info_row = conn.execute(text("""
+                SELECT symbol, alert_type, dispatch_status FROM alert_intents
+                WHERE id = :intent_id
+            """), {"intent_id": intent_id}).fetchone()
+
+            result = conn.execute(text("""
                 UPDATE alert_intents
                 SET dispatch_status = 'suppressed', dispatch_reason = :reason
                 WHERE id = :intent_id
-                    AND dispatch_status = 'pending'
+                    AND dispatch_status NOT IN ('consumed', 'expired', 'suppressed', 'dispatch_failed')
             """), {"intent_id": intent_id, "reason": reason})
+
+        if result.rowcount == 0:
+            logger.warning(
+                "mark_suppressed: intent_id=%d skipped — already in terminal state, "
+                "attempted transition to suppressed (reason=%s)",
+                intent_id, reason,
+            )
+            return
+
+        # Emit structured state transition log (Requirement 9.3)
+        symbol = info_row[0] if info_row else "unknown"
+        alert_type = info_row[1] if info_row else "unknown"
+        old_status = info_row[2] if info_row else "unknown"
+        truncated_reason = reason[:200] if reason else ""
+        logger.info(
+            "ALERT_STATE_TRANSITION: symbol=%s alert_type=%s old_status=%s new_status=%s reason=%s",
+            symbol, alert_type, old_status, "suppressed", truncated_reason,
+        )
+
+    @with_lock_retry
+    def transition_to_expired(self, intent_id: int, reason: str) -> bool:
+        """Transition an active intent to expired with a reason.
+
+        Only transitions intents whose dispatch_status is in the active set:
+        ('pending', 'dispatched', 'claimed_by_scheduled').
+
+        If the intent is already in a terminal state (consumed, expired,
+        suppressed, dispatch_failed), logs a WARNING and returns False.
+
+        Returns True on successful transition, False if intent was already terminal.
+
+        Requirements: 3.3, 4.1, 9.3, 9.6
+        """
+        with self._engine.begin() as conn:
+            # Query old status, symbol, alert_type before transition for logging
+            row = conn.execute(text("""
+                SELECT dispatch_status, symbol, alert_type FROM alert_intents
+                WHERE id = :intent_id
+            """), {"intent_id": intent_id}).fetchone()
+
+            old_status = row[0] if row else "unknown"
+            symbol = row[1] if row else "unknown"
+            alert_type = row[2] if row else "unknown"
+
+            result = conn.execute(text("""
+                UPDATE alert_intents
+                SET dispatch_status = 'expired', dispatch_reason = :reason
+                WHERE id = :intent_id
+                    AND dispatch_status IN ('pending', 'dispatched', 'claimed_by_scheduled')
+            """), {"intent_id": intent_id, "reason": reason})
+
+        if result.rowcount == 0:
+            logger.warning(
+                "transition_to_expired: intent_id=%d already in terminal state, "
+                "cannot transition to expired (reason=%s)",
+                intent_id,
+                reason,
+            )
+            return False
+
+        truncated_reason = reason[:200] if reason else ""
+        logger.info(
+            "ALERT_STATE_TRANSITION: symbol=%s alert_type=%s old_status=%s new_status=%s reason=%s",
+            symbol, alert_type, old_status, "expired", truncated_reason,
+        )
+        return True
 
     @with_lock_retry
     def mark_dispatch_failed(self, intent_ids: list[int], error: str) -> int:
         """Increment dispatch_attempt_count, set last_dispatch_error.
         If count >= 3, transition to 'dispatch_failed' (terminal).
-        Otherwise, back to 'pending'. Returns count of updated rows."""
+        Otherwise, back to 'pending'. Returns count of updated rows.
+
+        Terminal-state intents (consumed, expired, suppressed, dispatch_failed) are
+        excluded from all updates. A WARNING is logged if any intents were skipped.
+
+        Requirements: 9.3, 9.6
+        """
         if not intent_ids:
             return 0
         with self._engine.begin() as conn:
@@ -529,12 +734,20 @@ class AlertIntentStore:
             params = {f"id_{i}": id_ for i, id_ in enumerate(intent_ids)}
             params["error"] = error
 
-            # First increment attempt count and set error for all
+            # Query symbol/alert_type/old_status for logging before UPDATE
+            info_rows = conn.execute(text(f"""
+                SELECT id, symbol, alert_type, dispatch_status FROM alert_intents
+                WHERE id IN ({placeholders})
+                    AND dispatch_status NOT IN ('consumed', 'expired', 'suppressed', 'dispatch_failed')
+            """), params).fetchall()
+
+            # Increment attempt count and set error — only for non-terminal intents
             conn.execute(text(f"""
                 UPDATE alert_intents
                 SET dispatch_attempt_count = dispatch_attempt_count + 1,
                     last_dispatch_error = :error
                 WHERE id IN ({placeholders})
+                    AND dispatch_status NOT IN ('consumed', 'expired', 'suppressed', 'dispatch_failed')
             """), params)
 
             # Then set terminal state for those at/above threshold
@@ -543,7 +756,7 @@ class AlertIntentStore:
                 SET dispatch_status = 'dispatch_failed'
                 WHERE id IN ({placeholders})
                     AND dispatch_attempt_count >= 3
-                    AND dispatch_status != 'dispatch_failed'
+                    AND dispatch_status NOT IN ('consumed', 'expired', 'suppressed', 'dispatch_failed')
             """), params)
 
             # Revert remaining to pending
@@ -554,7 +767,42 @@ class AlertIntentStore:
                     AND dispatch_attempt_count < 3
                     AND dispatch_status NOT IN ('dispatch_failed', 'consumed', 'expired', 'suppressed')
             """), params)
-        return result.rowcount + len(intent_ids)  # approximate
+
+            # Query final states for accurate transition logging
+            final_rows = conn.execute(text(f"""
+                SELECT id, dispatch_status FROM alert_intents
+                WHERE id IN ({placeholders})
+            """), params).fetchall()
+
+        # Build lookup for final states
+        final_status_map = {row[0]: row[1] for row in final_rows}
+        truncated_error = error[:200] if error else ""
+
+        # Emit structured state transition logs (Requirement 9.3)
+        for info_row in info_rows:
+            intent_id_val = info_row[0]
+            symbol = info_row[1]
+            alert_type = info_row[2]
+            old_status = info_row[3]
+            final_status = final_status_map.get(intent_id_val, "unknown")
+            # Only log if status actually changed
+            if old_status != final_status:
+                logger.info(
+                    "ALERT_STATE_TRANSITION: symbol=%s alert_type=%s old_status=%s new_status=%s reason=%s",
+                    symbol, alert_type, old_status, final_status, truncated_error,
+                )
+
+        # Check if any intents were potentially in terminal state
+        # The first UPDATE only touches non-terminal intents; if rowcount < len(intent_ids),
+        # some were skipped (already terminal)
+        total_processed = result.rowcount + len(intent_ids)  # approximate
+        if result.rowcount == 0 and len(intent_ids) > 0:
+            logger.warning(
+                "mark_dispatch_failed: some intents may have been skipped due to "
+                "terminal state (attempted transition for %d intents, error=%s)",
+                len(intent_ids), error,
+            )
+        return total_processed
 
     @with_lock_retry
     def mark_claimed_by_scheduled(self, intent_ids: list[int]) -> int:
@@ -608,7 +856,8 @@ class AlertIntentStore:
                     trigger_price, source_level, urgency, reason, dedupe_key,
                     filter_status, first_seen_at, last_seen_at, occurrence_count,
                     expiration_at, dispatch_status, dispatch_reason, dispatched_at,
-                    deferred_until, dispatch_attempt_count, last_dispatch_error
+                    deferred_until, occurrence_count_at_deferral,
+                    dispatch_attempt_count, last_dispatch_error
                 FROM alert_intents
                 WHERE dispatch_status = 'pending'
                     AND filter_status != 'unclassified'
@@ -628,7 +877,8 @@ class AlertIntentStore:
                     trigger_price, source_level, urgency, reason, dedupe_key,
                     filter_status, first_seen_at, last_seen_at, occurrence_count,
                     expiration_at, dispatch_status, dispatch_reason, dispatched_at,
-                    deferred_until, dispatch_attempt_count, last_dispatch_error
+                    deferred_until, occurrence_count_at_deferral,
+                    dispatch_attempt_count, last_dispatch_error
                 FROM alert_intents
                 WHERE filter_status = 'unclassified'
                     AND dispatch_status IN ('pending', 'dispatched', 'claimed_by_scheduled')
@@ -650,3 +900,177 @@ class AlertIntentStore:
                 "filter_status": filter_status,
                 "urgency": urgency,
             })
+
+    @with_lock_retry
+    def query_by_lifecycle(
+        self,
+        *,
+        status_list: Optional[list[str]] = None,
+        alert_type: Optional[str] = None,
+        symbol: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+    ) -> list[AlertIntent]:
+        """Query alert intents by lifecycle filters.
+
+        Supports filtering by any combination of dispatch_status, alert_type,
+        symbol, and a time range (start/end in ISO format against first_seen_at).
+        Returns matching records ordered by first_seen_at DESC, limited to 1000 rows.
+        Returns empty list when no matches found (never raises for empty results).
+
+        Requirements: 9.4, 9.5
+        """
+        clauses: list[str] = []
+        params: dict = {}
+
+        if status_list:
+            # Expand list into individual named params for SQLite compatibility
+            status_placeholders = ", ".join(
+                f":status_{i}" for i in range(len(status_list))
+            )
+            clauses.append(f"dispatch_status IN ({status_placeholders})")
+            for i, status in enumerate(status_list):
+                params[f"status_{i}"] = status
+
+        if alert_type is not None:
+            clauses.append("alert_type = :alert_type")
+            params["alert_type"] = alert_type
+
+        if symbol is not None:
+            clauses.append("symbol = :symbol")
+            params["symbol"] = symbol
+
+        if start_time is not None:
+            clauses.append("first_seen_at >= :start_time")
+            params["start_time"] = start_time
+
+        if end_time is not None:
+            clauses.append("first_seen_at <= :end_time")
+            params["end_time"] = end_time
+
+        where_clause = ""
+        if clauses:
+            where_clause = "WHERE " + " AND ".join(clauses)
+
+        sql = f"""
+            SELECT id, alert_intent_id, symbol, alert_type, direction,
+                trigger_price, source_level, urgency, reason, dedupe_key,
+                filter_status, first_seen_at, last_seen_at, occurrence_count,
+                expiration_at, dispatch_status, dispatch_reason, dispatched_at,
+                deferred_until, occurrence_count_at_deferral,
+                dispatch_attempt_count, last_dispatch_error
+            FROM alert_intents
+            {where_clause}
+            ORDER BY first_seen_at DESC
+            LIMIT 1000
+        """
+
+        with self._engine.begin() as conn:
+            rows = conn.execute(text(sql), params).fetchall()
+
+        return [self._row_to_intent(row) for row in rows]
+
+    @with_lock_retry
+    def set_deferred_until(
+        self, intent_id: int, deferred_until: datetime, occurrence_count_at_deferral: int
+    ) -> None:
+        """Set deferred_until and snapshot of occurrence_count at deferral time.
+
+        After any dispatch evaluation outcome, the dispatcher calls this to prevent
+        re-evaluation until the cooldown expires or occurrence_count changes.
+
+        Args:
+            intent_id: SQLite row id of the alert intent.
+            deferred_until: Cooldown expiry timestamp (stored as ISO 8601 TEXT).
+            occurrence_count_at_deferral: Snapshot of occurrence_count at deferral time,
+                used to detect material changes that should break the deferral.
+        """
+        with self._engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE alert_intents
+                SET deferred_until = :deferred_until,
+                    occurrence_count_at_deferral = :occ_count
+                WHERE id = :intent_id
+            """), {
+                "intent_id": intent_id,
+                "deferred_until": deferred_until.strftime(_ISO_FMT),
+                "occ_count": occurrence_count_at_deferral,
+            })
+
+    @with_lock_retry
+    def has_would_dispatch_for_occurrence(
+        self,
+        alert_intent_id: str,
+        dedupe_key: str,
+        trigger_price,
+        occurrence_count: int,
+    ) -> bool:
+        """Check if a would_dispatch audit row exists for this exact occurrence state.
+
+        Used for observation deduplication — if we already observed this exact
+        occurrence (same alert_intent_id, dedupe_key, trigger_price, and
+        occurrence_count), we don't write another would_dispatch row.
+
+        Args:
+            alert_intent_id: UUID4 string identifier of the alert intent.
+            dedupe_key: Composite deduplication key for the intent.
+            trigger_price: The trigger price (Decimal, str, or float).
+            occurrence_count: The current occurrence count of the intent.
+
+        Returns:
+            True if a matching would_dispatch row exists, False otherwise.
+
+        Requirements: 2.3, 2.4, 8.2
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT 1 FROM alert_dispatch_log
+                WHERE alert_intent_id = :aid
+                    AND dispatch_status = 'would_dispatch'
+                    AND dedupe_key = :dk
+                    AND trigger_price = :tp
+                    AND occurrence_count = :oc
+                LIMIT 1
+            """), {
+                "aid": alert_intent_id,
+                "dk": dedupe_key,
+                "tp": str(trigger_price),
+                "oc": occurrence_count,
+            }).fetchone()
+        return row is not None
+
+    @with_lock_retry
+    def get_latest_would_dispatch_trigger_price(
+        self,
+        alert_intent_id: str,
+    ) -> Optional[Decimal]:
+        """Get the trigger_price from the most recent would_dispatch row for an intent.
+
+        Used for material change detection — comparing the current trigger_price
+        against the last observed price to determine if the change exceeds the
+        0.5% threshold.
+
+        Args:
+            alert_intent_id: UUID4 string identifier of the alert intent.
+
+        Returns:
+            The trigger_price as Decimal from the most recent would_dispatch row,
+            or None if no would_dispatch row exists for this intent.
+
+        Requirements: 8.3
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT trigger_price FROM alert_dispatch_log
+                WHERE alert_intent_id = :aid
+                    AND dispatch_status = 'would_dispatch'
+                    AND trigger_price IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1
+            """), {"aid": alert_intent_id}).fetchone()
+        if row is None or row[0] is None:
+            return None
+        try:
+            return Decimal(row[0])
+        except Exception:
+            return None

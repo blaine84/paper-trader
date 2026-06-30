@@ -33,7 +33,7 @@ def init_alert_dispatch_schema(engine) -> None:
         cursor.close()
 
     with engine.begin() as conn:
-        # ─── alert_intents table ───────────────────────────────────────────
+        # --- alert_intents table -----------------------------------------------
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS alert_intents (
                 id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +84,7 @@ def init_alert_dispatch_schema(engine) -> None:
                 WHERE filter_status = 'unclassified'
         """))
 
-        # ─── alert_cooldowns table ─────────────────────────────────────────
+        # --- alert_cooldowns table ---------------------------------------------
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS alert_cooldowns (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +100,7 @@ def init_alert_dispatch_schema(engine) -> None:
                 ON alert_cooldowns(symbol, expiry_at)
         """))
 
-        # ─── alert_dispatch_log table (immutable append-only) ──────────────
+        # --- alert_dispatch_log table (immutable append-only) ------------------
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS alert_dispatch_log (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,4 +144,143 @@ def init_alert_dispatch_schema(engine) -> None:
             END
         """))
 
+        # --- pm_alert_claims table (mutable, PM-side idempotency) --------------
+        # Requirements: 5.1, 5.4
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pm_alert_claims (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_intent_id       TEXT NOT NULL,
+                symbol                TEXT NOT NULL,
+                alert_type            TEXT NOT NULL,
+                profile_id            TEXT NOT NULL,
+                status                TEXT NOT NULL DEFAULT 'claimed',
+                claimed_at            TEXT NOT NULL,
+                completed_at          TEXT,
+                UNIQUE(alert_intent_id, profile_id)
+            )
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_pm_alert_claims_status_claimed
+                ON pm_alert_claims(status, claimed_at)
+                WHERE status = 'claimed'
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_pm_alert_claims_symbol_claimed
+                ON pm_alert_claims(symbol, claimed_at)
+        """))
+
+        # --- pm_alert_events table (immutable, append-only audit log) ----------
+        # Requirements: 5.3, 7.4
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pm_alert_events (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_intent_id       TEXT NOT NULL,
+                event_type            TEXT NOT NULL,
+                symbol                TEXT NOT NULL DEFAULT '',
+                alert_type            TEXT NOT NULL DEFAULT '',
+                profile_id            TEXT NOT NULL DEFAULT '',
+                event_at              TEXT NOT NULL,
+                event_data            TEXT
+            )
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_pm_alert_events_intent_type
+                ON pm_alert_events(alert_intent_id, event_type)
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_pm_alert_events_event_at
+                ON pm_alert_events(event_at)
+        """))
+
+        # Immutability triggers - block UPDATE and DELETE (matching project pattern)
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS trg_pm_alert_events_no_update
+                BEFORE UPDATE ON pm_alert_events
+            BEGIN
+                SELECT RAISE(ABORT, 'pm_alert_events is immutable: UPDATE blocked');
+            END
+        """))
+
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS trg_pm_alert_events_no_delete
+                BEFORE DELETE ON pm_alert_events
+            BEGIN
+                SELECT RAISE(ABORT, 'pm_alert_events is immutable: DELETE blocked');
+            END
+        """))
+
+    # --- Non-destructive column migrations -----------------------------------
+    # Add columns to existing tables using PRAGMA table_info check.
+    # Safe to call multiple times — skips if column already exists.
+    _migrate_alert_intents_columns(engine)
+
+    # --- Enhanced audit columns for alert_dispatch_log (non-destructive) -----
+    # Requirements: 7.1, 7.2 — complete audit trail for dispatch decisions
+    _add_dispatch_log_audit_columns(engine)
+
     logger.info("alert_dispatch_schema: all tables and indexes initialized")
+
+
+def _migrate_alert_intents_columns(engine) -> None:
+    """Add new columns to alert_intents if not already present.
+
+    Non-destructive: checks PRAGMA table_info before ALTER TABLE.
+    Required for dispatch-once semantics (occurrence_count_at_deferral stores
+    the occurrence_count at the time deferral was set, enabling material change detection).
+
+    Requirements: 2.1, 2.5
+    """
+    with engine.begin() as conn:
+        result = conn.execute(text("PRAGMA table_info(alert_intents)"))
+        existing_columns = {row[1] for row in result.fetchall()}
+
+        if "occurrence_count_at_deferral" not in existing_columns:
+            conn.execute(text(
+                "ALTER TABLE alert_intents ADD COLUMN occurrence_count_at_deferral INTEGER DEFAULT 0"
+            ))
+            logger.warning(
+                "Schema migration: added alert_intents.occurrence_count_at_deferral (INTEGER DEFAULT 0)"
+            )
+
+
+def _add_dispatch_log_audit_columns(engine) -> None:
+    """Add enhanced audit columns to alert_dispatch_log via non-destructive ALTER TABLE.
+
+    Uses PRAGMA table_info to check for existing columns before adding.
+    Safe to call multiple times — skips columns that already exist.
+
+    Requirements: 7.1, 7.2
+    """
+    columns_to_add = [
+        ("dedupe_key", "TEXT"),
+        ("configured_mode", "TEXT"),
+        ("freshness_age_seconds", "REAL"),
+        ("first_seen_age_seconds", "REAL"),
+        ("dispatch_batch_symbols", "TEXT"),
+        ("trigger_price", "REAL"),
+        ("occurrence_count", "INTEGER"),
+    ]
+
+    with engine.begin() as conn:
+        result = conn.execute(text("PRAGMA table_info(alert_dispatch_log)"))
+        existing_columns = {row[1] for row in result.fetchall()}
+
+        for col_name, col_type in columns_to_add:
+            if col_name in existing_columns:
+                continue
+            try:
+                conn.execute(text(
+                    f"ALTER TABLE alert_dispatch_log ADD COLUMN {col_name} {col_type}"
+                ))
+                logger.warning(
+                    "Schema migration: added alert_dispatch_log.%s (%s)",
+                    col_name, col_type,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to add alert_dispatch_log.%s: %s", col_name, e
+                )

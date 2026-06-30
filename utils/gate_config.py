@@ -350,6 +350,80 @@ PM_ALERT_SCHEDULED_MAX_RUNTIME_MINUTES: int = int(
 )
 
 # ---------------------------------------------------------------------------
+# Per-Alert-Type Dispatch Mode Overrides
+# ---------------------------------------------------------------------------
+
+# Per-alert-type dispatch mode overrides.
+# Values: "dispatch" | "observe" | "disabled" | "" (fall back to global mode)
+PM_ALERT_MODE_ENTRY_ALERT: str = os.environ.get("PM_ALERT_MODE_ENTRY_ALERT", "")
+PM_ALERT_MODE_BREAKOUT: str = os.environ.get("PM_ALERT_MODE_BREAKOUT", "")
+PM_ALERT_MODE_RAPID_MOVE: str = os.environ.get("PM_ALERT_MODE_RAPID_MOVE", "")
+PM_ALERT_MODE_TARGET_HIT: str = os.environ.get("PM_ALERT_MODE_TARGET_HIT", "")
+
+
+# ---------------------------------------------------------------------------
+# Alert Freshness Limits
+# ---------------------------------------------------------------------------
+
+
+def _clamp_freshness(raw_value: str, alert_type: str) -> int:
+    """Parse and clamp a freshness value to [1, 120] minutes.
+
+    Args:
+        raw_value: The raw string value from the environment variable.
+        alert_type: The alert type name (for warning messages).
+
+    Returns:
+        The clamped integer value in the range [1, 120].
+    """
+    try:
+        value = int(raw_value)
+    except (ValueError, TypeError):
+        logger.warning(
+            "PM_ALERT_FRESHNESS_%s_MINUTES has non-numeric value '%s'; "
+            "using default of 15 minutes.",
+            alert_type,
+            raw_value,
+        )
+        value = 15
+
+    if value < 1:
+        logger.warning(
+            "PM_ALERT_FRESHNESS_%s_MINUTES value %d is below minimum; "
+            "clamping to 1 minute.",
+            alert_type,
+            value,
+        )
+        return 1
+    if value > 120:
+        logger.warning(
+            "PM_ALERT_FRESHNESS_%s_MINUTES value %d exceeds maximum; "
+            "clamping to 120 minutes.",
+            alert_type,
+            value,
+        )
+        return 120
+
+    return value
+
+
+# Freshness limits per alert type (minutes), clamped to [1, 120]
+PM_ALERT_FRESHNESS_ENTRY_ALERT_MINUTES: int = _clamp_freshness(
+    os.environ.get("PM_ALERT_FRESHNESS_ENTRY_ALERT_MINUTES", "15"), "ENTRY_ALERT"
+)
+PM_ALERT_FRESHNESS_BREAKOUT_MINUTES: int = _clamp_freshness(
+    os.environ.get("PM_ALERT_FRESHNESS_BREAKOUT_MINUTES", "10"), "BREAKOUT"
+)
+PM_ALERT_FRESHNESS_RAPID_MOVE_MINUTES: int = _clamp_freshness(
+    os.environ.get("PM_ALERT_FRESHNESS_RAPID_MOVE_MINUTES", "5"), "RAPID_MOVE"
+)
+
+# Stale claim recovery timeout (minutes)
+PM_ALERT_CLAIM_STALE_MINUTES: int = int(
+    os.environ.get("PM_ALERT_CLAIM_STALE_MINUTES", "10")
+)
+
+# ---------------------------------------------------------------------------
 # Pilot Controller
 # ---------------------------------------------------------------------------
 

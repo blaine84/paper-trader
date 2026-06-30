@@ -286,13 +286,15 @@ class TestObserveMode:
         from utils.alert_intent_store import AlertIntent
 
         # Insert a classified pending intent with future expiration
+        # last_seen_at must be within freshness limit (15 min for entry_alert)
         future_exp = (datetime.utcnow() + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        past_seen = (datetime.utcnow() - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        recent_seen = (datetime.utcnow() - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        past_first = (datetime.utcnow() - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         intent = store.record_or_update_intent(_sample_intent_data(
             filter_status="passed",
             urgency="high",
-            first_seen_at=past_seen,
-            last_seen_at=past_seen,
+            first_seen_at=past_first,
+            last_seen_at=recent_seen,
             expiration_at=future_exp,
         ))
 
@@ -302,11 +304,7 @@ class TestObserveMode:
         # Patch internal methods so we control the flow
         with patch.object(dispatcher, "_recover_stale_intents"), \
              patch.object(dispatcher, "_classify_unclassified"), \
-             patch.object(dispatcher._store, "mark_expired", return_value=0), \
-             patch.object(dispatcher, "_is_market_hours", return_value=True), \
-             patch.object(dispatcher._store, "is_global_cooled", return_value=False), \
-             patch.object(dispatcher._store, "is_symbol_cooled", return_value=False), \
-             patch.object(dispatcher, "_is_stale_duplicate", return_value=False):
+             patch.object(dispatcher._store, "mark_expired", return_value=0):
 
             result = dispatcher.evaluate_and_dispatch()
 
