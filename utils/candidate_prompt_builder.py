@@ -27,7 +27,8 @@ def build_candidate_pm_prompt(
     Args:
         candidate_summaries: List of summary dicts from registry.get_offered_summary()
             Each has: candidate_id, symbol, direction, setup_type, entry_price,
-            stop_price, target_price, risk_reward, geometry_name, trigger
+            stop_price, target_price, risk_reward, geometry_name, trigger,
+            invalidation_basis, target_basis
         portfolio_summary: Dict with portfolio state: cash, total_equity, positions, daily_pnl
         profile: PM profile dict with personality, max_positions, etc.
         profile_id: Profile identifier
@@ -38,15 +39,18 @@ def build_candidate_pm_prompt(
     # Build candidate table
     table_lines = []
     table_lines.append(
-        "| # | ID | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Trigger |"
+        "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | Trigger | Invalidation | Target Basis |"
     )
-    table_lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    table_lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for i, c in enumerate(candidate_summaries, 1):
         trigger_text = c.get("trigger", "") or ""
+        invalidation_text = c.get("invalidation_basis", "") or ""
+        target_basis_text = c.get("target_basis", "") or ""
         table_lines.append(
-            f"| {i} | {c['candidate_id'][:8]}... | {c['symbol']} | {c['direction']} "
+            f"| {i} | {c['candidate_id']} | {c['symbol']} | {c['direction']} "
             f"| ${c['entry_price']:.2f} | ${c['stop_price']:.2f} | ${c['target_price']:.2f} "
-            f"| {c['risk_reward']:.1f}:1 | {c['setup_type']} | {trigger_text[:40]} |"
+            f"| {c['risk_reward']:.1f}:1 | {c['setup_type']} | {c.get('geometry_name', '')} "
+            f"| {trigger_text[:80]} | {invalidation_text[:80]} | {target_basis_text[:80]} |"
         )
     candidate_table = "\n".join(table_lines)
 
@@ -81,9 +85,11 @@ Rules:
 - Select by candidate_id only — do NOT specify symbols, prices, quantities, or sector labels
 - A candidate not in this list cannot be traded
 - Categories, themes, and sector concepts are for commentary only — they are not executable
+- The table above is the complete executable candidate set; Entry, Stop, Target, R:R, Setup, Trigger, Invalidation, and Target Basis are already provided by the deterministic scaffold
+- Do NOT reject a candidate because setup data, entry, stop, target, risk/reward, trigger, invalidation, or target basis is missing
 - An empty accepted set is a valid response — passing on all candidates is acceptable
 - If you accept a candidate, you may optionally specify a risk_multiplier (0.01 to 1.0) to reduce position size
-- Provide a brief rationale for your decisions
+- If you reject a candidate, cite concrete portfolio, timing, exposure, confidence, or market-quality criteria from your PM profile
 
 Respond with your decisions in the required JSON format.
 """

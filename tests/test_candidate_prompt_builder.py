@@ -31,6 +31,8 @@ def _make_candidate_summary(
     risk_reward: float = 2.0,
     geometry_name: str = "primary",
     trigger: str = "Earnings beat with guidance raise",
+    invalidation_basis: str = "Breaks below premarket VWAP",
+    target_basis: str = "Prior day high retest",
 ) -> dict:
     """Create a candidate summary dict matching registry.get_offered_summary() output."""
     return {
@@ -44,6 +46,8 @@ def _make_candidate_summary(
         "risk_reward": risk_reward,
         "geometry_name": geometry_name,
         "trigger": trigger,
+        "invalidation_basis": invalidation_basis,
+        "target_basis": target_basis,
     }
 
 
@@ -97,16 +101,19 @@ class TestPromptCandidateTable:
         prompt = build_candidate_pm_prompt(
             summaries, _make_portfolio_summary(), _make_profile(), "prof-1"
         )
-        assert "| # | ID | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Trigger |" in prompt
+        assert (
+            "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | Trigger | Invalidation | Target Basis |"
+            in prompt
+        )
 
-    def test_table_includes_candidate_id_prefix(self):
+    def test_table_includes_full_candidate_id(self):
         cid = str(uuid.uuid4())
         summaries = [_make_candidate_summary(candidate_id=cid)]
         prompt = build_candidate_pm_prompt(
             summaries, _make_portfolio_summary(), _make_profile(), "prof-1"
         )
-        # First 8 chars of the ID should be in the prompt
-        assert cid[:8] in prompt
+        assert cid in prompt
+        assert f"{cid[:8]}..." not in prompt
 
     def test_table_includes_direction(self):
         summaries = [_make_candidate_summary(direction="SHORT")]
@@ -149,15 +156,29 @@ class TestPromptCandidateTable:
         )
         assert "Strong volume breakout above resistance" in prompt
 
-    def test_trigger_truncated_at_40_chars(self):
-        long_trigger = "A" * 60
+    def test_trigger_truncated_at_80_chars(self):
+        long_trigger = "A" * 100
         summaries = [_make_candidate_summary(trigger=long_trigger)]
         prompt = build_candidate_pm_prompt(
             summaries, _make_portfolio_summary(), _make_profile(), "prof-1"
         )
-        # Only the first 40 chars should appear in the table row
-        assert "A" * 40 in prompt
-        assert "A" * 41 not in prompt
+        assert "A" * 80 in prompt
+        assert "A" * 81 not in prompt
+
+    def test_table_includes_geometry_invalidation_and_target_basis(self):
+        summaries = [
+            _make_candidate_summary(
+                geometry_name="gap_and_go",
+                invalidation_basis="Fails opening range low",
+                target_basis="Measured move to premarket high",
+            )
+        ]
+        prompt = build_candidate_pm_prompt(
+            summaries, _make_portfolio_summary(), _make_profile(), "prof-1"
+        )
+        assert "gap_and_go" in prompt
+        assert "Fails opening range low" in prompt
+        assert "Measured move to premarket high" in prompt
 
     def test_none_trigger_handled_gracefully(self):
         summaries = [_make_candidate_summary(trigger=None)]
@@ -268,6 +289,15 @@ class TestPromptInstructions:
         lower = prompt.lower()
         assert "accept" in lower
         assert "reject" in lower
+
+    def test_instruct_scaffold_geometry_is_complete(self):
+        prompt = build_candidate_pm_prompt(
+            [_make_candidate_summary()], _make_portfolio_summary(), _make_profile(), "prof-1"
+        )
+        lower = prompt.lower()
+        assert "complete executable candidate set" in lower
+        assert "do not reject" in lower
+        assert "risk/reward" in lower
 
 
 # ---------------------------------------------------------------------------
