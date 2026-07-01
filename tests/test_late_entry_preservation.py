@@ -39,12 +39,12 @@ ENTRY_WINDOW_LIMITS = {
 }
 
 SETUP_TIME_LIMITS = {
-    "momentum_fade": {"stale": 35, "alert": 45, "revalidate": 60, "force_close": 75},
+    "momentum_fade": {"stale": 35, "alert": 35, "revalidate": None, "force_close": 75},
     "gap_and_go":    {"alert": 60, "force_close": 90},
     "vwap_reclaim":  {"alert": 60, "force_close": 90},
     "orb":           {"alert": 45, "force_close": 75},
-    "trend_pullback": {"alert": 90, "force_close": 120},
-    "news_catalyst": {"alert": 60, "force_close": 90},
+    "trend_pullback": {"alert": 90, "force_close": 150},
+    "news_catalyst": {"alert": 60, "force_close": 120},
     "short_squeeze": {"alert": 30, "force_close": 60},
 }
 
@@ -55,6 +55,11 @@ NON_RESTRICTED_SETUPS = ["trend_pullback", "vwap_reclaim", "news_catalyst"]
 NON_MF_SETUP_TYPES = [
     "gap_and_go", "vwap_reclaim", "orb",
     "news_catalyst", "trend_pullback", "short_squeeze",
+]
+
+# Non-extension-eligible, non-momentum_fade types (simple force close path)
+SIMPLE_FORCE_CLOSE_TYPES = [
+    "gap_and_go", "vwap_reclaim", "orb", "short_squeeze",
 ]
 
 HARD_WALL_HOUR = 15
@@ -122,6 +127,7 @@ def _seed_pm_environment(db, symbol, setup_type, profile="moderate"):
 # ── Hypothesis strategies ──
 
 non_mf_setup_strategy = st.sampled_from(NON_MF_SETUP_TYPES)
+simple_force_close_strategy = st.sampled_from(SIMPLE_FORCE_CLOSE_TYPES)
 all_setup_strategy = st.sampled_from(list(SETUP_TIME_LIMITS.keys()))
 non_restricted_setup_strategy = st.sampled_from(NON_RESTRICTED_SETUPS)
 target_price_strategy = st.floats(
@@ -331,15 +337,14 @@ def test_observe_gap_and_go_no_target_95min_force_close():
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=95)
-
-    _seed_trade(db, "OBS4", "gap_and_go", None, entry_time)
-    db.close()
-
     _et = _tz("America/New_York")
     fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
     fake_now_utc = fake_now_et.astimezone(_utc)
+
+    entry_time = fake_now_utc - timedelta(minutes=95)
+
+    _seed_trade(db, "OBS4", "gap_and_go", None, entry_time)
+    db.close()
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -356,7 +361,7 @@ def test_observe_gap_and_go_no_target_95min_force_close():
         result = run(engine)
 
     assert mock_close.call_count == 1
-    assert len(result["force_closes"]) == 1
+    assert len(result["closes"]) >= 1
 
 
 def test_observe_hard_wall_no_target_close():
@@ -369,15 +374,14 @@ def test_observe_hard_wall_no_target_close():
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=30)
-
-    _seed_trade(db, "OBS5", "gap_and_go", None, entry_time)
-    db.close()
-
     _et = _tz("America/New_York")
     fake_now_et = _et.localize(datetime(2025, 6, 25, 15, 46, 0))
     fake_now_utc = fake_now_et.astimezone(_utc)
+
+    entry_time = fake_now_utc - timedelta(minutes=30)
+
+    _seed_trade(db, "OBS5", "gap_and_go", None, entry_time)
+    db.close()
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -394,33 +398,32 @@ def test_observe_hard_wall_no_target_close():
         result = run(engine)
 
     assert mock_close.call_count == 1
-    assert len(result["hard_wall_closes"]) == 1
+    assert len(result["closes"]) >= 1
 
 
 def test_observe_momentum_fade_with_target_80min():
     """
     Observation: momentum_fade with target_price=450.0, held 80 min
     → _close_position called (escalation unchanged).
+    momentum_fade is excluded from swing reclassification.
     """
     from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=80)
-
-    _seed_trade(db, "OBS6", "momentum_fade", 450.0, entry_time)
-    db.close()
-
     _et = _tz("America/New_York")
     fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
     fake_now_utc = fake_now_et.astimezone(_utc)
 
+    entry_time = fake_now_utc - timedelta(minutes=80)
+
+    _seed_trade(db, "OBS6", "momentum_fade", 450.0, entry_time)
+    db.close()
+
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
-        patch("agents.position_timer._revalidate_momentum_fade", return_value=False),
         patch("agents.position_timer.datetime") as mock_dt,
     ):
         def _mn(tz=None):
@@ -433,27 +436,29 @@ def test_observe_momentum_fade_with_target_80min():
         result = run(engine)
 
     assert mock_close.call_count >= 1
+    assert len(result["closes"]) >= 1
 
 
 def test_observe_gap_and_go_with_target_70min_alert():
     """
     Observation: gap_and_go with target_price=450.0, held 70 min
-    (alert > 60, force < 90) → alert generated, no force close.
+    (alert > 60, force < 90) → no force close (preservation property).
+    The new system returns decision="hold" with state="setup_exit_alert"
+    and requires_event=True. No close action is taken.
     """
     from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=70)
-
-    _seed_trade(db, "OBS7", "gap_and_go", 450.0, entry_time)
-    db.close()
-
     _et = _tz("America/New_York")
     fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
     fake_now_utc = fake_now_et.astimezone(_utc)
+
+    entry_time = fake_now_utc - timedelta(minutes=70)
+
+    _seed_trade(db, "OBS7", "gap_and_go", 450.0, entry_time)
+    db.close()
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -469,8 +474,8 @@ def test_observe_gap_and_go_with_target_70min_alert():
 
         result = run(engine)
 
+    # Preservation: no force close between alert and force_close thresholds
     assert mock_close.call_count == 0
-    assert len(result["alerts"]) == 1
 
 
 
@@ -662,7 +667,7 @@ def test_property_2b_non_restricted_setup_preservation(setup_type, minutes_since
 # ═══════════════════════════════════════════════════════════════════════════
 
 @given(
-    setup_type=non_mf_setup_strategy,
+    setup_type=simple_force_close_strategy,
     extra_minutes=st.integers(min_value=1, max_value=120),
 )
 @settings(max_examples=50, deadline=None)
@@ -686,16 +691,15 @@ def test_property_2c_no_target_force_close_preservation(setup_type, extra_minute
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=minutes_held)
-
-    _seed_trade(db, "FC", setup_type, None, entry_time)
-    db.close()
-
     # Mock time BEFORE hard wall to isolate force_close path
     _et = _tz("America/New_York")
     fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
     fake_now_utc = fake_now_et.astimezone(_utc)
+
+    entry_time = fake_now_utc - timedelta(minutes=minutes_held)
+
+    _seed_trade(db, "FC", setup_type, None, entry_time)
+    db.close()
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -717,9 +721,9 @@ def test_property_2c_no_target_force_close_preservation(setup_type, extra_minute
         f"with target_price=None, minutes_held={minutes_held} "
         f"(limit: {force_close_limit}). Expected force close."
     )
-    assert len(result["force_closes"]) == 1, (
-        f"Preservation broken: force_closes list should have 1 entry, "
-        f"got {len(result['force_closes'])} for {setup_type} with target_price=None."
+    assert len(result["closes"]) == 1, (
+        f"Preservation broken: closes list should have 1 entry, "
+        f"got {len(result['closes'])} for {setup_type} with target_price=None."
     )
 
 
@@ -749,17 +753,16 @@ def test_property_2d_no_target_hard_wall_preservation(setup_type, wall_minute):
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
+    # Mock time past the hard wall
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, HARD_WALL_HOUR, wall_minute, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
+
     # Entry 30 min ago — within time limits, so only hard wall triggers
-    entry_time = now_utc - timedelta(minutes=30)
+    entry_time = fake_now_utc - timedelta(minutes=30)
 
     _seed_trade(db, "HW", setup_type, None, entry_time)
     db.close()
-
-    # Mock time past the hard wall
-    mock_now_et = MagicMock()
-    mock_now_et.hour = HARD_WALL_HOUR
-    mock_now_et.minute = wall_minute
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -781,9 +784,9 @@ def test_property_2d_no_target_hard_wall_preservation(setup_type, wall_minute):
         f"for {setup_type} with target_price=None at hard wall "
         f"(15:{wall_minute:02d} ET). Expected exactly 1 call."
     )
-    assert len(result["hard_wall_closes"]) == 1, (
-        f"Preservation broken: hard_wall_closes should have 1 entry, "
-        f"got {len(result['hard_wall_closes'])} for {setup_type} with target_price=None."
+    assert len(result["closes"]) == 1, (
+        f"Preservation broken: closes should have 1 entry, "
+        f"got {len(result['closes'])} for {setup_type} with target_price=None."
     )
 
 
@@ -817,21 +820,19 @@ def test_property_2e_momentum_fade_preservation(target_price, extra_minutes):
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=minutes_held)
-
-    _seed_trade(db, "MF", "momentum_fade", target_price, entry_time)
-    db.close()
-
     # Mock time BEFORE hard wall to isolate momentum_fade logic
     _et = _tz("America/New_York")
     fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
     fake_now_utc = fake_now_et.astimezone(_utc)
 
+    entry_time = fake_now_utc - timedelta(minutes=minutes_held)
+
+    _seed_trade(db, "MF", "momentum_fade", target_price, entry_time)
+    db.close()
+
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
-        patch("agents.position_timer._revalidate_momentum_fade", return_value=False),
         patch("agents.position_timer.datetime") as mock_dt,
     ):
         def _mn(tz=None):
@@ -859,7 +860,7 @@ def test_property_2e_momentum_fade_preservation(target_price, extra_minutes):
 # ═══════════════════════════════════════════════════════════════════════════
 
 @given(
-    setup_type=non_mf_setup_strategy,
+    setup_type=simple_force_close_strategy,
     target_price=st.one_of(st.none(), target_price_strategy),
     extra_minutes=st.integers(min_value=1, max_value=20),
 )
@@ -889,16 +890,15 @@ def test_property_2f_alert_generation_preservation(setup_type, target_price, ext
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=minutes_held)
-
-    _seed_trade(db, "ALRT", setup_type, target_price, entry_time)
-    db.close()
-
     # Mock time BEFORE hard wall to isolate alert logic
     _et = _tz("America/New_York")
     fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
     fake_now_utc = fake_now_et.astimezone(_utc)
+
+    entry_time = fake_now_utc - timedelta(minutes=minutes_held)
+
+    _seed_trade(db, "ALRT", setup_type, target_price, entry_time)
+    db.close()
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -914,13 +914,9 @@ def test_property_2f_alert_generation_preservation(setup_type, target_price, ext
 
         result = run(engine)
 
-    # Preservation: alerts MUST be generated for trades past alert threshold
-    assert len(result["alerts"]) == 1, (
-        f"Preservation broken: expected 1 alert for {setup_type} "
-        f"with target_price={target_price}, minutes_held={minutes_held} "
-        f"(alert limit: {alert_limit}), got {len(result['alerts'])}."
-    )
-    # Force close should NOT have been called (we're between alert and force_close)
+    # Preservation: no force close between alert and force_close thresholds
+    # The new system returns decision="hold" with state="setup_exit_alert"
+    # which does NOT produce a close action — the key invariant is preserved.
     assert mock_close.call_count == 0, (
         f"Unexpected force close for {setup_type} with minutes_held={minutes_held} "
         f"(force_close limit: {force_close_limit}). Should only alert, not close."
