@@ -469,7 +469,7 @@ class CandidateRegistry:
 
         Each dict contains: candidate_id, symbol, direction, setup_type,
         entry_price, stop_price, target_price, risk_reward, geometry_name,
-        trigger, state.
+        trigger, invalidation_basis, target_basis, state.
         """
         try:
             with self._db.connect() as conn:
@@ -478,7 +478,8 @@ class CandidateRegistry:
                         """
                         SELECT candidate_id, symbol, direction, setup_type,
                                entry_price, stop_price, target_price, risk_reward,
-                               geometry_name, trigger, state
+                               geometry_name, trigger, invalidation_basis,
+                               target_basis, state
                         FROM pm_candidates
                         WHERE cycle_id = :cycle_id
                           AND profile_id = :profile_id
@@ -502,7 +503,9 @@ class CandidateRegistry:
                         "risk_reward": row[7],
                         "geometry_name": row[8],
                         "trigger": row[9],
-                        "state": row[10],
+                        "invalidation_basis": row[10],
+                        "target_basis": row[11],
+                        "state": row[12],
                     }
                     for row in rows
                 ]

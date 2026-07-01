@@ -151,3 +151,8 @@ def test_moderate_profile_candidate_builder_produces_candidates_with_live_shape(
     assert all(row.direction == "SHORT" for row in rows)
     assert all(row.risk_reward >= 1.0 for row in rows)
     assert all(row.state == "registered" for row in rows)
+
+    offered = registry.get_offered_summary()
+    assert offered
+    assert all(candidate["invalidation_basis"] for candidate in offered)
+    assert all(candidate["target_basis"] for candidate in offered)
