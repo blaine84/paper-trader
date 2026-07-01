@@ -244,7 +244,7 @@ def test_property_1b_missing_reclassification_at_force_close(
     On unfixed code this FAILS because no reclassification logic exists —
     the trade's setup_type remains unchanged.
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     force_close_limit = SETUP_TIME_LIMITS[setup_type]["force_close"]
     minutes_held = force_close_limit + extra_minutes
@@ -252,27 +252,28 @@ def test_property_1b_missing_reclassification_at_force_close(
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
-    entry_time = now_utc - timedelta(minutes=minutes_held)
+    from pytz import timezone as _tz, utc as _utc
+    et_tz = _tz("America/New_York")
+    # Use a fixed Wednesday 10:30 AM ET — well before hard wall, is a weekday
+    fake_now_et = et_tz.localize(datetime(2025, 6, 25, 10, 30, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
+    entry_time = fake_now_utc - timedelta(minutes=minutes_held)
 
     trade = _seed_trade(db, "TEST", setup_type, target_price, entry_time)
     trade_id = trade.id
     db.close()
 
-    _alert_status.clear()
-
-    # Mock time to be BEFORE the hard wall so we isolate the force_close path
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 10
-    mock_now_et.minute = 30
+    def _mock_now(tz=None):
+        if tz is not None and str(tz) == "UTC":
+            return fake_now_utc
+        return fake_now_et
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        mock_dt.now.side_effect = _mock_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         run(engine)
@@ -315,33 +316,34 @@ def test_property_1c_missing_reclassification_at_hard_wall(
     On unfixed code this FAILS because the hard wall skip just defers to
     price_monitor without reclassifying — setup_type remains unchanged.
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
 
-    now_utc = datetime.utcnow()
+    from pytz import timezone as _tz, utc as _utc
+    et_tz = _tz("America/New_York")
+    # Wednesday 3:XX PM ET — past the hard wall
+    fake_now_et = et_tz.localize(datetime(2025, 6, 25, HARD_WALL_HOUR, wall_minute, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
     # Entry 30 min ago — well within force_close limits, so only hard wall triggers
-    entry_time = now_utc - timedelta(minutes=30)
+    entry_time = fake_now_utc - timedelta(minutes=30)
 
     trade = _seed_trade(db, "WALL", setup_type, target_price, entry_time)
     trade_id = trade.id
     db.close()
 
-    _alert_status.clear()
-
-    # Mock time to be PAST the hard wall
-    mock_now_et = MagicMock()
-    mock_now_et.hour = HARD_WALL_HOUR
-    mock_now_et.minute = wall_minute
+    def _mock_now(tz=None):
+        if tz is not None and str(tz) == "UTC":
+            return fake_now_utc
+        return fake_now_et
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        mock_dt.now.side_effect = _mock_now
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         run(engine)

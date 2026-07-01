@@ -23,6 +23,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from hypothesis import given, settings, assume
 from hypothesis import strategies as st
+from pytz import timezone as _tz, utc as _utc
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -325,7 +326,7 @@ def test_observe_gap_and_go_no_target_95min_force_close():
     Observation: gap_and_go with target_price=None, held 95 min
     → _close_position called (force close unchanged).
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
@@ -336,19 +337,20 @@ def test_observe_gap_and_go_no_target_95min_force_close():
     _seed_trade(db, "OBS4", "gap_and_go", None, entry_time)
     db.close()
 
-    _alert_status.clear()
-
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 10
-    mock_now_et.minute = 30
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)
@@ -362,7 +364,7 @@ def test_observe_hard_wall_no_target_close():
     Observation: any intraday trade with target_price=None past 3:45 PM
     → _close_position called (hard wall unchanged).
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
@@ -373,19 +375,20 @@ def test_observe_hard_wall_no_target_close():
     _seed_trade(db, "OBS5", "gap_and_go", None, entry_time)
     db.close()
 
-    _alert_status.clear()
-
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 15
-    mock_now_et.minute = 46
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 15, 46, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)
@@ -399,7 +402,7 @@ def test_observe_momentum_fade_with_target_80min():
     Observation: momentum_fade with target_price=450.0, held 80 min
     → _close_position called (escalation unchanged).
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
@@ -410,11 +413,9 @@ def test_observe_momentum_fade_with_target_80min():
     _seed_trade(db, "OBS6", "momentum_fade", 450.0, entry_time)
     db.close()
 
-    _alert_status.clear()
-
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 10
-    mock_now_et.minute = 30
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -422,8 +423,11 @@ def test_observe_momentum_fade_with_target_80min():
         patch("agents.position_timer._revalidate_momentum_fade", return_value=False),
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)
@@ -436,7 +440,7 @@ def test_observe_gap_and_go_with_target_70min_alert():
     Observation: gap_and_go with target_price=450.0, held 70 min
     (alert > 60, force < 90) → alert generated, no force close.
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
@@ -447,19 +451,20 @@ def test_observe_gap_and_go_with_target_70min_alert():
     _seed_trade(db, "OBS7", "gap_and_go", 450.0, entry_time)
     db.close()
 
-    _alert_status.clear()
-
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 10
-    mock_now_et.minute = 30
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)
@@ -672,7 +677,7 @@ def test_property_2c_no_target_force_close_preservation(setup_type, extra_minute
     This preserves the existing behavior: trades without a price target
     are force-closed when they exceed their time limit.
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     limits = SETUP_TIME_LIMITS[setup_type]
     force_close_limit = limits["force_close"]
@@ -687,20 +692,21 @@ def test_property_2c_no_target_force_close_preservation(setup_type, extra_minute
     _seed_trade(db, "FC", setup_type, None, entry_time)
     db.close()
 
-    _alert_status.clear()
-
     # Mock time BEFORE hard wall to isolate force_close path
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 10
-    mock_now_et.minute = 30
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)
@@ -738,7 +744,7 @@ def test_property_2d_no_target_hard_wall_preservation(setup_type, wall_minute):
     This preserves the existing hard wall behavior for trades without
     a price target.
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     engine = _make_engine()
     db = _make_session(engine)
@@ -750,8 +756,6 @@ def test_property_2d_no_target_hard_wall_preservation(setup_type, wall_minute):
     _seed_trade(db, "HW", setup_type, None, entry_time)
     db.close()
 
-    _alert_status.clear()
-
     # Mock time past the hard wall
     mock_now_et = MagicMock()
     mock_now_et.hour = HARD_WALL_HOUR
@@ -762,8 +766,11 @@ def test_property_2d_no_target_hard_wall_preservation(setup_type, wall_minute):
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)
@@ -802,7 +809,7 @@ def test_property_2e_momentum_fade_preservation(target_price, extra_minutes):
     The momentum_fade branch has its own escalation logic that is independent
     of target_price. Force close at 75 min must always fire.
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     force_close_limit = SETUP_TIME_LIMITS["momentum_fade"]["force_close"]  # 75
     minutes_held = force_close_limit + extra_minutes
@@ -816,12 +823,10 @@ def test_property_2e_momentum_fade_preservation(target_price, extra_minutes):
     _seed_trade(db, "MF", "momentum_fade", target_price, entry_time)
     db.close()
 
-    _alert_status.clear()
-
     # Mock time BEFORE hard wall to isolate momentum_fade logic
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 10
-    mock_now_et.minute = 30
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
@@ -829,8 +834,11 @@ def test_property_2e_momentum_fade_preservation(target_price, extra_minutes):
         patch("agents.position_timer._revalidate_momentum_fade", return_value=False),
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)
@@ -868,7 +876,7 @@ def test_property_2f_alert_generation_preservation(setup_type, target_price, ext
     between alert and force_close limits so the alert path is reached
     without triggering force close.
     """
-    from agents.position_timer import run, _alert_status
+    from agents.position_timer import run
 
     limits = SETUP_TIME_LIMITS[setup_type]
     alert_limit = limits["alert"]
@@ -887,20 +895,21 @@ def test_property_2f_alert_generation_preservation(setup_type, target_price, ext
     _seed_trade(db, "ALRT", setup_type, target_price, entry_time)
     db.close()
 
-    _alert_status.clear()
-
     # Mock time BEFORE hard wall to isolate alert logic
-    mock_now_et = MagicMock()
-    mock_now_et.hour = 10
-    mock_now_et.minute = 30
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 10, 30, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
 
     with (
         patch("agents.position_timer._get_current_price", return_value=452.0),
         patch("agents.position_timer._close_position") as mock_close,
         patch("agents.position_timer.datetime") as mock_dt,
     ):
-        mock_dt.now.return_value = mock_now_et
-        mock_dt.utcnow.return_value = now_utc
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
         result = run(engine)

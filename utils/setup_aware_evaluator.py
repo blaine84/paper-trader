@@ -734,7 +734,8 @@ def _build_decision(
     entry_time = _parse_dt(trade.get("entry_time"))
     if entry_time is not None:
         now_aware = now_utc if now_utc.tzinfo is not None else now_utc.replace(tzinfo=timezone.utc)
-        hours_held = (now_aware - entry_time).total_seconds() / 3600
+        entry_aware = entry_time if entry_time.tzinfo is not None else entry_time.replace(tzinfo=timezone.utc)
+        hours_held = (now_aware - entry_aware).total_seconds() / 3600
     else:
         hours_held = 0.0
 

@@ -641,6 +641,47 @@ def run(engine) -> dict:
                 log_lifecycle_decision_once(db, decision)
                 db.commit()
 
+            # ── Swing reclassification (Requirement 1.3, 1.4) ──────────────
+            # If the evaluator determined this trade has exceeded its intraday
+            # time limit (via revalidation hold or explicit close) AND the
+            # trade has a target_price, the trade has graduated to swing.
+            # Reclassify setup_type to "swing" and skip the close action.
+            _RECLASSIFY_STATES = {
+                "setup_time_limit_exceeded",
+                "setup_pre_wall_buffer_close",
+                "setup_max_extension_reached",
+                "setup_revalidation_hold",
+                "overnight_unauthorized",
+            }
+            state = decision.get("state", "")
+            reason_type = decision.get("reason_type", "")
+            if (
+                state in _RECLASSIFY_STATES
+                and trade_dict.get("target_price") is not None
+                and trade_dict.get("setup_type") not in ("swing", "momentum_fade", None, "")
+            ):
+                try:
+                    reclass_db = get_session(engine)
+                    trade_row = reclass_db.query(Trade).filter_by(id=trade_dict["id"]).first()
+                    if trade_row and trade_row.setup_type != "swing":
+                        old_setup = trade_row.setup_type
+                        trade_row.setup_type = "swing"
+                        reclass_db.commit()
+                        log.info(
+                            f"SWING_RECLASSIFICATION: {trade_dict['symbol']} "
+                            f"({trade_dict['profile']}) reclassified from "
+                            f"'{old_setup}' to 'swing' — target_price set, "
+                            f"state={state}"
+                        )
+                    reclass_db.close()
+                except Exception as e:
+                    log.error(f"Swing reclassification failed for {trade_dict['symbol']}: {e}")
+
+                # If the decision was "close", skip the close (reclassify instead)
+                if decision["decision"] == "close":
+                    results["skipped"].append({**decision, "reclassified_to_swing": True})
+                    continue
+
             # Execute action
             if decision["decision"] == "close":
                 # Reconstruct minimal trade object for _close_position
