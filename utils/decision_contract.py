@@ -193,6 +193,12 @@ def parse_decision_contract(
             for pf in prohibited_found:
                 del entry[pf]
 
+        # Normalize common LLM alias: "reason" → "rationale"
+        if "reason" in entry:
+            if not entry.get("rationale"):
+                entry["rationale"] = entry["reason"]
+            del entry["reason"]
+
         # 5a: Check for extra fields and log violation (strip them)
         extra_fields = set(entry.keys()) - _VALID_DECISION_FIELDS
         if extra_fields:

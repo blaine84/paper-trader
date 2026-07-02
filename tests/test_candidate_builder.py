@@ -84,7 +84,7 @@ def test_candidate_builder_does_not_pass_pm_profile_as_geometry_overrides(monkey
                 "symbol": "XLF",
                 "signal": "SHORT",
                 "strength": "moderate",
-                "setup_type": "risk_off_macro_short_fade",
+                "setup_type": "momentum_fade",
                 "current_price": 53.9,
             }
         },
@@ -101,7 +101,7 @@ def test_candidate_builder_does_not_pass_pm_profile_as_geometry_overrides(monkey
                 "symbol": "XLF",
                 "signal": "SHORT",
                 "strength": "moderate",
-                "setup_type": "risk_off_macro_short_fade",
+                "setup_type": "momentum_fade",
                 "current_price": 53.9,
             },
             "profile_id": "moderate",
@@ -121,7 +121,7 @@ def test_moderate_profile_candidate_builder_produces_candidates_with_live_shape(
                 "symbol": "XLF",
                 "signal": "SHORT",
                 "strength": "moderate",
-                "setup_type": "risk_off_macro_short_fade",
+                "setup_type": "momentum_fade",
                 "current_price": 53.9,
                 "key_levels": {
                     "support": 53.88,
@@ -151,3 +151,95 @@ def test_moderate_profile_candidate_builder_produces_candidates_with_live_shape(
     assert all(row.direction == "SHORT" for row in rows)
     assert all(row.risk_reward >= 1.0 for row in rows)
     assert all(row.state == "registered" for row in rows)
+
+
+def test_non_executable_setup_type_excluded(monkeypatch):
+    """Signals with setup types not in CANDIDATE_EXECUTABLE_SETUP_TYPES are excluded."""
+    engine = create_engine("sqlite:///:memory:")
+    _create_pm_candidates_table(engine)
+
+    def fake_scaffold(signal, profile_id=None, profile_context=None):
+        return {
+            "symbol": signal["symbol"],
+            "direction": "LONG",
+            "status": "ok",
+            "candidates": [
+                {
+                    "name": "base_breakout",
+                    "entry_price": 150.0,
+                    "stop_loss": 148.0,
+                    "target": 154.0,
+                    "risk_reward": 2.0,
+                    "trigger": "Price breaks above",
+                    "invalidation_basis": "Falls below stop",
+                    "target_basis": "Entry + RR * risk",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("utils.candidate_builder.build_entry_geometry_scaffold", fake_scaffold)
+
+    registry = build_candidate_set(
+        engine,
+        {
+            "AAPL": {
+                "symbol": "AAPL",
+                "signal": "BUY",
+                "strength": "strong",
+                "setup_type": "sector_rotation",
+                "current_price": 150.0,
+            }
+        },
+        "moderate",
+        PM_PROFILES["moderate"],
+        {"positions": {}},
+        "cycle_test",
+    )
+
+    assert registry.is_empty
+
+
+def test_executable_setup_type_registered(monkeypatch):
+    """Signals with setup types in CANDIDATE_EXECUTABLE_SETUP_TYPES are registered."""
+    engine = create_engine("sqlite:///:memory:")
+    _create_pm_candidates_table(engine)
+
+    def fake_scaffold(signal, profile_id=None, profile_context=None):
+        return {
+            "symbol": signal["symbol"],
+            "direction": "LONG",
+            "status": "ok",
+            "candidates": [
+                {
+                    "name": "base_breakout",
+                    "entry_price": 150.0,
+                    "stop_loss": 148.0,
+                    "target": 154.0,
+                    "risk_reward": 2.0,
+                    "trigger": "Price breaks above",
+                    "invalidation_basis": "Falls below stop",
+                    "target_basis": "Entry + RR * risk",
+                }
+            ],
+        }
+
+    monkeypatch.setattr("utils.candidate_builder.build_entry_geometry_scaffold", fake_scaffold)
+
+    registry = build_candidate_set(
+        engine,
+        {
+            "AAPL": {
+                "symbol": "AAPL",
+                "signal": "BUY",
+                "strength": "strong",
+                "setup_type": "momentum_fade",
+                "current_price": 150.0,
+            }
+        },
+        "moderate",
+        PM_PROFILES["moderate"],
+        {"positions": {}},
+        "cycle_test",
+    )
+
+    assert not registry.is_empty

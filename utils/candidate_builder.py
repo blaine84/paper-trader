@@ -22,7 +22,7 @@ from utils.candidate_registry import (
     _compute_integrity_hash,
 )
 from utils.entry_geometry import build_entry_geometry_scaffold
-from utils.gate_config import PM_BENCHMARK_CONTEXT_ENABLED
+from utils.gate_config import PM_BENCHMARK_CONTEXT_ENABLED, CANDIDATE_EXECUTABLE_SETUP_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,15 @@ def build_candidate_set(
         if not candidates:
             logger.debug(
                 "Scaffold ok but no candidates for symbol=%s", symbol
+            )
+            continue
+
+        # Filter by executable setup type (only types in the closed set are eligible)
+        setup_type = signal.get("setup_type", "unknown")
+        if setup_type not in CANDIDATE_EXECUTABLE_SETUP_TYPES:
+            logger.debug(
+                "Excluding candidate %s: setup_type '%s' not in executable set",
+                symbol, setup_type,
             )
             continue
 

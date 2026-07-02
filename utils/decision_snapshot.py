@@ -591,12 +591,14 @@ PRE_TRADE_EVENT_TYPES = frozenset({
 
 # Event types that represent post-trade observations (append-only, linked)
 POST_TRADE_EVENT_TYPES = frozenset({
-    "pipeline_executed",         # Trade was successfully executed
-    "pipeline_gate_rejected",    # Gate pipeline rejected
-    "pipeline_sizing_rejected",  # Position sizer rejected
-    "shadow_outcome",            # Shadow outcome scoring result
-    "realized_outcome",          # Actual trade P&L outcome
-    "recovery_released",         # Crash recovery action
+    "pipeline_executed",              # Trade was successfully executed
+    "pipeline_gate_rejected",         # Gate pipeline rejected
+    "pipeline_sizing_rejected",       # Position sizer rejected
+    "pipeline_execution_failed",      # Trade execution failed (exception or success=False)
+    "execution_failed_cycle_sweep",   # finalize_cycle() safety-net sweep of RESERVED stragglers
+    "shadow_outcome",                 # Shadow outcome scoring result
+    "realized_outcome",              # Actual trade P&L outcome
+    "recovery_released",             # Crash recovery action
 })
 
 

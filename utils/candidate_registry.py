@@ -35,6 +35,7 @@ class CandidateState(Enum):
     EXECUTED = "executed"  # Trade successfully created
     SIZING_REJECTED = "sizing_rejected"  # Position sizer rejected
     GATE_REJECTED = "gate_rejected"  # Gate pipeline rejected
+    EXECUTION_FAILED = "execution_failed"  # Trade execution failed (exception or success=False)
     REJECTED = "rejected"  # PM explicitly rejected
     NOT_SELECTED = "not_selected"  # Omitted from PM response
     EXPIRED = "expired"  # Past expiration or cycle boundary
@@ -269,6 +270,19 @@ class CandidateRegistry:
             rejection_reason=reason,
         )
 
+    def mark_execution_failed(self, candidate_id: str, reason: str) -> None:
+        """Transition RESERVED → EXECUTION_FAILED with rejection reason.
+
+        Uses @with_lock_retry (3 attempts, 50/100/200ms backoff) via _execute_state_write.
+        Raises CandidateRegistryError if CAS fails after retries.
+        """
+        self._transition_state(
+            candidate_id=candidate_id,
+            from_state=CandidateState.RESERVED,
+            to_state=CandidateState.EXECUTION_FAILED,
+            rejection_reason=reason,
+        )
+
     def mark_rejected(self, candidate_id: str, reason: str) -> None:
         """Transition REGISTERED → REJECTED with rejection reason (PM explicit)."""
         self._transition_state(
@@ -279,9 +293,10 @@ class CandidateRegistry:
         )
 
     def finalize_cycle(self) -> dict[str, CandidateState]:
-        """Assign terminal states to all remaining REGISTERED candidates.
+        """Assign terminal states to all remaining REGISTERED and RESERVED candidates.
 
-        - Past expires_at → EXPIRED
+        - RESERVED → EXECUTION_FAILED (safety-net sweep for stranded reservations)
+        - Past expires_at REGISTERED → EXPIRED
         - Still REGISTERED (not expired) → NOT_SELECTED
 
         Fails closed if any UPDATE fails.
@@ -294,6 +309,68 @@ class CandidateRegistry:
 
         try:
             with self._db.connect() as conn:
+                # Sweep 0: RESERVED → EXECUTION_FAILED (safety-net for stranded reservations)
+                sweep_result = conn.execute(
+                    text(
+                        """
+                        UPDATE pm_candidates
+                        SET state = :execution_failed_state,
+                            rejection_reason = :reason
+                        WHERE cycle_id = :cycle_id
+                          AND profile_id = :profile_id
+                          AND state = :reserved_state
+                        """
+                    ),
+                    {
+                        "execution_failed_state": CandidateState.EXECUTION_FAILED.value,
+                        "reason": "cycle_finalized_while_reserved",
+                        "cycle_id": self.cycle_id,
+                        "profile_id": self.profile_id,
+                        "reserved_state": CandidateState.RESERVED.value,
+                    },
+                )
+
+                if sweep_result.rowcount > 0:
+                    # Retrieve swept candidate IDs (those just transitioned)
+                    swept_rows = conn.execute(
+                        text(
+                            """
+                            SELECT candidate_id FROM pm_candidates
+                            WHERE cycle_id = :cycle_id
+                              AND profile_id = :profile_id
+                              AND state = :execution_failed_state
+                              AND rejection_reason = :reason
+                            """
+                        ),
+                        {
+                            "cycle_id": self.cycle_id,
+                            "profile_id": self.profile_id,
+                            "execution_failed_state": CandidateState.EXECUTION_FAILED.value,
+                            "reason": "cycle_finalized_while_reserved",
+                        },
+                    ).fetchall()
+
+                    for row in swept_rows:
+                        terminal_assignments[row[0]] = CandidateState.EXECUTION_FAILED
+                        # Emit terminal event for each swept candidate
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO pm_candidate_events
+                                (candidate_id, cycle_id, profile_id, event_type, event_data, created_at)
+                                VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at)
+                                """
+                            ),
+                            {
+                                "cid": row[0],
+                                "cycle_id": self.cycle_id,
+                                "profile_id": self.profile_id,
+                                "event_type": "execution_failed_cycle_sweep",
+                                "event_data": json.dumps({"reason": "cycle_finalized_while_reserved"}),
+                                "created_at": now,
+                            },
+                        )
+
                 # First: mark expired candidates
                 result = conn.execute(
                     text(
