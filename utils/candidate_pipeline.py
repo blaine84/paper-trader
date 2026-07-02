@@ -1395,6 +1395,14 @@ def execute_candidate_pipeline(
     except Exception as exc:
         error_msg = f"Execution error: {exc}"
         logger.error("Pipeline execution error for %s: %s", candidate_id, exc)
+        # Best-effort state transition — finalize_cycle() is the hard guarantee
+        try:
+            registry.mark_execution_failed(candidate_id, error_msg[:500])
+        except Exception as mark_exc:
+            logger.error(
+                "mark_execution_failed raised for %s (finalize_cycle will enforce): %s",
+                candidate_id, mark_exc
+            )
         if checkpoint_logger is not None:
             try:
                 from utils.checkpoint_logger import CheckpointEvent
@@ -1422,6 +1430,14 @@ def execute_candidate_pipeline(
         logger.warning(
             "Pipeline execution failed for %s: %s", candidate_id, exec_msg
         )
+        # Best-effort state transition — finalize_cycle() is the hard guarantee
+        try:
+            registry.mark_execution_failed(candidate_id, (exec_msg or "")[:1024])
+        except Exception as mark_exc:
+            logger.error(
+                "mark_execution_failed raised for %s (finalize_cycle will enforce): %s",
+                candidate_id, mark_exc
+            )
         if checkpoint_logger is not None:
             try:
                 from utils.checkpoint_logger import CheckpointEvent

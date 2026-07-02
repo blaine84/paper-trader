@@ -284,6 +284,17 @@ PM_SHADOW_RUN_LEGACY_ENTRY: bool = os.environ.get(
     "PM_SHADOW_RUN_LEGACY_ENTRY", "false"
 ).lower() == "true"
 
+# Closed set of setup types eligible for candidate-ID pipeline execution.
+# Only these types will be offered to PM in candidate mode.
+# Other setup types may still flow through legacy entry or shadow mode.
+CANDIDATE_EXECUTABLE_SETUP_TYPES: frozenset[str] = frozenset({
+    "momentum_fade",
+    "news_breakout",
+    "gap_and_go",
+    "technical_breakout",
+    "vwap_reclaim",
+})
+
 # P1 Benchmark Context (independent of P0)
 PM_BENCHMARK_CONTEXT_ENABLED: bool = os.environ.get(
     "PM_BENCHMARK_CONTEXT_ENABLED", "false"
