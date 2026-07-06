@@ -9,6 +9,9 @@ from db.schema import get_session, DynamicStrategy
 from models.strategies import STRATEGIES, SETUP_TYPE_MAP
 
 
+LIVE_DYNAMIC_STRATEGY_STATUSES = ("active", "live_50", "live_100")
+
+
 def get_all_strategies(engine) -> dict:
     """Return merged dict of hardcoded + live dynamic strategies.
 
@@ -71,13 +74,19 @@ def get_pipeline_strategies(engine, stage: str = None) -> list[DynamicStrategy]:
 
 
 def get_all_setup_types(engine) -> list[str]:
-    """Return all valid setup type names (hardcoded + dynamic)."""
+    """Return all valid setup type names (hardcoded + live dynamic).
+
+    Setup-type aliases in ``SETUP_TYPE_MAP`` are valid analyst labels even
+    when they map onto a broader strategy, e.g. ``technical_breakout`` -> ORB.
+    """
     types = list(SETUP_TYPE_MAP.keys()) + list(STRATEGIES.keys())
     db = get_session(engine)
-    dynamic = db.query(DynamicStrategy).filter_by(status="active").all()
+    dynamic = db.query(DynamicStrategy).filter(
+        DynamicStrategy.status.in_(LIVE_DYNAMIC_STRATEGY_STATUSES)
+    ).all()
     types += [d.key for d in dynamic]
     db.close()
-    return list(set(types))
+    return sorted(set(types))
 
 
 def propose_strategy(engine, strategy_data: dict) -> DynamicStrategy:
