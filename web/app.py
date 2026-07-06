@@ -59,7 +59,7 @@ def get_quotes(symbols: list[str]) -> dict:
         try:
             if finnhub is None:
                 finnhub = FinnhubClient()
-            q = finnhub.get_quote(sym)
+            q = finnhub.get_quote(sym, retries=0)
             price = round(float(q.get("price", 0)), 2)
             if price <= 0:
                 raise ValueError(f"Finnhub returned non-positive price for {sym}: {price}")
@@ -96,7 +96,7 @@ def get_quotes(symbols: list[str]) -> dict:
 
 def get_market_open() -> bool:
     try:
-        return FinnhubClient().is_market_open()
+        return FinnhubClient().is_market_open(retries=0)
     except Exception:
         return False
 

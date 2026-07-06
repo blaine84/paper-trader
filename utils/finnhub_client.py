@@ -52,10 +52,10 @@ class FinnhubClient:
                     continue
                 raise
 
-    def get_quote(self, symbol: str) -> dict:
+    def get_quote(self, symbol: str, retries: int = 2) -> dict:
         """Current price quote."""
         self._rate_limit()
-        q = self._call_with_retry(lambda: self.client.quote(symbol))
+        q = self._call_with_retry(lambda: self.client.quote(symbol), retries=retries)
         return {
             "symbol": symbol,
             "price": q["c"],        # current
@@ -325,8 +325,8 @@ class FinnhubClient:
         self._rate_limit()
         return self._call_with_retry(lambda: self.client.recommendation_trends(symbol)[:3] or [])
 
-    def is_market_open(self) -> bool:
+    def is_market_open(self, retries: int = 2) -> bool:
         """Check if US market is currently open."""
         self._rate_limit()
-        status = self._call_with_retry(lambda: self.client.market_status(exchange="US"))
+        status = self._call_with_retry(lambda: self.client.market_status(exchange="US"), retries=retries)
         return status.get("isOpen", False)
