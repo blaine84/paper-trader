@@ -633,14 +633,18 @@ def update_blocked_candidate_outcomes(
     inserted = 0
     skipped = 0
     candidates_seen = 0
+    if engine.dialect.name == "postgresql":
+        due_filter_sql = "created_at <= (CAST(:now AS timestamp) - INTERVAL '15 minutes')"
+    else:
+        due_filter_sql = "datetime(created_at) <= datetime(:now, '-15 minutes')"
 
     with engine.begin() as conn:
         rows = conn.execute(
             text(
-                """
+                f"""
                 SELECT * FROM blocked_trade_candidates
                 WHERE action IN ('BUY', 'SHORT')
-                  AND datetime(created_at) <= datetime(:now, '-15 minutes')
+                  AND {due_filter_sql}
                 ORDER BY created_at DESC
                 LIMIT :limit
                 """

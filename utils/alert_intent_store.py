@@ -437,9 +437,15 @@ class AlertIntentStore:
         # Apply defaults
         filter_status = intent_data.get("filter_status", "unclassified")
         urgency = intent_data.get("urgency", "medium")
+        if self._engine.dialect.name == "postgresql":
+            occurrence_update = "alert_intents.occurrence_count + 1"
+            expiration_update = "GREATEST(alert_intents.expiration_at, excluded.expiration_at)"
+        else:
+            occurrence_update = "occurrence_count + 1"
+            expiration_update = "MAX(expiration_at, excluded.expiration_at)"
 
         with self._engine.begin() as conn:
-            conn.execute(text("""
+            conn.execute(text(f"""
                 INSERT INTO alert_intents (
                     alert_intent_id, symbol, alert_type, direction, trigger_price,
                     source_level, urgency, reason, dedupe_key, filter_status,
@@ -456,8 +462,8 @@ class AlertIntentStore:
                     WHERE dispatch_status IN ('pending', 'dispatched', 'claimed_by_scheduled')
                 DO UPDATE SET
                     last_seen_at = excluded.last_seen_at,
-                    occurrence_count = occurrence_count + 1,
-                    expiration_at = MAX(expiration_at, excluded.expiration_at),
+                    occurrence_count = {occurrence_update},
+                    expiration_at = {expiration_update},
                     trigger_price = excluded.trigger_price,
                     direction = excluded.direction,
                     source_level = excluded.source_level

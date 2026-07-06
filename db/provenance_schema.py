@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS pm_raw_responses (
     parse_status VARCHAR(48) NOT NULL,
     attempt_ordinal INTEGER NOT NULL DEFAULT 1,
     payload_size_bytes INTEGER NOT NULL,
-    payload_truncated BOOLEAN DEFAULT 0,
+    payload_truncated BOOLEAN DEFAULT false,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """
@@ -130,8 +130,8 @@ CREATE TABLE IF NOT EXISTS provenance_events (
     validation_before VARCHAR(16) NOT NULL,
     validation_after VARCHAR(16) NOT NULL,
     attempt_ordinal INTEGER NOT NULL DEFAULT 1,
-    is_terminal BOOLEAN DEFAULT 0,
-    payload_truncated BOOLEAN DEFAULT 0,
+    is_terminal BOOLEAN DEFAULT false,
+    payload_truncated BOOLEAN DEFAULT false,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """
@@ -256,7 +256,7 @@ def init_provenance_schema(engine) -> None:
             conn.execute(text("""
                 CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
                 BEGIN
-                    RAISE EXCEPTION '%% is immutable: %% prohibited', TG_TABLE_NAME, TG_OP;
+                    RAISE EXCEPTION '% is immutable: % prohibited', TG_TABLE_NAME, TG_OP;
                 END;
                 $$ LANGUAGE plpgsql
             """))

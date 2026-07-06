@@ -239,6 +239,7 @@ TABLE_ORDER = [
     "positions",
     "balance",
     "agent_memory",
+    "cases",
     "daily_log",
     "dynamic_strategies",
     "analyst_feedback_queue",
@@ -300,6 +301,8 @@ def _normalize_row(row: dict) -> dict:
             bool_exact = (
                 "stop_hit", "target_hit", "first_hit",
                 "active", "resolved", "acknowledged",
+                "diagnostic_mode", "expired", "no_data_reject",
+                "payload_truncated",
             )
             lower_key = key.lower()
             if (
@@ -738,7 +741,8 @@ def _print_report(report: ValidationReport, row_counts: dict[str, int]) -> None:
     if report.duplicate_candidate_ids > 0:
         print(f"\n  \u2717 Duplicate candidate_ids: {report.duplicate_candidate_ids}")
 
-    print(f"\n  Snapshot hash match: {'\u2713' if report.snapshot_hash_match else '\u2717'}")
+    snapshot_symbol = "\u2713" if report.snapshot_hash_match else "\u2717"
+    print(f"\n  Snapshot hash match: {snapshot_symbol}")
 
     print(f"\n  Checks:")
     for check in report.checks:
