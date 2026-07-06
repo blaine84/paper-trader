@@ -59,7 +59,7 @@ Respond in JSON:
   "signal": "LONG|SHORT|HOLD",
   "strength": "weak|moderate|strong",
   "confidence": "low|medium|high",
-  "setup_type": "gap_and_go|vwap_reclaim|orb|momentum_fade|trend_pullback|news_catalyst|sector_rotation|short_squeeze",
+  "setup_type": "one of the VALID SETUP TYPES from the user prompt",
   "setup_reasoning": "why this setup type was chosen — what specific price action, indicators, or conditions match this setup",
   "reasoning": "what the indicators and tape are saying — be specific",
   "key_levels": {
@@ -80,6 +80,8 @@ Respond in JSON:
   "llm_veto_reason": "required when you output HOLD while deterministic sanity favors LONG/SHORT; otherwise null",
   "veto_evidence": ["specific evidence that overrules the deterministic directional read"]
 }
+
+Prefer the exact VALID SETUP TYPES listed in the user prompt. If the setup genuinely fits a label outside that list, preserve the best label and explain it in setup_reasoning.
 
 gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
 
@@ -190,6 +192,25 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
         normalized["indicators"] = {}
 
     return normalized
+
+
+def annotate_unregistered_setup(signal: dict, valid_setups: list[str]) -> dict:
+    """Flag setup labels outside the registry without rewriting them."""
+    setup_type = signal.get("setup_type")
+    if not setup_type or setup_type in set(valid_setups):
+        return signal
+
+    signal["setup_validation_warning"] = (
+        f"setup_type '{setup_type}' is not in the current setup registry; "
+        "preserved for review"
+    )
+    signal["needs_setup_type_review"] = True
+    log.warning(
+        "Analyst emitted unregistered setup_type=%s for %s; preserving with warning",
+        setup_type,
+        signal.get("symbol", "unknown"),
+    )
+    return signal
 
 
 def _current_price_from_quote(quote: dict) -> float | None:
@@ -934,6 +955,7 @@ Produce your trading signal JSON for {sym}.
             signal = apply_signal_mitigation(signal, active_mitigations)
             validation_result = validate_setup_for_symbol(sym, signal.get("setup_type"))
             signal.update(validation_result)
+            signal = annotate_unregistered_setup(signal, valid_setups)
 
             # Enrich signal with structured quote context for downstream gates,
             # then sanitize again because enrichment can overwrite key/session
