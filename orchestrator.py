@@ -1744,7 +1744,12 @@ def run_once():
 
 
 def check_llm_connectivity():
-    """Ping LLM providers at startup to catch config issues early."""
+    """Optionally ping LLM providers at startup to catch config issues early."""
+    enabled = os.getenv("STARTUP_LLM_CONNECTIVITY_CHECKS", "false").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        log.info("Startup LLM connectivity checks disabled")
+        return
+
     from utils.llm import call_llm
     probe = "Reply with one word: ok"
 
