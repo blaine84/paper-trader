@@ -1,11 +1,12 @@
-"""SQLite Lock Retry — bounded retry for transient lock contention.
+"""Database Transient Error Retry — bounded retry for lock contention and serialization failures.
 
-Provides a decorator that retries database operations on SQLite lock
-contention errors. Only retries on lock-related OperationalErrors;
+Provides a decorator that retries database operations on transient errors
+for both SQLite (lock contention) and Postgres (serialization failures,
+deadlock detection). Only retries on recognized transient OperationalErrors;
 all other errors (constraint violations, syntax errors, corruption)
 raise immediately without retry.
 
-Requirements: 12.3, 12.4, 12.5, 12.6
+Requirements: 12.3, 12.4, 12.5, 12.6, 2.1, 2.2
 """
 
 from __future__ import annotations
@@ -23,6 +24,12 @@ logger = logging.getLogger(__name__)
 _LOCK_CONTENTION_MESSAGES = (
     "database is locked",
     "database table is locked",
+)
+
+# Postgres SQLSTATE codes for transient serialization errors
+_POSTGRES_RETRYABLE_STATES = (
+    "40001",  # serialization_failure
+    "40P01",  # deadlock_detected
 )
 
 # Backoff schedule: 50ms, 100ms, 200ms
@@ -52,13 +59,34 @@ def is_lock_contention(exc: Exception) -> bool:
     return False
 
 
+def is_retryable_error(exc: Exception) -> bool:
+    """Check if an exception is a retryable transient error.
+
+    Returns True for:
+    - SQLite lock contention (via is_lock_contention())
+    - Postgres serialization_failure (SQLSTATE 40001)
+    - Postgres deadlock_detected (SQLSTATE 40P01)
+
+    Returns False for all other errors (constraint violations, syntax
+    errors, corruption, non-transient Postgres errors).
+    """
+    if is_lock_contention(exc):
+        return True
+    if isinstance(exc, SAOperationalError) and exc.orig is not None:
+        pgcode = getattr(exc.orig, "pgcode", None)
+        if pgcode in _POSTGRES_RETRYABLE_STATES:
+            return True
+    return False
+
+
 def with_lock_retry(func=None, *, max_retries: int = 3):
-    """Decorator: retry on SQLite lock contention with bounded backoff.
+    """Decorator: retry on transient database errors with bounded backoff.
 
     Retries the decorated function up to max_retries times when it raises
-    an OperationalError containing a lock contention message.
+    an OperationalError that is a recognized transient error (SQLite lock
+    contention, Postgres serialization failure, or Postgres deadlock).
 
-    Non-lock errors (IntegrityError, ProgrammingError, etc.) raise immediately.
+    Non-transient errors (IntegrityError, ProgrammingError, etc.) raise immediately.
 
     Backoff schedule: 50ms, 100ms, 200ms (capped at max_retries).
 
@@ -79,14 +107,14 @@ def with_lock_retry(func=None, *, max_retries: int = 3):
                 try:
                     return fn(*args, **kwargs)
                 except (SAOperationalError, Sqlite3OperationalError) as exc:
-                    if not is_lock_contention(exc):
-                        # Not lock contention — raise immediately, no retry
+                    if not is_retryable_error(exc):
+                        # Not a transient error — raise immediately, no retry
                         raise
                     last_exc = exc
                     if attempt < max_retries:
                         wait_ms = _BACKOFF_MS[min(attempt, len(_BACKOFF_MS) - 1)]
                         logger.warning(
-                            "Lock contention retry: func=%s attempt=%d/%d wait_ms=%d error=%s",
+                            "Transient retry: func=%s attempt=%d/%d wait_ms=%d error=%s",
                             fn.__qualname__,
                             attempt + 1,
                             max_retries,
@@ -97,7 +125,7 @@ def with_lock_retry(func=None, *, max_retries: int = 3):
                     else:
                         # All retries exhausted
                         logger.error(
-                            "Lock contention retries exhausted: func=%s attempts=%d error=%s",
+                            "Transient retries exhausted: func=%s attempts=%d error=%s",
                             fn.__qualname__,
                             max_retries,
                             str(exc),

@@ -19,6 +19,9 @@ logs/
 *.db-wal
 *.sqlite3
 
+# migration snapshots
+db/snapshots/*.db
+
 # OS/editor
 .DS_Store
 Thumbs.db

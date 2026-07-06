@@ -652,16 +652,20 @@ def _ensure_checkpoint_tables(engine, inspector):
     Requirements: 11.1
     """
     from sqlalchemy import text
+    from utils.dialect_sql import _pk_column, _default_timestamp
 
     if inspector.has_table("checkpoint_events"):
         return
 
+    pk = _pk_column(engine)
+    ts_default = _default_timestamp(engine)
+
     with engine.connect() as conn:
         conn.execute(
             text(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS checkpoint_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    {pk},
                     stage VARCHAR(64) NOT NULL,
                     outcome_category VARCHAR(64),
                     cycle_id VARCHAR(36) NOT NULL,
@@ -673,7 +677,7 @@ def _ensure_checkpoint_tables(engine, inspector):
                     decision VARCHAR(32),
                     reason_code VARCHAR(64),
                     metadata_json TEXT,
-                    created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+                    created_at DATETIME NOT NULL {ts_default}
                 )
                 """
             )
@@ -702,12 +706,12 @@ def _ensure_checkpoint_tables(engine, inspector):
 
 def check_schema(engine):
     """Verify the DB schema has all expected columns. Fail fast if not."""
-    import sqlite3
     from sqlalchemy import inspect as sa_inspect, text
+    from db.schema import verify_wal_mode, is_sqlite
 
-    # --- Verify WAL mode and busy_timeout (non-destructive) ---
-    from db.schema import verify_wal_mode
-    verify_wal_mode(engine)
+    # --- Verify WAL mode and busy_timeout (non-destructive, SQLite only) ---
+    if is_sqlite(engine):
+        verify_wal_mode(engine)
 
     inspector = sa_inspect(engine)
 
@@ -760,26 +764,20 @@ def check_schema(engine):
         "exit_category": "VARCHAR(40)",
     }
 
-    raw_conn = engine.raw_connection()
-    cursor = raw_conn.cursor()
-    for table, cols in missing.items():
-        for col in cols:
-            col_type = col_types.get(col, "TEXT")
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-            log.warning(f"Schema migration: added {table}.{col} ({col_type})")
-    raw_conn.commit()
-    raw_conn.close()
+    with engine.begin() as conn:
+        for table, cols in missing.items():
+            for col in cols:
+                col_type = col_types.get(col, "TEXT")
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"))
+                log.warning(f"Schema migration: added {table}.{col} ({col_type})")
 
     # Create unique index for trade_events dedupe_key if column was just added
     if "trade_events" in missing and "dedupe_key" in missing["trade_events"]:
-        raw_conn = engine.raw_connection()
-        cursor = raw_conn.cursor()
-        cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_trade_events_dedupe "
-            "ON trade_events(event_type, trade_id, dedupe_key)"
-        )
-        raw_conn.commit()
-        raw_conn.close()
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_trade_events_dedupe "
+                "ON trade_events(event_type, trade_id, dedupe_key)"
+            ))
         log.warning("Schema migration: created unique index ix_trade_events_dedupe on trade_events(event_type, trade_id, dedupe_key)")
 
     # If stop_role was just added, backfill existing open trades
