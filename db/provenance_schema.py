@@ -17,6 +17,8 @@ Requirements: 3.4, 14.1
 import logging
 from sqlalchemy import text, event
 
+from db.schema import is_sqlite
+
 log = logging.getLogger(__name__)
 
 
@@ -207,44 +209,81 @@ def init_provenance_schema(engine) -> None:
     """Initialize provenance schema with correct pragmas and all provenance tables.
 
     Sets up:
-    - WAL mode for concurrent read/write performance
-    - busy_timeout=30000ms to handle lock contention
-    - foreign_keys=ON to enforce FK constraints
+    - WAL mode for concurrent read/write performance (SQLite only)
+    - busy_timeout=30000ms to handle lock contention (SQLite only)
+    - foreign_keys=ON to enforce FK constraints (SQLite only)
     - All provenance tables with immutability triggers and indexes
 
-    Safe to call multiple times (all DDL uses IF NOT EXISTS).
+    Safe to call multiple times (all DDL uses IF NOT EXISTS / CREATE OR REPLACE).
     """
-    # Register pragma listener for this engine
-    _register_pragmas(engine)
+    # Only register SQLite pragmas when engine is SQLite
+    if is_sqlite(engine):
+        _register_pragmas(engine)
 
     with engine.connect() as conn:
         # --- pm_raw_responses ---
         conn.execute(text(_PM_RAW_RESPONSES_DDL))
         for idx_sql in _PM_RAW_RESPONSES_INDEXES:
             conn.execute(text(idx_sql))
-        for trigger_sql in _PM_RAW_RESPONSES_IMMUTABILITY_TRIGGERS:
-            conn.execute(text(trigger_sql))
 
         # --- response_lineage_links ---
         conn.execute(text(_RESPONSE_LINEAGE_LINKS_DDL))
         for idx_sql in _RESPONSE_LINEAGE_LINKS_INDEXES:
             conn.execute(text(idx_sql))
-        for trigger_sql in _RESPONSE_LINEAGE_LINKS_IMMUTABILITY_TRIGGERS:
-            conn.execute(text(trigger_sql))
 
         # --- provenance_events ---
         conn.execute(text(_PROVENANCE_EVENTS_DDL))
         for idx_sql in _PROVENANCE_EVENTS_INDEXES:
             conn.execute(text(idx_sql))
-        for trigger_sql in _PROVENANCE_EVENTS_IMMUTABILITY_TRIGGERS:
-            conn.execute(text(trigger_sql))
 
         # --- provenance_findings ---
         conn.execute(text(_PROVENANCE_FINDINGS_DDL))
         for idx_sql in _PROVENANCE_FINDINGS_INDEXES:
             conn.execute(text(idx_sql))
-        for trigger_sql in _PROVENANCE_FINDINGS_IMMUTABILITY_TRIGGERS:
-            conn.execute(text(trigger_sql))
+
+        # --- Immutability triggers (dialect-specific) ---
+        if is_sqlite(engine):
+            for trigger_sql in _PM_RAW_RESPONSES_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(trigger_sql))
+            for trigger_sql in _RESPONSE_LINEAGE_LINKS_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(trigger_sql))
+            for trigger_sql in _PROVENANCE_EVENTS_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(trigger_sql))
+            for trigger_sql in _PROVENANCE_FINDINGS_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(trigger_sql))
+        else:
+            # Postgres: create shared trigger function (idempotent)
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION '%% is immutable: %% prohibited', TG_TABLE_NAME, TG_OP;
+                END;
+                $$ LANGUAGE plpgsql
+            """))
+            # Create triggers for each immutable table
+            _immutable_tables = [
+                "pm_raw_responses",
+                "response_lineage_links",
+                "provenance_events",
+                "provenance_findings",
+            ]
+            for table in _immutable_tables:
+                conn.execute(text(
+                    f"DROP TRIGGER IF EXISTS tr_{table}_no_update ON {table}"
+                ))
+                conn.execute(text(
+                    f"CREATE TRIGGER tr_{table}_no_update "
+                    f"BEFORE UPDATE ON {table} "
+                    f"FOR EACH ROW EXECUTE FUNCTION raise_immutable()"
+                ))
+                conn.execute(text(
+                    f"DROP TRIGGER IF EXISTS tr_{table}_no_delete ON {table}"
+                ))
+                conn.execute(text(
+                    f"CREATE TRIGGER tr_{table}_no_delete "
+                    f"BEFORE DELETE ON {table} "
+                    f"FOR EACH ROW EXECUTE FUNCTION raise_immutable()"
+                ))
 
         conn.commit()
 

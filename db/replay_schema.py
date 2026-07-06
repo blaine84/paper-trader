@@ -12,7 +12,9 @@ Requirements: 3.3, 3.4, 9.4, 13.3
 """
 
 import logging
-from sqlalchemy import text, event
+from sqlalchemy import text, event, inspect as sa_inspect
+
+from db.schema import is_sqlite
 
 log = logging.getLogger(__name__)
 
@@ -277,32 +279,29 @@ def init_replay_db(engine) -> None:
     """Initialize replay schema with correct pragmas and all replay tables.
 
     Sets up:
-    - WAL mode for concurrent read/write performance
-    - busy_timeout=30000ms to handle lock contention
-    - foreign_keys=ON to enforce FK constraints in replay namespace
+    - WAL mode for concurrent read/write performance (SQLite only)
+    - busy_timeout=30000ms to handle lock contention (SQLite only)
+    - foreign_keys=ON to enforce FK constraints in replay namespace (SQLite only)
     - All replay namespace tables with triggers and indexes
     - decision_snapshots table in production schema with immutability triggers
     - candidate_lineage_id columns on existing tables (non-destructive)
 
     Safe to call multiple times (all DDL uses IF NOT EXISTS / IF NOT EXISTS triggers).
     """
-    # Register pragma listener for this engine
-    _register_pragmas(engine)
+    # Register pragma listener only for SQLite engines
+    if is_sqlite(engine):
+        _register_pragmas(engine)
 
     with engine.connect() as conn:
         # --- Production schema: decision_snapshots ---
         conn.execute(text(_DECISION_SNAPSHOTS_DDL))
         for idx_sql in _DECISION_SNAPSHOTS_INDEXES:
             conn.execute(text(idx_sql))
-        for trigger_sql in _DECISION_SNAPSHOTS_IMMUTABILITY_TRIGGERS:
-            conn.execute(text(trigger_sql))
 
         # --- Replay namespace tables ---
         conn.execute(text(_REPLAY_AUDIT_RECORDS_DDL))
         for idx_sql in _REPLAY_AUDIT_RECORDS_INDEXES:
             conn.execute(text(idx_sql))
-        for trigger_sql in _REPLAY_AUDIT_RECORDS_IMMUTABILITY_TRIGGERS:
-            conn.execute(text(trigger_sql))
 
         conn.execute(text(_REPLAY_BATCH_RUNS_DDL))
 
@@ -318,8 +317,35 @@ def init_replay_db(engine) -> None:
         for idx_sql in _REPLAY_COUNTERFACTUAL_OUTCOMES_INDEXES:
             conn.execute(text(idx_sql))
 
+        # --- Immutability triggers (dialect-specific) ---
+        if is_sqlite(engine):
+            for trigger_sql in _DECISION_SNAPSHOTS_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(trigger_sql))
+            for trigger_sql in _REPLAY_AUDIT_RECORDS_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(trigger_sql))
+        else:
+            # Postgres: use shared PL/pgSQL trigger function
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION '% is immutable: % prohibited', TG_TABLE_NAME, TG_OP;
+                END;
+                $$ LANGUAGE plpgsql
+            """))
+            for table in ["decision_snapshots", "replay_audit_records"]:
+                conn.execute(text(f"DROP TRIGGER IF EXISTS tr_{table}_no_update ON {table}"))
+                conn.execute(text(f"""
+                    CREATE TRIGGER tr_{table}_no_update BEFORE UPDATE ON {table}
+                    FOR EACH ROW EXECUTE FUNCTION raise_immutable()
+                """))
+                conn.execute(text(f"DROP TRIGGER IF EXISTS tr_{table}_no_delete ON {table}"))
+                conn.execute(text(f"""
+                    CREATE TRIGGER tr_{table}_no_delete BEFORE DELETE ON {table}
+                    FOR EACH ROW EXECUTE FUNCTION raise_immutable()
+                """))
+
         # --- Add candidate_lineage_id to existing tables ---
-        _migrate_lineage_columns(conn)
+        _migrate_lineage_columns(conn, engine)
 
         conn.commit()
 
@@ -340,23 +366,23 @@ def _register_pragmas(engine) -> None:
         cursor.close()
 
 
-def _migrate_lineage_columns(conn) -> None:
+def _migrate_lineage_columns(conn, engine) -> None:
     """Add candidate_lineage_id column to existing tables if not already present.
 
     Non-destructive: skips tables/columns that already exist.
+    Uses SQLAlchemy inspector for dialect-neutral column introspection.
     Logs each migration for audit trail.
     """
+    inspector = sa_inspect(engine)
     for table_name, column_name, col_type, index_name in _LINEAGE_MIGRATIONS:
-        # Check if column already exists
-        try:
-            result = conn.execute(text(f"PRAGMA table_info({table_name})"))
-            columns = {row[1] for row in result.fetchall()}
-        except Exception:
-            # Table doesn't exist yet — skip (will be created by its own module)
+        # Check if table exists
+        if not inspector.has_table(table_name):
             log.debug(f"Table {table_name} not found, skipping lineage migration")
             continue
 
-        if column_name in columns:
+        # Check if column already exists
+        existing_columns = {col["name"] for col in inspector.get_columns(table_name)}
+        if column_name in existing_columns:
             continue
 
         try:

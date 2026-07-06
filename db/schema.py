@@ -1,13 +1,15 @@
 """
 Database schema and initialization.
-Uses SQLite via SQLAlchemy.
+Supports both SQLite (development/test) and Postgres (production) via DATABASE_URL.
 """
 
 import logging
+import os
 
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,
-    DateTime, Date, Text, Boolean, ForeignKey, Index
+    DateTime, Date, Text, Boolean, ForeignKey, Index,
+    event, text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
@@ -266,22 +268,36 @@ class FunnelRunLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+def is_sqlite(engine) -> bool:
+    """Return True if the engine dialect is SQLite."""
+    return engine.dialect.name == "sqlite"
+
+
 def init_db(db_path: str = "db/paper_trader.db"):
-    engine = create_engine(
-        f"sqlite:///{db_path}",
-        connect_args={"timeout": 30},  # wait up to 30s if DB is locked
-    )
-    # Enable WAL mode for better concurrent read/write performance
-    from sqlalchemy import event
+    database_url = os.environ.get("DATABASE_URL", "").strip()
 
-    @event.listens_for(engine, "connect")
-    def _set_sqlite_pragma(dbapi_conn, connection_record):
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.close()
+    if database_url:
+        # Postgres branch
+        engine = create_engine(database_url, pool_pre_ping=True)
+        # Verify connection at startup (fail-closed)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        # No PRAGMA listener is registered here.
+    else:
+        # SQLite branch
+        engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"timeout": 30},
+        )
 
-    # Import Case model so it registers with Base before create_all
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, connection_record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
+
+    # Common path (both dialects)
     from models.case import Case  # noqa: F401
     Base.metadata.create_all(engine)
     return engine
@@ -302,8 +318,6 @@ def verify_wal_mode(engine) -> bool:
 
     Requirements: 12.1, 12.2
     """
-    from sqlalchemy import text
-
     corrections_made = False
 
     with engine.connect() as conn:

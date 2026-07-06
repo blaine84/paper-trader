@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from utils.dialect_sql import _date_cutoff_filter, _json_field, _upsert_outcome_sql
 from utils.gate_config import SHADOW_SCORE_MAX_ENTRY_DEVIATION_PCT
 
 log = logging.getLogger(__name__)
@@ -528,12 +529,12 @@ def get_gate_effectiveness_summary(
 
         # --- Count unscorable exclusions ---
         unscorable_params: dict[str, Any] = {"cutoff": cutoff}
-        unscorable_sql = """
+        unscorable_sql = f"""
             SELECT COUNT(*) FROM blocked_trade_candidate_outcomes o
             JOIN blocked_trade_candidates b ON o.blocked_candidate_id = b.id
             WHERE o.eval_window = '60m'
               AND o.gate_verdict = 'unscorable'
-              AND datetime(b.created_at) >= datetime('now', :cutoff)
+              AND {_date_cutoff_filter(engine, "b.created_at")}
         """
         if gate_name is not None:
             unscorable_sql += " AND b.blocked_by = :gate_name"
@@ -545,13 +546,13 @@ def get_gate_effectiveness_summary(
 
         # --- Count malformed_decision exclusions ---
         malformed_params: dict[str, Any] = {"cutoff": cutoff}
-        malformed_sql = """
+        malformed_sql = f"""
             SELECT COUNT(*) FROM blocked_trade_candidate_outcomes o
             JOIN blocked_trade_candidates b ON o.blocked_candidate_id = b.id
             WHERE o.eval_window = '60m'
               AND o.gate_verdict != 'unscorable'
-              AND json_extract(o.notes_json, '$.candidate_source_classification') = 'malformed_decision'
-              AND datetime(b.created_at) >= datetime('now', :cutoff)
+              AND {_json_field(engine, "o.notes_json", "candidate_source_classification")} = 'malformed_decision'
+              AND {_date_cutoff_filter(engine, "b.created_at")}
         """
         if gate_name is not None:
             malformed_sql += " AND b.blocked_by = :gate_name"
@@ -563,14 +564,14 @@ def get_gate_effectiveness_summary(
 
         # --- Query valid 60m outcomes for effectiveness ---
         effectiveness_params: dict[str, Any] = {"cutoff": cutoff}
-        effectiveness_sql = """
+        effectiveness_sql = f"""
             SELECT o.outcome_label, o.gate_verdict, o.pnl_pct
             FROM blocked_trade_candidate_outcomes o
             JOIN blocked_trade_candidates b ON o.blocked_candidate_id = b.id
             WHERE o.eval_window = '60m'
               AND o.gate_verdict != 'unscorable'
-              AND json_extract(o.notes_json, '$.candidate_source_classification') != 'malformed_decision'
-              AND datetime(b.created_at) >= datetime('now', :cutoff)
+              AND {_json_field(engine, "o.notes_json", "candidate_source_classification")} != 'malformed_decision'
+              AND {_date_cutoff_filter(engine, "b.created_at")}
         """
         if gate_name is not None:
             effectiveness_sql += " AND b.blocked_by = :gate_name"
@@ -681,19 +682,7 @@ def update_blocked_candidate_outcomes(
                     regular_session_windows.append((label, minutes))
                     continue
                 conn.execute(
-                    text(
-                        """
-                        INSERT OR IGNORE INTO blocked_trade_candidate_outcomes (
-                            blocked_candidate_id, eval_window, evaluated_at, eval_price,
-                            pnl_pct, mfe_pct, mae_pct, stop_hit, target_hit, first_hit,
-                            first_hit_at, outcome_label, gate_verdict, notes_json
-                        ) VALUES (
-                            :blocked_candidate_id, :eval_window, :evaluated_at, :eval_price,
-                            :pnl_pct, :mfe_pct, :mae_pct, :stop_hit, :target_hit, :first_hit,
-                            :first_hit_at, :outcome_label, :gate_verdict, :notes_json
-                        )
-                        """
-                    ),
+                    text(_upsert_outcome_sql()),
                     _unscorable_outcome(candidate, label, minutes),
                 )
                 inserted += 1
@@ -727,19 +716,7 @@ def update_blocked_candidate_outcomes(
                     skipped += 1
                     continue
                 conn.execute(
-                    text(
-                        """
-                        INSERT OR IGNORE INTO blocked_trade_candidate_outcomes (
-                            blocked_candidate_id, eval_window, evaluated_at, eval_price,
-                            pnl_pct, mfe_pct, mae_pct, stop_hit, target_hit, first_hit,
-                            first_hit_at, outcome_label, gate_verdict, notes_json
-                        ) VALUES (
-                            :blocked_candidate_id, :eval_window, :evaluated_at, :eval_price,
-                            :pnl_pct, :mfe_pct, :mae_pct, :stop_hit, :target_hit, :first_hit,
-                            :first_hit_at, :outcome_label, :gate_verdict, :notes_json
-                        )
-                        """
-                    ),
+                    text(_upsert_outcome_sql()),
                     scored,
                 )
                 inserted += 1

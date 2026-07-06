@@ -33,6 +33,7 @@ from utils.catalyst_freshness import (
 )
 from feedback_loop.analyst_feedback import get_quality_metrics
 from utils.shadow_ledger import ensure_shadow_ledger_schema
+from utils.dialect_sql import _date_cutoff_filter
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
@@ -948,17 +949,18 @@ def api_shadow_outcomes():
     limit = request.args.get("limit", default=100, type=int)
     limit = max(1, min(limit or 100, 500))
 
+    date_filter = _date_cutoff_filter(engine, "b.created_at")
     with engine.connect() as conn:
         summary_rows = conn.execute(
             text(
-                """
+                f"""
                 SELECT
                   COALESCE(o.gate_verdict, 'pending') AS gate_verdict,
                   COUNT(*) AS count
                 FROM blocked_trade_candidates b
                 LEFT JOIN blocked_trade_candidate_outcomes o
                   ON o.blocked_candidate_id = b.id AND o.eval_window = '60m'
-                WHERE datetime(b.created_at) >= datetime('now', :cutoff)
+                WHERE {date_filter}
                 GROUP BY COALESCE(o.gate_verdict, 'pending')
                 """
             ),
@@ -967,7 +969,7 @@ def api_shadow_outcomes():
 
         rows = conn.execute(
             text(
-                """
+                f"""
                 SELECT
                   b.id, b.created_at, b.symbol, b.action, b.direction, b.profile,
                   b.setup_type, b.entry_price, b.stop_price, b.target_price,
@@ -978,7 +980,7 @@ def api_shadow_outcomes():
                 FROM blocked_trade_candidates b
                 LEFT JOIN blocked_trade_candidate_outcomes o
                   ON o.blocked_candidate_id = b.id
-                WHERE datetime(b.created_at) >= datetime('now', :cutoff)
+                WHERE {date_filter}
                 ORDER BY b.created_at DESC, o.eval_window ASC
                 LIMIT :limit
                 """
