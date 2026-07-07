@@ -738,6 +738,8 @@ def check_schema(engine):
         "trades": ["thesis", "setup_type", "invalidators", "stop_role", "stop_updated_by", "stop_updated_at"],
         "trade_events": ["dedupe_key"],
         "cases": ["exit_category"],
+        "pm_candidates": ["candidate_type", "holding_horizon", "normalized_setup_type"],
+        "pm_candidate_events": ["candidate_type"],
     }
 
     missing = {}
@@ -762,6 +764,9 @@ def check_schema(engine):
         "stop_updated_at": "DATETIME",
         "dedupe_key": "VARCHAR(256)",
         "exit_category": "VARCHAR(40)",
+        "candidate_type": "TEXT DEFAULT 'intraday'",
+        "holding_horizon": "INTEGER",
+        "normalized_setup_type": "TEXT",
     }
 
     with engine.begin() as conn:

@@ -106,7 +106,8 @@ def _create_pm_candidates_table(engine):
                     context_snapshot_json TEXT,
                     benchmark_mapping_json TEXT,
                     rejection_reason TEXT,
-                    candidate_lineage_id TEXT
+                    candidate_lineage_id TEXT,
+                    candidate_type TEXT DEFAULT 'intraday'
                 )
                 """
             )
@@ -126,7 +127,8 @@ def _create_pm_candidate_events_table(engine):
                     profile_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     event_data TEXT,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    candidate_type TEXT
                 )
                 """
             )

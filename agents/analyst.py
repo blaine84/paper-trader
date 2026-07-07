@@ -60,6 +60,7 @@ Respond in JSON:
   "strength": "weak|moderate|strong",
   "confidence": "low|medium|high",
   "setup_type": "one of the VALID SETUP TYPES from the user prompt",
+  "normalized_setup_suggestion": "null OR one of: sector_rotation_swing|risk_off_macro_short|breakout_retest|pullback_continuation|relative_strength_swing|support_bounce_swing|failed_breakdown_reclaim — populate only when your setup_type is NOT already in the executable intraday or swing set (e.g. 'sector_rotation' → suggest 'sector_rotation_swing'). Leave null when setup_type is already executable.",
   "setup_reasoning": "why this setup type was chosen — what specific price action, indicators, or conditions match this setup",
   "reasoning": "what the indicators and tape are saying — be specific",
   "key_levels": {
@@ -84,6 +85,22 @@ Respond in JSON:
 Prefer the exact VALID SETUP TYPES listed in the user prompt. If the setup genuinely fits a label outside that list, preserve the best label and explain it in setup_reasoning.
 
 gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
+
+SWING SETUP LABELS:
+When your confidence is at least medium, strength is at least moderate, and you output a directional signal (LONG or SHORT), prefer these canonical swing setup types:
+  - sector_rotation_swing: stock rotating into a strong sector with multi-day follow-through potential
+  - risk_off_macro_short: broad risk-off environment favoring macro short on a weak name
+  - breakout_retest: price broke out above resistance and is retesting the breakout level as support
+  - pullback_continuation: stock in an established trend pulling back to a key level for continuation
+  - relative_strength_swing: stock showing persistent relative strength vs. sector/market over multiple days
+  - support_bounce_swing: price testing a well-defined support level with signs of a multi-day reversal
+  - failed_breakdown_reclaim: price broke below support but quickly reclaimed, trapping shorts
+
+Use diagnostic labels (labels NOT in the canonical sets above) only when:
+  - Your signal is HOLD
+  - Your confidence is low
+  - Indicators conflict on direction and you cannot resolve a clean setup
+  - No canonical setup type matches the observed price action
 
 HOLD is a valid and useful signal. Output it whenever the setup is ambiguous or low quality.
 
@@ -183,6 +200,14 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
     normalized["confidence"] = confidence if confidence in valid_conf else "low"
 
     normalized.setdefault("setup_type", "unknown")
+    # Validate normalized_setup_suggestion: must be null or a canonical swing type
+    _suggestion = normalized.get("normalized_setup_suggestion")
+    if _suggestion is not None:
+        from utils.gate_config import SWING_EXECUTABLE_SETUP_TYPES
+        if _suggestion not in SWING_EXECUTABLE_SETUP_TYPES:
+            normalized["normalized_setup_suggestion"] = None
+    else:
+        normalized.setdefault("normalized_setup_suggestion", None)
     normalized.setdefault("setup_reasoning", "")
     normalized.setdefault("reasoning", "")
     if not isinstance(normalized.get("key_levels"), dict):

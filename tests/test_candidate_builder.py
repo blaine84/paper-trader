@@ -36,7 +36,10 @@ def _create_pm_candidates_table(engine):
                     context_snapshot_json TEXT,
                     benchmark_mapping_json TEXT,
                     rejection_reason TEXT,
-                    candidate_lineage_id TEXT
+                    candidate_lineage_id TEXT,
+                    candidate_type TEXT DEFAULT 'intraday',
+                    holding_horizon INTEGER,
+                    normalized_setup_type TEXT
                 )
                 """
             )

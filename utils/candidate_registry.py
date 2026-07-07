@@ -72,6 +72,8 @@ class CandidateRecord:
     # P1 fields (None when P1 disabled)
     context_snapshot_json: str | None = None
     benchmark_mapping_json: str | None = None
+    # Swing support: "intraday" or "swing"
+    candidate_type: str = "intraday"
 
 
 def _compute_integrity_hash(record_dict: dict) -> str:
@@ -152,14 +154,16 @@ class CandidateRegistry:
                         target_price, risk_reward, trigger, invalidation_basis,
                         target_basis, source_signal_id, signal_snapshot_json,
                         state, integrity_hash, created_at, expires_at,
-                        context_snapshot_json, benchmark_mapping_json
+                        context_snapshot_json, benchmark_mapping_json,
+                        candidate_type
                     ) VALUES (
                         :candidate_id, :cycle_id, :profile_id, :symbol, :direction,
                         :setup_type, :geometry_name, :entry_price, :stop_price,
                         :target_price, :risk_reward, :trigger, :invalidation_basis,
                         :target_basis, :source_signal_id, :signal_snapshot_json,
                         :state, :integrity_hash, :created_at, :expires_at,
-                        :context_snapshot_json, :benchmark_mapping_json
+                        :context_snapshot_json, :benchmark_mapping_json,
+                        :candidate_type
                     )
                     """
                 ),
@@ -186,6 +190,7 @@ class CandidateRegistry:
                     "expires_at": candidate.expires_at.isoformat(),
                     "context_snapshot_json": candidate.context_snapshot_json,
                     "benchmark_mapping_json": candidate.benchmark_mapping_json,
+                    "candidate_type": candidate.candidate_type,
                 },
             )
             conn.commit()
@@ -335,7 +340,7 @@ class CandidateRegistry:
                     swept_rows = conn.execute(
                         text(
                             """
-                            SELECT candidate_id FROM pm_candidates
+                            SELECT candidate_id, COALESCE(candidate_type, 'intraday') FROM pm_candidates
                             WHERE cycle_id = :cycle_id
                               AND profile_id = :profile_id
                               AND state = :execution_failed_state
@@ -357,8 +362,8 @@ class CandidateRegistry:
                             text(
                                 """
                                 INSERT INTO pm_candidate_events
-                                (candidate_id, cycle_id, profile_id, event_type, event_data, created_at)
-                                VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at)
+                                (candidate_id, cycle_id, profile_id, event_type, event_data, created_at, candidate_type)
+                                VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at, :candidate_type)
                                 """
                             ),
                             {
@@ -368,6 +373,7 @@ class CandidateRegistry:
                                 "event_type": "execution_failed_cycle_sweep",
                                 "event_data": json.dumps({"reason": "cycle_finalized_while_reserved"}),
                                 "created_at": now,
+                                "candidate_type": row[1],
                             },
                         )
 
@@ -513,25 +519,31 @@ class CandidateRegistry:
                 f"Failed to get candidate {candidate_id}: {e}"
             ) from e
 
-    def get_registered_ids(self) -> set[str]:
-        """Return set of candidate_ids in REGISTERED state for this cycle."""
+    def get_registered_ids(self, candidate_type: str | None = None) -> set[str]:
+        """Return set of candidate_ids in REGISTERED state for this cycle.
+
+        Args:
+            candidate_type: If provided, filter to only this type ("swing" or "intraday").
+                           If None, returns all types (backward compatible).
+        """
         try:
             with self._db.connect() as conn:
-                rows = conn.execute(
-                    text(
-                        """
-                        SELECT candidate_id FROM pm_candidates
-                        WHERE cycle_id = :cycle_id
-                          AND profile_id = :profile_id
-                          AND state = :state
-                        """
-                    ),
-                    {
-                        "cycle_id": self.cycle_id,
-                        "profile_id": self.profile_id,
-                        "state": CandidateState.REGISTERED.value,
-                    },
-                ).fetchall()
+                params: dict[str, Any] = {
+                    "cycle_id": self.cycle_id,
+                    "profile_id": self.profile_id,
+                    "state": CandidateState.REGISTERED.value,
+                }
+                sql = """
+                    SELECT candidate_id FROM pm_candidates
+                    WHERE cycle_id = :cycle_id
+                      AND profile_id = :profile_id
+                      AND state = :state
+                """
+                if candidate_type is not None:
+                    sql += "  AND COALESCE(candidate_type, 'intraday') = :candidate_type"
+                    params["candidate_type"] = candidate_type
+
+                rows = conn.execute(text(sql), params).fetchall()
                 return {row[0] for row in rows}
         except Exception as e:
             logger.error(
@@ -541,32 +553,40 @@ class CandidateRegistry:
                 f"Failed to get registered IDs for cycle {self.cycle_id}: {e}"
             ) from e
 
-    def get_offered_summary(self) -> list[dict]:
+    def get_offered_summary(self, candidate_type: str | None = None) -> list[dict]:
         """Return summary dicts for all candidates in this cycle.
 
         Each dict contains: candidate_id, symbol, direction, setup_type,
         entry_price, stop_price, target_price, risk_reward, geometry_name,
-        trigger, invalidation_basis, target_basis, state.
+        trigger, invalidation_basis, target_basis, state, candidate_type,
+        holding_horizon.
+
+        Args:
+            candidate_type: If provided, filter to only this type ("swing" or "intraday").
+                           If None, returns all types (backward compatible).
         """
         try:
             with self._db.connect() as conn:
-                rows = conn.execute(
-                    text(
-                        """
-                        SELECT candidate_id, symbol, direction, setup_type,
-                               entry_price, stop_price, target_price, risk_reward,
-                               geometry_name, trigger, invalidation_basis,
-                               target_basis, state
-                        FROM pm_candidates
-                        WHERE cycle_id = :cycle_id
-                          AND profile_id = :profile_id
-                        """
-                    ),
-                    {
-                        "cycle_id": self.cycle_id,
-                        "profile_id": self.profile_id,
-                    },
-                ).fetchall()
+                params: dict[str, Any] = {
+                    "cycle_id": self.cycle_id,
+                    "profile_id": self.profile_id,
+                }
+                sql = """
+                    SELECT candidate_id, symbol, direction, setup_type,
+                           entry_price, stop_price, target_price, risk_reward,
+                           geometry_name, trigger, invalidation_basis,
+                           target_basis, state,
+                           COALESCE(candidate_type, 'intraday'),
+                           holding_horizon
+                    FROM pm_candidates
+                    WHERE cycle_id = :cycle_id
+                      AND profile_id = :profile_id
+                """
+                if candidate_type is not None:
+                    sql += "  AND COALESCE(candidate_type, 'intraday') = :candidate_type"
+                    params["candidate_type"] = candidate_type
+
+                rows = conn.execute(text(sql), params).fetchall()
 
                 return [
                     {
@@ -583,6 +603,8 @@ class CandidateRegistry:
                         "invalidation_basis": row[10],
                         "target_basis": row[11],
                         "state": row[12],
+                        "candidate_type": row[13],
+                        "holding_horizon": row[14],
                     }
                     for row in rows
                 ]
@@ -661,6 +683,198 @@ class CandidateRegistry:
             raise CandidateRegistryError(
                 f"Failed to check is_empty for cycle {self.cycle_id}: {e}"
             ) from e
+
+    def expire_swing_candidates(
+        self, current_prices: dict[str, float] | None = None
+    ) -> list[str]:
+        """Expire swing candidates that exceed max age or price deviation.
+
+        Checks two conditions for REGISTERED swing candidates:
+        1. Max age: created_at + SWING_MAX_CANDIDATE_AGE_HOURS < now
+        2. Price deviation: current price vs entry price beyond threshold
+
+        Does NOT expire swing candidates due to intraday window closure.
+        Transitions to EXPIRED with appropriate reason_code persisted in
+        rejection_reason. Emits swing_expired event for each expiration.
+
+        Args:
+            current_prices: Optional dict of {symbol: current_price} for
+                price deviation check. If None, only max-age check runs.
+
+        Returns:
+            List of expired candidate_ids.
+        """
+        from utils.gate_config import (
+            SWING_MAX_CANDIDATE_AGE_HOURS,
+            SWING_PRICE_DEVIATION_THRESHOLD_PCT,
+        )
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        max_age_cutoff = now - timedelta(hours=SWING_MAX_CANDIDATE_AGE_HOURS)
+        expired_ids: list[str] = []
+
+        try:
+            with self._db.connect() as conn:
+                # --- Max age expiration ---
+                age_result = conn.execute(
+                    text(
+                        """
+                        UPDATE pm_candidates
+                        SET state = :expired_state,
+                            rejection_reason = :reason
+                        WHERE cycle_id = :cycle_id
+                          AND profile_id = :profile_id
+                          AND state = :registered_state
+                          AND COALESCE(candidate_type, 'intraday') = 'swing'
+                          AND created_at <= :cutoff
+                        """
+                    ),
+                    {
+                        "expired_state": CandidateState.EXPIRED.value,
+                        "reason": "max_age_exceeded",
+                        "cycle_id": self.cycle_id,
+                        "profile_id": self.profile_id,
+                        "registered_state": CandidateState.REGISTERED.value,
+                        "cutoff": max_age_cutoff.isoformat(),
+                    },
+                )
+
+                if age_result.rowcount > 0:
+                    age_rows = conn.execute(
+                        text(
+                            """
+                            SELECT candidate_id FROM pm_candidates
+                            WHERE cycle_id = :cycle_id
+                              AND profile_id = :profile_id
+                              AND state = :expired_state
+                              AND rejection_reason = :reason
+                              AND COALESCE(candidate_type, 'intraday') = 'swing'
+                            """
+                        ),
+                        {
+                            "cycle_id": self.cycle_id,
+                            "profile_id": self.profile_id,
+                            "expired_state": CandidateState.EXPIRED.value,
+                            "reason": "max_age_exceeded",
+                        },
+                    ).fetchall()
+
+                    for row in age_rows:
+                        expired_ids.append(row[0])
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO pm_candidate_events
+                                (candidate_id, cycle_id, profile_id, event_type, event_data, created_at, candidate_type)
+                                VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at, :candidate_type)
+                                """
+                            ),
+                            {
+                                "cid": row[0],
+                                "cycle_id": self.cycle_id,
+                                "profile_id": self.profile_id,
+                                "event_type": "swing_expired",
+                                "event_data": json.dumps({"reason": "max_age_exceeded"}),
+                                "created_at": now_iso,
+                                "candidate_type": "swing",
+                            },
+                        )
+
+                # --- Price deviation expiration ---
+                if current_prices:
+                    # Fetch remaining registered swing candidates
+                    swing_rows = conn.execute(
+                        text(
+                            """
+                            SELECT candidate_id, symbol, entry_price FROM pm_candidates
+                            WHERE cycle_id = :cycle_id
+                              AND profile_id = :profile_id
+                              AND state = :registered_state
+                              AND COALESCE(candidate_type, 'intraday') = 'swing'
+                            """
+                        ),
+                        {
+                            "cycle_id": self.cycle_id,
+                            "profile_id": self.profile_id,
+                            "registered_state": CandidateState.REGISTERED.value,
+                        },
+                    ).fetchall()
+
+                    for row in swing_rows:
+                        cid, symbol, entry_price = row[0], row[1], row[2]
+                        if symbol not in current_prices:
+                            continue
+                        current_price = current_prices[symbol]
+                        if entry_price == 0:
+                            continue
+
+                        deviation_pct = abs(current_price - entry_price) / entry_price * 100
+                        if deviation_pct > float(SWING_PRICE_DEVIATION_THRESHOLD_PCT):
+                            conn.execute(
+                                text(
+                                    """
+                                    UPDATE pm_candidates
+                                    SET state = :expired_state,
+                                        rejection_reason = :reason
+                                    WHERE candidate_id = :cid
+                                      AND state = :registered_state
+                                    """
+                                ),
+                                {
+                                    "expired_state": CandidateState.EXPIRED.value,
+                                    "reason": "price_moved_beyond_threshold",
+                                    "cid": cid,
+                                    "registered_state": CandidateState.REGISTERED.value,
+                                },
+                            )
+                            expired_ids.append(cid)
+                            conn.execute(
+                                text(
+                                    """
+                                    INSERT INTO pm_candidate_events
+                                    (candidate_id, cycle_id, profile_id, event_type, event_data, created_at, candidate_type)
+                                    VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at, :candidate_type)
+                                    """
+                                ),
+                                {
+                                    "cid": cid,
+                                    "cycle_id": self.cycle_id,
+                                    "profile_id": self.profile_id,
+                                    "event_type": "swing_expired",
+                                    "event_data": json.dumps({
+                                        "reason": "price_moved_beyond_threshold",
+                                        "symbol": symbol,
+                                        "entry_price": entry_price,
+                                        "current_price": current_price,
+                                        "deviation_pct": round(deviation_pct, 2),
+                                    }),
+                                    "created_at": now_iso,
+                                    "candidate_type": "swing",
+                                },
+                            )
+
+                conn.commit()
+
+        except Exception as e:
+            logger.error(
+                "Failed to expire swing candidates for cycle %s: %s",
+                self.cycle_id,
+                e,
+            )
+            raise CandidateRegistryError(
+                f"Failed to expire swing candidates for cycle {self.cycle_id}: {e}"
+            ) from e
+
+        if expired_ids:
+            logger.info(
+                "Expired %d swing candidates in cycle %s: %s",
+                len(expired_ids),
+                self.cycle_id,
+                ", ".join(cid[:8] for cid in expired_ids),
+            )
+
+        return expired_ids
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -799,7 +1013,8 @@ def recover_stale_reservations(
         # Find all stale reserved candidates
         stale_rows = conn.execute(
             text("""
-                SELECT candidate_id, execution_key, cycle_id, profile_id, expires_at
+                SELECT candidate_id, execution_key, cycle_id, profile_id, expires_at,
+                       COALESCE(candidate_type, 'intraday') as candidate_type
                 FROM pm_candidates
                 WHERE state = :state
                   AND reserved_at <= :cutoff
@@ -813,6 +1028,7 @@ def recover_stale_reservations(
             cycle_id = row[2]
             profile_id = row[3]
             expires_at_str = row[4]
+            cand_type = row[5]
 
             # Check if trade exists for this execution_key
             trade_exists = False
@@ -894,8 +1110,8 @@ def recover_stale_reservations(
             conn.execute(
                 text("""
                     INSERT INTO pm_candidate_events
-                    (candidate_id, cycle_id, profile_id, event_type, event_data, created_at)
-                    VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at)
+                    (candidate_id, cycle_id, profile_id, event_type, event_data, created_at, candidate_type)
+                    VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at, :candidate_type)
                 """),
                 {
                     "cid": candidate_id,
@@ -904,6 +1120,7 @@ def recover_stale_reservations(
                     "event_type": "recovery_released",
                     "event_data": json.dumps(recoveries[-1]),
                     "created_at": now.isoformat(),
+                    "candidate_type": cand_type,
                 },
             )
 

@@ -100,7 +100,8 @@ def _create_test_tables(engine):
                 context_snapshot_json TEXT,
                 benchmark_mapping_json TEXT,
                 rejection_reason TEXT,
-                candidate_lineage_id TEXT
+                candidate_lineage_id TEXT,
+                candidate_type TEXT DEFAULT 'intraday'
             )
         """))
         conn.execute(text("""
@@ -111,7 +112,8 @@ def _create_test_tables(engine):
                 profile_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 event_data TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                candidate_type TEXT
             )
         """))
 
