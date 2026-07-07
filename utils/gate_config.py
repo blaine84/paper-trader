@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date, timedelta
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +326,91 @@ PM_PROVENANCE_LATENCY_BUDGET_MS: int = int(
     os.environ.get("PM_PROVENANCE_LATENCY_BUDGET_MS", "200")
 )
 
+
+# ---------------------------------------------------------------------------
+# Swing Candidate Pipeline Feature Flags
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enabled"
+_raw_swing_mode = os.environ.get("SWING_CANDIDATE_MODE", "disabled")
+if _raw_swing_mode not in ("disabled", "observe", "enabled"):
+    logger.warning(
+        "Unrecognized SWING_CANDIDATE_MODE=%r, defaulting to 'disabled'",
+        _raw_swing_mode,
+    )
+    _raw_swing_mode = "disabled"
+SWING_CANDIDATE_MODE: str = _raw_swing_mode
+
+
+def get_swing_candidate_mode() -> str:
+    """Return current SWING_CANDIDATE_MODE value.
+
+    Exposed as a function so callers (e.g., swing_candidate_bridge) can
+    read the flag at call time rather than import time, making tests simpler
+    (patch this function instead of reloading the module).
+    """
+    return SWING_CANDIDATE_MODE
+
+
+# Closed set of executable swing setup types
+SWING_EXECUTABLE_SETUP_TYPES: frozenset[str] = frozenset({
+    "sector_rotation_swing",
+    "risk_off_macro_short",
+    "breakout_retest",
+    "pullback_continuation",
+    "relative_strength_swing",
+    "support_bounce_swing",
+    "failed_breakdown_reclaim",
+})
+
+# Per-profile swing policy configuration
+SWING_PROFILE_POLICY: dict[str, dict] = {
+    "conservative": {
+        "min_confidence": "high",
+        "min_strength": "strong",
+        "min_risk_reward": Decimal("3.0"),
+        "sizing_multiplier": Decimal("0.5"),
+    },
+    "moderate": {
+        "min_confidence": "medium",
+        "min_strength": "moderate",
+        "min_risk_reward": Decimal("1.5"),
+        "sizing_multiplier": Decimal("0.5"),
+    },
+    "aggressive": {
+        "min_confidence": "low",
+        "min_strength": "moderate",
+        "min_risk_reward": Decimal("1.25"),
+        "sizing_multiplier": Decimal("1.0"),
+    },
+}
+
+# Maximum concurrent swing positions per profile
+SWING_MAX_CONCURRENT_POSITIONS: dict[str, int] = {
+    "conservative": 2,
+    "moderate": 4,
+    "aggressive": 6,
+}
+
+# Swing candidate expiration
+SWING_MAX_CANDIDATE_AGE_HOURS: int = int(
+    os.environ.get("SWING_MAX_CANDIDATE_AGE_HOURS", "24")
+)
+
+# Price deviation threshold for expiration (percentage)
+SWING_PRICE_DEVIATION_THRESHOLD_PCT: Decimal = Decimal(
+    os.environ.get("SWING_PRICE_DEVIATION_THRESHOLD_PCT", "3.0")
+)
+
+# Sector concentration warning threshold
+SWING_SECTOR_CONCENTRATION_WARN_THRESHOLD: int = int(
+    os.environ.get("SWING_SECTOR_CONCENTRATION_WARN_THRESHOLD", "3")
+)
+
+# Conservative observe-only flag
+SWING_CONSERVATIVE_OBSERVE_ONLY: bool = os.environ.get(
+    "SWING_CONSERVATIVE_OBSERVE_ONLY", "false"
+).lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Price Alert PM Dispatcher

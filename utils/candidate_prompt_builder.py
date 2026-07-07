@@ -39,18 +39,21 @@ def build_candidate_pm_prompt(
     # Build candidate table
     table_lines = []
     table_lines.append(
-        "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | Trigger | Invalidation | Target Basis |"
+        "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | Trigger | Invalidation | Target Basis | Horizon |"
     )
-    table_lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    table_lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for i, c in enumerate(candidate_summaries, 1):
         trigger_text = c.get("trigger", "") or ""
         invalidation_text = c.get("invalidation_basis", "") or ""
         target_basis_text = c.get("target_basis", "") or ""
+        # Display holding horizon for swing candidates (integer days), blank for intraday
+        holding_horizon = c.get("holding_horizon")
+        horizon_text = f"{holding_horizon}d" if holding_horizon else ""
         table_lines.append(
             f"| {i} | {c['candidate_id']} | {c['symbol']} | {c['direction']} "
             f"| ${c['entry_price']:.2f} | ${c['stop_price']:.2f} | ${c['target_price']:.2f} "
             f"| {c['risk_reward']:.1f}:1 | {c['setup_type']} | {c.get('geometry_name', '')} "
-            f"| {trigger_text[:80]} | {invalidation_text[:80]} | {target_basis_text[:80]} |"
+            f"| {trigger_text[:80]} | {invalidation_text[:80]} | {target_basis_text[:80]} | {horizon_text} |"
         )
     candidate_table = "\n".join(table_lines)
 
