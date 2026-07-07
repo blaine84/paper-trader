@@ -40,3 +40,32 @@ def test_check_schema_initializes_replay_lineage_columns():
     assert "candidate_lineage_id" in {
         column["name"] for column in inspector.get_columns("trade_events")
     }
+
+
+def test_check_schema_creates_candidate_events_with_generated_id():
+    engine = create_engine("sqlite://")
+
+    orchestrator.check_schema(engine)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO pm_candidate_events
+                (candidate_id, cycle_id, profile_id, event_type, event_data)
+                VALUES ('', 'cycle-1', 'moderate', 'swing_no_candidates', '{}')
+                """
+            )
+        )
+        row = conn.execute(
+            text(
+                """
+                SELECT id, candidate_type
+                FROM pm_candidate_events
+                WHERE cycle_id = 'cycle-1'
+                """
+            )
+        ).one()
+
+    assert row.id is not None
+    assert row.candidate_type == "intraday"

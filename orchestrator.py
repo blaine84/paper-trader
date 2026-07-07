@@ -523,14 +523,18 @@ def _ensure_candidate_tables(engine, inspector):
     Requirements: 1.3, 12.1, 12.2, 12.5, 13.2
     """
     from sqlalchemy import text
+    from utils.dialect_sql import _pk_column, _default_timestamp
+
+    pk = _pk_column(engine)
+    ts_default = _default_timestamp(engine)
 
     if not inspector.has_table("pm_candidates"):
         with engine.connect() as conn:
             conn.execute(
                 text(
-                    """
+                    f"""
                     CREATE TABLE IF NOT EXISTS pm_candidates (
-                        id INTEGER PRIMARY KEY,
+                        {pk},
                         candidate_id VARCHAR(36) NOT NULL UNIQUE,
                         cycle_id VARCHAR(64) NOT NULL,
                         profile_id VARCHAR(64) NOT NULL,
@@ -551,11 +555,14 @@ def _ensure_candidate_tables(engine, inspector):
                         integrity_hash VARCHAR(64) NOT NULL,
                         execution_key VARCHAR(128),
                         reserved_at DATETIME,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        created_at DATETIME {ts_default},
                         expires_at DATETIME NOT NULL,
                         context_snapshot_json TEXT,
                         benchmark_mapping_json TEXT,
-                        rejection_reason TEXT
+                        rejection_reason TEXT,
+                        candidate_type TEXT DEFAULT 'intraday',
+                        holding_horizon INTEGER,
+                        normalized_setup_type TEXT
                     )
                     """
                 )
@@ -585,15 +592,16 @@ def _ensure_candidate_tables(engine, inspector):
         with engine.connect() as conn:
             conn.execute(
                 text(
-                    """
+                    f"""
                     CREATE TABLE IF NOT EXISTS pm_candidate_events (
-                        id INTEGER PRIMARY KEY,
+                        {pk},
                         candidate_id VARCHAR(36) NOT NULL,
                         cycle_id VARCHAR(64) NOT NULL,
                         profile_id VARCHAR(64) NOT NULL,
                         event_type VARCHAR(64) NOT NULL,
                         event_data TEXT,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        created_at DATETIME {ts_default},
+                        candidate_type TEXT DEFAULT 'intraday'
                     )
                     """
                 )
@@ -617,9 +625,9 @@ def _ensure_candidate_tables(engine, inspector):
         with engine.connect() as conn:
             conn.execute(
                 text(
-                    """
+                    f"""
                     CREATE TABLE IF NOT EXISTS candidate_shadow_comparison (
-                        id INTEGER PRIMARY KEY,
+                        {pk},
                         cycle_id VARCHAR(64) NOT NULL,
                         profile_id VARCHAR(64) NOT NULL,
                         candidate_results_json TEXT NOT NULL,
@@ -627,7 +635,7 @@ def _ensure_candidate_tables(engine, inspector):
                         agreement_summary TEXT,
                         malformed_count INTEGER DEFAULT 0,
                         hypothetical_diffs TEXT,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        created_at DATETIME {ts_default}
                     )
                     """
                 )
@@ -640,6 +648,53 @@ def _ensure_candidate_tables(engine, inspector):
             )
             conn.commit()
         log.warning("Schema migration: created candidate_shadow_comparison table with indexes")
+
+
+def _ensure_pm_candidate_events_identity_default(engine, inspector):
+    """Repair migrated Postgres pm_candidate_events.id columns missing a default.
+
+    SQLite's ``INTEGER PRIMARY KEY`` auto-generates values. During the
+    SQLite-to-Postgres migration, the same DDL can leave an integer primary key
+    with no sequence/default, causing inserts that omit ``id`` to fail.
+    """
+    from sqlalchemy import text
+    from db.schema import is_sqlite
+
+    if is_sqlite(engine) or not inspector.has_table("pm_candidate_events"):
+        return
+
+    columns = {
+        col["name"]: col
+        for col in inspector.get_columns("pm_candidate_events")
+    }
+    id_col = columns.get("id")
+    if not id_col or id_col.get("default"):
+        return
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE SEQUENCE IF NOT EXISTS pm_candidate_events_id_seq "
+                "OWNED BY pm_candidate_events.id"
+            )
+        )
+        conn.execute(
+            text(
+                "SELECT setval("
+                "'pm_candidate_events_id_seq', "
+                "COALESCE((SELECT MAX(id) FROM pm_candidate_events), 0) + 1, "
+                "false)"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE pm_candidate_events "
+                "ALTER COLUMN id SET DEFAULT nextval('pm_candidate_events_id_seq')"
+            )
+        )
+    log.warning(
+        "Schema migration: repaired pm_candidate_events.id sequence default"
+    )
 
 
 def _ensure_checkpoint_tables(engine, inspector):
@@ -720,6 +775,7 @@ def check_schema(engine):
 
     # --- Auto-create candidate-ID selection tables if missing (non-destructive) ---
     _ensure_candidate_tables(engine, inspector)
+    _ensure_pm_candidate_events_identity_default(engine, inspector)
 
     # --- Auto-create checkpoint funnel logging tables if missing (non-destructive) ---
     _ensure_checkpoint_tables(engine, inspector)

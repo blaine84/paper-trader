@@ -611,11 +611,11 @@ def compute_confidence_regime(engine) -> dict:
     """
     db = get_session(engine)
     try:
-        today = date.today().isoformat()
+        today_start = datetime.combine(date.today(), datetime.min.time())
 
         # 1. Edge quality: average edge score of today's trades
         trades_today = db.query(Trade).filter(
-            Trade.entry_time >= today,
+            Trade.entry_time >= today_start,
             Trade.edge_score.isnot(None),
         ).all()
         avg_edge = (
