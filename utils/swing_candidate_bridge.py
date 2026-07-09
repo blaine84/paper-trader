@@ -23,6 +23,144 @@ _DECIMAL_CTX = Context(prec=28, rounding=ROUND_HALF_UP)
 _FLOOR_CTX = Context(prec=28, rounding=ROUND_DOWN)
 
 
+# ---------------------------------------------------------------------------
+# Canonical Rejection Codes — Stable closed set (Requirement 3.1, 3.3)
+# ---------------------------------------------------------------------------
+
+CANONICAL_REJECTION_CODES: frozenset[str] = frozenset({
+    # --- Freshness stage ---
+    "stale_signal",
+    "stale_catalyst",
+    # --- Normalization stage (from setup_normalizer) ---
+    "diagnostic_only",
+    "unmapped_label",
+    "insufficient_normalization_evidence",
+    "context_mismatch",
+    "data_provider_error",
+    "analyst_veto",
+    # --- Geometry stage ---
+    "missing_geometry",
+    # --- Risk gates stage ---
+    "failed_risk_gates",
+    # --- Exposure stage ---
+    "same_symbol_exposure",
+    "correlation_exposure",
+    # --- Profile policy stage ---
+    "profile_policy",
+    # --- Catch-all ---
+    "unknown_error",
+})
+
+
+@dataclass(frozen=True)
+class RejectionMapping:
+    """Result of mapping a raw rejection reason to a canonical code."""
+
+    canonical_code: str  # Always from CANONICAL_REJECTION_CODES
+    raw_reason: str      # Original string, preserved for audit
+
+
+# ---------------------------------------------------------------------------
+# Raw-to-Canonical Mapping Layer (Requirement 3.2, 3.4, 3.5)
+# ---------------------------------------------------------------------------
+
+_RAW_TO_CANONICAL: dict[str, str] = {
+    # Already canonical (identity mappings)
+    "stale_signal": "stale_signal",
+    "stale_catalyst": "stale_catalyst",
+    "diagnostic_only": "diagnostic_only",
+    "unmapped_label": "unmapped_label",
+    "insufficient_normalization_evidence": "insufficient_normalization_evidence",
+    "context_mismatch": "context_mismatch",
+    "missing_geometry": "missing_geometry",
+    "failed_risk_gates": "failed_risk_gates",
+    "same_symbol_exposure": "same_symbol_exposure",
+    "correlation_exposure": "correlation_exposure",
+    "data_provider_error": "data_provider_error",
+    "analyst_veto": "analyst_veto",
+    "profile_policy": "profile_policy",
+    "unknown_error": "unknown_error",
+    # --- Mappings from setup_normalizer raw codes ---
+    "error_setup_blocked": "data_provider_error",
+    "data_provider_error_blocked": "data_provider_error",
+    # --- Mappings from POLICY_REJECTION_CODES ---
+    "observe_only_period": "profile_policy",
+    "confidence_below_threshold": "profile_policy",
+    "strength_below_threshold": "profile_policy",
+    "rr_below_threshold": "profile_policy",
+    "same_symbol_overlap_blocked": "same_symbol_exposure",
+    # --- Mappings from process_swing_signals inline strings ---
+    "max_swing_positions_reached": "profile_policy",
+    "sizing_rejected": "failed_risk_gates",
+}
+
+
+def map_rejection_reason(raw_reason: str, symbol: str) -> RejectionMapping:
+    """Map a raw rejection reason string to a canonical code.
+
+    Returns RejectionMapping with:
+    - canonical_code: from CANONICAL_REJECTION_CODES (queryable)
+    - raw_reason: original string (preserves full detail)
+
+    If raw_reason is directly in CANONICAL_REJECTION_CODES, canonical == raw.
+    If raw_reason is in _RAW_TO_CANONICAL, uses the mapped canonical.
+    Otherwise, logs warning and returns canonical_code='unknown_error'.
+
+    This function NEVER raises — it is the single normalization point for
+    all rejection reasons flowing into PerSymbolEntry.
+    """
+    canonical = _RAW_TO_CANONICAL.get(raw_reason)
+    if canonical is not None:
+        return RejectionMapping(canonical_code=canonical, raw_reason=raw_reason)
+
+    # Truly unknown — log and fall back
+    logger.warning(
+        "Unrecognized rejection reason %r for symbol=%s; mapping to unknown_error",
+        raw_reason, symbol,
+    )
+    return RejectionMapping(canonical_code="unknown_error", raw_reason=raw_reason)
+
+
+# ---------------------------------------------------------------------------
+# Per-Symbol Evaluation Entry (Requirement 2.1, 4.2, 17.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PerSymbolEntry:
+    """Immutable per-signal evaluation record for the SwingEvaluationSummary."""
+
+    symbol: str
+    raw_direction: Literal["LONG", "SHORT", "HOLD"]
+    raw_setup_label: str
+    normalized_setup_label: str | None  # None if normalization failed
+    confidence: Literal["low", "medium", "high"]
+    strength: Literal["weak", "moderate", "strong"]
+    construction_attempted: bool
+    construction_succeeded: bool
+    final_rejection_reason: str | None  # Canonical code from CANONICAL_REJECTION_CODES, or None
+    raw_rejection_reason: str | None    # Original raw string from the rejecting stage, or None
+    missing_evidence: list[str] | None  # Populated for near-miss rejections (Req 17.3)
+
+
+# ---------------------------------------------------------------------------
+# Swing Evaluation Summary (Requirements 1.2, 1.3, 4.1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SwingEvaluationSummary:
+    """Immutable structured event persisted per PM cycle."""
+
+    cycle_id: str
+    profile_id: str
+    timestamp: str  # ISO 8601 UTC
+    candidate_mode: str  # Current SWING_CANDIDATE_MODE value
+    total_signals_evaluated: int  # Non-negative count of signals processed
+    per_symbol_entries: tuple[PerSymbolEntry, ...]  # One per evaluated signal
+    counts_by_rejection_category: dict[str, int]  # canonical_code → count (omits zero-count)
+
+
 @dataclass(frozen=True)
 class PolicyResult:
     """Result of profile policy evaluation."""
@@ -169,6 +307,150 @@ class SwingBridgeResult:
     construction_succeeded: bool
 
 
+def _check_signal_freshness(signal: dict) -> str | None:
+    """Check if signal is fresh enough for swing evaluation.
+
+    Returns None if fresh, or 'stale_signal' if stale.
+    Uses SWING_SIGNAL_FRESHNESS_HOURS from gate_config.
+
+    A signal is stale if:
+    - signal_age_hours > threshold, OR
+    - signal has no valid signal_age_hours field (None or missing) (Req 10.4)
+    """
+    from utils.gate_config import SWING_SIGNAL_FRESHNESS_HOURS
+
+    age = signal.get("signal_age_hours")
+    if age is None:
+        return "stale_signal"
+    try:
+        if float(age) > SWING_SIGNAL_FRESHNESS_HOURS:
+            return "stale_signal"
+    except (ValueError, TypeError):
+        return "stale_signal"
+    return None
+
+
+def _check_catalyst_freshness(signal: dict) -> str | None:
+    """Check if catalyst/news context is fresh enough for swing hold.
+
+    Consumes the existing `catalyst_freshness` field from the analyst signal.
+    This field is already present in the signal payload from funnel_analyst.py
+    with values: "fresh", "aging", "stale", or absent/null.
+
+    Threshold mapping:
+    - "fresh" → pass
+    - "aging" → pass (observe mode: warn via log, do not reject)
+    - "stale" → reject with stale_catalyst
+    - absent/null → treat as stale, reject with stale_catalyst
+
+    In observe mode, "stale" causes rejection (not merely flagging) per Req 11.3.
+    No new timestamp computation is needed — we consume the existing field.
+    """
+    catalyst_freshness = signal.get("catalyst_freshness")
+    if catalyst_freshness is None:
+        return "stale_catalyst"
+    if catalyst_freshness == "stale":
+        return "stale_catalyst"
+    if catalyst_freshness == "aging":
+        # Log warning for aging catalysts but allow through
+        logger.debug(
+            "Catalyst freshness is 'aging' for symbol=%s; passing but flagging",
+            signal.get("symbol", "?"),
+        )
+        return None
+    # "fresh" or any other value → pass
+    return None
+
+
+def _build_evaluation_summary(
+    cycle_id: str,
+    profile_id: str,
+    mode: str,
+    entries: list[PerSymbolEntry],
+) -> SwingEvaluationSummary:
+    """Construct the SwingEvaluationSummary from collected per-symbol entries.
+
+    Computes counts_by_rejection_category from entries using CANONICAL codes,
+    omitting codes with zero occurrences.
+    """
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if entry.final_rejection_reason:
+            code = entry.final_rejection_reason
+            counts[code] = counts.get(code, 0) + 1
+
+    return SwingEvaluationSummary(
+        cycle_id=cycle_id,
+        profile_id=profile_id,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        candidate_mode=mode,
+        total_signals_evaluated=len(entries),
+        per_symbol_entries=tuple(entries),
+        counts_by_rejection_category=counts,
+    )
+
+
+def _persist_evaluation_summary(
+    db: Any,
+    summary: SwingEvaluationSummary,
+) -> None:
+    """Persist SwingEvaluationSummary to pm_candidate_events. Fail-open.
+
+    Stores as event_type='swing_evaluation_summary' with candidate_type='swing'.
+    event_data contains the full JSON payload (per-symbol entries + counts).
+
+    This event REPLACES the old 'swing_no_candidates' event. The summary
+    carries strictly more information.
+
+    On failure: logs WARNING with failure reason, does not raise (Req 20.1-20.3).
+    """
+    try:
+        payload = {
+            "cycle_id": summary.cycle_id,
+            "profile_id": summary.profile_id,
+            "timestamp": summary.timestamp,
+            "candidate_mode": summary.candidate_mode,
+            "total_signals_evaluated": summary.total_signals_evaluated,
+            "per_symbol_entries": [
+                {
+                    "symbol": e.symbol,
+                    "raw_direction": e.raw_direction,
+                    "raw_setup_label": e.raw_setup_label,
+                    "normalized_setup_label": e.normalized_setup_label,
+                    "confidence": e.confidence,
+                    "strength": e.strength,
+                    "construction_attempted": e.construction_attempted,
+                    "construction_succeeded": e.construction_succeeded,
+                    "final_rejection_reason": e.final_rejection_reason,
+                    "raw_rejection_reason": e.raw_rejection_reason,
+                    "missing_evidence": e.missing_evidence,
+                }
+                for e in summary.per_symbol_entries
+            ],
+            "counts_by_rejection_category": summary.counts_by_rejection_category,
+        }
+        from sqlalchemy import text as sql_text
+        with db.begin() as conn:
+            conn.execute(sql_text("""
+                INSERT INTO pm_candidate_events
+                (candidate_id, cycle_id, profile_id, event_type, event_data, created_at, candidate_type)
+                VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at, :candidate_type)
+            """), {
+                "cid": "",
+                "cycle_id": summary.cycle_id,
+                "profile_id": summary.profile_id,
+                "event_type": "swing_evaluation_summary",
+                "event_data": json.dumps(payload, default=str),
+                "created_at": summary.timestamp,
+                "candidate_type": "swing",
+            })
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist SwingEvaluationSummary: cycle=%s error=%s",
+            summary.cycle_id, exc,
+        )
+
+
 def _get_swing_mode() -> str:
     """Read SWING_CANDIDATE_MODE at call time (not import time).
 
@@ -213,6 +495,7 @@ def process_swing_signals(
     from utils.swing_geometry_builder import build_swing_geometry, SwingGeometry
 
     results: list[SwingBridgeResult] = []
+    entries: list[PerSymbolEntry] = []
     registered_candidates: list[dict] = []
 
     # Get open swing positions for same-symbol and max-concurrent checks
@@ -224,9 +507,76 @@ def process_swing_signals(
         symbol = signal.get("symbol", "")
         raw_label = signal.get("setup_type", "")
 
-        # Skip stale signals
+        # --- Freshness checks (before normalization) — Req 10.3, 11.3, 3.4 ---
+        stale_reason = _check_signal_freshness(signal)
+        if stale_reason:
+            mapping = map_rejection_reason(stale_reason, symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=None,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=False,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
+            result = SwingBridgeResult(
+                signal_id=signal_id, symbol=symbol, raw_label=raw_label,
+                normalized_label=None, rejection_reason=stale_reason,
+                construction_attempted=False, construction_succeeded=False,
+            )
+            results.append(result)
+            _safe_emit_log(result)
+            continue
+
+        stale_catalyst = _check_catalyst_freshness(signal)
+        if stale_catalyst:
+            mapping = map_rejection_reason(stale_catalyst, symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=None,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=False,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
+            result = SwingBridgeResult(
+                signal_id=signal_id, symbol=symbol, raw_label=raw_label,
+                normalized_label=None, rejection_reason=stale_catalyst,
+                construction_attempted=False, construction_succeeded=False,
+            )
+            results.append(result)
+            _safe_emit_log(result)
+            continue
+
+        # --- End freshness checks ---
+
+        # Skip stale signals (legacy check — kept for backward compat with SWING_MAX_CANDIDATE_AGE_HOURS)
         signal_age_hours = signal.get("signal_age_hours", 0)
         if signal_age_hours > SWING_MAX_CANDIDATE_AGE_HOURS:
+            mapping = map_rejection_reason("stale_signal", symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=None,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=False,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
             result = SwingBridgeResult(
                 signal_id=signal_id, symbol=symbol, raw_label=raw_label,
                 normalized_label=None, rejection_reason="stale_signal",
@@ -239,6 +589,20 @@ def process_swing_signals(
         # Max concurrent positions check
         max_allowed = SWING_MAX_CONCURRENT_POSITIONS.get(profile_id, 0)
         if open_swing_count >= max_allowed:
+            mapping = map_rejection_reason("max_swing_positions_reached", symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=None,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=False,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
             result = SwingBridgeResult(
                 signal_id=signal_id, symbol=symbol, raw_label=raw_label,
                 normalized_label=None, rejection_reason="max_swing_positions_reached",
@@ -250,6 +614,20 @@ def process_swing_signals(
 
         # Same-symbol exposure check
         if symbol in open_swing_symbols:
+            mapping = map_rejection_reason("same_symbol_exposure", symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=None,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=False,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
             result = SwingBridgeResult(
                 signal_id=signal_id, symbol=symbol, raw_label=raw_label,
                 normalized_label=None, rejection_reason="same_symbol_exposure",
@@ -279,6 +657,20 @@ def process_swing_signals(
         )
 
         if not norm_result.success:
+            mapping = map_rejection_reason(norm_result.reason_code, symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=None,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=False,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=norm_result.missing_evidence,
+            ))
             result = SwingBridgeResult(
                 signal_id=signal_id, symbol=symbol, raw_label=raw_label,
                 normalized_label=None, rejection_reason=norm_result.reason_code,
@@ -296,18 +688,9 @@ def process_swing_signals(
 
         normalized_type = norm_result.executable_type
 
-        if mode == "observe":
-            # In observe mode: normalize + log per signal, return []
-            result = SwingBridgeResult(
-                signal_id=signal_id, symbol=symbol, raw_label=raw_label,
-                normalized_label=normalized_type, rejection_reason=None,
-                construction_attempted=False, construction_succeeded=False,
-            )
-            results.append(result)
-            _safe_emit_log(result)
-            continue
-
-        # mode == "enabled" — build geometry
+        # --- Both observe and enabled modes run the full pipeline from here ---
+        # mode == "enabled" — build geometry + register candidates
+        # mode == "observe" — build geometry in shadow, capture telemetry, NEVER register
         entry_price = signal.get("entry_price")
         stop_price = signal.get("stop_price")
         target_price = signal.get("target_price")
@@ -330,6 +713,20 @@ def process_swing_signals(
 
         if not isinstance(geom_result, SwingGeometry):
             # Geometry rejected
+            mapping = map_rejection_reason(geom_result.reason_code, symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=normalized_type,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=True,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
             result = SwingBridgeResult(
                 signal_id=signal_id, symbol=symbol, raw_label=raw_label,
                 normalized_label=normalized_type, rejection_reason=geom_result.reason_code,
@@ -337,12 +734,13 @@ def process_swing_signals(
             )
             results.append(result)
             _safe_emit_log(result)
-            _safe_emit_event(db, None, cycle_id, profile_id,
-                "swing_candidate_rejected", {
-                    "signal_id": signal_id, "symbol": symbol,
-                    "raw_label": raw_label, "normalized_label": normalized_type,
-                    "reason_code": geom_result.reason_code,
-                })
+            if mode == "enabled":
+                _safe_emit_event(db, None, cycle_id, profile_id,
+                    "swing_candidate_rejected", {
+                        "signal_id": signal_id, "symbol": symbol,
+                        "raw_label": raw_label, "normalized_label": normalized_type,
+                        "reason_code": geom_result.reason_code,
+                    })
             continue
 
         # Profile policy check
@@ -356,6 +754,20 @@ def process_swing_signals(
         )
 
         if not policy_result.accepted:
+            mapping = map_rejection_reason(policy_result.reason_code, symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=normalized_type,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=True,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
             result = SwingBridgeResult(
                 signal_id=signal_id, symbol=symbol, raw_label=raw_label,
                 normalized_label=normalized_type, rejection_reason=policy_result.reason_code,
@@ -363,12 +775,13 @@ def process_swing_signals(
             )
             results.append(result)
             _safe_emit_log(result)
-            _safe_emit_event(db, None, cycle_id, profile_id,
-                "swing_candidate_rejected", {
-                    "signal_id": signal_id, "symbol": symbol,
-                    "raw_label": raw_label, "normalized_label": normalized_type,
-                    "reason_code": policy_result.reason_code,
-                })
+            if mode == "enabled":
+                _safe_emit_event(db, None, cycle_id, profile_id,
+                    "swing_candidate_rejected", {
+                        "signal_id": signal_id, "symbol": symbol,
+                        "raw_label": raw_label, "normalized_label": normalized_type,
+                        "reason_code": policy_result.reason_code,
+                    })
             continue
 
         # Position sizing
@@ -384,6 +797,20 @@ def process_swing_signals(
         )
 
         if not sizing_result.accepted:
+            mapping = map_rejection_reason("sizing_rejected", symbol)
+            entries.append(PerSymbolEntry(
+                symbol=symbol,
+                raw_direction=signal.get("direction", "HOLD"),
+                raw_setup_label=raw_label,
+                normalized_setup_label=normalized_type,
+                confidence=signal.get("confidence", "low"),
+                strength=signal.get("strength", "weak"),
+                construction_attempted=True,
+                construction_succeeded=False,
+                final_rejection_reason=mapping.canonical_code,
+                raw_rejection_reason=mapping.raw_reason,
+                missing_evidence=None,
+            ))
             result = SwingBridgeResult(
                 signal_id=signal_id, symbol=symbol, raw_label=raw_label,
                 normalized_label=normalized_type, rejection_reason="sizing_rejected",
@@ -391,12 +818,13 @@ def process_swing_signals(
             )
             results.append(result)
             _safe_emit_log(result)
-            _safe_emit_event(db, None, cycle_id, profile_id,
-                "swing_candidate_rejected", {
-                    "signal_id": signal_id, "symbol": symbol,
-                    "raw_label": raw_label, "normalized_label": normalized_type,
-                    "reason_code": "sizing_rejected",
-                })
+            if mode == "enabled":
+                _safe_emit_event(db, None, cycle_id, profile_id,
+                    "swing_candidate_rejected", {
+                        "signal_id": signal_id, "symbol": symbol,
+                        "raw_label": raw_label, "normalized_label": normalized_type,
+                        "reason_code": "sizing_rejected",
+                    })
             continue
 
         # Sector concentration warning
@@ -412,17 +840,32 @@ def process_swing_signals(
                 pass
 
         # SUCCESS — candidate passes all checks
-        registered_candidates.append({
-            "signal_id": signal_id,
-            "symbol": symbol,
-            "direction": signal.get("direction", "LONG"),
-            "normalized_setup_type": normalized_type,
-            "geometry": geom_result,
-            "quantity": sizing_result.quantity,
-            "dollar_risk": sizing_result.dollar_risk,
-            "sizing_multiplier": policy_result.sizing_multiplier,
-            "holding_horizon": geom_result.holding_horizon,
-        })
+        if mode == "enabled":
+            registered_candidates.append({
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "direction": signal.get("direction", "LONG"),
+                "normalized_setup_type": normalized_type,
+                "geometry": geom_result,
+                "quantity": sizing_result.quantity,
+                "dollar_risk": sizing_result.dollar_risk,
+                "sizing_multiplier": policy_result.sizing_multiplier,
+                "holding_horizon": geom_result.holding_horizon,
+            })
+
+        entries.append(PerSymbolEntry(
+            symbol=symbol,
+            raw_direction=signal.get("direction", "HOLD"),
+            raw_setup_label=raw_label,
+            normalized_setup_label=normalized_type,
+            confidence=signal.get("confidence", "low"),
+            strength=signal.get("strength", "weak"),
+            construction_attempted=True,
+            construction_succeeded=True,
+            final_rejection_reason=None,
+            raw_rejection_reason=None,
+            missing_evidence=None,
+        ))
 
         result = SwingBridgeResult(
             signal_id=signal_id, symbol=symbol, raw_label=raw_label,
@@ -431,15 +874,24 @@ def process_swing_signals(
         )
         results.append(result)
         _safe_emit_log(result)
-        _safe_emit_event(db, signal_id, cycle_id, profile_id,
-            "swing_candidate_constructed", {
-                "signal_id": signal_id, "symbol": symbol,
-                "raw_label": raw_label, "normalized_label": normalized_type,
-            })
+        if mode == "enabled":
+            _safe_emit_event(db, signal_id, cycle_id, profile_id,
+                "swing_candidate_constructed", {
+                    "signal_id": signal_id, "symbol": symbol,
+                    "raw_label": raw_label, "normalized_label": normalized_type,
+                })
 
-        # Update tracking for subsequent signals in this batch
-        open_swing_symbols.add(symbol)
-        open_swing_count += 1
+            # Update tracking for subsequent signals in this batch
+            open_swing_symbols.add(symbol)
+            open_swing_count += 1
+
+    # --- Build and persist evaluation summary ---
+    if entries:  # Only when at least one signal was present (Req 1.5)
+        summary = _build_evaluation_summary(cycle_id, profile_id, mode, entries)
+        _persist_evaluation_summary(db, summary)
+
+    if mode == "observe":
+        return []
 
     return registered_candidates
 

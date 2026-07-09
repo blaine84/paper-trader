@@ -288,8 +288,8 @@ def _build_swing_candidates(
         )
 
         if not swing_candidates:
-            # Record JSON explanation in PM notes when no swing candidates built
-            _record_no_swing_explanation(db, cycle_id, profile_id, signals)
+            # swing_evaluation_summary (persisted inside process_swing_signals)
+            # supersedes the old swing_no_candidates event — no duplicate recording.
             return
 
         # Register each swing candidate returned by the bridge

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -231,6 +232,28 @@ class TestSwingCandidateModeDefault:
 
         # Default env should produce "disabled"
         assert SWING_CANDIDATE_MODE in ("disabled", "observe", "enabled")
+
+    def test_code_default_is_disabled_without_env_var(self):
+        """Reload module without SWING_CANDIDATE_MODE env var to verify code default is 'disabled'.
+
+        This is a safety check: the code must default to disabled so the swing
+        candidate pipeline doesn't run in production unless explicitly enabled
+        via environment variable.
+        Requirements: 18.1
+        """
+        import utils.gate_config as gc_module
+
+        env_without_swing_mode = {
+            k: v for k, v in os.environ.items() if k != "SWING_CANDIDATE_MODE"
+        }
+        with patch.dict("os.environ", env_without_swing_mode, clear=True):
+            importlib.reload(gc_module)
+
+        assert gc_module.SWING_CANDIDATE_MODE == "disabled"
+        assert gc_module.get_swing_candidate_mode() == "disabled"
+
+        # Reload with current env to restore module state
+        importlib.reload(gc_module)
 
     def test_get_swing_candidate_mode_returns_string(self):
         from utils.gate_config import get_swing_candidate_mode

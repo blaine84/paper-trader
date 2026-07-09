@@ -2,9 +2,10 @@
 
 Tests the integration between build_candidate_set / _build_swing_candidates
 and the swing candidate bridge: candidate_type assignment, non-executable
-label filtering, PM notes explanation, and expiration timestamp computation.
+label filtering, PM notes explanation, expiration timestamp computation,
+evaluation summary production, and fail-open exception handling.
 
-Validates: Requirements 1.3, 1.4, 6.1, 6.5, 9.2
+Validates: Requirements 1.3, 1.4, 6.1, 6.5, 9.2, 16.1, 20.1, 20.2, 21.1
 """
 
 from __future__ import annotations
@@ -354,12 +355,15 @@ class TestNonExecutableLabelExcluded:
 
 
 class TestNoSwingExplanation:
-    """When no swing candidates are produced, a JSON explanation is written to pm_candidate_events."""
+    """When mode != disabled, swing_evaluation_summary (inside process_swing_signals)
+    supersedes the old swing_no_candidates event. candidate_builder should NOT
+    produce a separate swing_no_candidates row."""
 
     @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
     @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
-    def test_no_swing_explanation_recorded(self, mock_mode, mock_bridge, engine):
-        """When process_swing_signals returns [], a 'swing_no_candidates' event is written."""
+    def test_no_swing_no_candidates_event_when_mode_enabled(self, mock_mode, mock_bridge, engine):
+        """When process_swing_signals returns [], no swing_no_candidates event is written
+        (observability is handled inside process_swing_signals via swing_evaluation_summary)."""
         registry = CandidateRegistry(engine, "cycle-1", "moderate")
         signals = {"MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"}}
 
@@ -371,24 +375,16 @@ class TestNoSwingExplanation:
 
         with engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT event_type, event_data, candidate_type FROM pm_candidate_events")
+                text("SELECT event_type FROM pm_candidate_events WHERE event_type = 'swing_no_candidates'")
             ).fetchall()
 
-        assert len(rows) == 1
-        assert rows[0][0] == "swing_no_candidates"
-        event_data = json.loads(rows[0][1])
-        assert "reason" in event_data
-        valid_reasons = {
-            "no_fresh_signals", "no_executable_mapping", "missing_geometry",
-            "failed_risk_gates", "stale_data", "same_symbol_exposure", "profile_policy",
-        }
-        assert event_data["reason"] in valid_reasons
-        assert rows[0][2] == "swing"
+        # No swing_no_candidates event — summary is produced inside process_swing_signals
+        assert len(rows) == 0
 
     @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
-    @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
-    def test_no_swing_explanation_empty_signals(self, mock_mode, mock_bridge, engine):
-        """Empty signals dict produces reason 'no_fresh_signals'."""
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_no_swing_no_candidates_event_when_mode_observe(self, mock_mode, mock_bridge, engine):
+        """Observe mode also does not produce swing_no_candidates from candidate_builder."""
         registry = CandidateRegistry(engine, "cycle-2", "moderate")
 
         _build_swing_candidates(
@@ -399,17 +395,15 @@ class TestNoSwingExplanation:
 
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT event_data FROM pm_candidate_events WHERE cycle_id = 'cycle-2'")
+                text("SELECT event_data FROM pm_candidate_events WHERE event_type = 'swing_no_candidates' AND cycle_id = 'cycle-2'")
             ).fetchone()
 
-        assert row is not None
-        event_data = json.loads(row[0])
-        assert event_data["reason"] == "no_fresh_signals"
+        assert row is None
 
     @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
     @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
-    def test_no_swing_explanation_no_executable_mapping(self, mock_mode, mock_bridge, engine):
-        """Signals with no swing-eligible setup types produce reason 'no_executable_mapping'."""
+    def test_no_swing_no_candidates_event_no_executable_mapping(self, mock_mode, mock_bridge, engine):
+        """Even with non-swing-eligible signals, no swing_no_candidates event is written."""
         registry = CandidateRegistry(engine, "cycle-3", "moderate")
         signals = {"AAPL": {"symbol": "AAPL", "setup_type": "totally_random_label"}}
 
@@ -421,12 +415,10 @@ class TestNoSwingExplanation:
 
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT event_data FROM pm_candidate_events WHERE cycle_id = 'cycle-3'")
+                text("SELECT event_data FROM pm_candidate_events WHERE event_type = 'swing_no_candidates' AND cycle_id = 'cycle-3'")
             ).fetchone()
 
-        assert row is not None
-        event_data = json.loads(row[0])
-        assert event_data["reason"] == "no_executable_mapping"
+        assert row is None
 
 
 # ---------------------------------------------------------------------------
@@ -530,3 +522,257 @@ class TestDisabledModeNoop:
 
         assert cand_count == 0
         assert event_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Test Case 7: Integration — process_swing_signals candidates registered in registry
+# Validates: Requirements 20.1, 21.1
+# ---------------------------------------------------------------------------
+
+
+class TestSwingCandidateRegistration:
+    """Candidates returned by process_swing_signals are properly registered in the CandidateRegistry."""
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals")
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
+    def test_candidates_from_bridge_are_in_registry(self, mock_mode, mock_bridge, engine):
+        """Candidates from process_swing_signals are registered with correct state."""
+        mock_bridge.return_value = [
+            _make_swing_candidate_result("MSFT"),
+            _make_swing_candidate_result("AAPL"),
+        ]
+
+        registry = CandidateRegistry(engine, "cycle-reg", "moderate")
+        signals = {
+            "MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation", "signal": "BUY", "strength": "strong"},
+            "AAPL": {"symbol": "AAPL", "setup_type": "sector_rotation", "signal": "BUY", "strength": "strong"},
+        }
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-reg", registry=registry,
+        )
+
+        # Registry should not be empty
+        assert not registry.is_empty
+
+        # Verify candidates are in the database with correct state
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT symbol, state, candidate_type FROM pm_candidates WHERE cycle_id = 'cycle-reg' ORDER BY symbol")
+            ).fetchall()
+
+        assert len(rows) == 2
+        assert rows[0][0] == "AAPL"
+        assert rows[0][1] == "registered"
+        assert rows[0][2] == "swing"
+        assert rows[1][0] == "MSFT"
+        assert rows[1][1] == "registered"
+        assert rows[1][2] == "swing"
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals")
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
+    def test_registered_candidates_have_correct_geometry(self, mock_mode, mock_bridge, engine):
+        """Registered swing candidates carry correct entry/stop/target from geometry."""
+        mock_bridge.return_value = [_make_swing_candidate_result("TSLA")]
+
+        registry = CandidateRegistry(engine, "cycle-geom", "moderate")
+        signals = {"TSLA": {"symbol": "TSLA", "setup_type": "sector_rotation", "signal": "BUY", "strength": "strong"}}
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-geom", registry=registry,
+        )
+
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT entry_price, stop_price, target_price, risk_reward FROM pm_candidates WHERE cycle_id = 'cycle-geom'")
+            ).fetchone()
+
+        assert row is not None
+        assert row[0] == 400.00  # entry_price
+        assert row[1] == 388.00  # stop_price
+        assert row[2] == 430.00  # target_price
+        assert row[3] == 2.50    # risk_reward
+
+
+# ---------------------------------------------------------------------------
+# Test Case 8: Fail-open — process_swing_signals exception does not block pipeline
+# Validates: Requirements 20.1, 20.2, 21.1
+# ---------------------------------------------------------------------------
+
+
+class TestSwingFailOpen:
+    """Exceptions from process_swing_signals are caught and logged, never block pipeline."""
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", side_effect=RuntimeError("DB connection lost"))
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
+    def test_exception_logged_pipeline_continues(self, mock_mode, mock_bridge, engine, caplog):
+        """When process_swing_signals raises, _build_swing_candidates logs warning and returns."""
+        registry = CandidateRegistry(engine, "cycle-fail", "moderate")
+        signals = {"MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"}}
+
+        with caplog.at_level(logging.WARNING, logger="utils.candidate_builder"):
+            _build_swing_candidates(
+                db=engine, signals=signals, profile_id="moderate",
+                profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+                cycle_id="cycle-fail", registry=registry,
+            )
+
+        # No crash, registry is empty (nothing registered), and warning logged
+        assert registry.is_empty
+
+        warning_msgs = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        found = any("fail-open" in msg.lower() or "DB connection lost" in msg for msg in warning_msgs)
+        assert found, f"Expected WARNING about fail-open exception. Got: {warning_msgs}"
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", side_effect=Exception("Unexpected error"))
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_exception_in_observe_mode_does_not_crash(self, mock_mode, mock_bridge, engine, caplog):
+        """Observe mode exceptions are also caught — fail-open applies to all modes."""
+        registry = CandidateRegistry(engine, "cycle-obs-fail", "moderate")
+        signals = {"AAPL": {"symbol": "AAPL", "setup_type": "risk_off_macro_short"}}
+
+        with caplog.at_level(logging.WARNING, logger="utils.candidate_builder"):
+            _build_swing_candidates(
+                db=engine, signals=signals, profile_id="moderate",
+                profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+                cycle_id="cycle-obs-fail", registry=registry,
+            )
+
+        # No crash, registry is empty
+        assert registry.is_empty
+
+        # No candidates or events in database
+        with engine.connect() as conn:
+            cand_count = conn.execute(text("SELECT COUNT(*) FROM pm_candidates")).scalar()
+            event_count = conn.execute(text("SELECT COUNT(*) FROM pm_candidate_events")).scalar()
+
+        assert cand_count == 0
+        assert event_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Test Case 9: Disabled mode does not produce swing_evaluation_summary
+# Validates: Requirement 16.1
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledModeNoSummary:
+    """When mode=disabled, no swing_evaluation_summary event is produced."""
+
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="disabled")
+    def test_disabled_mode_no_evaluation_summary(self, mock_mode, engine):
+        """Mode=disabled returns immediately — no swing_evaluation_summary event."""
+        registry = CandidateRegistry(engine, "cycle-dis-sum", "moderate")
+        signals = {"MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"}}
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-dis-sum", registry=registry,
+        )
+
+        with engine.connect() as conn:
+            summary_row = conn.execute(
+                text("SELECT * FROM pm_candidate_events WHERE event_type = 'swing_evaluation_summary'")
+            ).fetchone()
+
+        assert summary_row is None
+
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="disabled")
+    def test_disabled_mode_no_events_at_all(self, mock_mode, engine):
+        """Mode=disabled produces zero events of any type."""
+        registry = CandidateRegistry(engine, "cycle-dis-ev", "moderate")
+        signals = {"AAPL": {"symbol": "AAPL", "setup_type": "risk_off_macro_short"}}
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-dis-ev", registry=registry,
+        )
+
+        with engine.connect() as conn:
+            total_events = conn.execute(
+                text("SELECT COUNT(*) FROM pm_candidate_events")
+            ).scalar()
+
+        assert total_events == 0
+
+
+# ---------------------------------------------------------------------------
+# Test Case 10: Observe mode — no swing_no_candidates, evaluation handled in bridge
+# Validates: Requirements 1.1, 16.1
+# ---------------------------------------------------------------------------
+
+
+class TestObserveModeIntegration:
+    """Observe mode: process_swing_signals handles observability internally,
+    candidate_builder does not write swing_no_candidates."""
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_observe_mode_no_swing_no_candidates_event(self, mock_mode, mock_bridge, engine):
+        """Observe mode: no swing_no_candidates written by candidate_builder."""
+        registry = CandidateRegistry(engine, "cycle-obs", "moderate")
+        signals = {"MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"}}
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-obs", registry=registry,
+        )
+
+        with engine.connect() as conn:
+            no_cand_rows = conn.execute(
+                text("SELECT * FROM pm_candidate_events WHERE event_type = 'swing_no_candidates'")
+            ).fetchall()
+
+        assert len(no_cand_rows) == 0
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_observe_mode_no_candidates_registered(self, mock_mode, mock_bridge, engine):
+        """Observe mode returns [] from bridge — no candidates registered."""
+        registry = CandidateRegistry(engine, "cycle-obs-empty", "moderate")
+        signals = {"MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"}}
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-obs-empty", registry=registry,
+        )
+
+        assert registry.is_empty
+
+        with engine.connect() as conn:
+            cand_count = conn.execute(text("SELECT COUNT(*) FROM pm_candidates")).scalar()
+
+        assert cand_count == 0
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_observe_mode_bridge_called_with_correct_args(self, mock_mode, mock_bridge, engine):
+        """Verify process_swing_signals is called with correct arguments in observe mode."""
+        registry = CandidateRegistry(engine, "cycle-obs-args", "aggressive")
+        signals = {"NVDA": {"symbol": "NVDA", "setup_type": "sector_rotation"}}
+        profile = {"risk_per_trade_pct": "0.02"}
+        portfolio = {"equity": 200000}
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="aggressive",
+            profile=profile, portfolio=portfolio,
+            cycle_id="cycle-obs-args", registry=registry,
+        )
+
+        mock_bridge.assert_called_once_with(
+            signals=signals,
+            profile_id="aggressive",
+            profile=profile,
+            portfolio=portfolio,
+            cycle_id="cycle-obs-args",
+            db=engine,
+            engine=engine,
+        )
