@@ -12,6 +12,10 @@ from datetime import datetime, timedelta, timezone as dt_tz
 from utils.finnhub_client import FinnhubClient
 from utils.technicals import compute_indicators
 from utils.llm import call_llm, parse_json_response
+from utils.multitimeframe_context import (
+    build_multitimeframe_context,
+    format_multitimeframe_context_for_prompt,
+)
 from db.schema import AgentMemory, get_session
 from utils.trade_events import log_trade_event
 from utils.case_library import get_relevant_cases, format_cases_for_prompt
@@ -884,6 +888,22 @@ def run(engine, symbols: list[str]) -> dict:
             candles = fh.get_candles(sym, resolution="5", days=2)
             indicators = compute_indicators(candles)
             validate_candle_indicator_alignment(sym, quote, candles, indicators)
+            try:
+                multitimeframe_context = build_multitimeframe_context(
+                    sym,
+                    fh,
+                    candles_5m=candles,
+                    indicators_5m=indicators,
+                )
+            except Exception as e:
+                log.warning("Multi-timeframe context failed for %s: %s", sym, e)
+                multitimeframe_context = {
+                    "symbol": sym,
+                    "errors": [f"context_build_failed:{e}"],
+                }
+            multitimeframe_prompt_context = format_multitimeframe_context_for_prompt(
+                multitimeframe_context
+            )
             sentiment = recent_sentiment.get(sym, {})
 
             case_context = {
@@ -975,6 +995,8 @@ CURRENT QUOTE:
 TECHNICAL INDICATORS:
 {json.dumps(indicators, indent=2)}
 
+{multitimeframe_prompt_context}
+
 DETERMINISTIC TECHNICAL SANITY CHECK:
 {deterministic_precheck_context}
 
@@ -995,6 +1017,7 @@ Produce your trading signal JSON for {sym}.
             raw = call_llm(SYSTEM_PROMPT, user_prompt, json_mode=True, tier="finance", purpose=f"analyst_signal:{sym}")
             signal = parse_json_response(raw)
             signal = normalize_analyst_signal_shape(signal, sym)
+            signal["multitimeframe_context"] = multitimeframe_context
             signal = sanitize_analyst_key_levels(signal, quote, indicators)
             signal = apply_signal_mitigation(signal, active_mitigations)
             validation_result = validate_setup_for_symbol(sym, signal.get("setup_type"))
