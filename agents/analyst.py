@@ -209,16 +209,21 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
 
     normalized.setdefault("setup_type", "unknown")
     setup_type = str(normalized.get("setup_type", "unknown")).lower().strip()
-    if setup_type == "directional_confusion_breakout":
+    if setup_type in {"directional_confusion_breakout", "unclear_direction"}:
         normalized["setup_type"] = "unclear_direction"
         normalized["signal"] = "HOLD"
         normalized["strength"] = "weak"
         normalized["confidence"] = "low"
         normalized["normalized_setup_suggestion"] = None
-        normalized["setup_validation_warning"] = (
-            "directional_confusion_breakout is not a valid setup label; "
-            "rewritten to unclear_direction/HOLD"
-        )
+        if setup_type == "directional_confusion_breakout":
+            normalized["setup_validation_warning"] = (
+                "directional_confusion_breakout is not a valid setup label; "
+                "rewritten to unclear_direction/HOLD"
+            )
+        else:
+            normalized["setup_validation_warning"] = (
+                "unclear_direction is diagnostic-only; forced to HOLD"
+            )
         normalized["needs_setup_type_review"] = True
     else:
         normalized["setup_type"] = setup_type

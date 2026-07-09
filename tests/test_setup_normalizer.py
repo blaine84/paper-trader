@@ -36,6 +36,15 @@ class TestErrorLabelRejection:
         assert result.reason_code == "error_setup_blocked"
 
 
+class TestUnclearDirectionRejection:
+    """Ambiguous direction labels are diagnostic-only and never executable."""
+
+    def test_unclear_direction_rejected_even_when_directional(self, default_context):
+        result = normalize_setup("unclear_direction", "LONG", "strong", "high", default_context)
+        assert not result.success
+        assert result.reason_code == "unclear_direction"
+
+
 class TestDataProviderErrorDetection:
     """Requirement 1.6: 429 fallback and data_source_error → data_provider_error_blocked."""
 

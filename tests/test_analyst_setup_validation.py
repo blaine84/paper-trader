@@ -38,3 +38,23 @@ def test_directional_confusion_breakout_is_rewritten_to_hold():
     assert result["confidence"] == "low"
     assert result["normalized_setup_suggestion"] is None
     assert result["needs_setup_type_review"] is True
+
+
+def test_unclear_direction_is_forced_to_hold():
+    signal = {
+        "symbol": "AAPL",
+        "signal": "SHORT",
+        "strength": "strong",
+        "confidence": "high",
+        "setup_type": "unclear_direction",
+        "normalized_setup_suggestion": "risk_off_macro_short",
+    }
+
+    result = normalize_analyst_signal_shape(signal, "AAPL")
+
+    assert result["setup_type"] == "unclear_direction"
+    assert result["signal"] == "HOLD"
+    assert result["strength"] == "weak"
+    assert result["confidence"] == "low"
+    assert result["normalized_setup_suggestion"] is None
+    assert result["needs_setup_type_review"] is True
