@@ -199,7 +199,12 @@ class TestPromptCandidateTable:
                         "vs_spy_5d": 1.8,
                         "vs_sector_5d": 0.7,
                     },
-                    "volume_context": {"intraday_vs_prior_session": 1.3},
+                    "volume_context": {
+                        "intraday_vs_prior_session": 1.3,
+                        "same_time_of_day": {"ratio": 1.6},
+                    },
+                    "sector_context": {"sector_confirmed": True},
+                    "breadth_proxy": {"bias": "supportive"},
                 }
             )
         ]
@@ -212,6 +217,9 @@ class TestPromptCandidateTable:
         assert "60m=bullish" in prompt
         assert "D=neutral" in prompt
         assert "rs_spy5=1.8" in prompt
+        assert "vol_tod=1.6" in prompt
+        assert "sector_confirmed=True" in prompt
+        assert "breadth=supportive" in prompt
 
     def test_none_trigger_handled_gracefully(self):
         summaries = [_make_candidate_summary(trigger=None)]

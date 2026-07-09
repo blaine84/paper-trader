@@ -54,7 +54,7 @@ def build_candidate_pm_prompt(
             f"| {i} | {c['candidate_id']} | {c['symbol']} | {c['direction']} "
             f"| ${c['entry_price']:.2f} | ${c['stop_price']:.2f} | ${c['target_price']:.2f} "
             f"| {c['risk_reward']:.1f}:1 | {c['setup_type']} | {c.get('geometry_name', '')} "
-            f"| {mtf_text[:120]} | {trigger_text[:80]} | {invalidation_text[:80]} "
+            f"| {mtf_text[:180]} | {trigger_text[:80]} | {invalidation_text[:80]} "
             f"| {target_basis_text[:80]} | {horizon_text} |"
         )
     candidate_table = "\n".join(table_lines)
@@ -111,6 +111,9 @@ def _format_mtf_summary(context: Any) -> str:
     alignment = context.get("directional_alignment") or {}
     relative_strength = context.get("relative_strength") or {}
     volume = context.get("volume_context") or {}
+    same_time_volume = volume.get("same_time_of_day") or {}
+    sector = context.get("sector_context") or {}
+    breadth = context.get("breadth_proxy") or {}
 
     def trend(label: str) -> str:
         value = (timeframes.get(label) or {}).get("trend")
@@ -125,7 +128,9 @@ def _format_mtf_summary(context: Any) -> str:
         f"5m={trend('5m')} 60m={trend('60m')} D={trend('daily')} "
         f"rs_spy5={fmt(relative_strength.get('vs_spy_5d'))} "
         f"rs_sector5={fmt(relative_strength.get('vs_sector_5d'))} "
-        f"vol={fmt(volume.get('intraday_vs_prior_session'))}"
+        f"vol_tod={fmt(same_time_volume.get('ratio'))} "
+        f"sector_confirmed={fmt(sector.get('sector_confirmed'))} "
+        f"breadth={breadth.get('bias', 'n/a')}"
     )
 
 

@@ -26,6 +26,7 @@ def build_multitimeframe_context(
     *,
     candles_5m: dict | None = None,
     indicators_5m: dict | None = None,
+    breadth_symbols: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
     """Build a compact multi-timeframe context shard.
 
@@ -38,6 +39,11 @@ def build_multitimeframe_context(
 
     if candles_5m is None:
         candles_5m = _get_candles_cached(market_data_client, symbol, "5", 2, errors)
+    candles_5m_baseline = candles_5m
+    if _session_count(candles_5m_baseline) < 5:
+        candles_5m_baseline = _get_candles_cached(
+            market_data_client, symbol, "5", 20, errors
+        )
     if indicators_5m is None:
         indicators_5m = _safe_compute_indicators(candles_5m, "5m", errors)
 
@@ -51,6 +57,15 @@ def build_multitimeframe_context(
     relative_strength = build_relative_strength(
         symbol, daily_candles, market_data_client, sector_etf, errors
     )
+    sector_context = build_sector_context(
+        symbol, daily_candles, market_data_client, sector_etf, errors
+    )
+    breadth_proxy = build_breadth_proxy(
+        market_data_client,
+        breadth_symbols=breadth_symbols,
+        sector_etf=sector_etf,
+        errors=errors,
+    )
     timeframes = {
         "5m": summarize_timeframe("5m", candles_5m, indicators_5m),
         "60m": summarize_timeframe("60m", candles_60m, indicators_60m),
@@ -62,8 +77,16 @@ def build_multitimeframe_context(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "timeframes": timeframes,
         "relative_strength": relative_strength,
-        "volume_context": build_volume_context(candles_5m, daily_candles),
-        "directional_alignment": build_directional_alignment(timeframes, relative_strength),
+        "volume_context": build_volume_context(
+            candles_5m,
+            daily_candles,
+            candles_5m_baseline=candles_5m_baseline,
+        ),
+        "sector_context": sector_context,
+        "breadth_proxy": breadth_proxy,
+        "directional_alignment": build_directional_alignment(
+            timeframes, relative_strength, sector_context, breadth_proxy
+        ),
         "sector_etf": sector_etf,
         "errors": errors,
     }
@@ -79,6 +102,9 @@ def format_multitimeframe_context_for_prompt(context: dict) -> str:
     align = context.get("directional_alignment", {})
     rs = context.get("relative_strength", {})
     vol = context.get("volume_context", {})
+    tod = vol.get("same_time_of_day") or {}
+    sector = context.get("sector_context", {}) or {}
+    breadth = context.get("breadth_proxy", {}) or {}
 
     def _tf_line(label: str) -> str:
         row = tf.get(label, {}) or {}
@@ -103,7 +129,24 @@ def format_multitimeframe_context_for_prompt(context: dict) -> str:
         (
             "  volume: "
             f"intraday_vs_prior_session={_fmt(vol.get('intraday_vs_prior_session'))} "
-            f"daily_vs_20d_avg={_fmt(vol.get('daily_vs_20d_avg'))}"
+            f"daily_vs_20d_avg={_fmt(vol.get('daily_vs_20d_avg'))} "
+            f"same_time_ratio={_fmt(tod.get('ratio'))} "
+            f"same_time_sessions={_fmt(tod.get('sessions_used'))}"
+        ),
+        (
+            "  sector_context: "
+            f"sector={sector.get('sector_key') or 'n/a'} "
+            f"name={sector.get('sector_name') or 'n/a'} "
+            f"etf={sector.get('sector_etf') or context.get('sector_etf')} "
+            f"etf_5d={_fmt(sector.get('sector_etf_return_5d'))} "
+            f"confirmed={_fmt(sector.get('sector_confirmed'))}"
+        ),
+        (
+            "  breadth_proxy: "
+            f"bias={breadth.get('bias')} "
+            f"watchlist_advancers={_fmt(breadth.get('watchlist_advancers_pct'))} "
+            f"benchmarks={breadth.get('benchmark_bias')} "
+            f"sector={breadth.get('sector_bias')}"
         ),
         (
             "  alignment: "
@@ -198,14 +241,123 @@ def build_relative_strength(
     return result
 
 
-def build_volume_context(candles_5m: dict | None, daily_candles: dict | None) -> dict:
+def build_volume_context(
+    candles_5m: dict | None,
+    daily_candles: dict | None,
+    *,
+    candles_5m_baseline: dict | None = None,
+) -> dict:
     return {
         "intraday_vs_prior_session": _intraday_volume_vs_prior_session(candles_5m or {}),
+        "same_time_of_day": _same_time_of_day_volume_baseline(
+            candles_5m_baseline or candles_5m or {}
+        ),
         "daily_vs_20d_avg": _last_volume_vs_average(daily_candles or {}, 20),
     }
 
 
-def build_directional_alignment(timeframes: dict, relative_strength: dict) -> dict:
+def build_sector_context(
+    symbol: str,
+    daily_candles: dict,
+    client: Any,
+    sector_etf: str | None,
+    errors: list[str],
+) -> dict:
+    mapping = get_sector_mapping(symbol)
+    sector_candles = (
+        _get_candles_cached(client, sector_etf, "D", 60, errors)
+        if sector_etf else {}
+    )
+    symbol_return_5d = _pct_return(_series(daily_candles, "close"), 5)
+    sector_return_5d = _pct_return(_series(sector_candles, "close"), 5)
+    sector_return_1d = _pct_return(_series(sector_candles, "close"), 1)
+    sector_confirmed = _same_direction(symbol_return_5d, sector_return_5d)
+
+    return {
+        "sector_key": mapping.get("sector_key"),
+        "sector_name": mapping.get("sector_name"),
+        "sector_etf": sector_etf,
+        "source": mapping.get("source"),
+        "peer_count": len(mapping.get("symbols") or []),
+        "sector_etf_return_1d": sector_return_1d,
+        "sector_etf_return_5d": sector_return_5d,
+        "symbol_return_5d": symbol_return_5d,
+        "sector_confirmed": sector_confirmed,
+    }
+
+
+def build_breadth_proxy(
+    client: Any,
+    *,
+    breadth_symbols: list[str] | tuple[str, ...] | None,
+    sector_etf: str | None,
+    errors: list[str],
+) -> dict:
+    """Build a lightweight participation proxy from known symbols/ETFs.
+
+    This is not exchange-wide breadth. It intentionally uses the current
+    watchlist plus benchmark/sector ETFs to estimate whether the tape supports
+    a candidate's direction.
+    """
+    symbols = _dedupe_symbols([*(breadth_symbols or ()), *BENCHMARK_SYMBOLS])
+    if sector_etf:
+        symbols = _dedupe_symbols([*symbols, sector_etf])
+
+    returns_1d: dict[str, float] = {}
+    for sym in symbols[:30]:
+        candles = _get_candles_cached(client, sym, "D", 60, errors)
+        ret = _pct_return(_series(candles, "close"), 1)
+        if ret is not None:
+            returns_1d[sym] = ret
+
+    watchlist_symbols = [
+        sym for sym in _dedupe_symbols(breadth_symbols or ())
+        if sym in returns_1d
+    ]
+    watchlist_returns = [returns_1d[sym] for sym in watchlist_symbols]
+    benchmark_returns = {
+        sym: returns_1d.get(sym)
+        for sym in BENCHMARK_SYMBOLS
+        if returns_1d.get(sym) is not None
+    }
+    sector_return = returns_1d.get(sector_etf) if sector_etf else None
+
+    advancers = sum(1 for ret in watchlist_returns if ret > 0)
+    decliners = sum(1 for ret in watchlist_returns if ret < 0)
+    total = len(watchlist_returns)
+    advancers_pct = round((advancers / total) * 100, 1) if total else None
+
+    benchmark_avg = _avg(list(benchmark_returns.values()))
+    if advancers_pct is None and benchmark_avg is None:
+        bias = "unknown"
+    elif (advancers_pct or 0) >= 60 and (benchmark_avg or 0) > 0:
+        bias = "supportive"
+    elif (advancers_pct or 100) <= 40 and (benchmark_avg or 0) < 0:
+        bias = "hostile"
+    else:
+        bias = "mixed"
+
+    return {
+        "type": "watchlist_etf_proxy",
+        "bias": bias,
+        "symbols_sampled": total,
+        "watchlist_advancers": advancers,
+        "watchlist_decliners": decliners,
+        "watchlist_advancers_pct": advancers_pct,
+        "benchmark_returns_1d": benchmark_returns,
+        "benchmark_bias": _return_bias(benchmark_avg),
+        "sector_etf": sector_etf,
+        "sector_return_1d": sector_return,
+        "sector_bias": _return_bias(sector_return),
+    }
+
+
+def build_directional_alignment(
+    timeframes: dict,
+    relative_strength: dict,
+    sector_context: dict | None = None,
+    breadth_proxy: dict | None = None,
+) -> dict:
     score = 0
     reasons: list[str] = []
 
@@ -230,6 +382,21 @@ def build_directional_alignment(timeframes: dict, relative_strength: dict) -> di
             score -= 1
             reasons.append(f"{key}_negative")
 
+    if (sector_context or {}).get("sector_confirmed") is True:
+        score += 1
+        reasons.append("sector_confirmed")
+    elif (sector_context or {}).get("sector_confirmed") is False:
+        score -= 1
+        reasons.append("sector_not_confirmed")
+
+    breadth_bias = (breadth_proxy or {}).get("bias")
+    if breadth_bias == "supportive":
+        score += 1
+        reasons.append("breadth_supportive")
+    elif breadth_bias == "hostile":
+        score -= 1
+        reasons.append("breadth_hostile")
+
     if score >= 4:
         bias = "bullish"
     elif score <= -4:
@@ -250,26 +417,70 @@ def build_directional_alignment(timeframes: dict, relative_strength: dict) -> di
 
 def get_sector_etf(symbol: str) -> str | None:
     """Return configured sector ETF for a symbol, with core fallback mappings."""
+    return get_sector_mapping(symbol).get("sector_etf")
+
+
+def get_sector_mapping(symbol: str) -> dict:
+    """Return sector metadata from Sector Scout config with core fallbacks."""
     symbol = str(symbol or "").upper()
     core = {
-        "AMD": "SMH", "NVDA": "SMH", "MU": "SMH", "AVGO": "SMH", "SMCI": "SMH",
-        "ARM": "SMH", "INTC": "SMH", "MSFT": "QQQ", "META": "QQQ", "TSLA": "DRIV",
-        "SPY": "SPY", "QQQ": "QQQ", "IWM": "IWM", "DIA": "DIA", "XLK": "XLK",
-        "XLF": "XLF", "XLE": "XLE", "TLT": "TLT", "GLD": "GLD",
+        "AMD": ("ai_semi_core", "AI / Semiconductors", "SMH"),
+        "NVDA": ("ai_semi_core", "AI / Semiconductors", "SMH"),
+        "MU": ("ai_semi", "AI / Semiconductors", "SMH"),
+        "AVGO": ("ai_semi", "AI / Semiconductors", "SMH"),
+        "SMCI": ("ai_semi", "AI / Semiconductors", "SMH"),
+        "ARM": ("ai_semi", "AI / Semiconductors", "SMH"),
+        "INTC": ("ai_semi", "AI / Semiconductors", "SMH"),
+        "MSFT": ("mega_cap_tech", "Mega-Cap Tech", "QQQ"),
+        "META": ("mega_cap_tech", "Mega-Cap Tech", "QQQ"),
+        "AAPL": ("mega_cap_tech", "Mega-Cap Tech", "QQQ"),
+        "GOOGL": ("mega_cap_tech", "Mega-Cap Tech", "QQQ"),
+        "AMZN": ("mega_cap_tech", "Mega-Cap Tech", "QQQ"),
+        "TSLA": ("ev_high_beta_core", "EV / High-Beta", "DRIV"),
+        "SPY": ("benchmark", "S&P 500", "SPY"),
+        "QQQ": ("benchmark", "Nasdaq 100", "QQQ"),
+        "IWM": ("benchmark", "Russell 2000", "IWM"),
+        "DIA": ("benchmark", "Dow Industrials", "DIA"),
+        "XLK": ("sector_etf", "Technology", "XLK"),
+        "XLF": ("sector_etf", "Financials", "XLF"),
+        "XLE": ("sector_etf", "Energy", "XLE"),
+        "TLT": ("macro", "Long Bonds", "TLT"),
+        "GLD": ("macro", "Gold", "GLD"),
     }
-    if symbol in core:
-        return core[symbol]
 
     try:
         from utils.sector_scout import load_sector_scout_config
         config = load_sector_scout_config()
-        for bucket in (config.get("sector_buckets") or {}).values():
+        for key, bucket in (config.get("sector_buckets") or {}).items():
             symbols = {str(s).upper() for s in bucket.get("symbols", [])}
             if symbol in symbols:
-                return bucket.get("sector_etf")
+                return {
+                    "sector_key": key,
+                    "sector_name": bucket.get("name"),
+                    "sector_etf": bucket.get("sector_etf"),
+                    "symbols": sorted(symbols),
+                    "source": "sector_scout_config",
+                }
     except Exception:
-        return None
-    return None
+        pass
+
+    if symbol in core:
+        sector_key, sector_name, sector_etf = core[symbol]
+        return {
+            "sector_key": sector_key,
+            "sector_name": sector_name,
+            "sector_etf": sector_etf,
+            "symbols": [symbol],
+            "source": "core_fallback",
+        }
+
+    return {
+        "sector_key": None,
+        "sector_name": None,
+        "sector_etf": None,
+        "symbols": [],
+        "source": "unknown",
+    }
 
 
 def _trend_from_indicators(indicators: dict) -> str | None:
@@ -373,6 +584,109 @@ def _intraday_volume_vs_prior_session(candles: dict) -> float | None:
     if prior_sum <= 0:
         return None
     return round(current_sum / prior_sum, 2)
+
+
+def _same_time_of_day_volume_baseline(candles: dict) -> dict:
+    volumes = _series(candles, "volume")
+    timestamps = candles.get("timestamps") or candles.get("timestamp") or candles.get("t") or []
+    if not volumes or len(volumes) != len(timestamps):
+        return {
+            "ratio": None,
+            "sessions_used": 0,
+            "reason": "missing_intraday_volume_or_timestamps",
+        }
+
+    rows = []
+    for idx, ts in enumerate(timestamps):
+        try:
+            dt = datetime.fromtimestamp(float(ts), timezone.utc)
+            rows.append((dt.date().isoformat(), dt.time().isoformat(), volumes[idx]))
+        except Exception:
+            continue
+    if not rows:
+        return {"ratio": None, "sessions_used": 0, "reason": "no_valid_rows"}
+
+    current_date = rows[-1][0]
+    current_times = [time_key for date_key, time_key, _ in rows if date_key == current_date]
+    if not current_times:
+        return {"ratio": None, "sessions_used": 0, "reason": "no_current_session"}
+    cutoff_time = current_times[-1]
+
+    by_date: dict[str, float] = {}
+    for date_key, time_key, volume in rows:
+        if time_key <= cutoff_time:
+            by_date[date_key] = by_date.get(date_key, 0.0) + volume
+
+    current_volume = by_date.get(current_date)
+    prior_volumes = [
+        volume for date_key, volume in sorted(by_date.items())
+        if date_key != current_date and volume > 0
+    ]
+    if current_volume is None or not prior_volumes:
+        return {
+            "ratio": None,
+            "sessions_used": len(prior_volumes),
+            "reason": "insufficient_prior_sessions",
+        }
+
+    avg_prior = sum(prior_volumes) / len(prior_volumes)
+    if avg_prior <= 0:
+        return {
+            "ratio": None,
+            "sessions_used": len(prior_volumes),
+            "reason": "zero_prior_volume",
+        }
+
+    return {
+        "ratio": round(current_volume / avg_prior, 2),
+        "current_cumulative_volume": round(current_volume, 2),
+        "average_prior_cumulative_volume": round(avg_prior, 2),
+        "sessions_used": len(prior_volumes),
+        "cutoff_time_utc": cutoff_time,
+    }
+
+
+def _session_count(candles: dict | None) -> int:
+    if not candles:
+        return 0
+    timestamps = candles.get("timestamps") or candles.get("timestamp") or candles.get("t") or []
+    dates = set()
+    for ts in timestamps:
+        try:
+            dates.add(datetime.fromtimestamp(float(ts), timezone.utc).date().isoformat())
+        except Exception:
+            continue
+    return len(dates)
+
+
+def _dedupe_symbols(symbols: list[str] | tuple[str, ...]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in symbols:
+        symbol = str(raw or "").upper().strip()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        result.append(symbol)
+    return result
+
+
+def _same_direction(left: float | None, right: float | None) -> bool | None:
+    if left is None or right is None:
+        return None
+    if abs(left) < 0.1 or abs(right) < 0.1:
+        return None
+    return (left > 0 and right > 0) or (left < 0 and right < 0)
+
+
+def _return_bias(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value > 0.2:
+        return "bullish"
+    if value < -0.2:
+        return "bearish"
+    return "neutral"
 
 
 def _fmt(value: Any) -> str:

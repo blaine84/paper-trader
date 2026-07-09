@@ -894,6 +894,7 @@ def run(engine, symbols: list[str]) -> dict:
                     fh,
                     candles_5m=candles,
                     indicators_5m=indicators,
+                    breadth_symbols=symbols,
                 )
             except Exception as e:
                 log.warning("Multi-timeframe context failed for %s: %s", sym, e)
