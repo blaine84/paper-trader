@@ -29,6 +29,7 @@ REJECTION_REASON_CODES: frozenset[str] = frozenset({
     "context_mismatch",
     "diagnostic_only",
     "unmapped_label",
+    "unclear_direction",
     "error_setup_blocked",
     "data_provider_error_blocked",
     "analyst_veto",
@@ -74,9 +75,9 @@ def normalize_setup(
     if raw_label == "risk_off_macro_short":
         return _normalize_risk_off_macro_short(direction, technical_context)
 
-    # 7. Directional confusion breakout mapping
-    if raw_label == "directional_confusion_breakout":
-        return _normalize_directional_confusion_breakout(technical_context)
+    # 7. Ambiguous directional labels are never executable.
+    if raw_label in ("directional_confusion_breakout", "unclear_direction"):
+        return NormalizationResult(success=False, reason_code="unclear_direction")
 
     # 4. Pass-through for labels already in SWING_EXECUTABLE_SETUP_TYPES
     if raw_label in SWING_EXECUTABLE_SETUP_TYPES:
@@ -140,21 +141,3 @@ def _normalize_risk_off_macro_short(
 
     return NormalizationResult(success=False, reason_code="context_mismatch")
 
-
-def _normalize_directional_confusion_breakout(
-    technical_context: TechnicalContext,
-) -> NormalizationResult:
-    """Directional confusion breakout: accept iff ema_trend in {bullish, bearish}
-    and key_levels has both non-null support AND resistance.
-    If bullish → breakout_retest; if bearish → failed_breakdown_reclaim.
-    """
-    trend = technical_context.ema_trend
-    has_both_levels = _has_both_support_and_resistance(technical_context)
-
-    if trend in ("bullish", "bearish") and has_both_levels:
-        if trend == "bullish":
-            return NormalizationResult(success=True, executable_type="breakout_retest")
-        else:
-            return NormalizationResult(success=True, executable_type="failed_breakdown_reclaim")
-
-    return NormalizationResult(success=False, reason_code="diagnostic_only")

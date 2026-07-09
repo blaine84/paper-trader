@@ -119,7 +119,7 @@ def test_risk_off_macro_short_normalization_correctness(
 
 
 # ---------------------------------------------------------------------------
-# Property 4: Directional Confusion Breakout Resolution
+# Property 4: Directional Confusion Labels Are Never Executable
 # Validates: Requirements 2.7, 2.8
 # ---------------------------------------------------------------------------
 
@@ -131,7 +131,7 @@ def test_risk_off_macro_short_normalization_correctness(
     technical_context=technical_context_st,
 )
 @settings(max_examples=200)
-def test_directional_confusion_breakout_resolution(
+def test_directional_confusion_breakout_never_executes(
     direction: str,
     strength: str,
     confidence: str,
@@ -139,29 +139,14 @@ def test_directional_confusion_breakout_resolution(
 ) -> None:
     """**Validates: Requirements 2.7, 2.8**
 
-    For any input where raw_label is "directional_confusion_breakout", the normalizer
-    SHALL return "breakout_retest" or "failed_breakdown_reclaim" if and only if
-    ema_trend is bullish or bearish AND key_levels contains both non-null support
-    AND resistance values. If bullish → "breakout_retest"; if bearish →
-    "failed_breakdown_reclaim". Otherwise, reject with "diagnostic_only".
+    For any input where raw_label is "directional_confusion_breakout", the
+    normalizer SHALL reject it as "unclear_direction". This label means the
+    analyst has no clean directional setup and must not be promoted into a
+    tradeable setup by normalization.
     """
     result = normalize_setup(
         "directional_confusion_breakout", direction, strength, confidence, technical_context
     )
 
-    trend = technical_context.ema_trend
-    has_both_levels = (
-        technical_context.key_levels.get("support") is not None
-        and technical_context.key_levels.get("resistance") is not None
-    )
-    resolvable = trend in ("bullish", "bearish") and has_both_levels
-
-    if resolvable:
-        assert result.success is True
-        if trend == "bullish":
-            assert result.executable_type == "breakout_retest"
-        else:
-            assert result.executable_type == "failed_breakdown_reclaim"
-    else:
-        assert result.success is False
-        assert result.reason_code == "diagnostic_only"
+    assert result.success is False
+    assert result.reason_code == "unclear_direction"

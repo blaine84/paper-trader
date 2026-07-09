@@ -1,4 +1,4 @@
-from agents.analyst import annotate_unregistered_setup
+from agents.analyst import annotate_unregistered_setup, normalize_analyst_signal_shape
 
 
 def test_registered_setup_type_has_no_warning():
@@ -18,3 +18,23 @@ def test_unregistered_setup_type_is_preserved_with_warning():
     assert result["setup_type"] == "liquidity_sweep"
     assert result["needs_setup_type_review"] is True
     assert "liquidity_sweep" in result["setup_validation_warning"]
+
+
+def test_directional_confusion_breakout_is_rewritten_to_hold():
+    signal = {
+        "symbol": "AAPL",
+        "signal": "LONG",
+        "strength": "moderate",
+        "confidence": "medium",
+        "setup_type": "directional_confusion_breakout",
+        "normalized_setup_suggestion": "breakout_retest",
+    }
+
+    result = normalize_analyst_signal_shape(signal, "AAPL")
+
+    assert result["setup_type"] == "unclear_direction"
+    assert result["signal"] == "HOLD"
+    assert result["strength"] == "weak"
+    assert result["confidence"] == "low"
+    assert result["normalized_setup_suggestion"] is None
+    assert result["needs_setup_type_review"] is True

@@ -86,6 +86,10 @@ Prefer the exact VALID SETUP TYPES listed in the user prompt. If the setup genui
 
 gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
 
+Do NOT use directional_confusion_breakout as a setup_type. If the directional
+read is confused, output HOLD with setup_type="unclear_direction" and explain
+the conflict in setup_reasoning.
+
 SWING SETUP LABELS:
 When your confidence is at least medium, strength is at least moderate, and you output a directional signal (LONG or SHORT), prefer these canonical swing setup types:
   - sector_rotation_swing: stock rotating into a strong sector with multi-day follow-through potential
@@ -200,6 +204,21 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
     normalized["confidence"] = confidence if confidence in valid_conf else "low"
 
     normalized.setdefault("setup_type", "unknown")
+    setup_type = str(normalized.get("setup_type", "unknown")).lower().strip()
+    if setup_type == "directional_confusion_breakout":
+        normalized["setup_type"] = "unclear_direction"
+        normalized["signal"] = "HOLD"
+        normalized["strength"] = "weak"
+        normalized["confidence"] = "low"
+        normalized["normalized_setup_suggestion"] = None
+        normalized["setup_validation_warning"] = (
+            "directional_confusion_breakout is not a valid setup label; "
+            "rewritten to unclear_direction/HOLD"
+        )
+        normalized["needs_setup_type_review"] = True
+    else:
+        normalized["setup_type"] = setup_type
+
     # Validate normalized_setup_suggestion: must be null or a canonical swing type
     _suggestion = normalized.get("normalized_setup_suggestion")
     if _suggestion is not None:
