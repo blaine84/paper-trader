@@ -98,6 +98,18 @@ def _compute_integrity_hash(record_dict: dict) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _extract_multitimeframe_context(signal_snapshot_json: str | None) -> dict | None:
+    """Extract Analyst-owned multi-timeframe context from a candidate snapshot."""
+    if not signal_snapshot_json:
+        return None
+    try:
+        snapshot = json.loads(signal_snapshot_json)
+    except (TypeError, ValueError):
+        return None
+    context = snapshot.get("multitimeframe_context") if isinstance(snapshot, dict) else None
+    return context if isinstance(context, dict) else None
+
+
 class CandidateRegistryError(Exception):
     """Raised when a registry operation fails closed in authoritative mode."""
 
@@ -559,7 +571,7 @@ class CandidateRegistry:
         Each dict contains: candidate_id, symbol, direction, setup_type,
         entry_price, stop_price, target_price, risk_reward, geometry_name,
         trigger, invalidation_basis, target_basis, state, candidate_type,
-        holding_horizon.
+        holding_horizon, multitimeframe_context.
 
         Args:
             candidate_type: If provided, filter to only this type ("swing" or "intraday").
@@ -577,7 +589,8 @@ class CandidateRegistry:
                            geometry_name, trigger, invalidation_basis,
                            target_basis, state,
                            COALESCE(candidate_type, 'intraday'),
-                           holding_horizon
+                           holding_horizon,
+                           signal_snapshot_json
                     FROM pm_candidates
                     WHERE cycle_id = :cycle_id
                       AND profile_id = :profile_id
@@ -605,6 +618,7 @@ class CandidateRegistry:
                         "state": row[12],
                         "candidate_type": row[13],
                         "holding_horizon": row[14],
+                        "multitimeframe_context": _extract_multitimeframe_context(row[15]),
                     }
                     for row in rows
                 ]

@@ -135,6 +135,19 @@ def test_moderate_profile_candidate_builder_produces_candidates_with_live_shape(
                     "day_high": 54.61,
                     "day_low": 53.87,
                 },
+                "multitimeframe_context": {
+                    "timeframes": {
+                        "5m": {"trend": "bearish"},
+                        "60m": {"trend": "bearish"},
+                        "daily": {"trend": "neutral"},
+                    },
+                    "directional_alignment": {
+                        "bias": "bearish",
+                        "agreement": "aligned",
+                    },
+                    "relative_strength": {"vs_spy_5d": -1.2},
+                    "volume_context": {"intraday_vs_prior_session": 1.4},
+                },
             }
         },
         "moderate",
@@ -159,6 +172,8 @@ def test_moderate_profile_candidate_builder_produces_candidates_with_live_shape(
     assert offered
     assert all(candidate["invalidation_basis"] for candidate in offered)
     assert all(candidate["target_basis"] for candidate in offered)
+    assert all(candidate["multitimeframe_context"] for candidate in offered)
+    assert offered[0]["multitimeframe_context"]["directional_alignment"]["bias"] == "bearish"
 
 
 def test_non_executable_setup_type_excluded(monkeypatch):

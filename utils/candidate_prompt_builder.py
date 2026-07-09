@@ -28,7 +28,7 @@ def build_candidate_pm_prompt(
         candidate_summaries: List of summary dicts from registry.get_offered_summary()
             Each has: candidate_id, symbol, direction, setup_type, entry_price,
             stop_price, target_price, risk_reward, geometry_name, trigger,
-            invalidation_basis, target_basis
+            invalidation_basis, target_basis, multitimeframe_context
         portfolio_summary: Dict with portfolio state: cash, total_equity, positions, daily_pnl
         profile: PM profile dict with personality, max_positions, etc.
         profile_id: Profile identifier
@@ -39,13 +39,14 @@ def build_candidate_pm_prompt(
     # Build candidate table
     table_lines = []
     table_lines.append(
-        "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | Trigger | Invalidation | Target Basis | Horizon |"
+        "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | MTF | Trigger | Invalidation | Target Basis | Horizon |"
     )
-    table_lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    table_lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for i, c in enumerate(candidate_summaries, 1):
         trigger_text = c.get("trigger", "") or ""
         invalidation_text = c.get("invalidation_basis", "") or ""
         target_basis_text = c.get("target_basis", "") or ""
+        mtf_text = _format_mtf_summary(c.get("multitimeframe_context"))
         # Display holding horizon for swing candidates (integer days), blank for intraday
         holding_horizon = c.get("holding_horizon")
         horizon_text = f"{holding_horizon}d" if holding_horizon else ""
@@ -53,7 +54,8 @@ def build_candidate_pm_prompt(
             f"| {i} | {c['candidate_id']} | {c['symbol']} | {c['direction']} "
             f"| ${c['entry_price']:.2f} | ${c['stop_price']:.2f} | ${c['target_price']:.2f} "
             f"| {c['risk_reward']:.1f}:1 | {c['setup_type']} | {c.get('geometry_name', '')} "
-            f"| {trigger_text[:80]} | {invalidation_text[:80]} | {target_basis_text[:80]} | {horizon_text} |"
+            f"| {mtf_text[:120]} | {trigger_text[:80]} | {invalidation_text[:80]} "
+            f"| {target_basis_text[:80]} | {horizon_text} |"
         )
     candidate_table = "\n".join(table_lines)
 
@@ -90,6 +92,7 @@ Rules:
 - Categories, themes, and sector concepts are for commentary only — they are not executable
 - The table above is the complete executable candidate set; Entry, Stop, Target, R:R, Setup, Trigger, Invalidation, and Target Basis are already provided by the deterministic scaffold
 - Do NOT reject a candidate because setup data, entry, stop, target, risk/reward, trigger, invalidation, or target basis is missing
+- Use the MTF column as shared Analyst context: it summarizes 5m/60m/daily trend, relative strength, volume, and directional alignment
 - An empty accepted set is a valid response — passing on all candidates is acceptable
 - If you accept a candidate, you may optionally specify a risk_multiplier (0.01 to 1.0) to reduce position size
 - If you reject a candidate, cite concrete portfolio, timing, exposure, confidence, or market-quality criteria from your PM profile
@@ -97,6 +100,33 @@ Rules:
 Respond with your decisions in the required JSON format.
 """
     return prompt
+
+
+def _format_mtf_summary(context: Any) -> str:
+    """Compact shared multi-timeframe context for a candidate prompt row."""
+    if not isinstance(context, dict):
+        return "n/a"
+
+    timeframes = context.get("timeframes") or {}
+    alignment = context.get("directional_alignment") or {}
+    relative_strength = context.get("relative_strength") or {}
+    volume = context.get("volume_context") or {}
+
+    def trend(label: str) -> str:
+        value = (timeframes.get(label) or {}).get("trend")
+        return str(value) if value else "n/a"
+
+    def fmt(value: Any) -> str:
+        return "n/a" if value is None else str(value)
+
+    return (
+        f"bias={alignment.get('bias', 'n/a')} "
+        f"agree={alignment.get('agreement', 'n/a')} "
+        f"5m={trend('5m')} 60m={trend('60m')} D={trend('daily')} "
+        f"rs_spy5={fmt(relative_strength.get('vs_spy_5d'))} "
+        f"rs_sector5={fmt(relative_strength.get('vs_sector_5d'))} "
+        f"vol={fmt(volume.get('intraday_vs_prior_session'))}"
+    )
 
 
 def build_decision_schema(candidate_ids: set[str]) -> dict:

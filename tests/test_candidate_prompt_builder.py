@@ -33,6 +33,7 @@ def _make_candidate_summary(
     trigger: str = "Earnings beat with guidance raise",
     invalidation_basis: str = "Breaks below premarket VWAP",
     target_basis: str = "Prior day high retest",
+    multitimeframe_context: dict | None = None,
 ) -> dict:
     """Create a candidate summary dict matching registry.get_offered_summary() output."""
     return {
@@ -48,6 +49,7 @@ def _make_candidate_summary(
         "trigger": trigger,
         "invalidation_basis": invalidation_basis,
         "target_basis": target_basis,
+        "multitimeframe_context": multitimeframe_context,
     }
 
 
@@ -102,7 +104,7 @@ class TestPromptCandidateTable:
             summaries, _make_portfolio_summary(), _make_profile(), "prof-1"
         )
         assert (
-            "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | Trigger | Invalidation | Target Basis |"
+            "| # | candidate_id | Symbol | Dir | Entry | Stop | Target | R:R | Setup | Geometry | MTF | Trigger | Invalidation | Target Basis |"
             in prompt
         )
 
@@ -179,6 +181,37 @@ class TestPromptCandidateTable:
         assert "gap_and_go" in prompt
         assert "Fails opening range low" in prompt
         assert "Measured move to premarket high" in prompt
+
+    def test_table_includes_multitimeframe_context(self):
+        summaries = [
+            _make_candidate_summary(
+                multitimeframe_context={
+                    "timeframes": {
+                        "5m": {"trend": "bullish"},
+                        "60m": {"trend": "bullish"},
+                        "daily": {"trend": "neutral"},
+                    },
+                    "directional_alignment": {
+                        "bias": "bullish",
+                        "agreement": "aligned",
+                    },
+                    "relative_strength": {
+                        "vs_spy_5d": 1.8,
+                        "vs_sector_5d": 0.7,
+                    },
+                    "volume_context": {"intraday_vs_prior_session": 1.3},
+                }
+            )
+        ]
+        prompt = build_candidate_pm_prompt(
+            summaries, _make_portfolio_summary(), _make_profile(), "prof-1"
+        )
+
+        assert "bias=bullish" in prompt
+        assert "5m=bullish" in prompt
+        assert "60m=bullish" in prompt
+        assert "D=neutral" in prompt
+        assert "rs_spy5=1.8" in prompt
 
     def test_none_trigger_handled_gracefully(self):
         summaries = [_make_candidate_summary(trigger=None)]
