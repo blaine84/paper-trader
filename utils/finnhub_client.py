@@ -73,7 +73,8 @@ class FinnhubClient:
         resolution: 1, 5, 15, 30, 60, D, W, M
 
         For sub-daily resolutions (1, 5, 15, 30, 60): Alpaca first, yfinance fallback, Finnhub fallback.
-        For daily+ resolutions (D, W, M): Finnhub first, yfinance fallback (unchanged).
+        For daily resolution (D): Alpaca first, Finnhub fallback, yfinance fallback.
+        For weekly/monthly resolutions (W, M): Finnhub first, yfinance fallback.
 
         Returns dict with keys: symbol, resolution, timestamps, open, high, low, close, volume, source.
         The 'source' field identifies which provider supplied the data.
@@ -98,8 +99,24 @@ class FinnhubClient:
                 result["source"] = "finnhub"
                 return result
             return {}
+        elif resolution == "D":
+            # Alpaca daily bars are more reliable than Finnhub/yfinance in the
+            # current runtime, and keep daily trend/sector context populated.
+            result = self._get_candles_alpaca(symbol, resolution, days)
+            if result:
+                result["source"] = "alpaca"
+                return result
+            result = self._get_candles_finnhub(symbol, resolution, days)
+            if result:
+                result["source"] = "finnhub"
+                return result
+            result = self._get_candles_yfinance(symbol, resolution, days)
+            if result:
+                result["source"] = "yfinance"
+                return result
+            return {}
         else:
-            # Daily+ unchanged: Finnhub primary
+            # Weekly/monthly: Finnhub primary.
             result = self._get_candles_finnhub(symbol, resolution, days)
             if result:
                 result["source"] = "finnhub"
@@ -111,7 +128,7 @@ class FinnhubClient:
             return {}
 
     def _get_candles_alpaca(self, symbol: str, resolution: str, days: int) -> dict:
-        """Alpaca Market Data candle fetch for intraday aggregate bars."""
+        """Alpaca Market Data candle fetch for supported aggregate bars."""
         api_key = os.getenv("ALPACA_API_KEY")
         secret_key = os.getenv("ALPACA_SECRET_KEY")
         if not api_key or not secret_key:
@@ -123,6 +140,7 @@ class FinnhubClient:
             "15": "15Min",
             "30": "30Min",
             "60": "1Hour",
+            "D": "1Day",
         }
         timeframe = timeframe_map.get(resolution)
         if not timeframe:

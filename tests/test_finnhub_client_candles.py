@@ -119,10 +119,46 @@ def test_intraday_candles_fall_back_when_alpaca_empty(monkeypatch):
     assert candles["close"] == [10.5]
 
 
-def test_daily_candles_keep_finnhub_primary(monkeypatch):
+def test_daily_candles_use_alpaca_primary(monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "alpaca-key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "alpaca-secret")
-    monkeypatch.setattr(finnhub_client.requests, "get", lambda *args, **kwargs: pytest.fail("alpaca should not be called"))
+    calls = []
+
+    def fake_get(url, params, headers, timeout):
+        calls.append((url, params, headers, timeout))
+        return FakeResponse({
+            "bars": {
+                "SPY": [
+                    {"t": "2026-06-20T04:00:00Z", "o": 625.0, "h": 630.0, "l": 624.0, "c": 629.0, "v": 1000000},
+                    {"t": "2026-06-23T04:00:00Z", "o": 629.0, "h": 632.0, "l": 628.0, "c": 631.0, "v": 1200000},
+                ]
+            }
+        })
+
+    monkeypatch.setattr(finnhub_client.requests, "get", fake_get)
+    monkeypatch.setattr(FinnhubClient, "_get_candles_finnhub", lambda *args, **kwargs: pytest.fail("finnhub should not be called"))
+    monkeypatch.setattr(FinnhubClient, "_get_candles_yfinance", lambda *args, **kwargs: pytest.fail("yfinance should not be called"))
+
+    candles = FinnhubClient().get_candles("SPY", resolution="D", days=30)
+
+    assert candles == {
+        "symbol": "SPY",
+        "resolution": "D",
+        "timestamps": [1781928000, 1782187200],
+        "open": [625.0, 629.0],
+        "high": [630.0, 632.0],
+        "low": [624.0, 628.0],
+        "close": [629.0, 631.0],
+        "volume": [1000000, 1200000],
+        "source": "alpaca",
+    }
+    assert calls[0][1]["timeframe"] == "1Day"
+
+
+def test_daily_candles_fall_back_to_finnhub_when_alpaca_empty(monkeypatch):
+    monkeypatch.setenv("ALPACA_API_KEY", "alpaca-key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "alpaca-secret")
+    monkeypatch.setattr(finnhub_client.requests, "get", lambda *args, **kwargs: FakeResponse({"bars": {}}))
     monkeypatch.setattr(
         FinnhubClient,
         "_get_candles_finnhub",
@@ -137,7 +173,9 @@ def test_daily_candles_keep_finnhub_primary(monkeypatch):
             "volume": [100],
         },
     )
+    monkeypatch.setattr(FinnhubClient, "_get_candles_yfinance", lambda *args, **kwargs: pytest.fail("yfinance should not be called"))
 
     candles = FinnhubClient().get_candles("SPY", resolution="D", days=30)
 
     assert candles["source"] == "finnhub"
+    assert candles["close"] == [10.5]
