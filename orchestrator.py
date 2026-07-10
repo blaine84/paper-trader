@@ -650,8 +650,8 @@ def _ensure_candidate_tables(engine, inspector):
         log.warning("Schema migration: created candidate_shadow_comparison table with indexes")
 
 
-def _ensure_pm_candidate_events_identity_default(engine, inspector):
-    """Repair migrated Postgres pm_candidate_events.id columns missing a default.
+def _ensure_postgres_identity_default(engine, inspector, table_name: str) -> None:
+    """Repair migrated Postgres integer primary keys missing a sequence default.
 
     SQLite's ``INTEGER PRIMARY KEY`` auto-generates values. During the
     SQLite-to-Postgres migration, the same DDL can leave an integer primary key
@@ -660,41 +660,45 @@ def _ensure_pm_candidate_events_identity_default(engine, inspector):
     from sqlalchemy import text
     from db.schema import is_sqlite
 
-    if is_sqlite(engine) or not inspector.has_table("pm_candidate_events"):
+    if is_sqlite(engine) or not inspector.has_table(table_name):
         return
 
-    columns = {
-        col["name"]: col
-        for col in inspector.get_columns("pm_candidate_events")
-    }
+    columns = {col["name"]: col for col in inspector.get_columns(table_name)}
     id_col = columns.get("id")
     if not id_col or id_col.get("default"):
         return
 
+    sequence_name = f"{table_name}_id_seq"
     with engine.begin() as conn:
         conn.execute(
             text(
-                "CREATE SEQUENCE IF NOT EXISTS pm_candidate_events_id_seq "
-                "OWNED BY pm_candidate_events.id"
+                f"CREATE SEQUENCE IF NOT EXISTS {sequence_name} "
+                f"OWNED BY {table_name}.id"
             )
         )
         conn.execute(
             text(
                 "SELECT setval("
-                "'pm_candidate_events_id_seq', "
-                "COALESCE((SELECT MAX(id) FROM pm_candidate_events), 0) + 1, "
+                f"'{sequence_name}', "
+                f"COALESCE((SELECT MAX(id) FROM {table_name}), 0) + 1, "
                 "false)"
             )
         )
         conn.execute(
             text(
-                "ALTER TABLE pm_candidate_events "
-                "ALTER COLUMN id SET DEFAULT nextval('pm_candidate_events_id_seq')"
+                f"ALTER TABLE {table_name} "
+                f"ALTER COLUMN id SET DEFAULT nextval('{sequence_name}')"
             )
         )
-    log.warning(
-        "Schema migration: repaired pm_candidate_events.id sequence default"
-    )
+    log.warning("Schema migration: repaired %s.id sequence default", table_name)
+
+
+def _ensure_pm_candidate_events_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "pm_candidate_events")
+
+
+def _ensure_pm_candidates_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "pm_candidates")
 
 
 def _ensure_checkpoint_tables(engine, inspector):
@@ -775,6 +779,7 @@ def check_schema(engine):
 
     # --- Auto-create candidate-ID selection tables if missing (non-destructive) ---
     _ensure_candidate_tables(engine, inspector)
+    _ensure_pm_candidates_identity_default(engine, inspector)
     _ensure_pm_candidate_events_identity_default(engine, inspector)
 
     # --- Auto-create checkpoint funnel logging tables if missing (non-destructive) ---
