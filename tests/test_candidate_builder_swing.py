@@ -380,10 +380,85 @@ class TestNoSwingExplanation:
         assert "reason" in event_data
         valid_reasons = {
             "no_fresh_signals", "no_executable_mapping", "missing_geometry",
-            "failed_risk_gates", "stale_data", "same_symbol_exposure", "profile_policy",
+            "failed_risk_gates", "swing_observe_mode", "all_swing_candidates_rejected",
+            "stale_data", "same_symbol_exposure", "profile_policy",
         }
         assert event_data["reason"] in valid_reasons
         assert rows[0][2] == "swing"
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_no_swing_explanation_observe_mode(self, mock_mode, mock_bridge, engine):
+        """Observe mode reports that registration was intentionally disabled."""
+        registry = CandidateRegistry(engine, "cycle-observe", "moderate")
+        signals = {"MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"}}
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-observe", registry=registry,
+        )
+
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT event_data FROM pm_candidate_events WHERE cycle_id = 'cycle-observe'")
+            ).fetchone()
+
+        assert row is not None
+        event_data = json.loads(row[0])
+        assert event_data == {"mode": "observe", "reason": "swing_observe_mode"}
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
+    def test_no_swing_explanation_summarizes_rejections(self, mock_mode, mock_bridge, engine):
+        """Enabled mode reports bridge rejection counts when all signals reject."""
+        registry = CandidateRegistry(engine, "cycle-reject", "moderate")
+        signals = {
+            "MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"},
+            "NVDA": {"symbol": "NVDA", "setup_type": "breakout_retest"},
+        }
+
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO pm_candidate_events
+                    (candidate_id, cycle_id, profile_id, event_type, event_data, created_at, candidate_type)
+                    VALUES
+                    ('', 'cycle-reject', 'moderate', 'swing_candidate_rejected',
+                     '{"reason_code": "confidence_below_threshold"}', :now, 'swing'),
+                    ('', 'cycle-reject', 'moderate', 'swing_candidate_rejected',
+                     '{"reason_code": "confidence_below_threshold"}', :now, 'swing'),
+                    ('', 'cycle-reject', 'moderate', 'swing_candidate_rejected',
+                     '{"reason_code": "rr_below_threshold"}', :now, 'swing')
+                """),
+                {"now": datetime.now(timezone.utc).isoformat()},
+            )
+            conn.commit()
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-reject", registry=registry,
+        )
+
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT event_data
+                    FROM pm_candidate_events
+                    WHERE cycle_id = 'cycle-reject'
+                      AND event_type = 'swing_no_candidates'
+                """)
+            ).fetchone()
+
+        assert row is not None
+        event_data = json.loads(row[0])
+        assert event_data["reason"] == "all_swing_candidates_rejected"
+        assert event_data["primary_rejection_reason"] == "confidence_below_threshold"
+        assert event_data["rejection_counts"] == {
+            "confidence_below_threshold": 2,
+            "rr_below_threshold": 1,
+        }
 
     @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
     @patch("utils.gate_config.get_swing_candidate_mode", return_value="enabled")
