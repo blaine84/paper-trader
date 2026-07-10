@@ -20,6 +20,20 @@ def test_unregistered_setup_type_is_preserved_with_warning():
     assert "liquidity_sweep" in result["setup_validation_warning"]
 
 
+def test_unregistered_setup_annotation_preserves_existing_warning():
+    signal = {
+        "symbol": "AAPL",
+        "setup_type": "unclear_direction",
+        "setup_validation_warning": "forced to HOLD by normalizer",
+        "needs_setup_type_review": True,
+    }
+
+    result = annotate_unregistered_setup(signal, ["technical_breakout", "orb"])
+
+    assert result["setup_validation_warning"] == "forced to HOLD by normalizer"
+    assert result["needs_setup_type_review"] is True
+
+
 def test_directional_confusion_breakout_is_rewritten_to_hold():
     signal = {
         "symbol": "AAPL",
@@ -131,3 +145,65 @@ def test_oversold_unclear_short_without_suggestion_stays_hold():
     assert result["setup_type"] == "unclear_direction"
     assert result["signal"] == "HOLD"
     assert result["normalized_setup_suggestion"] is None
+
+
+def test_technical_confusion_breakout_is_rewritten_to_hold():
+    signal = {
+        "symbol": "TSLA",
+        "signal": "SHORT",
+        "strength": "moderate",
+        "confidence": "medium",
+        "setup_type": "technical_confusion_breakout",
+        "setup_reasoning": "Bearish read, but no clean technical setup.",
+        "normalized_setup_suggestion": None,
+    }
+
+    result = normalize_analyst_signal_shape(signal, "TSLA")
+
+    assert result["setup_type"] == "unclear_direction"
+    assert result["signal"] == "HOLD"
+    assert result["strength"] == "weak"
+    assert result["confidence"] == "low"
+    assert result["normalized_setup_suggestion"] is None
+    assert result["needs_setup_type_review"] is True
+
+
+def test_directional_unknown_setup_is_forced_to_hold():
+    signal = {
+        "symbol": "MSFT",
+        "signal": "SHORT",
+        "strength": "strong",
+        "confidence": "high",
+        "setup_type": "liquidity_sweep",
+        "setup_reasoning": "Unregistered bearish label from the LLM.",
+        "normalized_setup_suggestion": None,
+    }
+
+    result = normalize_analyst_signal_shape(signal, "MSFT")
+
+    assert result["setup_type"] == "unclear_direction"
+    assert result["signal"] == "HOLD"
+    assert result["strength"] == "weak"
+    assert result["confidence"] == "low"
+    assert result["original_signal"] == "SHORT"
+    assert result["original_setup_type"] == "liquidity_sweep"
+    assert result["needs_setup_type_review"] is True
+
+
+def test_directional_sector_rotation_remains_mappable():
+    signal = {
+        "symbol": "AMD",
+        "signal": "LONG",
+        "strength": "strong",
+        "confidence": "high",
+        "setup_type": "sector_rotation",
+        "setup_reasoning": "Semis leading with strong sector breadth.",
+        "normalized_setup_suggestion": "sector_rotation_swing",
+    }
+
+    result = normalize_analyst_signal_shape(signal, "AMD")
+
+    assert result["setup_type"] == "sector_rotation"
+    assert result["signal"] == "LONG"
+    assert result["strength"] == "strong"
+    assert result["confidence"] == "high"

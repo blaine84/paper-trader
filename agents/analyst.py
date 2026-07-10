@@ -55,7 +55,7 @@ You DO decide:
   - How strong and clean the setup is
   - What the key price levels are (support, resistance, VWAP, prior highs/lows)
   - What would invalidate the setup (the line in the sand)
-  - How confident you are in the read
+  - How confident you are that the observed price action matches an executable setup
 
 Respond in JSON:
 {
@@ -90,9 +90,10 @@ Prefer the exact VALID SETUP TYPES listed in the user prompt. If the setup genui
 
 gap_and_go is ONLY valid for individual stocks. Do NOT assign gap_and_go to ETFs (SPY, QQQ, IWM, XLK, etc.), indices (VIX), or other non-stock instruments. Use technical_breakout or orb instead.
 
-Do NOT use directional_confusion_breakout as a setup_type. If the directional
-read is confused, output HOLD with setup_type="unclear_direction" and explain
-the conflict in setup_reasoning.
+Do NOT use directional_confusion_breakout, technical_confusion_breakout, or
+any *_confusion_* label as a setup_type. If the executable setup is confused,
+output HOLD with setup_type="unclear_direction", strength="weak",
+confidence="low", and explain the conflict in setup_reasoning.
 
 SWING SETUP LABELS:
 When your confidence is at least medium, strength is at least moderate, and you output a directional signal (LONG or SHORT), prefer these canonical swing setup types:
@@ -110,7 +111,10 @@ Use diagnostic labels (labels NOT in the canonical sets above) only when:
   - Indicators conflict on direction and you cannot resolve a clean setup
   - No canonical setup type matches the observed price action
 
-HOLD is a valid and useful signal. Output it whenever the setup is ambiguous or low quality.
+Confidence is setup confidence, not just directional confidence. If price action
+looks bullish or bearish but does not match a clean executable setup, output
+HOLD with low confidence. HOLD is a valid and useful signal. Output it whenever
+the setup is ambiguous or low quality.
 
 VETO ACCOUNTABILITY:
 - If the DETERMINISTIC TECHNICAL SANITY CHECK below says bias=LONG or bias=SHORT and you still output HOLD, you MUST fill llm_veto_reason with the specific disqualifying evidence.
@@ -219,14 +223,14 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
 
     normalized.setdefault("setup_type", "unknown")
     setup_type = str(normalized.get("setup_type", "unknown")).lower().strip()
-    if setup_type == "directional_confusion_breakout":
+    if _is_diagnostic_confusion_setup(setup_type) and setup_type != "unclear_direction":
         normalized["setup_type"] = "unclear_direction"
         normalized["signal"] = "HOLD"
         normalized["strength"] = "weak"
         normalized["confidence"] = "low"
         normalized["normalized_setup_suggestion"] = None
         normalized["setup_validation_warning"] = (
-            "directional_confusion_breakout is not a valid setup label; "
+            f"{setup_type} is not a valid setup label; "
             "rewritten to unclear_direction/HOLD"
         )
         normalized["needs_setup_type_review"] = True
@@ -271,7 +275,56 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
     if not isinstance(normalized.get("indicators"), dict):
         normalized["indicators"] = {}
 
+    _enforce_directional_setup_contract(normalized)
+
     return normalized
+
+
+def _is_diagnostic_confusion_setup(setup_type: str) -> bool:
+    """Return True when a setup label is diagnostic-only confusion drift."""
+    return (
+        setup_type in {
+            "unclear_direction",
+            "directional_confusion_breakout",
+            "technical_confusion_breakout",
+        }
+        or "_confusion_" in setup_type
+    )
+
+
+def _enforce_directional_setup_contract(signal: dict) -> None:
+    """Prevent directional analyst signals from carrying non-executable labels."""
+    if signal.get("signal") not in {"LONG", "SHORT"}:
+        return
+
+    from utils.gate_config import (
+        CANDIDATE_EXECUTABLE_SETUP_TYPES,
+        SWING_EXECUTABLE_SETUP_TYPES,
+    )
+
+    setup_type = signal.get("setup_type")
+    executable_or_mappable = (
+        set(CANDIDATE_EXECUTABLE_SETUP_TYPES)
+        | set(SWING_EXECUTABLE_SETUP_TYPES)
+        | {"sector_rotation"}
+    )
+    if setup_type in executable_or_mappable:
+        return
+
+    signal["original_signal"] = signal.get("signal")
+    signal["original_strength"] = signal.get("strength")
+    signal["original_confidence"] = signal.get("confidence")
+    signal["original_setup_type"] = setup_type
+    signal["signal"] = "HOLD"
+    signal["strength"] = "weak"
+    signal["confidence"] = "low"
+    signal["setup_type"] = "unclear_direction"
+    signal["normalized_setup_suggestion"] = None
+    signal["setup_validation_warning"] = (
+        f"Directional signal carried non-executable setup_type '{setup_type}'; "
+        "forced to HOLD"
+    )
+    signal["needs_setup_type_review"] = True
 
 
 def _infer_unclear_direction_swing_setup(signal: dict) -> str | None:
@@ -338,9 +391,12 @@ def annotate_unregistered_setup(signal: dict, valid_setups: list[str]) -> dict:
     if not setup_type or setup_type in set(valid_setups):
         return signal
 
-    signal["setup_validation_warning"] = (
-        f"setup_type '{setup_type}' is not in the current setup registry; "
-        "preserved for review"
+    signal.setdefault(
+        "setup_validation_warning",
+        (
+            f"setup_type '{setup_type}' is not in the current setup registry; "
+            "preserved for review"
+        ),
     )
     signal["needs_setup_type_review"] = True
     log.warning(
