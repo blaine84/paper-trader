@@ -40,7 +40,7 @@ def test_directional_confusion_breakout_is_rewritten_to_hold():
     assert result["needs_setup_type_review"] is True
 
 
-def test_unclear_direction_is_forced_to_hold():
+def test_actionable_unclear_direction_uses_valid_swing_suggestion():
     signal = {
         "symbol": "AAPL",
         "signal": "SHORT",
@@ -48,6 +48,27 @@ def test_unclear_direction_is_forced_to_hold():
         "confidence": "high",
         "setup_type": "unclear_direction",
         "normalized_setup_suggestion": "risk_off_macro_short",
+    }
+
+    result = normalize_analyst_signal_shape(signal, "AAPL")
+
+    assert result["setup_type"] == "risk_off_macro_short"
+    assert result["signal"] == "SHORT"
+    assert result["strength"] == "strong"
+    assert result["confidence"] == "high"
+    assert result["normalized_setup_suggestion"] == "risk_off_macro_short"
+    assert result["original_setup_type"] == "unclear_direction"
+    assert result["needs_setup_type_review"] is True
+
+
+def test_unclear_direction_without_actionable_suggestion_is_forced_to_hold():
+    signal = {
+        "symbol": "AAPL",
+        "signal": "SHORT",
+        "strength": "strong",
+        "confidence": "high",
+        "setup_type": "unclear_direction",
+        "normalized_setup_suggestion": None,
     }
 
     result = normalize_analyst_signal_shape(signal, "AAPL")

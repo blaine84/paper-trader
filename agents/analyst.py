@@ -207,28 +207,8 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
     confidence = str(normalized.get("confidence", "low")).lower().strip()
     normalized["confidence"] = confidence if confidence in valid_conf else "low"
 
-    normalized.setdefault("setup_type", "unknown")
-    setup_type = str(normalized.get("setup_type", "unknown")).lower().strip()
-    if setup_type in {"directional_confusion_breakout", "unclear_direction"}:
-        normalized["setup_type"] = "unclear_direction"
-        normalized["signal"] = "HOLD"
-        normalized["strength"] = "weak"
-        normalized["confidence"] = "low"
-        normalized["normalized_setup_suggestion"] = None
-        if setup_type == "directional_confusion_breakout":
-            normalized["setup_validation_warning"] = (
-                "directional_confusion_breakout is not a valid setup label; "
-                "rewritten to unclear_direction/HOLD"
-            )
-        else:
-            normalized["setup_validation_warning"] = (
-                "unclear_direction is diagnostic-only; forced to HOLD"
-            )
-        normalized["needs_setup_type_review"] = True
-    else:
-        normalized["setup_type"] = setup_type
-
-    # Validate normalized_setup_suggestion: must be null or a canonical swing type
+    # Validate normalized_setup_suggestion before deciding whether a diagnostic
+    # setup label can be safely mapped into an executable swing setup.
     _suggestion = normalized.get("normalized_setup_suggestion")
     if _suggestion is not None:
         from utils.gate_config import SWING_EXECUTABLE_SETUP_TYPES
@@ -236,6 +216,50 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
             normalized["normalized_setup_suggestion"] = None
     else:
         normalized.setdefault("normalized_setup_suggestion", None)
+
+    normalized.setdefault("setup_type", "unknown")
+    setup_type = str(normalized.get("setup_type", "unknown")).lower().strip()
+    if setup_type == "directional_confusion_breakout":
+        normalized["setup_type"] = "unclear_direction"
+        normalized["signal"] = "HOLD"
+        normalized["strength"] = "weak"
+        normalized["confidence"] = "low"
+        normalized["normalized_setup_suggestion"] = None
+        normalized["setup_validation_warning"] = (
+            "directional_confusion_breakout is not a valid setup label; "
+            "rewritten to unclear_direction/HOLD"
+        )
+        normalized["needs_setup_type_review"] = True
+    elif setup_type == "unclear_direction":
+        actionable_direction = normalized["signal"] in {"LONG", "SHORT"}
+        actionable_strength = normalized["strength"] in {"moderate", "strong"}
+        actionable_confidence = normalized["confidence"] in {"medium", "high"}
+        suggestion = normalized.get("normalized_setup_suggestion")
+        if (
+            actionable_direction
+            and actionable_strength
+            and actionable_confidence
+            and suggestion is not None
+        ):
+            normalized["original_setup_type"] = "unclear_direction"
+            normalized["setup_type"] = suggestion
+            normalized["setup_validation_warning"] = (
+                "unclear_direction carried a directional signal and valid "
+                "normalized_setup_suggestion; promoted to canonical swing setup"
+            )
+            normalized["needs_setup_type_review"] = True
+        else:
+            normalized["setup_type"] = "unclear_direction"
+            normalized["signal"] = "HOLD"
+            normalized["strength"] = "weak"
+            normalized["confidence"] = "low"
+            normalized["normalized_setup_suggestion"] = None
+            normalized["setup_validation_warning"] = (
+                "unclear_direction is diagnostic-only; forced to HOLD"
+            )
+            normalized["needs_setup_type_review"] = True
+    else:
+        normalized["setup_type"] = setup_type
     normalized.setdefault("setup_reasoning", "")
     normalized.setdefault("reasoning", "")
     if not isinstance(normalized.get("key_levels"), dict):

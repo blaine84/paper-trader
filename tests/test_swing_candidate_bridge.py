@@ -162,6 +162,17 @@ class TestEnabledModeValidSignal:
         assert len(result) == 1
         assert result[0]["quantity"] > 0
 
+    @patch("utils.swing_candidate_bridge._get_swing_mode", return_value="enabled")
+    @patch("utils.swing_candidate_bridge._get_open_swing_symbols", return_value=set())
+    def test_uses_analyst_signal_field_when_direction_missing(self, mock_symbols, mock_mode):
+        signals = {"sig-1": _make_signal(signal="LONG")}
+        signals["sig-1"].pop("direction")
+
+        result = _call_bridge(signals=signals)
+
+        assert len(result) == 1
+        assert result[0]["direction"] == "LONG"
+
 
 # ---------------------------------------------------------------------------
 # Test Case 4: Enabled mode with invalid signal (normalization fails)

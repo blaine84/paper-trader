@@ -45,6 +45,19 @@ _CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 _STRENGTH_ORDER = {"weak": 0, "moderate": 1, "strong": 2}
 
 
+def _get_signal_direction(signal: dict) -> str:
+    """Return analyst trade direction from either supported field name."""
+    direction = str(signal.get("direction") or "").upper().strip()
+    if direction in ("LONG", "SHORT", "HOLD"):
+        return direction
+
+    analyst_signal = str(signal.get("signal") or "").upper().strip()
+    if analyst_signal in ("LONG", "SHORT", "HOLD"):
+        return analyst_signal
+
+    return "HOLD"
+
+
 def evaluate_profile_policy(
     profile_id: str,
     confidence: Literal["low", "medium", "high"],
@@ -223,6 +236,7 @@ def process_swing_signals(
     for signal_id, signal in signals.items():
         symbol = signal.get("symbol", "")
         raw_label = signal.get("setup_type", "")
+        direction = _get_signal_direction(signal)
 
         # Skip stale signals
         signal_age_hours = signal.get("signal_age_hours", 0)
@@ -269,7 +283,7 @@ def process_swing_signals(
         # Normalize
         norm_result = normalize_setup(
             raw_label=raw_label,
-            direction=signal.get("direction", "HOLD"),
+            direction=direction,
             strength=signal.get("strength", "weak"),
             confidence=signal.get("confidence", "low"),
             technical_context=tc,
@@ -319,7 +333,7 @@ def process_swing_signals(
 
         geom_result = build_swing_geometry(
             symbol=symbol,
-            direction=signal.get("direction", "LONG"),
+            direction=direction,
             normalized_setup_type=normalized_type,
             entry_price=entry_dec,
             stop_price=stop_dec,
@@ -415,7 +429,7 @@ def process_swing_signals(
         registered_candidates.append({
             "signal_id": signal_id,
             "symbol": symbol,
-            "direction": signal.get("direction", "LONG"),
+            "direction": direction,
             "normalized_setup_type": normalized_type,
             "geometry": geom_result,
             "quantity": sizing_result.quantity,
