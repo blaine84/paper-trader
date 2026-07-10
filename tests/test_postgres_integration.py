@@ -469,6 +469,8 @@ class TestWebApiHealth:
             data = resp.get_json()
             assert "timestamp" in data
             assert "watchlist" in data
+            assert "analysis" in data
+            assert data["analysis"] == data["watchlist"]
 
 
 # ---------------------------------------------------------------------------

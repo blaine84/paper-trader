@@ -271,6 +271,7 @@ def api_data():
         "timestamp": datetime.utcnow().isoformat(),
         "market_open": market_open,
         "watchlist": watchlist,
+        "analysis": watchlist,
         "scout_picks": scout_picks,
         "portfolio": portfolio,
         "regime": regime,

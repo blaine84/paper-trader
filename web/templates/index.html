@@ -338,9 +338,10 @@
     try {
       const res = await fetch('/api/data');
       const data = await res.json();
+      const analysisRows = data.analysis || data.watchlist || [];
       renderPortfolios(data.portfolio);
       renderWatchlist(data.watchlist);
-      renderAnalysis(data.watchlist);
+      renderAnalysis(analysisRows);
       updateHeader(data.market_open, data.timestamp, data.regime);
       if (activeTab === 'positions') loadPositions();
       loadAlerts();
