@@ -701,6 +701,10 @@ def _ensure_pm_candidates_identity_default(engine, inspector):
     _ensure_postgres_identity_default(engine, inspector, "pm_candidates")
 
 
+def _ensure_decision_snapshots_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "decision_snapshots")
+
+
 def _ensure_checkpoint_tables(engine, inspector):
     """Create checkpoint_events table if missing.
 
@@ -791,6 +795,8 @@ def check_schema(engine):
     # --- Auto-create decision replay tables and lineage columns if missing ---
     from db.replay_schema import init_replay_db
     init_replay_db(engine)
+    inspector = sa_inspect(engine)
+    _ensure_decision_snapshots_identity_default(engine, inspector)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —

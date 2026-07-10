@@ -69,3 +69,21 @@ def test_check_schema_creates_candidate_events_with_generated_id():
 
     assert row.id is not None
     assert row.candidate_type == "intraday"
+
+
+def test_check_schema_repairs_decision_snapshot_identity_default(monkeypatch):
+    engine = create_engine("sqlite://")
+    repaired_tables = []
+
+    def record_identity_repair(_engine, _inspector, table_name):
+        repaired_tables.append(table_name)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_postgres_identity_default",
+        record_identity_repair,
+    )
+
+    orchestrator.check_schema(engine)
+
+    assert "decision_snapshots" in repaired_tables
