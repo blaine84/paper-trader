@@ -313,3 +313,22 @@ class TestSetupTypeCaseNormalization:
             f"Expected tactical_stop_applied=True for setup_type='VWAP_PULLBACK' (all caps). "
             f"Got decision={result.get('decision')}, reason_code={result.get('reason_code')}"
         )
+
+
+class TestGeometryNameEligibility:
+    """Candidate geometry can qualify a tactical stop when setup_type is broad."""
+
+    def test_geometry_name_support_bounce_matches_config(self):
+        """Broad setup_type with support_bounce geometry uses the tactical stop exception."""
+        kwargs = {
+            **_BASE_KWARGS,
+            "setup_type": "technical_breakout",
+            "geometry_name": "support_bounce",
+        }
+
+        result = evaluate_risk_geometry(**kwargs)
+
+        assert result["decision"] == "passed_unchanged"
+        assert result.get("tactical_stop_applied") is True
+        assert result["tactical_stop_match_field"] == "geometry_name"
+        assert result["tactical_stop_match_value"] == "support_bounce"

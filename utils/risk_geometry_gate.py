@@ -464,6 +464,7 @@ def _evaluate_tactical_stop_exception(
     direction: str,
     symbol: str,
     setup_type: str | None,
+    geometry_name: str | None,
     atr_5min: float | None,
     atr_timestamp: datetime | None,
     trade_timestamp: datetime | None,
@@ -482,8 +483,9 @@ def _evaluate_tactical_stop_exception(
     Returns:
         - Result dict with decision="passed_unchanged" + tactical metadata if
           exception applies and passes all validation.
-        - None if exception does not apply or tactical validation fails
-          (caller should continue to global path).
+        - Result dict with decision="rejected" if the trade is tactical but
+          fails tactical validation; caller should not rewrite that geometry.
+        - None if exception does not apply (caller should continue to global path).
 
     Error handling:
         Wraps entire body in try/except. Any unexpected exception is logged as
@@ -492,7 +494,8 @@ def _evaluate_tactical_stop_exception(
     try:
         # --- Normalize inputs ---
         profile_key = profile.lower() if isinstance(profile, str) else None
-        setup_key = setup_type.lower() if isinstance(setup_type, str) else None
+        setup_key = setup_type.strip().lower() if isinstance(setup_type, str) and setup_type.strip() else None
+        geometry_key = geometry_name.strip().lower() if isinstance(geometry_name, str) and geometry_name.strip() else None
 
         # --- Check profile exists in tactical config ---
         tactical_config = rule.get("tactical_stop_by_profile")
@@ -523,35 +526,98 @@ def _evaluate_tactical_stop_exception(
                 return None
 
         # --- Check setup eligibility ---
-        if setup_key is None:
+        if setup_key is None and geometry_key is None:
             return None
 
         qualifying_setups = [s.lower() for s in profile_cfg["qualifying_setups"]]
         conditional_setups = [s.lower() for s in profile_cfg["conditional_setups"]]
 
-        if setup_key in qualifying_setups:
-            # Unconditional qualification
-            pass
-        elif setup_key in conditional_setups:
-            # Conditional: requires tactical context indicator match
+        match_field = None
+        match_value = None
+        for field, value in (("setup_type", setup_key), ("geometry_name", geometry_key)):
+            if value in qualifying_setups:
+                match_field = field
+                match_value = value
+                break
+
+        if match_field is None:
             indicators = profile_cfg["tactical_context_indicators"]
-            if not _has_tactical_context(indicators, trade_metadata, trade_rationale):
-                return None
-        else:
-            # Not in either list
+            has_context = _has_tactical_context(indicators, trade_metadata, trade_rationale)
+            for field, value in (("setup_type", setup_key), ("geometry_name", geometry_key)):
+                if value in conditional_setups and has_context:
+                    match_field = field
+                    match_value = value
+                    break
+
+        if match_field is None:
             return None
+
+        def _build_tactical_rejection(
+            *,
+            reason: str,
+            reason_code: str,
+            stop_distance: float = 0.0,
+            target_distance: float = 0.0,
+            min_stop_distance: float = 0.0,
+            original_rr: float = 0.0,
+            original_dollar_risk: float = 0.0,
+            extra_payload: dict | None = None,
+        ) -> dict:
+            payload = {
+                "decision": "rejected",
+                "canonical_decision": "reject",
+                "reason": reason,
+                "reason_code": reason_code,
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "quantity": quantity,
+                "stop_distance": stop_distance,
+                "target_distance": target_distance,
+                "min_stop_distance": min_stop_distance,
+                "adjusted_stop_price": None,
+                "adjusted_quantity": None,
+                "original_dollar_risk": original_dollar_risk,
+                "adjusted_dollar_risk": None,
+                "original_rr": original_rr,
+                "adjusted_rr": None,
+                "atr_value": atr_5min,
+                "atr_source": atr_source,
+                "atr_timestamp": atr_timestamp,
+                "atr_fallback": False,
+                "rule_name": rule_name,
+                "rule_source": rule_source,
+                "quantity_policy": quantity_policy,
+                "setup_type": setup_type,
+                "geometry_name": geometry_name,
+                "tactical_stop_exception_rejected": True,
+                "tactical_stop_match_field": match_field,
+                "tactical_stop_match_value": match_value,
+            }
+            if extra_payload:
+                payload.update(extra_payload)
+            return payload
 
         # --- Validate ATR freshness ---
         if atr_5min is None or atr_5min <= 0:
-            return None
+            return _build_tactical_rejection(
+                reason="Tactical stop exception rejected: ATR unavailable",
+                reason_code="TACTICAL_STOP_ATR_UNAVAILABLE",
+            )
         if atr_timestamp is None:
-            return None
+            return _build_tactical_rejection(
+                reason="Tactical stop exception rejected: ATR timestamp missing",
+                reason_code="TACTICAL_STOP_ATR_UNAVAILABLE",
+            )
 
         effective_trade_ts = trade_timestamp if trade_timestamp is not None else datetime.now(timezone.utc)
         atr_max_age_minutes = rule.get("atr_max_age_minutes", 15)
         atr_age = effective_trade_ts - atr_timestamp
         if atr_age > timedelta(minutes=atr_max_age_minutes):
-            return None
+            return _build_tactical_rejection(
+                reason="Tactical stop exception rejected: ATR data stale",
+                reason_code="TACTICAL_STOP_ATR_STALE",
+            )
 
         # --- Compute tactical minimum stop ---
         tactical_min_stop = _compute_tactical_min_stop(
@@ -564,21 +630,60 @@ def _evaluate_tactical_stop_exception(
         # --- Compute stop and target distances ---
         stop_distance = abs(entry_price - stop_price)
         target_distance = abs(target_price - entry_price)
+        original_rr = target_distance / stop_distance if stop_distance > 0 else 0.0
+        dollar_risk = quantity * stop_distance
 
         # --- Validate stop_distance >= tactical_min_stop ---
-        if stop_distance < tactical_min_stop:
-            return None
+        # Candidate prices are persisted at cent precision. Allow a one-cent
+        # edge tolerance so rounding does not destroy otherwise valid geometry.
+        price_rounding_tolerance = 0.01
+        if stop_distance + price_rounding_tolerance < tactical_min_stop:
+            return _build_tactical_rejection(
+                reason=(
+                    f"Tactical stop exception rejected: stop distance {stop_distance:.4f} "
+                    f"is below tactical minimum {tactical_min_stop:.4f}"
+                ),
+                reason_code="TACTICAL_STOP_TOO_TIGHT",
+                stop_distance=stop_distance,
+                target_distance=target_distance,
+                min_stop_distance=tactical_min_stop,
+                original_rr=original_rr,
+                original_dollar_risk=dollar_risk,
+                extra_payload={"tactical_stop_tolerance": price_rounding_tolerance},
+            )
 
         # --- Validate original R:R ---
-        original_rr = target_distance / stop_distance if stop_distance > 0 else 0.0
         min_rr = profile_cfg["min_reward_to_risk"]
         if original_rr < min_rr:
-            return None
+            return _build_tactical_rejection(
+                reason=(
+                    f"Tactical stop exception rejected: original R:R {original_rr:.2f} "
+                    f"is below minimum {min_rr:.2f}"
+                ),
+                reason_code="TACTICAL_STOP_RR_TOO_LOW",
+                stop_distance=stop_distance,
+                target_distance=target_distance,
+                min_stop_distance=tactical_min_stop,
+                original_rr=original_rr,
+                original_dollar_risk=dollar_risk,
+                extra_payload={"tactical_stop_tolerance": price_rounding_tolerance},
+            )
 
         # --- Validate dollar risk ---
-        dollar_risk = quantity * stop_distance
         if dollar_risk > max_dollar_risk:
-            return None
+            return _build_tactical_rejection(
+                reason=(
+                    f"Tactical stop exception rejected: dollar risk {dollar_risk:.2f} "
+                    f"exceeds max {max_dollar_risk:.2f}"
+                ),
+                reason_code="TACTICAL_STOP_DOLLAR_RISK_TOO_HIGH",
+                stop_distance=stop_distance,
+                target_distance=target_distance,
+                min_stop_distance=tactical_min_stop,
+                original_rr=original_rr,
+                original_dollar_risk=dollar_risk,
+                extra_payload={"tactical_stop_tolerance": price_rounding_tolerance},
+            )
 
         # --- All checks passed: return tactical pass result ---
         return {
@@ -609,16 +714,22 @@ def _evaluate_tactical_stop_exception(
             "min_reward_to_risk": min_rr,
             "tactical_stop_applied": True,
             "tactical_min_stop_distance": tactical_min_stop,
+            "tactical_stop_tolerance": price_rounding_tolerance,
+            "tactical_stop_match_field": match_field,
+            "tactical_stop_match_value": match_value,
+            "setup_type": setup_type,
+            "geometry_name": geometry_name,
         }
 
     except Exception as exc:
         log.warning(
             "Tactical stop exception evaluation failed (fail-closed): %s "
-            "[symbol=%s, profile=%s, setup_type=%s, entry_price=%s]",
+            "[symbol=%s, profile=%s, setup_type=%s, geometry_name=%s, entry_price=%s]",
             exc,
             symbol,
             profile,
             setup_type,
+            geometry_name,
             entry_price,
         )
         return None
@@ -716,6 +827,7 @@ def evaluate_risk_geometry(
     direction: str,
     symbol: str,
     setup_type: str | None = None,
+    geometry_name: str | None = None,
     atr_5min: float | None = None,
     atr_timestamp: datetime | None = None,
     atr_source: str | None = None,
@@ -758,6 +870,7 @@ def evaluate_risk_geometry(
             direction=direction,
             symbol=symbol,
             setup_type=setup_type,
+            geometry_name=geometry_name,
             atr_5min=atr_5min,
             atr_timestamp=atr_timestamp,
             atr_source=atr_source,
@@ -840,6 +953,7 @@ def _evaluate_risk_geometry_inner(
     direction: str,
     symbol: str,
     setup_type: str | None,
+    geometry_name: str | None,
     atr_5min: float | None,
     atr_timestamp: datetime | None,
     atr_source: str | None,
@@ -999,6 +1113,7 @@ def _evaluate_risk_geometry_inner(
             direction=norm_direction,
             symbol=symbol,
             setup_type=setup_type,
+            geometry_name=geometry_name,
             atr_5min=atr_5min,
             atr_timestamp=atr_timestamp,
             trade_timestamp=trade_timestamp,

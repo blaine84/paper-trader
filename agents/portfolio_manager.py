@@ -2920,6 +2920,7 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
         target = decision.get("target") or decision.get("target_price") or decision.get("profit_target")
         quantity = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
         action = decision.get("action", "")
+        geometry_name = decision.get("geometry_name") or decision.get("geometry_candidate_name")
 
         # Only run the gate if we have the minimum required parameters
         if price and price > 0 and stop and target:
@@ -2957,6 +2958,7 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
                     direction=action,
                     symbol=symbol,
                     setup_type=setup_type,
+                    geometry_name=geometry_name,
                     atr_5min=atr_data.get("atr"),
                     atr_timestamp=atr_data.get("timestamp"),
                     atr_source=atr_data.get("source"),

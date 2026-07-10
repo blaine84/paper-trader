@@ -45,6 +45,7 @@ def _call_gate(
     target_price=TARGET_PRICE_PASS,
     profile="aggressive",
     setup_type="support_bounce",
+    geometry_name=None,
     atr_5min=ATR_5MIN,
 ):
     """Call evaluate_risk_geometry with shared defaults, overriding as needed."""
@@ -56,6 +57,7 @@ def _call_gate(
         direction=DIRECTION,
         symbol=SYMBOL,
         setup_type=setup_type,
+        geometry_name=geometry_name,
         atr_5min=atr_5min,
         atr_timestamp=ATR_TIMESTAMP,
         atr_source="polygon_5min",
@@ -121,6 +123,29 @@ class TestAggressiveTacticalSupportBouncePass:
         assert result["stop_price"] == STOP_PRICE_PASS
         assert result["target_price"] == TARGET_PRICE_PASS
         assert result["quantity"] == QUANTITY
+
+
+class TestBroadSetupTacticalGeometryPass:
+    """Regression for broad setup_type carrying tactical geometry_name."""
+
+    def test_nvda_support_bounce_geometry_preserves_cent_rounded_stop(self):
+        """The 2026-07-10 NVDA support-bounce geometry must not be widened to 1.5%."""
+        result = _call_gate(
+            entry_price=202.07,
+            stop_price=201.67,
+            target_price=202.68,
+            setup_type="technical_breakout",
+            geometry_name="support_bounce",
+            atr_5min=0.39,
+        )
+
+        assert result["decision"] == "passed_unchanged"
+        assert result["stop_price"] == 201.67
+        assert result["target_price"] == 202.68
+        assert result["adjusted_stop_price"] is None
+        assert result["tactical_stop_applied"] is True
+        assert result["tactical_stop_match_field"] == "geometry_name"
+        assert result["original_rr"] == pytest.approx((202.68 - 202.07) / (202.07 - 201.67))
 
 
 # ---------------------------------------------------------------------------
