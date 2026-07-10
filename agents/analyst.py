@@ -235,6 +235,9 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
         actionable_strength = normalized["strength"] in {"moderate", "strong"}
         actionable_confidence = normalized["confidence"] in {"medium", "high"}
         suggestion = normalized.get("normalized_setup_suggestion")
+        if suggestion is None:
+            suggestion = _infer_unclear_direction_swing_setup(normalized)
+            normalized["normalized_setup_suggestion"] = suggestion
         if (
             actionable_direction
             and actionable_strength
@@ -269,6 +272,64 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
         normalized["indicators"] = {}
 
     return normalized
+
+
+def _infer_unclear_direction_swing_setup(signal: dict) -> str | None:
+    """Infer a conservative swing setup for directional unclear_direction rows."""
+    direction = signal.get("signal")
+    strength = signal.get("strength")
+    confidence = signal.get("confidence")
+    if direction not in {"LONG", "SHORT"}:
+        return None
+    if strength not in {"moderate", "strong"} or confidence not in {"medium", "high"}:
+        return None
+
+    indicators = signal.get("indicators") if isinstance(signal.get("indicators"), dict) else {}
+    key_levels = signal.get("key_levels") if isinstance(signal.get("key_levels"), dict) else {}
+    has_levels = key_levels.get("support") is not None and key_levels.get("resistance") is not None
+    if not has_levels:
+        return None
+
+    ema_trend = str(signal.get("ema_trend") or indicators.get("ema_trend") or "").lower()
+    macd_bias = str(indicators.get("macd_bias") or "").lower()
+    above_vwap = indicators.get("above_vwap")
+    text = " ".join(
+        str(signal.get(field) or "")
+        for field in ("setup_reasoning", "reasoning", "invalidation")
+    ).lower()
+
+    if direction == "LONG":
+        bullish_context = (
+            ema_trend == "bullish"
+            and macd_bias == "bullish"
+            and above_vwap is True
+        )
+        if not bullish_context:
+            return None
+        if "breakout" in text or "resistance" in text:
+            return "breakout_retest"
+        if "support" in text or "vwap" in text:
+            return "support_bounce_swing"
+        return "pullback_continuation"
+
+    try:
+        rsi = float(indicators.get("rsi"))
+    except (TypeError, ValueError):
+        rsi = None
+    bearish_context = (
+        ema_trend == "bearish"
+        and macd_bias == "bearish"
+        and above_vwap is False
+        and (rsi is None or rsi >= 40)
+    )
+    risk_off_context = (
+        signal.get("market_regime") == "risk_off"
+        or "risk-off" in text
+        or "risk off" in text
+    )
+    if bearish_context and risk_off_context:
+        return "risk_off_macro_short"
+    return None
 
 
 def annotate_unregistered_setup(signal: dict, valid_setups: list[str]) -> dict:

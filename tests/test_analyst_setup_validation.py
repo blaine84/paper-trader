@@ -79,3 +79,55 @@ def test_unclear_direction_without_actionable_suggestion_is_forced_to_hold():
     assert result["confidence"] == "low"
     assert result["normalized_setup_suggestion"] is None
     assert result["needs_setup_type_review"] is True
+
+
+def test_actionable_unclear_direction_infers_long_breakout_setup():
+    signal = {
+        "symbol": "TSLA",
+        "signal": "LONG",
+        "strength": "moderate",
+        "confidence": "medium",
+        "setup_type": "unclear_direction",
+        "normalized_setup_suggestion": None,
+        "setup_reasoning": "Bullish trend near VWAP with a potential breakout.",
+        "reasoning": "MACD bullish and price is holding above VWAP.",
+        "key_levels": {"support": 404.91, "resistance": 412.49, "vwap": 408.97},
+        "indicators": {
+            "rsi": 54.54,
+            "macd_bias": "bullish",
+            "ema_trend": "bullish",
+            "above_vwap": True,
+        },
+    }
+
+    result = normalize_analyst_signal_shape(signal, "TSLA")
+
+    assert result["setup_type"] == "breakout_retest"
+    assert result["signal"] == "LONG"
+    assert result["normalized_setup_suggestion"] == "breakout_retest"
+
+
+def test_oversold_unclear_short_without_suggestion_stays_hold():
+    signal = {
+        "symbol": "GLD",
+        "signal": "SHORT",
+        "strength": "strong",
+        "confidence": "high",
+        "setup_type": "unclear_direction",
+        "normalized_setup_suggestion": None,
+        "setup_reasoning": "Risk-off but RSI is oversold and price may bounce.",
+        "reasoning": "Bearish MACD, below VWAP, but oversold near support.",
+        "key_levels": {"support": 374.97, "resistance": 378.44, "vwap": 375.75},
+        "indicators": {
+            "rsi": 36.47,
+            "macd_bias": "bearish",
+            "ema_trend": "bearish",
+            "above_vwap": False,
+        },
+    }
+
+    result = normalize_analyst_signal_shape(signal, "GLD")
+
+    assert result["setup_type"] == "unclear_direction"
+    assert result["signal"] == "HOLD"
+    assert result["normalized_setup_suggestion"] is None
