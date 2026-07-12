@@ -223,7 +223,11 @@ def process_swing_signals(
         SWING_SECTOR_CONCENTRATION_WARN_THRESHOLD,
     )
     from utils.setup_normalizer import normalize_setup, TechnicalContext
-    from utils.swing_geometry_builder import build_swing_geometry, SwingGeometry
+    from utils.swing_geometry_builder import (
+        build_swing_geometry,
+        derive_sector_rotation_swing_prices,
+        SwingGeometry,
+    )
 
     results: list[SwingBridgeResult] = []
     registered_candidates: list[dict] = []
@@ -326,10 +330,19 @@ def process_swing_signals(
         stop_price = signal.get("stop_price")
         target_price = signal.get("target_price")
 
-        # Convert to Decimal if not None
-        entry_dec = Decimal(str(entry_price)) if entry_price is not None else Decimal("0")
-        stop_dec = Decimal(str(stop_price)) if stop_price is not None else None
-        target_dec = Decimal(str(target_price)) if target_price is not None else None
+        if normalized_type == "sector_rotation_swing" and (
+            entry_price is None or stop_price is None or target_price is None
+        ):
+            entry_dec, stop_dec, target_dec = derive_sector_rotation_swing_prices(
+                signal=signal,
+                direction=direction,
+                profile_id=profile_id,
+            )
+        else:
+            # Convert to Decimal if not None
+            entry_dec = Decimal(str(entry_price)) if entry_price is not None else Decimal("0")
+            stop_dec = Decimal(str(stop_price)) if stop_price is not None else None
+            target_dec = Decimal(str(target_price)) if target_price is not None else None
 
         geom_result = build_swing_geometry(
             symbol=symbol,

@@ -73,6 +73,111 @@ SWING_GEOMETRY_MIN_RR: dict[str, Decimal] = {
     "aggressive": Decimal("1.25"),
 }
 
+DERIVED_SWING_TARGET_MULTIPLIER: dict[str, Decimal] = {
+    "conservative": Decimal("3.0"),
+    "moderate": Decimal("2.0"),
+    "aggressive": Decimal("1.5"),
+}
+
+DERIVED_SWING_MIN_STOP_PCT: Decimal = Decimal("0.02")
+
+
+def _to_positive_decimal(value) -> Decimal | None:
+    """Convert a finite positive price-like value to Decimal."""
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        dec = Decimal(str(value))
+    except Exception:
+        return None
+
+    try:
+        value_float = float(dec)
+    except Exception:
+        return None
+
+    if math.isnan(value_float) or math.isinf(value_float) or dec <= 0:
+        return None
+    return dec
+
+
+def _extract_level_prices(signal: dict) -> dict[str, Decimal]:
+    """Extract positive numeric key levels from an Analyst signal."""
+    source = signal.get("key_levels_sanitized")
+    if not isinstance(source, dict):
+        source = signal.get("key_levels")
+    if not isinstance(source, dict):
+        return {}
+
+    levels: dict[str, Decimal] = {}
+    for key, value in source.items():
+        if not isinstance(key, str):
+            continue
+        dec = _to_positive_decimal(value)
+        if dec is not None:
+            levels[key.lower()] = dec
+    return levels
+
+
+def derive_sector_rotation_swing_prices(
+    signal: dict,
+    direction: Literal["LONG", "SHORT"],
+    profile_id: str,
+) -> tuple[Decimal, Decimal | None, Decimal | None]:
+    """Derive missing sector-rotation swing entry/stop/target prices.
+
+    The Analyst classifies setup quality; this deterministic helper supplies
+    executable geometry when the signal has current price and key levels but
+    no explicit swing prices.
+    """
+    entry = _to_positive_decimal(signal.get("entry_price"))
+    if entry is None:
+        entry = _to_positive_decimal(signal.get("current_price"))
+    if entry is None:
+        return Decimal("0"), None, None
+
+    stop = _to_positive_decimal(signal.get("stop_price"))
+    target = _to_positive_decimal(signal.get("target_price"))
+
+    levels = _extract_level_prices(signal)
+    min_stop_distance = DECIMAL_CTX.multiply(entry, DERIVED_SWING_MIN_STOP_PCT)
+
+    if stop is None:
+        if direction == "LONG":
+            lower_levels = [
+                price for name, price in levels.items()
+                if name in {"support", "vwap", "day_low", "previous_close"}
+                and price < entry
+            ]
+            if lower_levels:
+                stop = min(max(lower_levels), entry - min_stop_distance)
+            else:
+                stop = entry - min_stop_distance
+        elif direction == "SHORT":
+            upper_levels = [
+                price for name, price in levels.items()
+                if name in {"resistance", "vwap", "day_high", "previous_close"}
+                and price > entry
+            ]
+            if upper_levels:
+                stop = max(min(upper_levels), entry + min_stop_distance)
+            else:
+                stop = entry + min_stop_distance
+
+    if target is None and stop is not None:
+        risk = abs(entry - stop)
+        multiplier = DERIVED_SWING_TARGET_MULTIPLIER.get(
+            profile_id, DERIVED_SWING_TARGET_MULTIPLIER["moderate"]
+        )
+        reward = DECIMAL_CTX.multiply(risk, multiplier)
+        if direction == "LONG":
+            target = entry + reward
+        elif direction == "SHORT":
+            target = entry - reward
+
+    return entry, stop, target
+
 
 def build_swing_geometry(
     symbol: str,

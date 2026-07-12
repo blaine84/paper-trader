@@ -9,6 +9,7 @@ from decimal import Decimal
 
 from utils.swing_geometry_builder import (
     build_swing_geometry,
+    derive_sector_rotation_swing_prices,
     GeometryRejection,
     SwingGeometry,
     SETUP_HOLDING_HORIZONS,
@@ -141,6 +142,52 @@ class TestMissingGeometry:
         )
         assert isinstance(result, GeometryRejection)
         assert result.reason_code == "missing_geometry"
+
+
+class TestSectorRotationSwingPriceDerivation:
+    """Missing sector-rotation swing geometry can be derived from signal context."""
+
+    def test_long_prices_derive_from_current_price_and_support(self):
+        entry, stop, target = derive_sector_rotation_swing_prices(
+            {
+                "current_price": 100.0,
+                "key_levels": {"support": 97.0, "resistance": 106.0},
+            },
+            direction="LONG",
+            profile_id="moderate",
+        )
+
+        assert entry == Decimal("100.0")
+        assert stop == Decimal("97.0")
+        assert target == Decimal("106.00")
+
+    def test_support_inside_min_stop_uses_swing_stop_floor(self):
+        entry, stop, target = derive_sector_rotation_swing_prices(
+            {
+                "current_price": 100.0,
+                "key_levels": {"support": 99.5, "resistance": 104.0},
+            },
+            direction="LONG",
+            profile_id="moderate",
+        )
+
+        assert entry == Decimal("100.0")
+        assert stop == Decimal("98.000")
+        assert target == Decimal("104.000")
+
+    def test_short_prices_derive_from_current_price_and_resistance(self):
+        entry, stop, target = derive_sector_rotation_swing_prices(
+            {
+                "current_price": 50.0,
+                "key_levels": {"support": 47.0, "resistance": 52.0},
+            },
+            direction="SHORT",
+            profile_id="aggressive",
+        )
+
+        assert entry == Decimal("50.0")
+        assert stop == Decimal("52.0")
+        assert target == Decimal("47.00")
 
 
 class TestKnownRiskReward:

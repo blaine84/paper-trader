@@ -173,6 +173,27 @@ class TestEnabledModeValidSignal:
         assert len(result) == 1
         assert result[0]["direction"] == "LONG"
 
+    @patch("utils.swing_candidate_bridge._get_swing_mode", return_value="enabled")
+    @patch("utils.swing_candidate_bridge._get_open_swing_symbols", return_value=set())
+    def test_derives_sector_rotation_geometry_when_signal_prices_missing(self, mock_symbols, mock_mode):
+        signals = {
+            "sig-1": _make_signal(
+                current_price=100.0,
+                key_levels={"support": 96.0, "resistance": 108.0},
+            )
+        }
+        for field in ("entry_price", "stop_price", "target_price"):
+            signals["sig-1"].pop(field)
+
+        result = _call_bridge(signals=signals)
+
+        assert len(result) == 1
+        geometry = result[0]["geometry"]
+        assert float(geometry.entry_price) == pytest.approx(100.0)
+        assert float(geometry.stop_price) == pytest.approx(96.0)
+        assert float(geometry.target_price) == pytest.approx(108.0)
+        assert geometry.normalized_setup_type == "sector_rotation_swing"
+
 
 # ---------------------------------------------------------------------------
 # Test Case 4: Enabled mode with invalid signal (normalization fails)
