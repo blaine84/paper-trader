@@ -182,6 +182,43 @@ class TestPromptCandidateTable:
         assert "Fails opening range low" in prompt
         assert "Measured move to premarket high" in prompt
 
+    def test_candidate_details_repeat_complete_trade_specs(self):
+        cid = str(uuid.uuid4())
+        summaries = [
+            _make_candidate_summary(
+                candidate_id=cid,
+                symbol="XLE",
+                direction="BUY",
+                setup_type="sector_rotation_swing",
+                entry_price=56.37,
+                stop_price=55.24,
+                target_price=58.62,
+                risk_reward=2.0,
+                geometry_name="swing_sector_rotation_swing",
+                trigger="Energy rotation continuation above VWAP",
+                invalidation_basis="Fails below swing support",
+                target_basis="Sector rotation measured move",
+            )
+        ]
+
+        prompt = build_candidate_pm_prompt(
+            summaries, _make_portfolio_summary(), _make_profile(), "prof-1"
+        )
+
+        assert "## Candidate Details" in prompt
+        assert f"candidate_id={cid}" in prompt
+        assert "symbol=XLE" in prompt
+        assert "direction=BUY" in prompt
+        assert "entry=$56.37" in prompt
+        assert "stop=$55.24" in prompt
+        assert "target=$58.62" in prompt
+        assert "risk_reward=2.0:1" in prompt
+        assert "setup=sector_rotation_swing" in prompt
+        assert "geometry=swing_sector_rotation_swing" in prompt
+        assert "trigger=Energy rotation continuation above VWAP" in prompt
+        assert "invalidation=Fails below swing support" in prompt
+        assert "target_basis=Sector rotation measured move" in prompt
+
     def test_table_includes_multitimeframe_context(self):
         summaries = [
             _make_candidate_summary(

@@ -4559,7 +4559,23 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                 _record_candidate_event(
                     engine, summary["candidate_id"], cycle_id, profile_id,
                     "offered",
-                    {"symbol": summary["symbol"], "direction": summary["direction"], "risk_reward": summary.get("risk_reward")},
+                    {
+                        "candidate_id": summary["candidate_id"],
+                        "symbol": summary["symbol"],
+                        "direction": summary["direction"],
+                        "setup_type": summary.get("setup_type"),
+                        "geometry_name": summary.get("geometry_name"),
+                        "entry_price": summary.get("entry_price"),
+                        "stop_price": summary.get("stop_price"),
+                        "target_price": summary.get("target_price"),
+                        "risk_reward": summary.get("risk_reward"),
+                        "trigger": summary.get("trigger"),
+                        "invalidation_basis": summary.get("invalidation_basis"),
+                        "target_basis": summary.get("target_basis"),
+                        "candidate_type": summary.get("candidate_type"),
+                        "holding_horizon": summary.get("holding_horizon"),
+                        "multitimeframe_context": summary.get("multitimeframe_context"),
+                    },
                 )
 
             pm_prompt = build_candidate_pm_prompt(

@@ -58,6 +58,9 @@ def build_candidate_pm_prompt(
             f"| {target_basis_text[:80]} | {horizon_text} |"
         )
     candidate_table = "\n".join(table_lines)
+    candidate_details = "\n".join(
+        _format_candidate_detail(i, c) for i, c in enumerate(candidate_summaries, 1)
+    )
 
     # Build portfolio summary
     cash = portfolio_summary.get("cash", 0)
@@ -80,6 +83,10 @@ def build_candidate_pm_prompt(
 
 {candidate_table}
 
+## Candidate Details
+
+{candidate_details}
+
 ## Instructions
 
 You are selecting from the candidates above by their candidate_id ONLY.
@@ -100,6 +107,36 @@ Rules:
 Respond with your decisions in the required JSON format.
 """
     return prompt
+
+
+def _format_candidate_detail(index: int, candidate: dict) -> str:
+    """Repeat executable trade specs in model-friendly prose.
+
+    The wide table is useful for operators, but local models occasionally miss
+    individual columns. Keep a redundant plain-text block so entry geometry is
+    hard to overlook during accept/reject decisions.
+    """
+    trigger_text = _clip_detail(candidate.get("trigger") or "n/a")
+    invalidation_text = _clip_detail(candidate.get("invalidation_basis") or "n/a")
+    target_basis_text = _clip_detail(candidate.get("target_basis") or "n/a")
+    mtf_text = _format_mtf_summary(candidate.get("multitimeframe_context"))
+    holding_horizon = candidate.get("holding_horizon")
+    horizon_text = f"; horizon={holding_horizon}d" if holding_horizon else ""
+
+    return (
+        f"{index}. candidate_id={candidate['candidate_id']}; "
+        f"symbol={candidate['symbol']}; direction={candidate['direction']}; "
+        f"entry=${candidate['entry_price']:.2f}; stop=${candidate['stop_price']:.2f}; "
+        f"target=${candidate['target_price']:.2f}; "
+        f"risk_reward={candidate['risk_reward']:.1f}:1; "
+        f"setup={candidate['setup_type']}; geometry={candidate.get('geometry_name', '')}; "
+        f"trigger={trigger_text}; invalidation={invalidation_text}; "
+        f"target_basis={target_basis_text}{horizon_text}; mtf={mtf_text}"
+    )
+
+
+def _clip_detail(value: Any, max_chars: int = 80) -> str:
+    return str(value)[:max_chars]
 
 
 def _format_mtf_summary(context: Any) -> str:
