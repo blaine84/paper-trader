@@ -54,7 +54,7 @@ class TestDateCutoffFilter:
 
     def test_postgres_default_param(self, pg_engine):
         result = _date_cutoff_filter(pg_engine, "b.created_at")
-        assert result == "b.created_at >= NOW() + :cutoff::interval"
+        assert result == "b.created_at >= NOW() + CAST(:cutoff AS interval)"
 
     def test_custom_param_name_sqlite(self, sqlite_engine):
         result = _date_cutoff_filter(sqlite_engine, "t.updated_at", param_name="window")
@@ -62,7 +62,7 @@ class TestDateCutoffFilter:
 
     def test_custom_param_name_postgres(self, pg_engine):
         result = _date_cutoff_filter(pg_engine, "t.updated_at", param_name="window")
-        assert result == "t.updated_at >= NOW() + :window::interval"
+        assert result == "t.updated_at >= NOW() + CAST(:window AS interval)"
 
 
 # ── _json_field tests ───────────────────────────────────────────────────────

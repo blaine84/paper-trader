@@ -17,12 +17,12 @@ def _date_cutoff_filter(engine: Engine, column: str, param_name: str = "cutoff")
     """Return a WHERE clause fragment for date cutoff filtering.
 
     SQLite: datetime({column}) >= datetime('now', :{param_name})
-    Postgres: {column} >= NOW() + :{param_name}::interval
+    Postgres: {column} >= NOW() + CAST(:{param_name} AS interval)
     """
     if is_sqlite(engine):
         return f"datetime({column}) >= datetime('now', :{param_name})"
     else:
-        return f"{column} >= NOW() + :{param_name}::interval"
+        return f"{column} >= NOW() + CAST(:{param_name} AS interval)"
 
 
 def _json_field(engine: Engine, column: str, key: str) -> str:
