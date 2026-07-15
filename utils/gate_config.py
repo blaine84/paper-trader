@@ -285,6 +285,14 @@ PM_SHADOW_RUN_LEGACY_ENTRY: bool = os.environ.get(
     "PM_SHADOW_RUN_LEGACY_ENTRY", "false"
 ).lower() == "true"
 
+# Controls whether missing rejection codes produce violations or just warnings.
+# Values: "warn" | "enforcing"
+PM_REJECTION_CODE_MODE: str = os.environ.get("PM_REJECTION_CODE_MODE", "warn")
+
+# Controls whether preflight-failed candidates are excluded or shown in observe mode.
+# Values: "disabled" | "observe" | "enabled"
+PM_PREFLIGHT_OBSERVE_MODE: str = os.environ.get("PM_PREFLIGHT_OBSERVE_MODE", "disabled")
+
 # Closed set of setup types eligible for candidate-ID pipeline execution.
 # Only these types will be offered to PM in candidate mode.
 # Other setup types may still flow through legacy entry or shadow mode.
@@ -411,6 +419,26 @@ SWING_SECTOR_CONCENTRATION_WARN_THRESHOLD: int = int(
 SWING_CONSERVATIVE_OBSERVE_ONLY: bool = os.environ.get(
     "SWING_CONSERVATIVE_OBSERVE_ONLY", "false"
 ).lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Swing Freshness Thresholds
+# ---------------------------------------------------------------------------
+
+# Signal freshness: maximum age in hours before a signal is considered stale.
+# Read from the SWING_SIGNAL_FRESHNESS_HOURS environment variable.
+# Bounded to [1, 168] hours (1 hour minimum, 1 week maximum).
+# Default: 24 hours (matches SWING_MAX_CANDIDATE_AGE_HOURS).
+_raw_signal_freshness = os.environ.get("SWING_SIGNAL_FRESHNESS_HOURS", "24")
+try:
+    _signal_freshness_val = int(_raw_signal_freshness)
+except (ValueError, TypeError):
+    logger.warning(
+        "SWING_SIGNAL_FRESHNESS_HOURS has non-numeric value '%s'; using default 24.",
+        _raw_signal_freshness,
+    )
+    _signal_freshness_val = 24
+
+SWING_SIGNAL_FRESHNESS_HOURS: int = max(1, min(168, _signal_freshness_val))
 
 # ---------------------------------------------------------------------------
 # Price Alert PM Dispatcher

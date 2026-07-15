@@ -331,6 +331,475 @@ def _record_pipeline_shadow_block(
         )
 
 
+def _write_candidate_event(
+    engine,
+    candidate_id: str,
+    cycle_id: str,
+    profile_id: str,
+    event_type: str,
+    event_data: dict,
+    candidate_type: str = "intraday",
+) -> None:
+    """Generic helper to INSERT a row into pm_candidate_events.
+
+    This is the low-level writer used by all preflight event recording
+    functions. It does NOT wrap in try/except — callers are responsible
+    for fail-open guards.
+
+    Args:
+        engine: SQLAlchemy engine with access to pm_candidate_events table.
+        candidate_id: UUID of the candidate.
+        cycle_id: Current cycle identifier.
+        profile_id: Active profile identifier.
+        event_type: Event classification string.
+        event_data: Dict payload serialized to JSON.
+        candidate_type: "intraday" or "swing".
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import text as sql_text
+
+    now = datetime.now(timezone.utc).isoformat()
+    with engine.connect() as conn:
+        conn.execute(
+            sql_text("""
+                INSERT INTO pm_candidate_events
+                (candidate_id, cycle_id, profile_id, event_type, event_data, created_at, candidate_type)
+                VALUES (:candidate_id, :cycle_id, :profile_id, :event_type, :event_data, :created_at, :candidate_type)
+            """),
+            {
+                "candidate_id": candidate_id,
+                "cycle_id": cycle_id,
+                "profile_id": profile_id,
+                "event_type": event_type,
+                "event_data": json.dumps(event_data),
+                "created_at": now,
+                "candidate_type": candidate_type,
+            },
+        )
+        conn.commit()
+
+
+def _write_preflight_passed_event(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    preflight_summary,
+) -> None:
+    """Write preflight_passed event with full summary dict. Fail-open.
+
+    Records all boolean check results and an empty blocking_reason_codes list
+    when a candidate passes all preflight checks.
+
+    Requirements: 2.2, 2.3, 9.4
+    """
+    try:
+        event_data = {
+            "has_entry_stop_target": preflight_summary.has_entry_stop_target,
+            "min_risk_reward_met": preflight_summary.min_risk_reward_met,
+            "direction_valid": preflight_summary.direction_valid,
+            "profile_allowed": preflight_summary.profile_allowed,
+            "candidate_not_expired": preflight_summary.candidate_not_expired,
+            "cash_available": preflight_summary.cash_available,
+            "sizing_possible": preflight_summary.sizing_possible,
+            "max_positions_available": preflight_summary.max_positions_available,
+            "same_symbol_allowed": preflight_summary.same_symbol_allowed,
+            "blocking_reason_codes": [],
+        }
+        _write_candidate_event(
+            engine, candidate.candidate_id, cycle_id, profile_id,
+            "preflight_passed", event_data, candidate.candidate_type,
+        )
+    except Exception:
+        logger.error(
+            "Failed to write preflight_passed event for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+def _write_preflight_failed_event(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    preflight_summary,
+) -> None:
+    """Write preflight_failed event with blocking_reason_codes. Fail-open.
+
+    Records all boolean check results and the list of blocking reason codes
+    when a candidate fails one or more preflight checks.
+
+    Requirements: 2.2, 9.4
+    """
+    try:
+        event_data = {
+            "has_entry_stop_target": preflight_summary.has_entry_stop_target,
+            "min_risk_reward_met": preflight_summary.min_risk_reward_met,
+            "direction_valid": preflight_summary.direction_valid,
+            "profile_allowed": preflight_summary.profile_allowed,
+            "candidate_not_expired": preflight_summary.candidate_not_expired,
+            "cash_available": preflight_summary.cash_available,
+            "sizing_possible": preflight_summary.sizing_possible,
+            "max_positions_available": preflight_summary.max_positions_available,
+            "same_symbol_allowed": preflight_summary.same_symbol_allowed,
+            "blocking_reason_codes": list(preflight_summary.blocking_reason_codes),
+        }
+        _write_candidate_event(
+            engine, candidate.candidate_id, cycle_id, profile_id,
+            "preflight_failed", event_data, candidate.candidate_type,
+        )
+    except Exception:
+        logger.error(
+            "Failed to write preflight_failed event for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+def _write_preflight_excluded_event(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    preflight_summary,
+) -> None:
+    """Write preflight_excluded event with geometry and shadow_eligible. Fail-open.
+
+    Records blocking reason codes, the candidate's signal snapshot, geometry
+    fields, and whether the candidate is eligible for shadow analysis.
+
+    shadow_eligible is true if all of entry_price, stop_price, target_price,
+    and risk_reward are present and non-zero.
+
+    Requirements: 3.1, 3.3, 3.4, 9.4
+    """
+    try:
+        # shadow_eligible = all geometry fields present and non-zero
+        shadow_eligible = (
+            candidate.entry_price is not None and candidate.entry_price != 0
+            and candidate.stop_price is not None and candidate.stop_price != 0
+            and candidate.target_price is not None and candidate.target_price != 0
+            and candidate.risk_reward is not None and candidate.risk_reward != 0
+        )
+        event_data = {
+            "blocking_reason_codes": list(preflight_summary.blocking_reason_codes),
+            "signal_snapshot_json": candidate.signal_snapshot_json,
+            "entry_price": candidate.entry_price,
+            "stop_price": candidate.stop_price,
+            "target_price": candidate.target_price,
+            "risk_reward": candidate.risk_reward,
+            "geometry_name": candidate.geometry_name,
+            "shadow_eligible": shadow_eligible,
+        }
+        _write_candidate_event(
+            engine, candidate.candidate_id, cycle_id, profile_id,
+            "preflight_excluded", event_data, candidate.candidate_type,
+        )
+    except Exception:
+        logger.error(
+            "Failed to write preflight_excluded event for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+def _write_execution_failed_event(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    intended_action: str,
+    attempted_quantity: int,
+    failure_reason: str,
+) -> None:
+    """Write execution_failed event with truncated failure_reason. Fail-open.
+
+    This is DISTINCT from pm_reject and gate_fail events. It indicates that
+    a candidate passed PM selection and all gates but no trade row was created.
+
+    The failure_reason is truncated to a maximum of 1024 characters.
+
+    Requirements: 6.1, 6.2
+    """
+    try:
+        event_data = {
+            "candidate_id": candidate.candidate_id,
+            "profile": profile_id,
+            "symbol": candidate.symbol,
+            "intended_action": intended_action,
+            "attempted_quantity": attempted_quantity,
+            "failure_reason": str(failure_reason)[:1024],
+        }
+        _write_candidate_event(
+            engine, candidate.candidate_id, cycle_id, profile_id,
+            "execution_failed", event_data, candidate.candidate_type,
+        )
+    except Exception:
+        logger.error(
+            "Failed to write execution_failed event for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+def _write_execution_fallback_blocked_event(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    blocked_path: str,
+) -> None:
+    """Write execution_fallback_blocked event when legacy path is blocked. Fail-open.
+
+    Emitted when the execution path targets the legacy free-form order
+    construction path while the pipeline is operating in candidate-ID mode.
+
+    Requirements: 6.3
+    """
+    try:
+        event_data = {
+            "candidate_id": candidate.candidate_id,
+            "blocked_path": blocked_path,
+        }
+        _write_candidate_event(
+            engine, candidate.candidate_id, cycle_id, profile_id,
+            "execution_fallback_blocked", event_data, candidate.candidate_type,
+        )
+    except Exception:
+        logger.error(
+            "Failed to write execution_fallback_blocked event for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+def _attempt_execution_failed_transition(engine, candidate_id: str) -> None:
+    """Attempt CAS transition to EXECUTION_FAILED state. Fail-open.
+
+    Attempts to transition the candidate from RESERVED to EXECUTION_FAILED
+    using a Compare-And-Swap update. If CAS fails (rowcount == 0), this means
+    another thread/process already moved the state — log and continue, relying
+    on finalize_cycle() to enforce the terminal state guarantee.
+
+    Requirements: 6.4, 6.5
+    """
+    try:
+        from sqlalchemy import text as sql_text
+
+        with engine.connect() as conn:
+            result = conn.execute(
+                sql_text(
+                    "UPDATE pm_candidates SET state = 'execution_failed' "
+                    "WHERE candidate_id = :candidate_id AND state = 'reserved'"
+                ),
+                {"candidate_id": candidate_id},
+            )
+            conn.commit()
+            if result.rowcount == 0:
+                logger.error(
+                    "CAS transition to EXECUTION_FAILED failed for %s (rowcount=0), "
+                    "relying on finalize_cycle()",
+                    candidate_id,
+                )
+    except Exception:
+        logger.error(
+            "Exception during EXECUTION_FAILED CAS transition for %s, "
+            "relying on finalize_cycle()",
+            candidate_id,
+            exc_info=True,
+        )
+
+
+def _write_pm_accept_event(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    risk_multiplier: float,
+) -> None:
+    """Write pm_accept event with candidate_id, profile, risk_multiplier. Fail-open.
+
+    Requirements: 5.1, 9.4
+    """
+    try:
+        event_data = {
+            "candidate_id": candidate.candidate_id,
+            "profile": profile_id,
+            "risk_multiplier": risk_multiplier,
+        }
+        _write_candidate_event(
+            engine, candidate.candidate_id, cycle_id, profile_id,
+            "pm_accept", event_data, candidate.candidate_type,
+        )
+    except Exception:
+        logger.error(
+            "Failed to write pm_accept event for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+def _write_sizing_event(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    passed: bool,
+    quantity: int,
+    dollar_risk: float,
+    risk_percent: float,
+    reason_code: str | None = None,
+) -> None:
+    """Write sizing_pass or sizing_fail event. Fail-open.
+
+    Args:
+        engine: SQLAlchemy engine.
+        candidate: CandidateRecord being evaluated.
+        cycle_id: Current cycle identifier.
+        profile_id: Active profile identifier.
+        passed: True if sizing succeeded, False if rejected.
+        quantity: Computed quantity (0 if rejected).
+        dollar_risk: Dollar amount at risk.
+        risk_percent: Percentage of portfolio equity risked.
+        reason_code: Rejection rule identifier (only when passed=False).
+
+    Requirements: 5.2, 9.4
+    """
+    try:
+        event_type = "sizing_pass" if passed else "sizing_fail"
+        event_data = {
+            "quantity": quantity,
+            "dollar_risk": str(dollar_risk),
+            "risk_percent": str(risk_percent),
+        }
+        if not passed and reason_code:
+            event_data["reason_code"] = reason_code
+        _write_candidate_event(
+            engine, candidate.candidate_id, cycle_id, profile_id,
+            event_type, event_data, candidate.candidate_type,
+        )
+    except Exception:
+        logger.error(
+            "Failed to write sizing event for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+# Fixed gate pipeline order for telemetry events.
+# Maps canonical gate names to the gate key used in _run_gate_pipeline notes.
+GATE_PIPELINE_ORDER = [
+    "setup_quality",
+    "pre_trade_quality",
+    "catalyst_specificity",
+    "risk_geometry",
+    "concentration",
+]
+
+# Map from _run_gate_pipeline note "gate" field to canonical gate name
+_GATE_NOTE_TO_CANONICAL = {
+    "setup_quality_gate": "setup_quality",
+    "pre_trade_quality_gate": "pre_trade_quality",
+    "catalyst_specificity_gate": "catalyst_specificity",
+    "risk_geometry_gate": "risk_geometry",
+    "concentration_gate": "concentration",
+}
+
+
+def _write_gate_events(
+    engine,
+    candidate: CandidateRecord,
+    cycle_id: str,
+    profile_id: str,
+    gate_notes: list[dict],
+) -> None:
+    """Write gate_pass/gate_fail events in pipeline order, stopping after first failure. Fail-open.
+
+    Iterates through the gate notes in pipeline order. For each gate that
+    has a result in gate_notes, writes a gate_pass or gate_fail event.
+    Stops after the first gate_fail event.
+
+    A gate is considered failed if its decision is "reject", "rejected",
+    "override_required", or "block".
+
+    Requirements: 5.3, 9.4
+    """
+    try:
+        if not gate_notes:
+            return
+
+        # Index gate notes by canonical name for ordered iteration
+        notes_by_canonical = {}
+        for note in gate_notes:
+            if not isinstance(note, dict):
+                continue
+            gate_key = note.get("gate") or note.get("gate_name")
+            if gate_key:
+                canonical = _GATE_NOTE_TO_CANONICAL.get(gate_key, gate_key)
+                notes_by_canonical[canonical] = note
+
+        # Emit events in fixed pipeline order, stopping after first failure
+        for gate_name in GATE_PIPELINE_ORDER:
+            note = notes_by_canonical.get(gate_name)
+            if note is None:
+                continue
+
+            decision = note.get("decision", "")
+            gate_failed = decision in ("reject", "rejected", "override_required", "block")
+            event_type = "gate_fail" if gate_failed else "gate_pass"
+
+            event_data = {"gate_name": gate_name}
+            if gate_failed:
+                event_data["reason_code"] = (
+                    note.get("reason_type")
+                    or note.get("reason_code")
+                    or note.get("reason")
+                    or gate_name
+                )
+
+            _write_candidate_event(
+                engine, candidate.candidate_id, cycle_id, profile_id,
+                event_type, event_data, candidate.candidate_type,
+            )
+
+            if gate_failed:
+                break  # Stop after first failure
+
+    except Exception:
+        logger.error(
+            "Failed to write gate events for %s",
+            candidate.candidate_id,
+            exc_info=True,
+        )
+
+
+def _determine_first_blocking_stage(
+    sizing_failed: bool,
+    failing_gate_name: str | None,
+) -> str | None:
+    """Determine first_blocking_stage from fixed pipeline ordering.
+
+    Uses the fixed ordering: position_sizer → setup_quality → pre_trade_quality
+    → catalyst_specificity → risk_geometry → concentration.
+
+    Args:
+        sizing_failed: True if the position sizer rejected the candidate.
+        failing_gate_name: Canonical name of the first failing gate (from gate notes),
+            or None if no gate failed.
+
+    Returns:
+        The first blocking stage name, or None if neither sizing nor gates failed.
+
+    Requirements: 5.4
+    """
+    if sizing_failed:
+        return "position_sizer"
+    if failing_gate_name:
+        return failing_gate_name
+    return None
+
+
 def record_behavioral_adjustment_provenance(
     chain: 'ProvenanceChain | None',
     resolved_order: ResolvedOrder,
@@ -1592,3 +2061,59 @@ def dry_run_candidate_pipeline(
         resolved_order=resolved_order,
         sizing_result=sizing_result,
     )
+
+
+# ── Missing geometry claim detection (Requirement 4.2) ─────────────────────
+
+# Phrases that indicate the PM is claiming missing geometry in rejection rationale
+_MISSING_GEOMETRY_PHRASES = [
+    "missing entry", "no entry", "no entry price",
+    "missing stop", "no stop", "no stop price", "without stop",
+    "missing target", "no target", "no target price", "without target",
+    "missing geometry", "incomplete geometry",
+    "no risk reward", "no r:r", "missing r:r",
+]
+
+
+def _detect_missing_geometry_claim(
+    engine,
+    candidate_id: str,
+    cycle_id: str,
+    profile_id: str,
+    rationale: str | None,
+) -> None:
+    """Detect and emit event when PM claims missing geometry on preflight-passed candidate.
+
+    When a PM rejects a candidate that passed preflight (meaning geometry IS valid),
+    and the rationale contains phrases claiming missing geometry, emit a contract
+    violation event.
+
+    Fail-open: logs and continues on error.
+    Requirements: 4.2
+    """
+    try:
+        if not rationale:
+            return
+        rationale_lower = rationale.lower()
+        for phrase in _MISSING_GEOMETRY_PHRASES:
+            if phrase in rationale_lower:
+                event_data = {
+                    "candidate_id": candidate_id,
+                    "rationale": str(rationale)[:2000],
+                    "matched_phrase": phrase,
+                }
+                _write_candidate_event(
+                    engine,
+                    candidate_id,
+                    cycle_id,
+                    profile_id,
+                    "contract_violation_missing_geometry_claim",
+                    event_data,
+                )
+                break  # Only emit one event even if multiple phrases match
+    except Exception:
+        logger.error(
+            "Failed to detect missing geometry claim for candidate %s",
+            candidate_id,
+            exc_info=True,
+        )

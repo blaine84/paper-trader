@@ -37,8 +37,6 @@ SWING_NO_CANDIDATES_REASONS = frozenset({
     "no_executable_mapping",
     "missing_geometry",
     "failed_risk_gates",
-    "swing_observe_mode",
-    "all_swing_candidates_rejected",
     "stale_data",
     "same_symbol_exposure",
     "profile_policy",
@@ -290,8 +288,8 @@ def _build_swing_candidates(
         )
 
         if not swing_candidates:
-            # Record JSON explanation in PM notes when no swing candidates built
-            _record_no_swing_explanation(db, cycle_id, profile_id, signals, mode=mode)
+            # swing_evaluation_summary (persisted inside process_swing_signals)
+            # supersedes the old swing_no_candidates event — no duplicate recording.
             return
 
         # Register each swing candidate returned by the bridge
@@ -374,8 +372,6 @@ def _record_no_swing_explanation(
     cycle_id: str,
     profile_id: str,
     signals: dict[str, dict],
-    *,
-    mode: str | None = None,
 ) -> None:
     """Record JSON explanation when no swing candidates are built for a cycle.
 
@@ -383,15 +379,9 @@ def _record_no_swing_explanation(
     persists it as a pm_candidate_events row with event_type 'swing_no_candidates'.
     Fail-open: exceptions are caught and logged.
     """
-    explanation_payload: dict[str, Any]
-
-    if mode == "observe":
-        explanation_payload = {
-            "reason": "swing_observe_mode",
-            "mode": mode,
-        }
-    elif not signals:
-        explanation_payload = {"reason": "no_fresh_signals"}
+    # Determine reason based on available signals
+    if not signals:
+        reason = "no_fresh_signals"
     else:
         # Check if any signals have swing-eligible setup types
         has_swing_eligible = any(
@@ -403,23 +393,11 @@ def _record_no_swing_explanation(
             for sig in signals.values()
         )
         if not has_swing_eligible:
-            explanation_payload = {"reason": "no_executable_mapping"}
+            reason = "no_executable_mapping"
         else:
-            rejection_counts = _get_swing_rejection_counts(db, cycle_id, profile_id)
-            if rejection_counts:
-                primary_reason = max(
-                    rejection_counts,
-                    key=lambda reason_code: rejection_counts[reason_code],
-                )
-                explanation_payload = {
-                    "reason": "all_swing_candidates_rejected",
-                    "primary_rejection_reason": primary_reason,
-                    "rejection_counts": rejection_counts,
-                }
-            else:
-                explanation_payload = {"reason": "failed_risk_gates"}
+            reason = "failed_risk_gates"
 
-    explanation = json.dumps(explanation_payload, sort_keys=True)
+    explanation = json.dumps({"reason": reason}, sort_keys=True)
 
     try:
         from sqlalchemy import text as sql_text
@@ -449,55 +427,8 @@ def _record_no_swing_explanation(
 
     logger.debug(
         "No swing candidates built: profile=%s cycle=%s reason=%s",
-        profile_id, cycle_id, explanation_payload.get("reason"),
+        profile_id, cycle_id, reason,
     )
-
-
-def _get_swing_rejection_counts(
-    db: Any,
-    cycle_id: str,
-    profile_id: str,
-) -> dict[str, int]:
-    """Return per-reason counts from bridge rejection events for one cycle/profile."""
-    if db is None:
-        return {}
-
-    try:
-        from sqlalchemy import text as sql_text
-
-        with db.connect() as conn:
-            rows = conn.execute(
-                sql_text("""
-                    SELECT event_data
-                    FROM pm_candidate_events
-                    WHERE cycle_id = :cycle_id
-                      AND profile_id = :profile_id
-                      AND event_type = 'swing_candidate_rejected'
-                      AND COALESCE(candidate_type, 'swing') = 'swing'
-                """),
-                {"cycle_id": cycle_id, "profile_id": profile_id},
-            ).fetchall()
-
-        counts: dict[str, int] = {}
-        for row in rows:
-            raw_event_data = row[0]
-            if not raw_event_data:
-                continue
-            try:
-                event_data = json.loads(raw_event_data)
-            except (TypeError, ValueError):
-                continue
-            reason_code = event_data.get("reason_code")
-            if not isinstance(reason_code, str) or not reason_code:
-                continue
-            counts[reason_code] = counts.get(reason_code, 0) + 1
-        return counts
-    except Exception as exc:
-        logger.warning(
-            "Failed to summarize swing rejection reasons (fail-open): %s",
-            exc,
-        )
-        return {}
 
 
 def _get_held_symbols(portfolio: dict) -> set[str]:

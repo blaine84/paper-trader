@@ -56,6 +56,7 @@ def _make_signal(symbol="AAPL", setup_type="sector_rotation", direction="LONG",
         "stop_price": stop_price,
         "target_price": target_price,
         "signal_age_hours": 0,
+        "catalyst_freshness": "fresh",
         "sector": "technology",
     }
 
