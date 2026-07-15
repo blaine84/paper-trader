@@ -285,6 +285,14 @@ PM_SHADOW_RUN_LEGACY_ENTRY: bool = os.environ.get(
     "PM_SHADOW_RUN_LEGACY_ENTRY", "false"
 ).lower() == "true"
 
+# Controls whether missing rejection codes produce violations or just warnings.
+# Values: "warn" | "enforcing"
+PM_REJECTION_CODE_MODE: str = os.environ.get("PM_REJECTION_CODE_MODE", "warn")
+
+# Controls whether preflight-failed candidates are excluded or shown in observe mode.
+# Values: "disabled" | "observe" | "enabled"
+PM_PREFLIGHT_OBSERVE_MODE: str = os.environ.get("PM_PREFLIGHT_OBSERVE_MODE", "disabled")
+
 # Closed set of setup types eligible for candidate-ID pipeline execution.
 # Only these types will be offered to PM in candidate mode.
 # Other setup types may still flow through legacy entry or shadow mode.

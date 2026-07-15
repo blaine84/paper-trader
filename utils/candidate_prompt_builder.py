@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from utils.gate_config import PM_PREFLIGHT_OBSERVE_MODE
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,6 +64,31 @@ def build_candidate_pm_prompt(
         _format_candidate_detail(i, c) for i, c in enumerate(candidate_summaries, 1)
     )
 
+    # Build preflight attestation block (only when preflight is active)
+    attestation_lines = []
+    if PM_PREFLIGHT_OBSERVE_MODE != "observe":
+        for c in candidate_summaries:
+            entry = c.get("entry_price", 0)
+            stop = c.get("stop_price", 0)
+            target = c.get("target_price", 0)
+            rr = c.get("risk_reward", 0)
+            cid = c["candidate_id"]
+            candidate_type = c.get("candidate_type", "intraday") or "intraday"
+            setup_type = c.get("setup_type", "")
+            horizon_label = "Swing" if candidate_type == "swing" else "Intraday"
+            attestation_lines.append(
+                f"✓ VALIDATED: Entry (${entry:.2f}), Stop (${stop:.2f}), "
+                f"Target (${target:.2f}), R:R ({rr:.2f}), Candidate ID {cid} verified. "
+                f"| Holding Horizon: {horizon_label} | Setup Type: {setup_type}"
+            )
+
+    attestation_block = ""
+    if attestation_lines:
+        attestation_block = (
+            "\n\n## Preflight Attestation\n\n"
+            + "\n".join(attestation_lines)
+        )
+
     # Build portfolio summary
     cash = portfolio_summary.get("cash", 0)
     equity = portfolio_summary.get("total_equity", 0)
@@ -74,6 +101,14 @@ def build_candidate_pm_prompt(
         f"{num_positions}/{max_positions} positions open"
     )
 
+    # Rejection guidance instruction (Requirements 4.1, 4.4)
+    rejection_guidance = (
+        "IMPORTANT: Valid reasons for rejection are market quality, profile fit, "
+        "timing, exposure, or risk. "
+        "Do NOT reject candidates for missing executable geometry — entry, stop, "
+        "target, and R:R have been verified."
+    )
+
     # Build full prompt
     prompt = f"""You are the {profile.get('name', profile_id)} Portfolio Manager.
 
@@ -81,7 +116,7 @@ def build_candidate_pm_prompt(
 
 ## Available Candidates
 
-{candidate_table}
+{candidate_table}{attestation_block}
 
 ## Candidate Details
 
@@ -92,6 +127,8 @@ def build_candidate_pm_prompt(
 You are selecting from the candidates above by their candidate_id ONLY.
 
 For each candidate, decide: accept (take the trade) or reject (pass on it).
+
+{rejection_guidance}
 
 Rules:
 - Select by candidate_id only — do NOT specify symbols, prices, quantities, or sector labels

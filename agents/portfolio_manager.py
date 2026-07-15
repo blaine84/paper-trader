@@ -4500,7 +4500,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
     if PM_CANDIDATE_MODE in ("enabled", "shadow"):
         import copy
         import uuid
-        from utils.candidate_registry import recover_stale_reservations
+        from utils.candidate_registry import recover_stale_reservations, CandidateState
         from utils.candidate_builder import build_candidate_set
         from utils.candidate_prompt_builder import build_candidate_pm_prompt, build_decision_schema
         from utils.decision_contract import (
@@ -4508,7 +4508,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             should_retry_candidate_contract,
             build_candidate_retry_prompt,
         )
-        from utils.candidate_pipeline import execute_candidate_pipeline, dry_run_candidate_pipeline
+        from utils.candidate_pipeline import execute_candidate_pipeline, dry_run_candidate_pipeline, _write_candidate_event
 
         # Instantiate checkpoint logger (fail-open, Requirements 11.1, 11.3)
         try:
@@ -4554,6 +4554,139 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             # Build PM prompt with candidate summaries
             candidate_summaries = registry.get_offered_summary()
 
+            # ── Preflight filtering (Requirements 3.1, 3.2, 3.5, 9.6, 9.7) ───
+            from utils.preflight_validator import compute_preflight_safe
+            from utils.gate_config import PM_PREFLIGHT_OBSERVE_MODE
+            from utils.candidate_pipeline import (
+                _write_preflight_passed_event,
+                _write_preflight_failed_event,
+                _write_preflight_excluded_event,
+            )
+
+            def _apply_preflight_filtering(
+                summaries: list[dict],
+                registry_ref,
+                engine_ref,
+                portfolio_ref: dict,
+                profile_ref: dict,
+                profile_id_ref: str,
+                cycle_id_ref: str,
+            ) -> tuple[list[dict], set[str]]:
+                """Apply preflight validation and filter candidates. Fail-open.
+
+                Returns:
+                    Tuple of (filtered_summaries for PM prompt, set of observe-only candidate_ids).
+                """
+                from datetime import timezone as _tz
+
+                observe_only_ids: set[str] = set()
+                filtered: list[dict] = []  # summaries to include in prompt
+                mode = PM_PREFLIGHT_OBSERVE_MODE
+
+                # Build open positions list from portfolio snapshot
+                open_positions = [
+                    {"symbol": p["symbol"]} for p in portfolio_ref.get("positions", [])
+                ]
+
+                # Adapt portfolio for preflight (expects 'available_cash' key)
+                preflight_portfolio = {
+                    "available_cash": portfolio_ref.get("cash", 0),
+                }
+
+                now_utc = datetime.now(_tz.utc)
+
+                for summary in summaries:
+                    cid = summary["candidate_id"]
+                    try:
+                        candidate_record = registry_ref.get(cid)
+                        if candidate_record is None:
+                            # Cannot evaluate — fail-open, include in prompt
+                            filtered.append(summary)
+                            continue
+
+                        pf_summary = compute_preflight_safe(
+                            candidate_record, profile_ref, preflight_portfolio,
+                            open_positions, now_utc,
+                        )
+
+                        if pf_summary.passed:
+                            # Write preflight_passed event (fail-open)
+                            try:
+                                _write_preflight_passed_event(
+                                    engine_ref, candidate_record, cycle_id_ref,
+                                    profile_id_ref, pf_summary,
+                                )
+                            except Exception:
+                                log.error(
+                                    "Failed to write preflight_passed event for %s",
+                                    cid, exc_info=True,
+                                )
+                            filtered.append(summary)
+                        else:
+                            # Candidate failed preflight
+                            if mode == "observe":
+                                # Write preflight_failed event, include with label
+                                try:
+                                    _write_preflight_failed_event(
+                                        engine_ref, candidate_record, cycle_id_ref,
+                                        profile_id_ref, pf_summary,
+                                    )
+                                except Exception:
+                                    log.error(
+                                        "Failed to write preflight_failed event for %s",
+                                        cid, exc_info=True,
+                                    )
+                                log.info(
+                                    "Preflight observe-mode: candidate %s would be excluded "
+                                    "(blocking_reasons=%s), including with observe label",
+                                    cid, pf_summary.blocking_reason_codes,
+                                )
+                                # Mark summary with observe label for prompt builder
+                                summary["_preflight_observe_only"] = True
+                                observe_only_ids.add(cid)
+                                filtered.append(summary)
+                            else:
+                                # mode == "disabled" or "enabled": exclude from prompt
+                                # Write preflight_excluded event (fail-open)
+                                try:
+                                    _write_preflight_excluded_event(
+                                        engine_ref, candidate_record, cycle_id_ref,
+                                        profile_id_ref, pf_summary,
+                                    )
+                                except Exception:
+                                    log.error(
+                                        "Failed to write preflight_excluded event for %s",
+                                        cid, exc_info=True,
+                                    )
+                                # Transition to NOT_SELECTED (fail-open)
+                                try:
+                                    registry_ref._transition_state(
+                                        candidate_id=cid,
+                                        from_state=CandidateState.REGISTERED,
+                                        to_state=CandidateState.NOT_SELECTED,
+                                        rejection_reason="preflight_excluded",
+                                    )
+                                except Exception:
+                                    log.error(
+                                        "Failed to transition %s to NOT_SELECTED after "
+                                        "preflight exclusion; finalize_cycle will handle",
+                                        cid, exc_info=True,
+                                    )
+                    except Exception:
+                        # Fail-open: if anything unexpected happens, include candidate
+                        log.error(
+                            "Preflight filtering error for %s, failing open",
+                            cid, exc_info=True,
+                        )
+                        filtered.append(summary)
+
+                return (filtered, observe_only_ids)
+
+            candidate_summaries, _observe_only_candidate_ids = _apply_preflight_filtering(
+                candidate_summaries, registry, engine, portfolio_snapshot,
+                profile, profile_id, cycle_id,
+            )
+
             # Record offered candidates for audit (Requirement 12.1)
             for summary in candidate_summaries:
                 _record_candidate_event(
@@ -4577,6 +4710,11 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                         "multitimeframe_context": summary.get("multitimeframe_context"),
                     },
                 )
+
+            # For observe-mode candidates, add [OBSERVE ONLY] label to trigger text
+            for summary in candidate_summaries:
+                if summary.get("_preflight_observe_only"):
+                    summary["trigger"] = "[OBSERVE ONLY - NOT EXECUTABLE] " + (summary.get("trigger") or "")
 
             pm_prompt = build_candidate_pm_prompt(
                 candidate_summaries, portfolio_snapshot, profile, profile_id
@@ -4740,7 +4878,10 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                 _record_candidate_event(
                     engine, decision.candidate_id, cycle_id, profile_id,
                     "pm_reject",
-                    {"rationale": decision.rationale},
+                    {
+                        "rationale": (decision.rationale[:2000] if decision.rationale else decision.rationale),
+                        "rejection_reason_code": decision.rejection_reason_code,
+                    },
                 )
             for ns_id in parse_result.not_selected_ids:
                 _record_candidate_event(
@@ -4752,10 +4893,41 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             # Record PM rejection decisions
             if PM_CANDIDATE_MODE == "enabled":
                 for decision in parse_result.rejected:
-                    registry.mark_rejected(decision.candidate_id, decision.rationale)
+                    registry.mark_rejected(
+                        decision.candidate_id,
+                        decision.rationale,
+                        rejection_reason_code=decision.rejection_reason_code,
+                    )
+
+                # Detect missing geometry claims in rejection rationale (Req 4.2)
+                from utils.candidate_pipeline import _detect_missing_geometry_claim
+                for decision in parse_result.rejected:
+                    # Only check preflight-passed candidates (not observe-only)
+                    if decision.candidate_id not in _observe_only_candidate_ids:
+                        _detect_missing_geometry_claim(
+                            engine,
+                            decision.candidate_id,
+                            cycle_id,
+                            profile_id,
+                            decision.rationale,
+                        )
 
                 # Execute each accepted candidate through the pipeline
                 for decision in parse_result.accepted:
+                    # Block execution for observe-only candidates (Req 3.2, 9.7)
+                    if decision.candidate_id in _observe_only_candidate_ids:
+                        log.info(
+                            "Preflight observe-mode: blocking execution for "
+                            "candidate %s despite PM acceptance",
+                            decision.candidate_id,
+                        )
+                        _record_candidate_event(
+                            engine, decision.candidate_id, cycle_id, profile_id,
+                            "preflight_observe_blocked",
+                            {"reason": "observe_only_not_executable"},
+                        )
+                        continue
+
                     pipeline_result = execute_candidate_pipeline(
                         db, engine, registry, decision,
                         portfolio_snapshot, profile, profile_id,
@@ -4779,6 +4951,37 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                         },
                     )
 
+                    # Lifecycle checklist after successful execution (Requirements 7.1, 7.2, 7.3, 7.4)
+                    if pipeline_result.outcome == "executed":
+                        try:
+                            from utils.lifecycle_checklist import write_lifecycle_checklist
+
+                            _lc_trade_id = pipeline_result.candidate_id  # trade linked by candidate_lineage_id
+                            checklist = write_lifecycle_checklist(
+                                engine,
+                                pipeline_result.candidate_id,
+                                _lc_trade_id,
+                                cycle_id,
+                                profile_id,
+                            )
+                            if checklist and not checklist.complete:
+                                try:
+                                    _write_candidate_event(
+                                        engine, pipeline_result.candidate_id, cycle_id, profile_id,
+                                        "lifecycle_incomplete",
+                                        {"missing_components": checklist.missing_components},
+                                    )
+                                except Exception:
+                                    log.error(
+                                        "Failed to write lifecycle_incomplete event for %s",
+                                        pipeline_result.candidate_id, exc_info=True,
+                                    )
+                        except Exception:
+                            log.error(
+                                "Lifecycle checklist failed for %s, continuing",
+                                pipeline_result.candidate_id, exc_info=True,
+                            )
+
                     executed.append({
                         "symbol": pipeline_result.resolved_order.symbol if pipeline_result.resolved_order else "unknown",
                         "action": pipeline_result.resolved_order.action if pipeline_result.resolved_order else "unknown",
@@ -4793,6 +4996,15 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                 from utils.trade_events import log_trade_event
                 candidate_results = []
                 for decision in parse_result.accepted:
+                    # Block execution for observe-only candidates (Req 3.2, 9.7)
+                    if decision.candidate_id in _observe_only_candidate_ids:
+                        log.info(
+                            "Preflight observe-mode (shadow): skipping dry-run for "
+                            "candidate %s despite PM acceptance",
+                            decision.candidate_id,
+                        )
+                        continue
+
                     pipeline_result = dry_run_candidate_pipeline(
                         db, engine, registry, decision,
                         portfolio_snapshot, profile, profile_id,
@@ -4840,6 +5052,22 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
 
             # Finalize cycle (assign terminal states to remaining candidates)
             registry.finalize_cycle()
+
+            # Compute and persist daily loss summary (Req 8.4, 8.5, 8.6)
+            # Must run AFTER finalize_cycle() but BEFORE downstream agents consume results.
+            # Fail-open: never blocks cycle completion.
+            try:
+                from datetime import date as _date_mod
+                from utils.daily_loss_summary import compute_daily_loss_summary, persist_daily_loss_summary
+
+                _trade_date = _date_mod.today().isoformat()
+                _loss_summary = compute_daily_loss_summary(engine, _trade_date, profile_id)
+                persist_daily_loss_summary(engine, _loss_summary)
+            except Exception:
+                log.error(
+                    "Daily loss summary computation/persistence failed for cycle=%s profile=%s",
+                    cycle_id, profile_id, exc_info=True,
+                )
 
             if PM_CANDIDATE_MODE == "enabled":
                 notes = f"Candidate-ID mode: processed {len(parse_result.accepted)} accepts, {len(parse_result.rejected)} rejects."

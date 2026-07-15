@@ -47,6 +47,7 @@ from utils.funnel_researcher import run_funnel_qualification
 from utils.funnel_analyst import run_funnel_analysis
 from utils.funnel_confirmation import run_opening_confirmation, run_confirmation_retry
 from db.provenance_schema import init_provenance_schema
+from db.blocker_mitigation_schema import init_blocker_mitigation_schema
 
 console = Console()
 logging.basicConfig(
@@ -792,6 +793,9 @@ def check_schema(engine):
     # --- Auto-create provenance tables if missing (non-destructive) ---
     init_provenance_schema(engine)
 
+    # --- Auto-create blocker mitigation tables if missing (non-destructive) ---
+    init_blocker_mitigation_schema(engine)
+
     # --- Auto-create decision replay tables and lineage columns if missing ---
     from db.replay_schema import init_replay_db
     init_replay_db(engine)
@@ -805,7 +809,7 @@ def check_schema(engine):
         "trades": ["thesis", "setup_type", "invalidators", "stop_role", "stop_updated_by", "stop_updated_at"],
         "trade_events": ["dedupe_key"],
         "cases": ["exit_category"],
-        "pm_candidates": ["candidate_type", "holding_horizon", "normalized_setup_type"],
+        "pm_candidates": ["candidate_type", "holding_horizon", "normalized_setup_type", "rejection_reason_code"],
         "pm_candidate_events": ["candidate_type"],
     }
 
@@ -834,6 +838,7 @@ def check_schema(engine):
         "candidate_type": "TEXT DEFAULT 'intraday'",
         "holding_horizon": "INTEGER",
         "normalized_setup_type": "TEXT",
+        "rejection_reason_code": "VARCHAR(64)",
     }
 
     with engine.begin() as conn:

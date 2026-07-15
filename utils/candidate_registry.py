@@ -300,13 +300,14 @@ class CandidateRegistry:
             rejection_reason=reason,
         )
 
-    def mark_rejected(self, candidate_id: str, reason: str) -> None:
+    def mark_rejected(self, candidate_id: str, reason: str, rejection_reason_code: str | None = None) -> None:
         """Transition REGISTERED → REJECTED with rejection reason (PM explicit)."""
         self._transition_state(
             candidate_id=candidate_id,
             from_state=CandidateState.REGISTERED,
             to_state=CandidateState.REJECTED,
             rejection_reason=reason,
+            rejection_reason_code=rejection_reason_code,
         )
 
     def finalize_cycle(self) -> dict[str, CandidateState]:
@@ -900,11 +901,13 @@ class CandidateRegistry:
         from_state: CandidateState,
         to_state: CandidateState,
         rejection_reason: str | None = None,
+        rejection_reason_code: str | None = None,
     ) -> None:
         """Execute a CAS state transition. Fails closed if rowcount != 1."""
         try:
             rowcount = self._execute_state_write(
-                candidate_id, from_state, to_state, rejection_reason
+                candidate_id, from_state, to_state, rejection_reason,
+                rejection_reason_code=rejection_reason_code,
             )
             if rowcount != 1:
                 msg = (
@@ -931,6 +934,7 @@ class CandidateRegistry:
         from_state: CandidateState,
         to_state: CandidateState,
         rejection_reason: str | None,
+        rejection_reason_code: str | None = None,
     ) -> int:
         """Execute the DB write for a state transition. Retried on lock contention.
 
@@ -943,7 +947,21 @@ class CandidateRegistry:
                 "expected_state": from_state.value,
             }
 
-            if rejection_reason is not None:
+            if rejection_reason is not None and rejection_reason_code is not None:
+                result = conn.execute(
+                    text(
+                        """
+                        UPDATE pm_candidates
+                        SET state = :new_state,
+                            rejection_reason = :rejection_reason,
+                            rejection_reason_code = :rejection_reason_code
+                        WHERE candidate_id = :candidate_id
+                          AND state = :expected_state
+                        """
+                    ),
+                    {**params, "rejection_reason": rejection_reason, "rejection_reason_code": rejection_reason_code},
+                )
+            elif rejection_reason is not None:
                 result = conn.execute(
                     text(
                         """
@@ -955,6 +973,19 @@ class CandidateRegistry:
                         """
                     ),
                     {**params, "rejection_reason": rejection_reason},
+                )
+            elif rejection_reason_code is not None:
+                result = conn.execute(
+                    text(
+                        """
+                        UPDATE pm_candidates
+                        SET state = :new_state,
+                            rejection_reason_code = :rejection_reason_code
+                        WHERE candidate_id = :candidate_id
+                          AND state = :expected_state
+                        """
+                    ),
+                    {**params, "rejection_reason_code": rejection_reason_code},
                 )
             else:
                 result = conn.execute(

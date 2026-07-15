@@ -19,8 +19,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Bounded rejection reason codes — the only valid values for rejection_reason_code
+VALID_REJECTION_REASON_CODES: frozenset[str] = frozenset({
+    "low_confidence",
+    "mixed_timeframes",
+    "late_day",
+    "hostile_breadth",
+    "thin_volume",
+    "risk_off_conflict",
+    "profile_rule_failed",
+    "exposure_conflict",
+    "liquidity_or_spread",
+    "event_risk",
+    "other",
+})
+
 # Valid fields in a single decision entry
-_VALID_DECISION_FIELDS = {"candidate_id", "decision", "risk_multiplier", "rationale", "adjustment_request"}
+_VALID_DECISION_FIELDS = {"candidate_id", "decision", "risk_multiplier", "rationale", "adjustment_request", "rejection_reason_code"}
 
 # Valid decision values
 _VALID_DECISIONS = {"accept", "reject", "adjust"}
@@ -44,6 +59,7 @@ class CandidateDecision:
     risk_multiplier: float | None = None  # 0.0 < x <= 1.0 (downward only)
     rationale: str = ""
     adjustment_request: dict | None = None  # supported adjustment types only
+    rejection_reason_code: str | None = None  # bounded code for reject decisions
 
 
 @dataclass
@@ -305,12 +321,55 @@ def parse_decision_contract(
         if not isinstance(rationale, str):
             rationale = str(rationale)
 
+        # 5h: Extract and validate rejection_reason_code for reject decisions
+        rejection_reason_code = None
+        if decision == "reject":
+            raw_code = entry.get("rejection_reason_code")
+            if raw_code is not None:
+                # Code is present — validate it
+                if not isinstance(raw_code, str) or raw_code == "" or raw_code not in VALID_REJECTION_REASON_CODES:
+                    # Invalid or empty code: normalize to "other" and record violation
+                    result.violations.append(
+                        {
+                            "type": "INVALID_REJECTION_CODE",
+                            "candidate_id": candidate_id,
+                            "raw_code": raw_code,
+                        }
+                    )
+                    rejection_reason_code = "other"
+                else:
+                    # Valid code: use as-is
+                    rejection_reason_code = raw_code
+            else:
+                # Code is missing/None — route based on PM_REJECTION_CODE_MODE
+                from utils.gate_config import PM_REJECTION_CODE_MODE
+
+                rejection_reason_code = "other"
+                if PM_REJECTION_CODE_MODE == "enforcing":
+                    # Enforcing mode: treat missing code as a contract violation
+                    result.violations.append(
+                        {
+                            "type": "MISSING_REJECTION_CODE",
+                            "candidate_id": candidate_id,
+                            "detail": "rejection_reason_code is missing",
+                        }
+                    )
+                else:
+                    # Warn mode (or unset/invalid value): log warning, no violation
+                    logger.warning(
+                        "rejection_reason_code is missing for candidate %s "
+                        "(PM_REJECTION_CODE_MODE=%s); normalizing to 'other'",
+                        candidate_id,
+                        PM_REJECTION_CODE_MODE,
+                    )
+
         candidate_decision = CandidateDecision(
             candidate_id=candidate_id,
             decision=decision,
             risk_multiplier=risk_multiplier,
             rationale=rationale,
             adjustment_request=adjustment_request if isinstance(adjustment_request, dict) else None,
+            rejection_reason_code=rejection_reason_code,
         )
 
         # 5h: Route to accepted, rejected, or adjusted list
