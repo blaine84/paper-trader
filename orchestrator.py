@@ -2412,14 +2412,8 @@ def main():
         id="daily_review",
     )
 
-    # CEO daily memo: 4:45 PM ET, Mon-Thu. Friday gets the deeper weekly memo.
-    scheduler.add_job(
-        run_ceo_daily,
-        CronTrigger(day_of_week="mon-thu", hour=16, minute=45, timezone="America/New_York"),
-        id="ceo_daily",
-        max_instances=1,
-        coalesce=True,
-    )
+    # CEO daily memo remains available via the manual `ceo-daily` command.
+    # The scheduled CEO memo is weekly-only to avoid duplicating the afternoon report.
 
     # CEO weekly strategy memo: Friday after close and daily review.
     scheduler.add_job(
