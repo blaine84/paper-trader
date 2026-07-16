@@ -13,7 +13,7 @@ Runs as part of the price monitor every 60 seconds.
 import json
 import logging
 from datetime import datetime
-from db.schema import Trade, Position, Balance, AgentMemory, get_session
+from db.schema import Trade, Position, Balance, AgentMemory, ReviewQueue, get_session
 from utils.trade_events import log_trade_event
 from utils.stop_authority import apply_stop_update
 
@@ -60,22 +60,38 @@ def _calc_r(trade, current_price) -> float:
 def _partial_close(engine, trade, quantity_pct, price, reason):
     """Close a percentage of the position."""
     db = get_session(engine)
+    managed_trade = db.query(Trade).filter_by(id=trade.id, status="open").first()
+    if not managed_trade or managed_trade.quantity <= 0:
+        db.close()
+        return
+
     pos = db.query(Position).filter_by(
-        symbol=trade.symbol, profile=trade.profile
+        symbol=managed_trade.symbol, profile=managed_trade.profile
     ).first()
     if not pos or pos.quantity <= 0:
         db.close()
         return
 
-    close_qty = max(1, int(pos.quantity * quantity_pct))
-    if close_qty >= pos.quantity:
-        close_qty = pos.quantity
+    close_qty = max(1, int(managed_trade.quantity * quantity_pct))
+    close_qty = min(close_qty, managed_trade.quantity, pos.quantity)
 
     # Calculate P&L for the partial
-    if trade.direction == "LONG":
-        pnl = (price - trade.entry_price) * close_qty
+    if managed_trade.direction == "LONG":
+        pnl = (price - managed_trade.entry_price) * close_qty
     else:
-        pnl = (trade.entry_price - price) * close_qty
+        pnl = (managed_trade.entry_price - price) * close_qty
+
+    managed_trade.quantity -= close_qty
+    if managed_trade.quantity <= 0:
+        managed_trade.quantity = 0
+        managed_trade.exit_price = price
+        managed_trade.exit_time = datetime.utcnow()
+        managed_trade.status = "closed"
+        managed_trade.pnl = round((managed_trade.pnl or 0) + pnl, 2)
+        denominator = managed_trade.entry_price * close_qty
+        managed_trade.pnl_pct = round((pnl / denominator) * 100, 2) if denominator else 0
+        managed_trade.reason_exit = reason
+        db.add(ReviewQueue(trade_id=managed_trade.id))
 
     # Reduce position
     pos.quantity -= close_qty
@@ -83,20 +99,21 @@ def _partial_close(engine, trade, quantity_pct, price, reason):
         db.delete(pos)
 
     # Return cash
-    bal = db.query(Balance).filter_by(profile=trade.profile).order_by(Balance.timestamp.desc()).first()
+    bal = db.query(Balance).filter_by(profile=managed_trade.profile).order_by(Balance.timestamp.desc()).first()
     if bal:
-        if trade.direction == "LONG":
+        if managed_trade.direction == "LONG":
             cash_back = close_qty * price
         else:
-            cash_back = close_qty * trade.entry_price + pnl
-        db.add(Balance(cash=bal.cash + cash_back, profile=trade.profile))
+            cash_back = close_qty * managed_trade.entry_price + pnl
+        db.add(Balance(cash=bal.cash + cash_back, profile=managed_trade.profile))
 
     log_trade_event(
-        db, "partial_profit", trade_id=trade.id, agent=f"profit_manager",
-        symbol=trade.symbol, profile=trade.profile, price=price,
+        db, "partial_profit", trade_id=managed_trade.id, agent=f"profit_manager",
+        symbol=managed_trade.symbol, profile=managed_trade.profile, price=price,
         message=reason,
         payload={
             "closed_qty": close_qty,
+            "trade_remaining_qty": managed_trade.quantity,
             "remaining_qty": max(0, pos.quantity) if pos else 0,
             "pnl": round(pnl, 2),
             "quantity_pct": quantity_pct,
@@ -105,12 +122,13 @@ def _partial_close(engine, trade, quantity_pct, price, reason):
 
     # Log the partial as an agent memory note
     db.add(AgentMemory(
-        agent=f"pm_{trade.profile}",
-        symbol=trade.symbol,
+        agent=f"pm_{managed_trade.profile}",
+        symbol=managed_trade.symbol,
         key="partial_profit",
         value=json.dumps({
-            "trade_id": trade.id,
+            "trade_id": managed_trade.id,
             "closed_qty": close_qty,
+            "trade_remaining_qty": managed_trade.quantity,
             "remaining_qty": max(0, pos.quantity) if pos else 0,
             "price": price,
             "pnl": round(pnl, 2),
@@ -119,9 +137,11 @@ def _partial_close(engine, trade, quantity_pct, price, reason):
         }),
     ))
 
+    log_symbol = managed_trade.symbol
+    log_profile = managed_trade.profile
     db.commit()
     db.close()
-    log.info(f"💰 PARTIAL PROFIT: {trade.symbol} ({trade.profile}) closed {close_qty} @ ${price:.2f} "
+    log.info(f"💰 PARTIAL PROFIT: {log_symbol} ({log_profile}) closed {close_qty} @ ${price:.2f} "
              f"(P&L: ${pnl:+.2f}) — {reason}")
 
 

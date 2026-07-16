@@ -345,19 +345,18 @@ def api_trades():
     db = get_session(engine)
     import yfinance as yf
 
-    # Reconcile orphaned trades: mark open trades as closed if no matching position exists
+    # Surface orphaned trades without mutating them. Silent reconciliation hides
+    # accounting bugs by creating closed trades with no exit price.
     open_trades_all = db.query(Trade).filter_by(status="open").all()
+    orphan_trade_ids = set()
     for ot in open_trades_all:
         side = "long" if ot.direction == "LONG" else "short"
         matching_pos = db.query(Position).filter_by(
             symbol=ot.symbol, profile=ot.profile, side=side
         ).first()
         if not matching_pos:
-            ot.status = "closed"
-            ot.exit_time = ot.exit_time or datetime.utcnow()
-            ot.reason_exit = (ot.reason_exit or "") + " [auto-reconciled: no matching position]"
-            log.warning("Reconciled orphan trade #%d (%s %s)", ot.id, ot.symbol, ot.profile)
-    db.commit()
+            orphan_trade_ids.add(ot.id)
+            log.warning("Open orphan trade #%d (%s %s) has no matching position", ot.id, ot.symbol, ot.profile)
 
     cutoff = datetime.utcnow() - timedelta(days=30)
     trades = (
@@ -405,6 +404,7 @@ def api_trades():
             "unrealized_pnl": unrealized_pnl,
             "unrealized_pct": unrealized_pct,
             "review_score": t.review_score,
+            "orphaned": t.id in orphan_trade_ids,
         })
     db.close()
     return jsonify(result)
