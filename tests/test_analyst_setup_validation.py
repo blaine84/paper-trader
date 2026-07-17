@@ -1,4 +1,8 @@
-from agents.analyst import annotate_unregistered_setup, normalize_analyst_signal_shape
+from agents.analyst import (
+    annotate_unregistered_setup,
+    normalize_analyst_signal_shape,
+    sanitize_historical_feedback_bleed,
+)
 
 
 def test_registered_setup_type_has_no_warning():
@@ -207,3 +211,37 @@ def test_directional_sector_rotation_remains_mappable():
     assert result["signal"] == "LONG"
     assert result["strength"] == "strong"
     assert result["confidence"] == "high"
+
+
+def test_historical_feedback_bleed_redacts_stale_cpi_sentences():
+    signal = {
+        "symbol": "XLK",
+        "signal": "HOLD",
+        "strength": "weak",
+        "confidence": "low",
+        "setup_type": "unclear_direction",
+        "setup_reasoning": (
+            "The setup is unclear due to the presence of a scheduled macro catalyst "
+            "(CPI inflation print) on July 15, which directly contradicts the intraday "
+            "rotation setup mandate. Price is below VWAP with bearish sector breadth."
+        ),
+        "reasoning": (
+            "The economic calendar intersection was either missed or consciously ignored. "
+            "Current tape is weak and volume is elevated."
+        ),
+        "invalidation": "Price reclaims VWAP or July 15 CPI risk resolves.",
+        "llm_veto_reason": "Scheduled major macro catalyst blocks the setup.",
+    }
+
+    result = sanitize_historical_feedback_bleed(signal)
+    combined = " ".join(
+        result.get(field, "")
+        for field in ("setup_reasoning", "reasoning", "invalidation", "llm_veto_reason")
+    )
+
+    assert result["historical_feedback_redacted"] is True
+    assert "CPI" not in combined
+    assert "July 15" not in combined
+    assert "scheduled macro catalyst" not in combined.lower()
+    assert "economic calendar intersection" not in combined.lower()
+    assert "Price is below VWAP" in result["setup_reasoning"]

@@ -8,6 +8,7 @@ Writes signal recommendations to AgentMemory.
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone as dt_tz
 from utils.finnhub_client import FinnhubClient
 from utils.technicals import compute_indicators
@@ -44,6 +45,15 @@ ANALYST_CONTEXT_BOUNDARY = """CONTEXT BOUNDARY:
 - Do not cite dated catalysts, old macro events, old earnings dates, or prior trade-review facts from historical lesson sections as current setup blockers unless they also appear in the current evidence sections for this symbol.
 - If a historical lesson references a calendar date before the Time line, treat it as a past example, not today's catalyst.
 """
+
+_STALE_HISTORICAL_FEEDBACK_RE = re.compile(
+    r"\b("
+    r"CPI|inflation print|July\s*15|Jul\s*15|"
+    r"scheduled\s+(?:major\s+)?macro catalyst|"
+    r"economic calendar intersection|intraday rotation setup mandate"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 SYSTEM_PROMPT = """You are a technical analyst for day trading.
@@ -284,8 +294,53 @@ def normalize_analyst_signal_shape(signal: dict, symbol: str) -> dict:
         normalized["indicators"] = {}
 
     _enforce_directional_setup_contract(normalized)
+    sanitize_historical_feedback_bleed(normalized)
 
     return normalized
+
+
+def _remove_historical_feedback_sentences(text: str) -> tuple[str, bool]:
+    """Remove stale reviewer/calendar sentences copied into current signal text."""
+    if not isinstance(text, str) or not text.strip():
+        return text, False
+    if not _STALE_HISTORICAL_FEEDBACK_RE.search(text):
+        return text, False
+
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    kept = [
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip() and not _STALE_HISTORICAL_FEEDBACK_RE.search(sentence)
+    ]
+    return " ".join(kept), True
+
+
+def sanitize_historical_feedback_bleed(signal: dict) -> dict:
+    """Prevent historical reviewer feedback from becoming persisted current evidence."""
+    if not isinstance(signal, dict):
+        return signal
+
+    redacted_fields = []
+    for field in ("setup_reasoning", "reasoning", "invalidation", "llm_veto_reason"):
+        value = signal.get(field)
+        cleaned, changed = _remove_historical_feedback_sentences(value)
+        if not changed:
+            continue
+        redacted_fields.append(field)
+        if cleaned:
+            signal[field] = cleaned
+        elif field == "invalidation":
+            signal[field] = "Use current technical invalidation levels; stale historical catalyst reference removed."
+        else:
+            signal[field] = (
+                "Stale historical reviewer catalyst reference removed; reassess using "
+                "current quote, technical, research, and catalyst freshness evidence."
+            )
+
+    if redacted_fields:
+        signal["historical_feedback_redacted"] = True
+        signal["historical_feedback_redacted_fields"] = redacted_fields
+    return signal
 
 
 def _is_diagnostic_confusion_setup(setup_type: str) -> bool:
@@ -1192,6 +1247,7 @@ Produce your trading signal JSON for {sym}.
             )
             signal = enforce_veto_accountability(signal)
             signal = repair_missing_veto_contract(signal, sym)
+            signal = sanitize_historical_feedback_bleed(signal)
             if signal["deterministic_sanity"].get("conflict"):
                 log.warning(
                     "Analyst sanity conflict for %s: llm=%s deterministic=%s score=%s veto_required=%s veto_present=%s reasons=%s",
