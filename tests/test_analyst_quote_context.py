@@ -345,6 +345,13 @@ def test_integration_signal_persisted_with_quote_fields(
     assert signal["change_pct"] == 2.93
     assert signal["relative_volume"] >= 1.9
 
+    # Regression: reviewer/case feedback can mention dated macro events, but
+    # the Analyst prompt must keep those historical lessons out of current facts.
+    prompt = mock_llm.call_args[0][1]
+    assert "CONTEXT BOUNDARY:" in prompt
+    assert "historical lessons only" in prompt
+    assert "unless they also appear in the current evidence sections" in prompt
+
     # Verify persisted to AgentMemory
     db = get_session(engine)
     mem = (

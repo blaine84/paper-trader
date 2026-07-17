@@ -37,6 +37,14 @@ from utils.symbol_class import classify_symbol, validate_setup_for_symbol
 
 log = logging.getLogger(__name__)
 
+ANALYST_CONTEXT_BOUNDARY = """CONTEXT BOUNDARY:
+- The Time line above is the current analysis time.
+- CURRENT QUOTE, TECHNICAL INDICATORS, MULTI-TIMEFRAME CONTEXT, RESEARCH SENTIMENT, and CATALYST FRESHNESS are the current evidence for this symbol.
+- SELECTION FEEDBACK, META-REVIEWER RECOMMENDATIONS, RELEVANT PAST CASES, and ANALYST FEEDBACK LOOP are historical lessons only.
+- Do not cite dated catalysts, old macro events, old earnings dates, or prior trade-review facts from historical lesson sections as current setup blockers unless they also appear in the current evidence sections for this symbol.
+- If a historical lesson references a calendar date before the Time line, treat it as a past example, not today's catalyst.
+"""
+
 
 SYSTEM_PROMPT = """You are a technical analyst for day trading.
 You receive price data, technical indicators, and research sentiment for a stock.
@@ -1146,6 +1154,8 @@ TECHNICAL INDICATORS:
 
 DETERMINISTIC TECHNICAL SANITY CHECK:
 {deterministic_precheck_context}
+
+{ANALYST_CONTEXT_BOUNDARY}
 
 RESEARCH SENTIMENT:
 {json.dumps(sentiment, indent=2)}
