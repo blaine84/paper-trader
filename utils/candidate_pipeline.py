@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from utils.candidate_registry import CandidateRecord, CandidateRegistry
 from utils.decision_contract import CandidateDecision
-from utils.gate_config import PM_PROVENANCE_MODE
+from utils.gate_config import MARKET_DATA_RELIABILITY_MODE, PM_PROVENANCE_MODE
 from utils.position_sizer import SizingResult, calculate_position_size
 
 if TYPE_CHECKING:
@@ -1554,6 +1554,89 @@ def execute_candidate_pipeline(
             outcome="reservation_failed",
             error=reason,
         )
+
+    # ── Step 2b: MARKET DATA READINESS CHECK (guarded by feature flag) ──
+    if MARKET_DATA_RELIABILITY_MODE != "disabled":
+        try:
+            from utils.market_data_reliability.pipeline_integration import (
+                check_market_data_readiness,
+            )
+
+            readiness = check_market_data_readiness(
+                symbol=candidate.symbol,
+                required_data_types=["quote", "atr", "volume"],
+                consumer="PM",
+            )
+            if readiness is not None and not readiness.ready:
+                # Market data unavailable/untrusted — block candidate
+                reason_codes_str = ", ".join(readiness.reason_codes) or "market_data_degraded"
+                error_msg = f"Market data readiness failed: {reason_codes_str}"
+                logger.warning(
+                    "Pipeline market data readiness blocked %s: %s "
+                    "(missing_data_types=%s)",
+                    candidate_id,
+                    reason_codes_str,
+                    readiness.missing_data_types,
+                )
+
+                # Write structured telemetry event (fail-open)
+                try:
+                    _write_candidate_event(
+                        engine,
+                        candidate_id,
+                        registry.cycle_id,
+                        profile_id,
+                        "market_data_readiness_blocked",
+                        {
+                            "reason_codes": list(readiness.reason_codes),
+                            "missing_data_types": list(readiness.missing_data_types),
+                            "symbol": candidate.symbol,
+                        },
+                        candidate.candidate_type,
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to write market_data_readiness_blocked event for %s",
+                        candidate_id,
+                        exc_info=True,
+                    )
+
+                # Transition candidate to gate_rejected (market data is a pre-gate check)
+                _commit_candidate_pipeline_session(db, candidate_id, "market_data_blocked")
+                registry.mark_gate_rejected(candidate_id, error_msg)
+
+                if checkpoint_logger is not None:
+                    try:
+                        from utils.checkpoint_logger import CheckpointEvent
+                        checkpoint_logger.emit_outcome("pm_accepted_and_gate_rejected", CheckpointEvent(
+                            stage="order_rejected",
+                            cycle_id=registry.cycle_id,
+                            profile=profile_id,
+                            candidate_id=candidate_id,
+                            symbol=candidate.symbol,
+                            setup_type=candidate.setup_type,
+                            decision="reject",
+                            reason_code=reason_codes_str,
+                        ))
+                    except Exception:
+                        logger.error(
+                            "Checkpoint emission failed at market_data_blocked for %s",
+                            candidate_id,
+                            exc_info=True,
+                        )
+
+                return PipelineResult(
+                    candidate_id=candidate_id,
+                    outcome="gate_rejected",
+                    error=error_msg,
+                )
+        except Exception:
+            # Fail-open: reliability check must never block pipeline on internal error
+            logger.error(
+                "Market data reliability check failed for %s; continuing (fail-open)",
+                candidate_id,
+                exc_info=True,
+            )
 
     # ── Step 3: SIZE ──
     resolved_order = _build_resolved_order(
