@@ -314,6 +314,13 @@ PM_BENCHMARK_CONTEXT_ENABLED: bool = os.environ.get(
 PM_ALIGNMENT_POLICY_MODE: str = os.environ.get("PM_ALIGNMENT_POLICY_MODE", "disabled")
 
 # ---------------------------------------------------------------------------
+# Market Data Reliability Layer Feature Flag
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enforcing"
+MARKET_DATA_RELIABILITY_MODE: str = os.environ.get("MARKET_DATA_RELIABILITY_MODE", "disabled")
+
+# ---------------------------------------------------------------------------
 # PM Decision Provenance Feature Flags
 # ---------------------------------------------------------------------------
 
