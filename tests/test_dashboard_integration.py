@@ -19,6 +19,10 @@ from utils.market_data_reliability.dashboard_integration import (
     get_freshness_label,
 )
 from utils.market_data_reliability.snapshot import Snapshot
+from web.app import (
+    _add_market_data_reliability_fields,
+    _build_dashboard_market_data_snapshot,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +319,64 @@ class TestEnrichFailOpen:
         result = enrich_market_data_response(data, snapshot)
 
         assert result is data
+
+
+# ---------------------------------------------------------------------------
+# /api/data row wiring helpers
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardApiRowWiring:
+    """Tests for dashboard row reliability wiring in web.app."""
+
+    def test_observe_mode_adds_market_data_fields_without_overwriting_catalyst_label(
+        self, monkeypatch
+    ):
+        """Dashboard rows expose MDR state while preserving catalyst freshness label."""
+        monkeypatch.setenv("MARKET_DATA_RELIABILITY_MODE", "observe")
+        now = datetime.now(timezone.utc)
+        quote = {
+            "price": 187.43,
+            "change_pct": 0.76,
+            "_provider": "finnhub",
+            "_timestamp": now.isoformat(),
+            "_open": 186.50,
+            "_high": 188.00,
+            "_low": 185.50,
+            "_prev_close": 186.00,
+        }
+        row = {
+            "symbol": "AAPL",
+            "price": 187.43,
+            "freshness_label": "Fresh catalyst",
+        }
+
+        snapshot = _build_dashboard_market_data_snapshot(
+            "AAPL", quote, market_open=True, now=now
+        )
+        result = _add_market_data_reliability_fields(row, snapshot)
+
+        assert result["freshness_label"] == "Fresh catalyst"
+        assert result["freshness_state"] == "fresh"
+        assert result["trust_state"] == "trusted"
+        assert result["market_data_freshness_label"] is None
+        assert result["is_actionable"] is True
+
+    def test_disabled_mode_leaves_dashboard_row_unenriched(self, monkeypatch):
+        """Disabled MDR mode does not add dashboard reliability fields."""
+        monkeypatch.setenv("MARKET_DATA_RELIABILITY_MODE", "disabled")
+        now = datetime.now(timezone.utc)
+        quote = {
+            "price": 187.43,
+            "change_pct": 0.76,
+            "_provider": "finnhub",
+            "_timestamp": now.isoformat(),
+        }
+        row = {"symbol": "AAPL", "freshness_label": "Fresh catalyst"}
+
+        snapshot = _build_dashboard_market_data_snapshot(
+            "AAPL", quote, market_open=True, now=now
+        )
+        result = _add_market_data_reliability_fields(row, snapshot)
+
+        assert result == {"symbol": "AAPL", "freshness_label": "Fresh catalyst"}

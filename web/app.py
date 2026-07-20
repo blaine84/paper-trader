@@ -10,7 +10,8 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -34,6 +35,12 @@ from utils.catalyst_freshness import (
 from feedback_loop.analyst_feedback import get_quality_metrics
 from utils.shadow_ledger import ensure_shadow_ledger_schema
 from utils.dialect_sql import _date_cutoff_filter
+from utils.market_data_reliability.config import ReliabilityConfig
+from utils.market_data_reliability.dashboard_integration import get_freshness_label
+from utils.market_data_reliability.freshness import FreshnessClassifier
+from utils.market_data_reliability.snapshot import Snapshot
+from utils.market_data_reliability.trust import TrustClassifier
+from utils.market_data_reliability.validator import ResponseValidator
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
@@ -41,6 +48,154 @@ ensure_shadow_ledger_schema(engine)
 
 _QUOTE_CACHE_SECONDS = int(os.getenv("DASHBOARD_QUOTE_CACHE_SECONDS", "25"))
 _quote_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _parse_quote_timestamp(value: object, fallback: datetime) -> datetime:
+    """Parse dashboard quote timestamp values into timezone-aware UTC datetimes."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            parsed = fallback
+    elif isinstance(value, str) and value.strip():
+        raw = value.strip()
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            try:
+                parsed = datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            except (OSError, OverflowError, ValueError):
+                parsed = fallback
+    else:
+        parsed = fallback
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _build_dashboard_market_data_snapshot(
+    symbol: str,
+    quote: dict,
+    market_open: bool,
+    now: datetime | None = None,
+) -> Snapshot | None:
+    """Build a dashboard reliability snapshot from already-fetched quote data.
+
+    This intentionally avoids an extra provider call on each dashboard refresh.
+    """
+    mode = os.getenv("MARKET_DATA_RELIABILITY_MODE", "disabled")
+    if mode == "disabled":
+        return None
+
+    fetched_at = now or datetime.now(timezone.utc)
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+
+    price = quote.get("price")
+    raw = {
+        "s": symbol,
+        "c": price,
+        "o": quote.get("_open"),
+        "h": quote.get("_high"),
+        "l": quote.get("_low"),
+        "pc": quote.get("_prev_close"),
+        "timestamp": quote.get("_timestamp"),
+    }
+
+    config = ReliabilityConfig.from_environment()
+    market_session = "open" if market_open else "closed"
+    validator = ResponseValidator(
+        staleness_threshold_seconds=(
+            config.freshness_thresholds[("quote", "display")].aging_threshold
+        )
+    )
+    validation_result = validator.validate(raw, symbol, "quote")
+
+    source_timestamp = _parse_quote_timestamp(quote.get("_timestamp"), fetched_at)
+    age_seconds = max(0.0, (fetched_at - source_timestamp).total_seconds())
+    freshness_state = FreshnessClassifier(config.freshness_thresholds).classify(
+        age_seconds, "quote", "Dashboard_API", market_session
+    )
+    trust_state, degradation_reasons = TrustClassifier().classify(
+        validation_result, freshness_state, "Dashboard_API", market_session
+    )
+
+    provider_status = "success"
+    if "rate_limited" in validation_result.degradation_reasons:
+        provider_status = "rate_limited"
+    elif "provider_error" in validation_result.degradation_reasons:
+        provider_status = "error"
+    elif "empty_response" in validation_result.degradation_reasons:
+        provider_status = "empty"
+    elif not validation_result.is_valid:
+        provider_status = "error"
+
+    return Snapshot(
+        symbol=symbol,
+        data_type="quote",
+        requested_at=fetched_at,
+        provider=quote.get("_provider", "unknown"),
+        provider_status=provider_status,
+        market_session=market_session,
+        last_price=_to_decimal(price),
+        bid=None,
+        ask=None,
+        previous_close=_to_decimal(quote.get("_prev_close")),
+        open=_to_decimal(quote.get("_open")),
+        high=_to_decimal(quote.get("_high")),
+        low=_to_decimal(quote.get("_low")),
+        volume=None,
+        fetched_at=fetched_at,
+        source_timestamp=source_timestamp,
+        age_seconds=age_seconds,
+        freshness_state=freshness_state,
+        trust_state=trust_state,
+        degradation_reasons=tuple(
+            dict.fromkeys((*validation_result.degradation_reasons, *degradation_reasons))
+        ),
+        raw_provider_latency_ms=None,
+        fallback_primary_provider=None,
+    )
+
+
+def _add_market_data_reliability_fields(
+    row: dict,
+    snapshot: Snapshot | None,
+) -> dict:
+    """Attach market-data reliability fields without touching catalyst labels."""
+    if snapshot is None:
+        return row
+
+    try:
+        row["freshness_state"] = snapshot.freshness_state
+        row["trust_state"] = snapshot.trust_state
+        row["market_data_freshness_label"] = get_freshness_label(
+            snapshot.freshness_state, snapshot.trust_state
+        )
+        row["is_actionable"] = (
+            snapshot.trust_state == "trusted"
+            and snapshot.freshness_state in ("fresh", "aging")
+        )
+    except Exception:
+        log.error(
+            "Dashboard market-data reliability enrichment failed for %s",
+            getattr(snapshot, "symbol", "unknown"),
+            exc_info=True,
+        )
+
+    return row
 
 
 def get_quotes(symbols: list[str]) -> dict:
@@ -66,6 +221,12 @@ def get_quotes(symbols: list[str]) -> dict:
             quote = {
                 "price": price,
                 "change_pct": float(q.get("change_pct", 0)),
+                "_provider": "finnhub",
+                "_timestamp": q.get("timestamp"),
+                "_open": q.get("open"),
+                "_high": q.get("high"),
+                "_low": q.get("low"),
+                "_prev_close": q.get("prev_close"),
             }
             quotes[sym] = quote
             _quote_cache[sym] = (now, quote)
@@ -82,7 +243,13 @@ def get_quotes(symbols: list[str]) -> dict:
                 if price <= 0:
                     raise ValueError(f"yfinance returned non-positive price for {sym}: {price}")
                 change_pct = round((price - prev) / prev * 100, 2) if prev else 0
-                quote = {"price": round(price, 2), "change_pct": change_pct}
+                quote = {
+                    "price": round(price, 2),
+                    "change_pct": change_pct,
+                    "_provider": "yfinance",
+                    "_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "_prev_close": prev,
+                }
                 quotes[sym] = quote
                 _quote_cache[sym] = (now, quote)
                 continue
@@ -90,7 +257,12 @@ def get_quotes(symbols: list[str]) -> dict:
                 yfinance_available = False
                 log.warning("yfinance quote fallback failed for %s; disabling for this batch: %s", sym, e)
 
-        quotes[sym] = {"price": 0, "change_pct": 0}
+        quotes[sym] = {
+            "price": 0,
+            "change_pct": 0,
+            "_provider": "none",
+            "_timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     return quotes
 
 
@@ -230,7 +402,7 @@ def api_data():
         q = quotes.get(sym, {})
         sig = signals.get(sym, {})
         sent = sentiment.get(sym, {})
-        watchlist.append({
+        row = {
             "symbol": sym,
             "is_scout": sym in scout_symbols,
             "price": q.get("price", 0),
@@ -249,7 +421,9 @@ def api_data():
             "breaking_news": breaking_news_by_symbol.get(sym, []),
             "catalyst_freshness": freshness_by_symbol.get(sym, {}),
             "freshness_label": build_freshness_label(sym, freshness_by_symbol.get(sym, {})),
-        })
+        }
+        snapshot = _build_dashboard_market_data_snapshot(sym, q, market_open)
+        watchlist.append(_add_market_data_reliability_fields(row, snapshot))
 
     # Market regime from quant researcher
     regime = None
