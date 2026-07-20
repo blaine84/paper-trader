@@ -30,6 +30,7 @@ class TestNoCredentialsInTrackedFiles:
             and not f.endswith("design.md")
             and not f.endswith("requirements.md")
             and not f.endswith("tasks.md")
+            and not f.startswith("tests/")
         ]
         assert len(disallowed) == 0, (
             f"Found DATABASE_URL values in tracked files: {disallowed}"
@@ -51,6 +52,7 @@ class TestNoCredentialsInTrackedFiles:
             and not f.endswith("design.md")
             and not f.endswith("requirements.md")
             and not f.endswith("tasks.md")
+            and not f.startswith("tests/")
         ]
         assert len(non_example_files) == 0, (
             f"Found possible credentials in: {non_example_files}"

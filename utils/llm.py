@@ -21,11 +21,109 @@ import logging
 import threading
 import requests
 
+from utils.llm_queue.config import QueueConfig
+from utils.llm_queue.dispatcher import OllamaDispatcher
+
 log = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 10  # seconds
 _OLLAMA_REQUEST_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# LLM Queue Dispatcher — lazy-initialized singleton
+# ---------------------------------------------------------------------------
+_dispatcher: OllamaDispatcher | None = None
+_dispatcher_init_lock = threading.Lock()
+
+
+def _do_ollama_request(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    json_mode: bool,
+    timeout: int,
+    num_ctx: int,
+) -> str:
+    """Execute the raw Ollama HTTP call (no lock, no queue).
+
+    This is the execute_fn passed to the dispatcher so the worker thread
+    can perform the actual HTTP request without re-entering queue logic.
+    """
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+        "format": "json" if json_mode else None,
+        "options": {
+            "num_ctx": num_ctx,
+            "temperature": 0.2,
+        },
+    }
+    # Remove None format key
+    if payload["format"] is None:
+        del payload["format"]
+
+    resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()["message"]["content"]
+
+
+def _get_dispatcher() -> OllamaDispatcher:
+    """Lazy-init the module-level OllamaDispatcher singleton.
+
+    Thread-safe double-checked locking. The dispatcher is wired with
+    _do_ollama_request as the execute_fn so workers call Ollama directly.
+    """
+    global _dispatcher
+    if _dispatcher is None:
+        with _dispatcher_init_lock:
+            if _dispatcher is None:
+                config = QueueConfig.from_environment()
+                _dispatcher = OllamaDispatcher(config, execute_fn=_do_ollama_request)
+    return _dispatcher
+
+
+def get_queue_cycle_summary() -> dict:
+    """Get LLM queue cycle summary for reporting surfaces (daily review, CEO).
+
+    Returns a summary dict with queue health metrics when the dispatcher is
+    active (observe or enforcing mode). Returns an empty dict when disabled.
+
+    The summary includes: total_requests, completed, timed_out, rejected,
+    deferred, fallback_used, stale_results, avg_queue_wait_seconds,
+    max_queue_wait_seconds, by_class, by_model.
+
+    Fail-open: returns empty dict on any error.
+    """
+    try:
+        queue_mode = os.getenv("LLM_QUEUE_MODE", "disabled")
+        if queue_mode == "disabled":
+            return {}
+        dispatcher = _get_dispatcher()
+        return dispatcher.get_cycle_summary()
+    except Exception:
+        return {}
+
+
+def reset_queue_cycle() -> None:
+    """Reset LLM queue cycle counters (called at cycle boundary by orchestrator).
+
+    Fail-open: silently does nothing on error.
+    """
+    try:
+        queue_mode = os.getenv("LLM_QUEUE_MODE", "disabled")
+        if queue_mode == "disabled":
+            return
+        dispatcher = _get_dispatcher()
+        dispatcher.reset_cycle()
+    except Exception:
+        pass
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -204,6 +302,11 @@ def _call_ollama_finance(system_prompt: str, user_prompt: str, model: str = None
 
     Returns a tuple of (response_text, actual_provider, actual_model) so the
     caller can log the real model that served the response.
+
+    In enforcing mode, the dispatcher classifies this as tier="finance" so
+    the purpose/priority are correctly tagged for queue policy. The fallback
+    to medium tier is preserved: if _call_ollama raises (including dispatcher
+    RuntimeError in enforcing mode), we catch and retry with the medium model.
     """
     timeout = int(os.getenv("OLLAMA_FINANCE_TIMEOUT", os.getenv("OLLAMA_TIMEOUT", 600)))
     num_ctx = int(os.getenv("OLLAMA_FINANCE_NUM_CTX", os.getenv("OLLAMA_NUM_CTX", 8192)))
@@ -215,6 +318,7 @@ def _call_ollama_finance(system_prompt: str, user_prompt: str, model: str = None
             purpose=purpose,
             timeout=timeout,
             num_ctx=num_ctx,
+            tier="finance",
         )
         return (result, "ollama", model)
     except Exception as e:
@@ -234,6 +338,7 @@ def _call_ollama(
     purpose: str = "unlabeled",
     timeout: int = None,
     num_ctx: int = None,
+    tier: str = "medium",
 ) -> str:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model = model or os.getenv("OLLAMA_MODEL", "llama3")
@@ -242,6 +347,63 @@ def _call_ollama(
 
     json_instruction = "\n\nYou MUST respond with valid JSON only. No markdown, no explanation, no preamble."
     system_content = system_prompt + json_instruction
+
+    # ---------------------------------------------------------------------------
+    # LLM Queue Mode dispatch
+    # ---------------------------------------------------------------------------
+    queue_mode = os.getenv("LLM_QUEUE_MODE", "disabled")
+
+    if queue_mode == "enforcing":
+        try:
+            dispatcher = _get_dispatcher()
+            result = dispatcher.dispatch(
+                system_prompt=system_content,
+                user_prompt=user_prompt,
+                model=model,
+                purpose=purpose,
+                tier=tier,
+                json_mode=True,
+                timeout=timeout,
+                num_ctx=num_ctx,
+            )
+            if result.ok:
+                return result.text
+            else:
+                log.warning(
+                    "Dispatcher failure: purpose=%s status=%s reason=%s",
+                    purpose, result.status, result.reason_code,
+                )
+                # For structured failures, raise so caller can handle
+                if result.status in ("timed_out", "rejected", "stale", "prompt_too_large"):
+                    raise RuntimeError(
+                        f"LLM queue failure: status={result.status} reason={result.reason_code}"
+                    )
+                return ""
+        except Exception as e:
+            if "LLM queue failure" in str(e):
+                raise
+            # Dispatcher internal error — fail open, fall through to existing path
+            log.warning("Dispatcher error, falling through to lock path: %s", e)
+
+    elif queue_mode == "observe":
+        try:
+            dispatcher = _get_dispatcher()
+            dispatcher.observe_dispatch(
+                system_prompt=system_content,
+                user_prompt=user_prompt,
+                model=model,
+                purpose=purpose,
+                tier=tier,
+                json_mode=True,
+                timeout=timeout,
+                num_ctx=num_ctx,
+            )
+        except Exception as e:
+            log.debug("Observe mode telemetry error (non-fatal): %s", e)
+
+    # ---------------------------------------------------------------------------
+    # Existing path (disabled mode, observe mode fallthrough, or enforcing error fallthrough)
+    # ---------------------------------------------------------------------------
 
     # Prompt-size telemetry: useful for diagnosing local model timeouts/context bloat.
     # Approx token estimate is intentionally rough and cheap: ~4 chars/token.
@@ -343,6 +505,12 @@ def _call_ollama(
             _OLLAMA_REQUEST_LOCK.release()
 
 
+# Thread-local counter to prevent unbounded recursive JSON repair attempts.
+# parse_json_response() calls call_llm() for repair, which could itself return
+# non-JSON and trigger another repair.  Cap at 2 attempts per original request.
+_json_repair_depth = threading.local()
+_JSON_REPAIR_MAX_DEPTH = 2
+
 _JSON_REPAIR_PROMPT = """You are a JSON extraction assistant. The following text is an LLM response that should have been JSON but came back as prose. Extract the trading decisions from it and return ONLY valid JSON.
 
 If the text recommends one or more trades, return:
@@ -383,35 +551,44 @@ def parse_json_response(text: str) -> dict:
 
     # LLM returned prose instead of JSON — try a repair call
     log.warning("LLM returned prose instead of JSON, attempting repair extraction")
-    try:
-        repair_raw = call_llm(
-            _JSON_REPAIR_PROMPT,
-            f"Extract JSON from this response:\n\n{text[:2000]}",
-            json_mode=True,
-            tier="low",
-            purpose="json_repair",
+    depth = getattr(_json_repair_depth, "depth", 0)
+    if depth >= _JSON_REPAIR_MAX_DEPTH:
+        log.warning(
+            "JSON repair recursion limit reached (depth=%d), skipping repair", depth
         )
-        repair_text = repair_raw.strip()
-        if repair_text.startswith("```"):
-            repair_lines = repair_text.split("\n")
-            repair_text = "\n".join(repair_lines[1:-1]).strip()
-        if "{" in repair_text:
-            rs = repair_text.index("{")
-            rd = 0
-            re_ = rs
-            for i in range(rs, len(repair_text)):
-                if repair_text[i] == "{":
-                    rd += 1
-                elif repair_text[i] == "}":
-                    rd -= 1
-                    if rd == 0:
-                        re_ = i + 1
-                        break
-            result = json.loads(repair_text[rs:re_])
-            log.info("JSON repair succeeded")
-            return result
-    except Exception as repair_err:
-        log.warning("JSON repair call failed: %s", repair_err)
+    else:
+        _json_repair_depth.depth = depth + 1
+        try:
+            repair_raw = call_llm(
+                _JSON_REPAIR_PROMPT,
+                f"Extract JSON from this response:\n\n{text[:2000]}",
+                json_mode=True,
+                tier="low",
+                purpose="json_repair",
+            )
+            repair_text = repair_raw.strip()
+            if repair_text.startswith("```"):
+                repair_lines = repair_text.split("\n")
+                repair_text = "\n".join(repair_lines[1:-1]).strip()
+            if "{" in repair_text:
+                rs = repair_text.index("{")
+                rd = 0
+                re_ = rs
+                for i in range(rs, len(repair_text)):
+                    if repair_text[i] == "{":
+                        rd += 1
+                    elif repair_text[i] == "}":
+                        rd -= 1
+                        if rd == 0:
+                            re_ = i + 1
+                            break
+                result = json.loads(repair_text[rs:re_])
+                log.info("JSON repair succeeded")
+                return result
+        except Exception as repair_err:
+            log.warning("JSON repair call failed: %s", repair_err)
+        finally:
+            _json_repair_depth.depth = depth  # restore previous depth
 
     # Last resort: detect "no action" intent from the prose
     lower = text[:500].lower()

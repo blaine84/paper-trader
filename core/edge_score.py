@@ -32,8 +32,11 @@ _CONFIDENCE_MAP = {
 
 
 def normalize_winrate(win_rate: float) -> float:
-    """Clamp *win_rate* to [0.0, 1.0]."""
-    return max(0.0, min(1.0, float(win_rate)))
+    """Clamp *win_rate* to [0.0, 1.0]. Returns 0.0 for non-numeric inputs."""
+    try:
+        return max(0.0, min(1.0, float(win_rate)))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def map_strength(strength: str) -> float:
@@ -99,8 +102,11 @@ def confluence_score(indicators: dict, bias: str) -> float:
 
 
 def similarity_quality(similarity_sample_size: int) -> float:
-    """Sample-size-aware confidence: min(1.0, similarity_sample_size / 10)."""
-    return min(1.0, max(0, int(similarity_sample_size)) / 10.0)
+    """Sample-size-aware confidence: min(1.0, similarity_sample_size / 10). Returns 0.0 for non-numeric."""
+    try:
+        return min(1.0, max(0, int(similarity_sample_size)) / 10.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def check_hard_rejection(case_stats: dict) -> bool:
