@@ -343,6 +343,23 @@ PM_PROVENANCE_LATENCY_BUDGET_MS: int = int(
 
 
 # ---------------------------------------------------------------------------
+# LLM Queue and Backpressure Feature Flag
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enforcing"
+LLM_QUEUE_MODE: str = os.environ.get("LLM_QUEUE_MODE", "disabled")
+
+# Startup log reporting active mode
+if LLM_QUEUE_MODE != "disabled":
+    logger.info(
+        "LLM Queue Mode: %s (concurrency=%s, max_queue=%s)",
+        LLM_QUEUE_MODE,
+        os.environ.get("LLM_QUEUE_GLOBAL_CONCURRENCY", "1"),
+        os.environ.get("LLM_QUEUE_MAX_SIZE", "10"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Swing Candidate Pipeline Feature Flags
 # ---------------------------------------------------------------------------
 

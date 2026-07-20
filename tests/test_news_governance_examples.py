@@ -48,7 +48,8 @@ def test_xle_strait_of_hormuz_classified_as_governed():
     assert is_governed is True
     assert evidence["triggered_by"] == "entry_text_terms"
     assert evidence["matched_field"] == "reason_entry"
-    assert "strait of hormuz" in evidence["matched_value"].lower()
+    # Set iteration is unordered — may match "oil spike" or "strait of hormuz"
+    assert evidence["matched_value"].lower() in ("strait of hormuz", "oil spike")
 
 
 # ─── Test 2: Plain technical breakout not governed ────────────────────────────
