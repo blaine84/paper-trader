@@ -129,6 +129,10 @@ def _open_position_symbols(engine) -> list[str]:
         db.close()
 
 
+_focus_list_cache = {}
+_focus_list_lock = threading.Lock()
+
+
 def _apply_focus_list(
     engine,
     candidate_symbols: list[str],
@@ -142,14 +146,41 @@ def _apply_focus_list(
     if not _analyst_focus_enabled():
         return candidate_symbols
 
-    focused = select_focus_symbols(
-        engine,
-        candidate_symbols,
-        max_symbols=_analyst_focus_max_symbols(),
-        required_symbols=required_symbols or [],
-        source_bonuses=_source_bonuses(_pm_base_watchlist(), scout_picks, expanded_symbols, alert_symbols),
-        context=context,
+    max_symbols = _analyst_focus_max_symbols()
+    required_symbols = required_symbols or []
+    alert_symbols = alert_symbols or []
+    focus_bucket = datetime.utcnow().replace(second=0, microsecond=0)
+    cache_key = (
+        focus_bucket.isoformat(),
+        max_symbols,
+        tuple(candidate_symbols),
+        tuple(required_symbols),
+        tuple(alert_symbols),
     )
+
+    with _focus_list_lock:
+        focused = _focus_list_cache.get(cache_key)
+        if focused is None:
+            focused = select_focus_symbols(
+                engine,
+                candidate_symbols,
+                max_symbols=max_symbols,
+                required_symbols=required_symbols,
+                source_bonuses=_source_bonuses(_pm_base_watchlist(), scout_picks, expanded_symbols, alert_symbols),
+                context=context,
+            )
+            _focus_list_cache[cache_key] = list(focused)
+            if len(_focus_list_cache) > 12:
+                _focus_list_cache.clear()
+                _focus_list_cache[cache_key] = list(focused)
+        else:
+            log.info(
+                "FOCUS_LIST_CACHE_HIT: context=%s selected=%s candidates=%s",
+                context,
+                focused,
+                len(candidate_symbols),
+            )
+
     log.info(
         "FOCUS_LIST_APPLIED: context=%s before=%d after=%d symbols=%s",
         context,
