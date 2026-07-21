@@ -34,6 +34,7 @@ from feedback_loop.analyst_feedback import (
     process_pending_feedback,
     write_feedback_health_status,
 )
+from utils.trigger_status import compute_trigger_status
 from utils.symbol_class import classify_symbol, validate_setup_for_symbol
 
 log = logging.getLogger(__name__)
@@ -1245,6 +1246,7 @@ Produce your trading signal JSON for {sym}.
             signal["deterministic_sanity"] = compute_deterministic_signal_sanity(
                 signal, quote, indicators
             )
+            signal["trigger_status"] = compute_trigger_status(signal, quote, indicators)
             signal = enforce_veto_accountability(signal)
             signal = repair_missing_veto_contract(signal, sym)
             signal = sanitize_historical_feedback_bleed(signal)

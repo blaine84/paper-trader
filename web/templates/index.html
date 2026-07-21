@@ -32,6 +32,7 @@
     .badge-long { background: #1a3a2a; color: #3fb950; } .badge-short { background: #3a1a1a; color: #f85149; }
     .badge-hold { background: #2a2a1a; color: #d29922; } .badge-scout { background: #1a2a3a; color: #58a6ff; }
     .badge-focus { background: #142d24; color: #3fb950; border: 1px solid #3fb95066; }
+    .badge-trigger { background: #2a2414; color: #d29922; border: 1px solid #d2992266; margin-left: 4px; }
     .badge-strong { background: #1a3a2a; color: #3fb950; } .badge-moderate { background: #2a2a1a; color: #d29922; }
     .badge-weak { background: #21262d; color: #8b949e; } .badge-success { background: #1a3a2a; color: #3fb950; }
     .badge-failure { background: #3a1a1a; color: #f85149; }
@@ -430,7 +431,7 @@
           <td class="right ${chgColor}">${w.change_pct >= 0 ? '+' : ''}${w.change_pct.toFixed(2)}%</td>
           <td class="center">${signalBadge(w.signal)}</td>
           <td class="center">${strengthBadge(w.strength)}</td>
-          <td><span class="setup-link" data-setup="${w.setup_type}">${w.setup_type}</span></td>
+          <td><span class="setup-link" data-setup="${w.setup_type}">${w.setup_type}</span>${triggerBadge(w)}</td>
           <td class="center dim">${w.confidence}</td>
           <td class="center">${sourceBadges(w)}</td>
           <td>${hasR ? `<span class="expand-btn" onclick="toggleReasoning('${w.symbol}')">${exp ? '▲' : '▼'}</span>` : ''}</td>
@@ -454,6 +455,12 @@
   function sourceBadges(w) {
     const source = w.is_scout ? '<span class="badge badge-scout">SCOUT</span>' : '<span class="dim">CORE</span>';
     return w.is_focus ? `<span class="badge badge-focus">FOCUS</span> ${source}` : source;
+  }
+
+  function triggerBadge(w) {
+    const status = w.trigger_status?.entry_trigger || w.trigger_status?.status;
+    if (!status || status === 'no_trigger' || status === 'unknown') return '';
+    return `<span class="badge badge-trigger">${escHtml(status.replaceAll('_', ' '))}</span>`;
   }
 
   function renderAlerts(alerts) {

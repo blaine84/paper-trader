@@ -41,6 +41,7 @@ from utils.market_data_reliability.freshness import FreshnessClassifier
 from utils.market_data_reliability.snapshot import Snapshot
 from utils.market_data_reliability.trust import TrustClassifier
 from utils.market_data_reliability.validator import ResponseValidator
+from utils.trigger_status import compute_trigger_status
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
@@ -441,6 +442,13 @@ def api_data():
         q = quotes.get(sym, {})
         sig = signals.get(sym, {})
         sent = sentiment.get(sym, {})
+        trigger_status = sig.get("trigger_status", {})
+        if not isinstance(trigger_status, dict):
+            try:
+                trigger_status = compute_trigger_status(sig, q, {})
+            except Exception as exc:
+                log.warning("Dashboard trigger_status derivation failed for %s: %s", sym, exc)
+                trigger_status = {}
         row = {
             "symbol": sym,
             "is_scout": sym in scout_symbols,
@@ -451,6 +459,7 @@ def api_data():
             "strength": sig.get("strength", "—"),
             "confidence": sig.get("confidence", "—"),
             "setup_type": sig.get("setup_type", "—"),
+            "trigger_status": trigger_status,
             "setup_reasoning": sig.get("setup_reasoning", ""),
             "reasoning": sig.get("reasoning", ""),
             "invalidation": sig.get("invalidation", ""),

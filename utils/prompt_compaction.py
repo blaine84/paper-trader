@@ -130,6 +130,30 @@ def compact_signal_for_pm(symbol: str, signal: dict, scaffold_result: dict | Non
     if invalidation:
         parts.append(f"invalidation: {invalidation}")
 
+    trigger_status = signal.get("trigger_status")
+    if isinstance(trigger_status, dict):
+        trigger_parts = []
+        status = trigger_status.get("status")
+        entry_trigger = trigger_status.get("entry_trigger")
+        breakout = trigger_status.get("breakout")
+        pullback = trigger_status.get("pullback")
+        if status:
+            trigger_parts.append(f"status: {status}")
+        if entry_trigger:
+            trigger_parts.append(f"entry_trigger: {entry_trigger}")
+        if isinstance(breakout, dict) and breakout.get("status"):
+            text = f"breakout: {breakout.get('status')}"
+            if breakout.get("level") is not None:
+                text += f" @ {breakout.get('level')}"
+            trigger_parts.append(text)
+        if isinstance(pullback, dict) and pullback.get("status"):
+            text = f"pullback: {pullback.get('status')}"
+            if pullback.get("level") is not None:
+                text += f" @ {pullback.get('level')}"
+            trigger_parts.append(text)
+        if trigger_parts:
+            parts.append(f"trigger_status: [{', '.join(trigger_parts)}]")
+
     result = " | ".join(parts)
 
     # Append scaffold section

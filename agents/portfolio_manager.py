@@ -42,6 +42,7 @@ from utils.raw_pm_capture import (
     persist_raw_response,
     persist_lineage_links,
 )
+from utils.trigger_status import compute_trigger_status
 
 log = logging.getLogger(__name__)
 
@@ -4022,6 +4023,17 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
         )
         if sig:
             signals[sym] = json.loads(sig.value)
+
+    for sym, signal in list(signals.items()):
+        if isinstance(signal, dict) and not isinstance(signal.get("trigger_status"), dict):
+            try:
+                signals[sym]["trigger_status"] = compute_trigger_status(
+                    signal,
+                    fh.get_quote(sym),
+                    {},
+                )
+            except Exception as exc:
+                log.warning("Failed to derive trigger_status for %s in PM cycle: %s", sym, exc)
 
     # Get profile-specific execution feedback from Reviewer
     exec_fb = (
