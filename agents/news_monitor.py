@@ -127,6 +127,10 @@ def fetch_and_store_news(engine, symbols: list, source_tag: str) -> dict:
 
 def run(engine) -> dict:
     """Check for breaking news on watchlist symbols."""
+    if os.getenv("NEWS_MONITOR_ENABLED", "true").strip().lower() in ("false", "0", "no", "disabled"):
+        log.info("News monitor disabled by NEWS_MONITOR_ENABLED")
+        return {"alerts": [], "market_update": "news monitor disabled"}
+
     fh = FinnhubClient()
     watchlist = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,TSLA,NVDA,AMD").split(",")]
 
@@ -212,7 +216,11 @@ Flag any breaking catalysts that could affect today's trading.
             # Trigger narrator flash update for high-urgency breaking news on held positions
             sym = alert.get("symbol", "")
             headline = alert.get("headline", "")
-            if alert.get("urgency") == "high" and sym in held_symbols:
+            if (
+                alert.get("urgency") == "high"
+                and sym in held_symbols
+                and os.getenv("NARRATOR_ENABLED", "true").strip().lower() not in ("false", "0", "no", "disabled")
+            ):
                 try:
                     import agents.narrator as narrator
                     narrator.run(engine, "flash_update", event_context={

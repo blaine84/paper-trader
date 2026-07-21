@@ -1999,6 +1999,9 @@ def run_price_monitor():
 
 def run_news_monitor():
     """Every 2 hours — check for breaking news catalysts."""
+    if os.getenv("NEWS_MONITOR_ENABLED", "true").strip().lower() in ("false", "0", "no", "disabled"):
+        log.info("News monitor disabled by NEWS_MONITOR_ENABLED")
+        return
     if _skip_closed_market_job("news_monitor"):
         return
     log.info("=== NEWS MONITOR ===")
@@ -2110,6 +2113,9 @@ def run_position_timer():
 
 def run_narrator(update_type: str):
     """Generic narrator runner for cron-triggered update types."""
+    if os.getenv("NARRATOR_ENABLED", "true").strip().lower() in ("false", "0", "no", "disabled"):
+        log.info(f"Narrator {update_type} disabled by NARRATOR_ENABLED")
+        return
     if update_type != "sunday_prep" and _skip_closed_market_job(f"narrator_{update_type}"):
         return
     log.info(f"=== NARRATOR: {update_type} ===")
