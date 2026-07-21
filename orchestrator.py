@@ -35,6 +35,7 @@ import agents.daily_review as daily_review
 import agents.ceo as ceo
 from utils.expanded_watchlist import get_expanded_watchlist
 from utils.funnel_transition import get_funnel_or_fallback_candidates, build_deduplicated_watchlist
+from utils.focus_list import select_focus_symbols
 from utils.sector_scout_outcomes import (
     record_analyst_outcome,
     record_pm_outcome,
@@ -83,6 +84,80 @@ LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL_MINUTES", 15))
 def _pm_base_watchlist() -> list[str]:
     """Core symbols plus configured non-core names that PM may trade."""
     return _parse_symbol_list(",".join(WATCHLIST + PM_TRADABLE_SYMBOLS))
+
+
+def _env_flag_enabled(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("true", "1", "yes", "enabled")
+
+
+def _analyst_focus_enabled() -> bool:
+    return _env_flag_enabled("ANALYST_FOCUS_MODE", "disabled")
+
+
+def _analyst_focus_max_symbols() -> int:
+    try:
+        return max(1, int(os.getenv("ANALYST_FOCUS_MAX_SYMBOLS", "3")))
+    except ValueError:
+        log.warning("Invalid ANALYST_FOCUS_MAX_SYMBOLS=%r; using 3", os.getenv("ANALYST_FOCUS_MAX_SYMBOLS"))
+        return 3
+
+
+def _source_bonuses(
+    base_symbols: list[str],
+    scout_picks: list[str],
+    expanded_symbols: list[str],
+    alert_symbols: list[str] | None = None,
+) -> dict[str, float]:
+    bonuses: dict[str, float] = {}
+    for sym in base_symbols:
+        bonuses[sym] = max(bonuses.get(sym, 0.0), 0.5)
+    for sym in scout_picks:
+        bonuses[sym] = max(bonuses.get(sym, 0.0), 2.0)
+    for sym in expanded_symbols:
+        bonuses[sym] = max(bonuses.get(sym, 0.0), 3.0)
+    for sym in alert_symbols or []:
+        bonuses[sym] = max(bonuses.get(sym, 0.0), 4.0)
+    return bonuses
+
+
+def _open_position_symbols(engine) -> list[str]:
+    from db.schema import Position, get_session
+    db = get_session(engine)
+    try:
+        return _parse_symbol_list(",".join(p.symbol for p in db.query(Position).all()))
+    finally:
+        db.close()
+
+
+def _apply_focus_list(
+    engine,
+    candidate_symbols: list[str],
+    *,
+    scout_picks: list[str],
+    expanded_symbols: list[str],
+    context: str,
+    required_symbols: list[str] | None = None,
+    alert_symbols: list[str] | None = None,
+) -> list[str]:
+    if not _analyst_focus_enabled():
+        return candidate_symbols
+
+    focused = select_focus_symbols(
+        engine,
+        candidate_symbols,
+        max_symbols=_analyst_focus_max_symbols(),
+        required_symbols=required_symbols or [],
+        source_bonuses=_source_bonuses(_pm_base_watchlist(), scout_picks, expanded_symbols, alert_symbols),
+        context=context,
+    )
+    log.info(
+        "FOCUS_LIST_APPLIED: context=%s before=%d after=%d symbols=%s",
+        context,
+        len(candidate_symbols),
+        len(focused),
+        focused,
+    )
+    return focused
 
 
 _engine = None
@@ -1124,10 +1199,17 @@ def run_analyst_refresh():
         log.error(f"Funnel/expanded watchlist error: {e}", exc_info=True)
 
     full_watchlist = build_deduplicated_watchlist(_pm_base_watchlist(), scout_picks, expanded_symbols)
+    analyst_symbols = _apply_focus_list(
+        engine,
+        full_watchlist,
+        scout_picks=scout_picks,
+        expanded_symbols=expanded_symbols,
+        context="analyst_refresh",
+    )
 
     try:
         console.print("[bold blue]📊 Analyst refresh...[/bold blue]")
-        signals = analyst.run(engine, full_watchlist)
+        signals = analyst.run(engine, analyst_symbols)
 
         # Outcome tracking hook (Req 10.5): record analyst signals for expanded candidates
         if expanded_symbols and signals:
@@ -1206,11 +1288,13 @@ def _run_intraday_inner(engine):
 
     # ─── Alert intent scheduled consumption ────────────────────────────
     _alert_intent_ids = []
+    _alert_symbols = []
     from utils.gate_config import PM_ALERT_DISPATCH_MODE
     if PM_ALERT_DISPATCH_MODE == "enabled" and _alert_dispatcher is not None:
         try:
             extra_symbols, _alert_intent_ids = _alert_dispatcher.consume_for_scheduled_cycle()
             if extra_symbols:
+                _alert_symbols = list(extra_symbols)
                 # Add intent symbols to the watchlist (deduplicating)
                 for sym in extra_symbols:
                     if sym not in full_watchlist:
@@ -1222,6 +1306,16 @@ def _run_intraday_inner(engine):
         except Exception as e:
             log.error(f"Alert intent consumption error: {e}", exc_info=True)
             _alert_intent_ids = []
+
+    full_watchlist = _apply_focus_list(
+        engine,
+        full_watchlist,
+        scout_picks=scout_picks,
+        expanded_symbols=expanded_symbols,
+        context="intraday_pm",
+        required_symbols=_open_position_symbols(engine),
+        alert_symbols=_alert_symbols,
+    )
 
     # Analyst signals are refreshed by the separate run_analyst_refresh job
     # on the same schedule — no need to duplicate here.
