@@ -397,8 +397,13 @@ def api_data():
     scout_picks = get_scout_picks(db)
     scout_symbols = [p["symbol"] for p in scout_picks]
     active_focus = get_active_focus(db)
-    focus_symbols = set(active_focus.get("symbols", []))
-    all_symbols = core + [s for s in scout_symbols if s not in core]
+    focus_symbol_list = active_focus.get("symbols", [])
+    focus_symbols = set(focus_symbol_list)
+    all_symbols = (
+        core
+        + [s for s in scout_symbols if s not in core]
+        + [s for s in focus_symbol_list if s not in core and s not in scout_symbols]
+    )
 
     signals = get_analyst_signals(db, all_symbols)
     sentiment = get_researcher_sentiment(db, all_symbols)
