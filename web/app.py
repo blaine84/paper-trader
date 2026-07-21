@@ -323,6 +323,38 @@ def get_scout_picks(db) -> list:
     return data.get("picks", [])
 
 
+def get_active_focus(db) -> dict:
+    today = datetime.utcnow().date().isoformat()
+    mem = (
+        db.query(AgentMemory)
+        .filter(AgentMemory.agent == "scout")
+        .filter(AgentMemory.key.like(f"focus_list:{today}:%"))
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if not mem:
+        return {"symbols": [], "context": None, "generated_at": None, "max_symbols": None}
+    try:
+        data = json.loads(mem.value)
+    except Exception:
+        log.warning("Active focus memory row is not valid JSON: %s", mem.key)
+        return {"symbols": [], "context": None, "generated_at": None, "max_symbols": None}
+    if data.get("date") != today:
+        return {"symbols": [], "context": None, "generated_at": None, "max_symbols": None}
+
+    symbols = []
+    for symbol in data.get("selected", []):
+        sym = str(symbol or "").strip().upper()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+    return {
+        "symbols": symbols,
+        "context": data.get("context"),
+        "generated_at": data.get("generated_at"),
+        "max_symbols": data.get("max_symbols"),
+    }
+
+
 def get_portfolio_summary(db) -> dict:
     summaries = {}
     for profile_id in ACTIVE_PROFILES:
@@ -364,6 +396,8 @@ def api_data():
     core = [s.strip() for s in os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,TLT,GLD,XLK,XLF,XLE,TSLA,NVDA,AMD").split(",")]
     scout_picks = get_scout_picks(db)
     scout_symbols = [p["symbol"] for p in scout_picks]
+    active_focus = get_active_focus(db)
+    focus_symbols = set(active_focus.get("symbols", []))
     all_symbols = core + [s for s in scout_symbols if s not in core]
 
     signals = get_analyst_signals(db, all_symbols)
@@ -405,6 +439,7 @@ def api_data():
         row = {
             "symbol": sym,
             "is_scout": sym in scout_symbols,
+            "is_focus": sym in focus_symbols,
             "price": q.get("price", 0),
             "change_pct": q.get("change_pct", 0),
             "signal": sig.get("signal", "—"),
@@ -447,6 +482,7 @@ def api_data():
         "watchlist": watchlist,
         "analysis": watchlist,
         "scout_picks": scout_picks,
+        "active_focus": active_focus,
         "portfolio": portfolio,
         "regime": regime,
     })
