@@ -2397,11 +2397,12 @@ def main():
         id="intraday_afternoon",
     )
 
-    # Price monitor: every 60 seconds during market hours only (uses yfinance, free)
+    # Price monitor: every 60 seconds during market hours only (uses yfinance, free).
+    # Offset from :00 to avoid colliding with analyst/PM batch jobs and quote-provider bursts.
     from apscheduler.triggers.cron import CronTrigger as CT
     scheduler.add_job(
         run_price_monitor,
-        CT(day_of_week="mon-fri", hour="9-15", second="0", timezone="America/New_York"),
+        CT(day_of_week="mon-fri", hour="9-15", second="20", timezone="America/New_York"),
         id="price_monitor",
         max_instances=1,
         coalesce=True,
