@@ -50,6 +50,26 @@ def _nearest_level(current: float, levels: dict[str, float], keys: tuple[str, ..
     return key, level
 
 
+def _active_breakout_level(current: float, levels: dict[str, float]) -> tuple[str | None, float | None]:
+    breakout_levels = []
+    for key in ("resistance", "day_high", "prior_high"):
+        level = levels.get(key)
+        if level is not None and level > 0:
+            breakout_levels.append((key, level))
+    if not breakout_levels:
+        return None, None
+
+    overhead = [(level - current, key, level) for key, level in breakout_levels if level >= current]
+    if overhead:
+        _, key, level = min(overhead, key=lambda item: item[0])
+        return key, level
+
+    # All tracked breakout levels are below current; confirm against the
+    # highest cleared level instead of the easiest prior level.
+    key, level = max(breakout_levels, key=lambda item: item[1])
+    return key, level
+
+
 def _distance_pct(current: float, level: float) -> float:
     return round(((current - level) / level) * 100, 4)
 
@@ -75,9 +95,7 @@ def compute_trigger_status(signal: dict, quote: dict, indicators: dict | None = 
             "pullback": {"status": "unknown"},
         }
 
-    resistance_name, resistance = _nearest_level(
-        current, levels, ("resistance", "day_high", "prior_high"), side="above"
-    )
+    resistance_name, resistance = _active_breakout_level(current, levels)
     support_name, support = _nearest_level(
         current, levels, ("vwap", "support", "day_low", "prior_low"), side="below"
     )

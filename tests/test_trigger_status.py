@@ -25,6 +25,20 @@ def test_breakout_confirmed_when_price_above_resistance():
     assert result["breakout"]["status"] == "confirmed"
 
 
+def test_overhead_resistance_takes_priority_over_cleared_prior_high():
+    result = compute_trigger_status(
+        {"key_levels": {"resistance": 104.58, "prior_high": 100.67, "vwap": 102.88}},
+        {"price": 102.09},
+    )
+
+    assert result["status"] == "trigger_failed"
+    assert result["entry_trigger"] == "pullback_failed"
+    assert result["breakout"]["status"] == "waiting"
+    assert result["breakout"]["level_name"] == "resistance"
+    assert result["breakout"]["level"] == 104.58
+    assert result["pullback"]["status"] == "failed"
+
+
 def test_pullback_validating_when_price_tests_vwap():
     result = compute_trigger_status(
         {"key_levels": {"resistance": 105, "vwap": 100, "support": 96}},
