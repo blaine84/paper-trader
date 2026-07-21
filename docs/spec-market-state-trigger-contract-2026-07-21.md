@@ -346,3 +346,277 @@ The work is acceptable when:
 9. Live dashboard/API verification can show, for a focused symbol, current
    `market_state`, `timeframe_authority`, and conditional trigger summary.
 
+## Amendment: Setup Lifecycle and Watch Candidate Contract
+
+### Problem
+
+Focused-symbol trading exposed a second gap beyond vague `unclear_direction`
+labels: the system does not distinguish where a symbol is in the setup
+lifecycle.
+
+For example, a focused symbol may show strong intraday action, sector
+confirmation, and relative strength while the higher-timeframe chart remains
+bearish or capped by resistance. The correct response may be neither "buy" nor
+"ignore"; it may be "watch for reclaim", "wait for retest", or "track a
+conditional long activation."
+
+Today, those cases often collapse into `HOLD / unclear_direction`. That is safe
+for execution, but it loses valuable timing information:
+
+- The system cannot explain whether a setup is early, late, invalidated, or
+  waiting for confirmation.
+- PM does not receive a non-trading watch object to monitor.
+- Reviewer/CEO cannot later score missed AMD/MU-style opportunities because no
+  structured watch candidate was recorded.
+- The dashboard cannot show that the system identified the right symbol but was
+  waiting for a specific activation boundary.
+
+### Proposed Fix
+
+Introduce a structured setup lifecycle layer between Analyst signal generation
+and PM trade candidate creation.
+
+The lifecycle layer shall convert mixed timeframe and trigger evidence into
+explicit non-trading watch states before any trade authority is granted.
+
+The intended flow is:
+
+```text
+market data -> Analyst/trigger state -> setup lifecycle -> watch candidate
+             -> activation event -> PM trade candidate -> PM gates -> trade
+```
+
+The goal is to make conditional opportunity tracking observable and reviewable
+without making PM more aggressive.
+
+### Lifecycle States
+
+Each focused analyzed symbol shall receive a `setup_lifecycle_state`.
+
+Allowed initial states shall include:
+
+- `no_setup`
+- `early_watch`
+- `compression_watch`
+- `breakout_watch`
+- `breakout_confirmed_wait_retest`
+- `pullback_watch`
+- `pullback_validating`
+- `activation_pending`
+- `activated_for_pm_review`
+- `invalidated`
+- `expired`
+
+The lifecycle state shall be derived from structured fields including:
+
+- `market_state`
+- `timeframe_authority`
+- `setup_reclassification`
+- `trigger_status`
+- `if_then_triggers`
+- volume/relative-volume confirmation when available
+- VWAP/support/resistance distance
+- higher-timeframe trend and resistance context
+- sector/breadth/relative-strength context
+
+`setup_lifecycle_state` shall not replace Analyst `signal`. It shall describe
+setup maturity and timing.
+
+### Timeframe Role Assignment
+
+The system shall treat timeframes as distinct decision roles:
+
+- Higher timeframe controls regime and trade permission.
+- Intermediate timeframe controls setup structure.
+- Intraday timeframe controls execution timing.
+- Sector, breadth, and relative strength control tailwind/headwind context.
+
+When these roles disagree, the lifecycle layer shall not classify the symbol as
+generically unclear if a more precise conditional state applies.
+
+Examples:
+
+- Higher timeframe bearish + intraday bullish + below resistance:
+  `counter_trend_retracement_under_resistance` and `breakout_watch` or
+  `compression_watch`.
+- Higher timeframe bearish + intraday bullish + confirmed reclaim over
+  resistance: `activation_pending` or `activated_for_pm_review`, subject to
+  Analyst direction and PM gates.
+- Higher timeframe bullish + intraday pullback to VWAP/support:
+  `pullback_validating`.
+- Breakout confirmed while extended from VWAP: `breakout_confirmed_wait_retest`.
+
+### Watch Candidates
+
+The system shall create a non-trading `watch_candidate` record when a focused
+symbol has a meaningful conditional opportunity but does not yet satisfy trade
+entry requirements.
+
+A watch candidate shall include:
+
+- `watch_id`
+- `symbol`
+- `created_at`
+- `expires_at`
+- `source_cycle_id`
+- `market_state`
+- `setup_lifecycle_state`
+- `timeframe_authority`
+- `direction_watch`
+- `trade_posture`
+- `activation_conditions`
+- `invalidation_conditions`
+- `key_levels`
+- `trigger_status`
+- `reason`
+- `source_signal_snapshot`
+
+Allowed `direction_watch` values shall include:
+
+- `long`
+- `short`
+- `two_sided`
+- `none`
+
+Allowed `trade_posture` values shall include:
+
+- `watch_only`
+- `watch_long_breakout`
+- `watch_short_breakdown`
+- `watch_retest`
+- `watch_pullback_hold`
+- `invalidated`
+
+Watch candidates shall be explicitly non-executable. They shall not be inserted
+into `pm_candidates` unless activation and existing PM eligibility requirements
+are satisfied.
+
+### Activation and Invalidation
+
+Each watch candidate shall define quantitative activation and invalidation
+conditions.
+
+Activation examples:
+
+```json
+{
+  "activation_conditions": [
+    {
+      "id": "long_reclaim_resistance",
+      "condition": "price_above",
+      "threshold": 544.65,
+      "confirmation": "configured close/hold rule and volume confirmation",
+      "then": "activated_for_pm_review"
+    }
+  ],
+  "invalidation_conditions": [
+    {
+      "id": "long_vwap_failure",
+      "condition": "price_below",
+      "threshold": 533.82,
+      "confirmation": "sustained below VWAP/support",
+      "then": "invalidated"
+    }
+  ]
+}
+```
+
+The implementation shall support activation in observe-only mode before any
+live PM promotion is enabled.
+
+### PM Promotion Rules
+
+Watch candidates may be promoted to PM review only when all required conditions
+are true:
+
+1. The watch candidate is active and unexpired.
+2. Activation conditions have been met.
+3. Analyst signal is directional, not `HOLD`, or a future explicitly approved
+   observe-to-PM promotion mode is enabled.
+4. Setup type is executable or mapped to an executable setup.
+5. Candidate geometry exists with valid entry, stop, target, and risk/reward.
+6. Existing PM quality, risk, profile, and portfolio gates pass.
+
+This amendment does not authorize watch candidates to bypass PM gates.
+
+When activation occurs while Analyst remains `HOLD`, the system shall record an
+activation event and keep the candidate in observe-only state unless a separate
+future requirement explicitly changes that behavior.
+
+### Shadow Outcome Tracking
+
+The system shall record shadow outcomes for watch candidates.
+
+At minimum, the system shall capture:
+
+- activation time, if any
+- hypothetical entry level
+- maximum favorable excursion
+- maximum adverse excursion
+- whether invalidation occurred before activation
+- whether the Analyst remained `HOLD`
+- whether PM would have accepted or rejected the activated candidate
+- reason actual trading did or did not occur
+
+Shadow outcomes shall be reviewable by the Reviewer and CEO agents.
+
+The purpose is to learn whether missed opportunities were:
+
+- correct avoids
+- late/chase setups
+- Analyst underconfidence
+- PM gate overrestriction
+- missing volume/timing confirmation
+- data freshness or provider failures
+
+### Dashboard Requirements
+
+For focused symbols, the dashboard shall show:
+
+- market state
+- setup lifecycle state
+- watch posture, when present
+- activation level
+- invalidation level
+- whether the setup is watch-only, activated, invalidated, or expired
+
+Dashboard language shall make flatness intentional.
+
+Examples:
+
+- `Watch: Long breakout over 544.65`
+- `State: Counter-trend rally under daily resistance`
+- `Posture: Wait for retest`
+- `Invalidates below VWAP 533.82`
+
+### Safety Requirements
+
+Watch candidates are not trades.
+
+Missing or malformed lifecycle fields shall fail closed.
+
+Expired watch candidates shall not activate.
+
+If activation and invalidation both appear true in the same evaluation window,
+the system shall prefer the conservative interpretation and require a fresh
+cycle before PM promotion.
+
+No lifecycle state shall create broker/execution authority by itself.
+
+### Additional Acceptance Criteria
+
+The amendment is acceptable when:
+
+1. Focused symbols can produce watch candidates while Analyst remains `HOLD`.
+2. Watch candidates are stored separately from executable PM candidates.
+3. PM does not trade from watch candidates unless promotion rules are satisfied.
+4. A higher-timeframe bearish / intraday bullish symbol under resistance is
+   classified as a counter-trend or compression watch instead of generic
+   `unclear_direction`.
+5. A confirmed breakout that is extended from VWAP becomes a retest watch, not
+   an automatic entry.
+6. The dashboard can show the current watch posture and activation/invalidation
+   levels for a focused symbol.
+7. Shadow outcome tracking can later answer whether an AMD/MU-style watch would
+   have produced a favorable trade.
+8. Observe-only mode can run without changing live trading behavior.
