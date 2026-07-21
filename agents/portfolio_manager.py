@@ -4025,7 +4025,8 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             signals[sym] = json.loads(sig.value)
 
     for sym, signal in list(signals.items()):
-        if isinstance(signal, dict) and not isinstance(signal.get("trigger_status"), dict):
+        trigger_status = signal.get("trigger_status") if isinstance(signal, dict) else None
+        if isinstance(signal, dict) and (not isinstance(trigger_status, dict) or not trigger_status):
             try:
                 signals[sym]["trigger_status"] = compute_trigger_status(
                     signal,

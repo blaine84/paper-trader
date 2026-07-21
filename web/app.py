@@ -443,7 +443,7 @@ def api_data():
         sig = signals.get(sym, {})
         sent = sentiment.get(sym, {})
         trigger_status = sig.get("trigger_status", {})
-        if not isinstance(trigger_status, dict):
+        if not isinstance(trigger_status, dict) or not trigger_status:
             try:
                 trigger_status = compute_trigger_status(sig, q, {})
             except Exception as exc:
