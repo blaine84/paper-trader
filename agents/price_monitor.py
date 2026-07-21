@@ -28,8 +28,58 @@ _QUOTE_CACHE_SECONDS = int(os.getenv("PRICE_MONITOR_QUOTE_CACHE_SECONDS", "20"))
 _quote_cache: dict[str, tuple[float, float]] = {}
 
 
-def get_batch_quotes(symbols: list[str]) -> dict:
-    """Get current prices for symbols via Finnhub, falling back to yfinance."""
+def _get_yfinance_quotes(symbols: list[str], now: float) -> dict:
+    quotes = {}
+    if not symbols:
+        return quotes
+
+    try:
+        import yfinance as yf
+        tickers = yf.Tickers(" ".join(symbols))
+        for sym in symbols:
+            try:
+                ticker = tickers.tickers.get(sym)
+                price = ticker.fast_info.get("lastPrice") if ticker else None
+                if price and float(price) > 0:
+                    quotes[sym] = round(float(price), 2)
+                    _quote_cache[sym] = (now, quotes[sym])
+            except Exception as e:
+                log.warning("yfinance quote fallback failed for %s: %s", sym, e)
+    except Exception as e:
+        log.warning("yfinance batch quote fallback failed: %s", e)
+
+    return quotes
+
+
+def _get_finnhub_quotes(symbols: list[str], now: float, retries: int) -> dict:
+    quotes = {}
+    if not symbols:
+        return quotes
+
+    try:
+        fh = FinnhubClient()
+        for sym in symbols:
+            try:
+                q = fh.get_quote(sym, retries=retries)
+                price = round(float(q.get("price", 0)), 2)
+                if price > 0:
+                    quotes[sym] = price
+                    _quote_cache[sym] = (now, price)
+            except Exception as e:
+                log.warning("Finnhub quote failed for %s: %s", sym, e)
+    except Exception as e:
+        log.warning("Finnhub quote client unavailable: %s", e)
+
+    return quotes
+
+
+def get_batch_quotes(symbols: list[str], *, prefer_finnhub: bool = False) -> dict:
+    """Get current prices for symbols with cache-aware provider routing.
+
+    Monitoring/display paths use yfinance first so Finnhub quota stays available
+    for execution-critical reads. Stop/target checks can opt into Finnhub-first
+    by passing prefer_finnhub=True.
+    """
     quotes = {}
     now = time.time()
     missing = []
@@ -43,41 +93,20 @@ def get_batch_quotes(symbols: list[str]) -> dict:
     if not missing:
         return quotes
 
-    finnhub_missing = []
-    try:
-        fh = FinnhubClient()
-        for sym in missing:
-            try:
-                q = fh.get_quote(sym)
-                price = round(float(q.get("price", 0)), 2)
-                if price > 0:
-                    quotes[sym] = price
-                    _quote_cache[sym] = (now, price)
-                else:
-                    finnhub_missing.append(sym)
-            except Exception as e:
-                log.warning("Finnhub quote failed for %s; trying yfinance fallback: %s", sym, e)
-                finnhub_missing.append(sym)
-    except Exception as e:
-        log.warning("Finnhub quote client unavailable; trying yfinance fallback for batch: %s", e)
-        finnhub_missing = missing
-
-    if not finnhub_missing:
+    if prefer_finnhub:
+        finnhub_quotes = _get_finnhub_quotes(missing, now, retries=2)
+        quotes.update(finnhub_quotes)
+        missing = [sym for sym in missing if sym not in finnhub_quotes]
+        quotes.update(_get_yfinance_quotes(missing, now))
         return quotes
 
-    try:
-        import yfinance as yf
-        tickers = yf.Tickers(" ".join(finnhub_missing))
-        for sym in finnhub_missing:
-            try:
-                price = tickers.tickers[sym].fast_info.get("lastPrice")
-                if price and float(price) > 0:
-                    quotes[sym] = round(float(price), 2)
-                    _quote_cache[sym] = (now, quotes[sym])
-            except Exception as e:
-                log.warning("yfinance quote fallback failed for %s: %s", sym, e)
-    except Exception as e:
-        log.warning("yfinance batch quote fallback failed: %s", e)
+    yfinance_quotes = _get_yfinance_quotes(missing, now)
+    quotes.update(yfinance_quotes)
+    missing = [sym for sym in missing if sym not in yfinance_quotes]
+
+    # Monitoring fallback should be fast. Avoid Finnhub's 60s retry sleep when
+    # the provider is already rate-limited.
+    quotes.update(_get_finnhub_quotes(missing, now, retries=0))
 
     return quotes
 
@@ -91,7 +120,7 @@ def check_stops_and_targets(engine) -> list[dict]:
             return []
 
         symbols = list(set(t.symbol for t in open_trades))
-        quotes = get_batch_quotes(symbols)
+        quotes = get_batch_quotes(symbols, prefer_finnhub=True)
         triggers = []
 
         for trade in open_trades:
