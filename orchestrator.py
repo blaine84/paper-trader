@@ -2402,7 +2402,7 @@ def main():
     from apscheduler.triggers.cron import CronTrigger as CT
     scheduler.add_job(
         run_price_monitor,
-        CT(day_of_week="mon-fri", hour="9-15", second="20", timezone="America/New_York"),
+        CT(day_of_week="mon-fri", hour="9-15", second="50", timezone="America/New_York"),
         id="price_monitor",
         max_instances=1,
         coalesce=True,
