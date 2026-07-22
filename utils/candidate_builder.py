@@ -98,6 +98,100 @@ def build_candidate_set(
     # Profile minimum signal strength
     min_signal_strength = profile.get("min_signal_strength", "moderate")
 
+    # ---------------------------------------------------------------------------
+    # Watch Candidate Management (guarded by MARKET_STATE_MODE feature flag)
+    # ---------------------------------------------------------------------------
+    from utils.gate_config import MARKET_STATE_MODE
+    if MARKET_STATE_MODE != "disabled":
+        try:
+            from utils.watch_candidates import (
+                evaluate_and_create_watch_candidates,
+                evaluate_active_watch_candidates,
+                get_promotable_candidates,
+            )
+            # 13.1: Create watch candidates for eligible symbols
+            evaluate_and_create_watch_candidates(
+                engine=db,
+                signals=signals,
+                cycle_id=cycle_id,
+                profile_id=profile_id,
+            )
+            # 13.2: Evaluate active watch candidates
+            evaluate_active_watch_candidates(
+                engine=db,
+                signals=signals,
+                profile_id=profile_id,
+            )
+            # 13.3: Promotion (enforcing mode only)
+            if MARKET_STATE_MODE == "enforcing":
+                promotable = get_promotable_candidates(
+                    engine=db,
+                    signals=signals,
+                    profile_id=profile_id,
+                )
+                for promo in promotable:
+                    try:
+                        promo_signal = promo["signal"]
+                        promo_scaffold = build_entry_geometry_scaffold(promo_signal, profile_id=profile_id)
+                        if promo_scaffold.get("status") != "ok":
+                            continue
+                        promo_candidates = promo_scaffold.get("candidates", [])
+                        if not promo_candidates:
+                            continue
+                        # Use first scaffold candidate for promoted watch
+                        pc = promo_candidates[0]
+                        promo_candidate_id = str(uuid.uuid4())
+                        promo_created_at = datetime.now(timezone.utc)
+                        promo_expires_at = cycle_expires_at or (promo_created_at + timedelta(hours=1))
+                        promo_direction = "BUY" if promo_scaffold["direction"] == "LONG" else "SHORT"
+                        promo_signal_json = json.dumps(promo_signal, default=str, sort_keys=True)
+                        promo_record_dict = {
+                            "candidate_id": promo_candidate_id,
+                            "symbol": promo["symbol"],
+                            "direction": promo_direction,
+                            "entry_price": pc["entry_price"],
+                            "stop_price": pc["stop_loss"],
+                            "target_price": pc["target"],
+                            "setup_type": promo_signal.get("setup_type", "unknown"),
+                            "profile_id": profile_id,
+                            "cycle_id": cycle_id,
+                        }
+                        promo_hash = _compute_integrity_hash(promo_record_dict)
+                        promo_record = CandidateRecord(
+                            candidate_id=promo_candidate_id,
+                            cycle_id=cycle_id,
+                            profile_id=profile_id,
+                            symbol=promo["symbol"],
+                            direction=promo_direction,
+                            setup_type=promo_signal.get("setup_type", "unknown"),
+                            geometry_name=pc["name"],
+                            entry_price=pc["entry_price"],
+                            stop_price=pc["stop_loss"],
+                            target_price=pc["target"],
+                            risk_reward=pc["risk_reward"],
+                            trigger=pc["trigger"],
+                            invalidation_basis=pc["invalidation_basis"],
+                            target_basis=pc["target_basis"],
+                            source_signal_id=promo["watch_id"],  # traceability
+                            signal_snapshot_json=promo_signal_json,
+                            created_at=promo_created_at,
+                            expires_at=promo_expires_at,
+                            integrity_hash=promo_hash,
+                            candidate_type="intraday",
+                        )
+                        registry.register(promo_record)
+                        logger.info(
+                            "Promoted watch candidate %s for %s → PM candidate %s",
+                            promo["watch_id"], promo["symbol"], promo_candidate_id,
+                        )
+                    except Exception as promo_exc:
+                        logger.warning(
+                            "Watch candidate promotion failed for %s: %s",
+                            promo.get("symbol"), promo_exc,
+                        )
+        except Exception as wc_exc:
+            logger.warning("Watch candidate management failed: %s", wc_exc)
+
     # Filter eligible signals
     eligible_signals = _filter_eligible_signals(
         signals, held_symbols, min_signal_strength

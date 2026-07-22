@@ -360,6 +360,20 @@ if LLM_QUEUE_MODE != "disabled":
 
 
 # ---------------------------------------------------------------------------
+# Market State Trigger Contract Feature Flag
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enforcing"
+_raw_market_state_mode = os.environ.get("MARKET_STATE_MODE", "disabled")
+if _raw_market_state_mode not in ("disabled", "observe", "enforcing"):
+    logger.warning(
+        "Unrecognized MARKET_STATE_MODE=%r, defaulting to 'disabled'",
+        _raw_market_state_mode,
+    )
+    _raw_market_state_mode = "disabled"
+MARKET_STATE_MODE: str = _raw_market_state_mode
+
+# ---------------------------------------------------------------------------
 # Swing Candidate Pipeline Feature Flags
 # ---------------------------------------------------------------------------
 

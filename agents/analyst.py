@@ -36,6 +36,8 @@ from feedback_loop.analyst_feedback import (
 )
 from utils.trigger_status import compute_trigger_status
 from utils.symbol_class import classify_symbol, validate_setup_for_symbol
+from utils.gate_config import MARKET_STATE_MODE
+from utils.market_state import compute_market_state
 
 log = logging.getLogger(__name__)
 
@@ -1247,6 +1249,36 @@ Produce your trading signal JSON for {sym}.
                 signal, quote, indicators
             )
             signal["trigger_status"] = compute_trigger_status(signal, quote, indicators)
+            # Market state computation (feature-flagged)
+            if MARKET_STATE_MODE != "disabled":
+                try:
+                    _ms_result = compute_market_state(
+                        signal, quote, indicators,
+                        market_regime=signal.get("market_regime"),
+                    )
+                    signal["market_state"] = _ms_result.market_state
+                    signal["timeframe_authority"] = _ms_result.timeframe_authority.to_dict()
+                    signal["setup_reclassification"] = (
+                        _ms_result.setup_reclassification.to_dict()
+                        if _ms_result.setup_reclassification else None
+                    )
+                    signal["if_then_triggers"] = [t.to_dict() for t in _ms_result.if_then_triggers]
+                    signal["setup_lifecycle_state"] = _ms_result.setup_lifecycle_state
+                    signal["veto_reason_category"] = _ms_result.veto_reason_category
+                    try:
+                        log_trade_event(
+                            "market_state_computed",
+                            symbol=sym,
+                            market_state=_ms_result.market_state,
+                            lifecycle=_ms_result.setup_lifecycle_state,
+                            triggers_count=len(_ms_result.if_then_triggers),
+                        )
+                    except Exception:
+                        pass  # fail-open: event logging never blocks
+                except Exception as ms_exc:
+                    log.warning("Market state computation failed for %s: %s", sym, ms_exc)
+                    signal["market_state"] = "confounded"
+                    signal["setup_lifecycle_state"] = "no_setup"
             signal = enforce_veto_accountability(signal)
             signal = repair_missing_veto_contract(signal, sym)
             signal = sanitize_historical_feedback_bleed(signal)
