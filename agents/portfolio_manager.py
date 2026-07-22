@@ -35,7 +35,7 @@ from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.catalyst_specificity import evaluate_catalyst_specificity
 from utils.stop_authority import apply_stop_update
 from utils.shadow_ledger import record_blocked_candidate, write_pilot_counterfactual_row
-from utils.gate_config import PM_PROVENANCE_MODE
+from utils.gate_config import PM_PROVENANCE_MODE, MARKET_STATE_MODE
 from utils.raw_pm_capture import (
     capture_raw_pm_response,
     link_response_to_lineages,
@@ -5360,6 +5360,40 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             + "\n--- END ANALYST REASONING DATA ---"
         )
 
+    # Build market-state context block for PM (enforcing mode only)
+    market_state_block = ""
+    if MARKET_STATE_MODE == "enforcing":
+        ms_lines: list[str] = []
+        for sym, sig in entry_signals.items():
+            ms = sig.get("market_state")
+            if not ms or ms == "confounded":
+                continue
+            authority_info = sig.get("timeframe_authority", {})
+            reclass = sig.get("setup_reclassification")
+            triggers = sig.get("if_then_triggers", [])
+            lifecycle = sig.get("setup_lifecycle_state", "no_setup")
+
+            sym_block = f"[{sym}] state={ms} authority={authority_info.get('authority', 'unknown')}"
+            if authority_info.get("conflict"):
+                sym_block += " CONFLICT"
+            if reclass:
+                sym_block += f" reclassified={reclass.get('reclassified_setup_type', '')} posture={reclass.get('trade_posture', '')}"
+            sym_block += f" lifecycle={lifecycle}"
+            if triggers:
+                trigger_summary = "; ".join(
+                    f"{t.get('id', '?')}@{t.get('threshold', '?')}"
+                    for t in triggers[:4]
+                )
+                sym_block += f" triggers=[{trigger_summary}]"
+            ms_lines.append(sym_block)
+
+        if ms_lines:
+            market_state_block = (
+                "\n--- MARKET STATE CONTEXT (deterministic analysis) ---\n"
+                + "\n".join(ms_lines)
+                + "\n--- END MARKET STATE CONTEXT ---\n"
+            )
+
     # Build scaffold unavailability notes for prompt
     scaffold_unavailable_notes: list[str] = []
     for sym in entry_signals:
@@ -5395,7 +5429,7 @@ ANALYST SIGNALS AND GEOMETRY SCAFFOLD CANDIDATES:
 {compact_signals_text if compact_signals_text else "No entry signals"}
 {chr(10).join(scaffold_unavailable_notes) if scaffold_unavailable_notes else ""}
 {analyst_data_section}
-
+{market_state_block}
 EXECUTION FEEDBACK (your profile only):
 {feedback_text}{weekly_stance_text}
 

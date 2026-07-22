@@ -874,6 +874,79 @@ def _ensure_checkpoint_tables(engine, inspector):
     log.warning("Schema migration: created checkpoint_events table with indexes")
 
 
+def _ensure_watch_candidate_tables(engine, inspector):
+    """Create watch_candidates table if missing.
+
+    Called during check_schema() startup. Non-destructive — only creates
+    tables that are missing.
+
+    Requirements: 8.2, 8.3, 8.5.1, 15.1, 15.3
+    """
+    from sqlalchemy import text
+    from utils.dialect_sql import _pk_column, _default_timestamp
+
+    if inspector.has_table("watch_candidates"):
+        return
+
+    pk = _pk_column(engine)
+    ts_default = _default_timestamp(engine)
+
+    with engine.connect() as conn:
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS watch_candidates (
+                    {pk},
+                    watch_id TEXT NOT NULL UNIQUE,
+                    symbol TEXT NOT NULL,
+                    created_at TEXT NOT NULL {ts_default},
+                    updated_at TEXT NOT NULL {ts_default},
+                    expires_at TEXT NOT NULL,
+                    source_cycle_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    market_state TEXT NOT NULL,
+                    setup_lifecycle_state TEXT NOT NULL,
+                    timeframe_authority_json TEXT NOT NULL,
+                    direction_watch TEXT NOT NULL,
+                    trade_posture TEXT NOT NULL,
+                    activation_conditions_json TEXT NOT NULL,
+                    invalidation_conditions_json TEXT NOT NULL,
+                    key_levels_json TEXT NOT NULL,
+                    trigger_status_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    source_signal_snapshot_json TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    state_changed_at TEXT,
+                    outcome_json TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_watch_candidates_active "
+                "ON watch_candidates (profile_id, state, symbol) "
+                "WHERE state = 'active'"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_watch_candidates_expires "
+                "ON watch_candidates (expires_at) "
+                "WHERE state = 'active'"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_candidates_active_unique "
+                "ON watch_candidates (symbol, profile_id, direction_watch) "
+                "WHERE state = 'active'"
+            )
+        )
+        conn.commit()
+    log.warning("Schema migration: created watch_candidates table with indexes")
+
+
 def check_schema(engine):
     """Verify the DB schema has all expected columns. Fail fast if not."""
     from sqlalchemy import inspect as sa_inspect, text
@@ -890,6 +963,7 @@ def check_schema(engine):
 
     # --- Auto-create candidate-ID selection tables if missing (non-destructive) ---
     _ensure_candidate_tables(engine, inspector)
+    _ensure_watch_candidate_tables(engine, inspector)
     _ensure_pm_candidates_identity_default(engine, inspector)
     _ensure_pm_candidate_events_identity_default(engine, inspector)
 
@@ -1847,6 +1921,15 @@ def run_post_market():
     log.info("=== POST-MARKET / END OF DAY ===")
     engine = get_engine()
 
+    # Expire session watch candidates at end of day
+    from utils.gate_config import MARKET_STATE_MODE
+    if MARKET_STATE_MODE != "disabled":
+        try:
+            from utils.watch_candidates import expire_session_watch_candidates
+            expire_session_watch_candidates(engine)
+        except Exception as exc:
+            log.warning("End-of-day watch candidate expiration failed: %s", exc)
+
     # Outcome tracking hook (Req 10.5): record trade outcomes for expanded candidates
     try:
         _record_expanded_trade_outcomes(engine)
@@ -2262,6 +2345,26 @@ def main():
     ensure_initial_balance(engine)
     check_schema(engine)
     ensure_shadow_ledger_schema(engine)
+
+    # Expire stale watch candidates (crash recovery / idempotent startup sweep)
+    from utils.gate_config import MARKET_STATE_MODE
+    if MARKET_STATE_MODE != "disabled":
+        try:
+            from sqlalchemy import text as _text
+            with engine.connect() as conn:
+                expired = conn.execute(
+                    _text(
+                        "UPDATE watch_candidates SET state = 'expired', "
+                        "state_changed_at = CURRENT_TIMESTAMP, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE state = 'active' AND expires_at < CURRENT_TIMESTAMP"
+                    )
+                )
+                if expired.rowcount > 0:
+                    log.info("Startup: expired %d stale watch candidates", expired.rowcount)
+                conn.commit()
+        except Exception as exc:
+            log.warning("Startup watch candidate expiration sweep failed: %s", exc)
 
     # Initialize alert dispatch schema (idempotent IF NOT EXISTS DDL)
     from utils.alert_dispatch_schema import init_alert_dispatch_schema

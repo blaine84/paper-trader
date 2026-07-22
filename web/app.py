@@ -470,6 +470,11 @@ def api_data():
             "breaking_news": breaking_news_by_symbol.get(sym, []),
             "catalyst_freshness": freshness_by_symbol.get(sym, {}),
             "freshness_label": build_freshness_label(sym, freshness_by_symbol.get(sym, {})),
+            "market_state": sig.get("market_state", "confounded"),
+            "timeframe_authority": sig.get("timeframe_authority", {}),
+            "setup_lifecycle_state": sig.get("setup_lifecycle_state", "no_setup"),
+            "if_then_triggers": sig.get("if_then_triggers", [])[:4],
+            "setup_reclassification": sig.get("setup_reclassification"),
         }
         snapshot = _build_dashboard_market_data_snapshot(sym, q, market_open)
         watchlist.append(_add_market_data_reliability_fields(row, snapshot))
@@ -500,6 +505,61 @@ def api_data():
         "portfolio": portfolio,
         "regime": regime,
     })
+
+
+@app.route("/api/watch-candidates")
+def api_watch_candidates():
+    """Return active watch candidates, optionally filtered by profile_id."""
+    from utils.gate_config import MARKET_STATE_MODE
+    if MARKET_STATE_MODE == "disabled":
+        return jsonify([])
+
+    profile_id = request.args.get("profile_id")
+    try:
+        from sqlalchemy import text as _text
+        with engine.connect() as conn:
+            if profile_id:
+                rows = conn.execute(
+                    _text(
+                        "SELECT watch_id, symbol, direction_watch, trade_posture, "
+                        "       activation_conditions_json, invalidation_conditions_json, "
+                        "       state, created_at, expires_at, market_state, setup_lifecycle_state "
+                        "FROM watch_candidates "
+                        "WHERE state = 'active' AND profile_id = :pid"
+                    ),
+                    {"pid": profile_id},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    _text(
+                        "SELECT watch_id, symbol, direction_watch, trade_posture, "
+                        "       activation_conditions_json, invalidation_conditions_json, "
+                        "       state, created_at, expires_at, market_state, setup_lifecycle_state "
+                        "FROM watch_candidates "
+                        "WHERE state = 'active'"
+                    )
+                ).fetchall()
+
+        result = []
+        for row in rows:
+            import json as _json
+            result.append({
+                "watch_id": row[0],
+                "symbol": row[1],
+                "direction": row[2],
+                "posture": row[3],
+                "activation_levels": _json.loads(row[4] or "[]"),
+                "invalidation_levels": _json.loads(row[5] or "[]"),
+                "state": row[6],
+                "created_at": row[7],
+                "expires_at": row[8],
+                "market_state": row[9],
+                "lifecycle_state": row[10],
+            })
+        return jsonify(result)
+    except Exception as exc:
+        log.warning("Watch candidates API failed: %s", exc)
+        return jsonify([])
 
 
 @app.route("/api/positions")
