@@ -374,6 +374,31 @@ if _raw_market_state_mode not in ("disabled", "observe", "enforcing"):
 MARKET_STATE_MODE: str = _raw_market_state_mode
 
 # ---------------------------------------------------------------------------
+# Watch Candidate Hardening Constants
+# ---------------------------------------------------------------------------
+
+# Key-level drift threshold (percentage). Active watches with support/resistance
+# drift exceeding this value are structurally invalidated.
+# Default: 2.0% (tighter than a naive 5% — catches meaningful structural shifts
+# on intraday key levels where 2% already represents a broken level).
+WATCH_KEY_LEVEL_DRIFT_PCT: float = float(
+    os.environ.get("WATCH_KEY_LEVEL_DRIFT_PCT", "2.0")
+)
+
+# Same-cycle promotion policy.
+# Values: "never" | "activation_pending_only" | "always"
+_raw_same_cycle_policy = os.environ.get(
+    "WATCH_SAME_CYCLE_PROMOTION_POLICY", "activation_pending_only"
+)
+if _raw_same_cycle_policy not in ("never", "activation_pending_only", "always"):
+    logger.warning(
+        "Unrecognized WATCH_SAME_CYCLE_PROMOTION_POLICY=%r, defaulting to 'activation_pending_only'",
+        _raw_same_cycle_policy,
+    )
+    _raw_same_cycle_policy = "activation_pending_only"
+WATCH_SAME_CYCLE_PROMOTION_POLICY: str = _raw_same_cycle_policy
+
+# ---------------------------------------------------------------------------
 # Swing Candidate Pipeline Feature Flags
 # ---------------------------------------------------------------------------
 

@@ -56,6 +56,287 @@ def _meets_threshold(signal_strength: str, threshold: str) -> bool:
     return sig_val >= thr_val
 
 
+def _process_promoted_watch(
+    engine: Any,
+    promo: dict,
+    registry: CandidateRegistry,
+    held_symbols: set[str],
+    min_signal_strength: str,
+    profile_id: str,
+    cycle_id: str,
+    cycle_expires_at: datetime | None,
+) -> None:
+    """Process a single promoted watch through eligibility -> geometry -> register.
+
+    Consumes one promoted watch candidate (from ``get_promotable_candidates()``)
+    and either creates a PM candidate (transitioning the watch to ``registered``)
+    or expires the watch with a terminal_reason describing why promotion was
+    blocked.
+
+    Eligibility checks (short-circuit on first failure, fail-closed):
+    1. held_symbols exclusion -> ``promotion_blocked_held_symbol``
+    2. min_signal_strength threshold -> ``promotion_blocked_weak_signal``
+    3. exception during checks -> ``promotion_blocked_eligibility_error``
+
+    Idempotent consumption:
+    - Before ``registry.register()``, check whether a PM candidate already exists
+      for ``(source_signal_id=watch_id, profile_id, cycle_id)``. If found, skip
+      registration, transition the watch to ``registered``, and log at DEBUG.
+
+    Terminal failure states in the promotion loop:
+    - ``promotion_blocked_held_symbol``
+    - ``promotion_blocked_weak_signal``
+    - ``promotion_blocked_eligibility_error`` (exception during eligibility)
+    - ``promotion_blocked_geometry_failed`` (scaffold status != 'ok' or exception)
+    - ``promotion_blocked_no_geometry_candidates`` (scaffold ok, empty candidates)
+    - ``promotion_blocked_registry_error`` (registry.register() raises)
+
+    All watch transitions here use ``_transition_watch_state()`` with
+    ``expected_state='promoted'``. A CAS failure (rowcount == 0) is logged at
+    WARNING and processing continues (fail-open) — the watch was already
+    consumed/transitioned concurrently or is swept by TTL/stale cleanup.
+
+    See design.md §9 (Promotion Loop with Idempotent Consumption).
+    Requirements: 1.2, 1.3, 1.7, 2.1-2.10, 5.5.
+    """
+    # Local (lazy) import mirrors the fail-open import pattern used by the caller
+    # and avoids a hard module-level coupling to watch_candidates.
+    from utils.watch_candidates import _transition_watch_state
+
+    watch_id = promo["watch_id"]
+    symbol = promo["symbol"]
+    signal = promo.get("signal", {}) or {}
+
+    def _expire(reason: str) -> None:
+        """Transition promoted -> expired with the given terminal_reason (fail-open CAS)."""
+        outcome_json = json.dumps(
+            {"terminal_state": "expired", "terminal_reason": reason}
+        )
+        ok = _transition_watch_state(
+            engine,
+            watch_id,
+            "expired",
+            outcome_json,
+            expected_state="promoted",
+        )
+        if not ok:
+            logger.warning(
+                "CAS promoted->expired (%s) failed for watch %s (already transitioned)",
+                reason,
+                watch_id,
+            )
+
+    # -------------------------------------------------------------------------
+    # Eligibility checks (fail-closed): held_symbols before strength, short-circuit
+    # -------------------------------------------------------------------------
+    try:
+        # Check 1 (short-circuit): held-symbol exclusion
+        if symbol in held_symbols:
+            logger.info(
+                "Promotion blocked for watch %s (%s): symbol held",
+                watch_id,
+                symbol,
+            )
+            _expire("promotion_blocked_held_symbol")
+            return
+
+        # Check 2: signal strength threshold
+        signal_strength = signal.get("strength")
+        if not _meets_threshold(signal_strength, min_signal_strength):
+            logger.info(
+                "Promotion blocked for watch %s (%s): weak signal (strength=%s < %s)",
+                watch_id,
+                symbol,
+                signal_strength,
+                min_signal_strength,
+            )
+            _expire("promotion_blocked_weak_signal")
+            return
+    except Exception as elig_exc:
+        # Fail-closed: an eligibility check error must block promotion.
+        logger.warning(
+            "Eligibility check raised for watch %s (%s): %s — blocking (fail-closed)",
+            watch_id,
+            symbol,
+            elig_exc,
+        )
+        _expire("promotion_blocked_eligibility_error")
+        return
+
+    # -------------------------------------------------------------------------
+    # Idempotent dedup: skip register if a PM candidate already exists for
+    # (source_signal_id=watch_id, profile_id, cycle_id).
+    # -------------------------------------------------------------------------
+    try:
+        from sqlalchemy import text as sql_text
+
+        with engine.connect() as conn:
+            existing = conn.execute(
+                sql_text(
+                    "SELECT candidate_id FROM pm_candidates "
+                    "WHERE source_signal_id = :watch_id "
+                    "  AND profile_id = :profile_id "
+                    "  AND cycle_id = :cycle_id "
+                    "LIMIT 1"
+                ),
+                {
+                    "watch_id": watch_id,
+                    "profile_id": profile_id,
+                    "cycle_id": cycle_id,
+                },
+            ).fetchone()
+        if existing is not None:
+            logger.debug(
+                "Idempotent promotion: PM candidate already exists for watch %s "
+                "(%s) in cycle %s — skipping register, transitioning to registered",
+                watch_id,
+                symbol,
+                cycle_id,
+            )
+            ok = _transition_watch_state(
+                engine,
+                watch_id,
+                "registered",
+                expected_state="promoted",
+            )
+            if not ok:
+                logger.warning(
+                    "CAS promoted->registered failed for watch %s (dedup path)",
+                    watch_id,
+                )
+            return
+    except Exception as dedup_exc:
+        # Dedup is a safety net; if the lookup itself fails, fall through to the
+        # normal register path (registry.register / integrity is authoritative).
+        logger.warning(
+            "Idempotent dedup query failed for watch %s (%s): %s — proceeding to register",
+            watch_id,
+            symbol,
+            dedup_exc,
+        )
+
+    # -------------------------------------------------------------------------
+    # Geometry scaffold (fail-closed on failure / empty result)
+    # -------------------------------------------------------------------------
+    try:
+        promo_scaffold = build_entry_geometry_scaffold(signal, profile_id=profile_id)
+    except Exception as geo_exc:
+        logger.warning(
+            "Geometry scaffold raised for watch %s (%s): %s",
+            watch_id,
+            symbol,
+            geo_exc,
+        )
+        _expire("promotion_blocked_geometry_failed")
+        return
+
+    if promo_scaffold.get("status") != "ok":
+        logger.warning(
+            "Geometry scaffold not ok for watch %s (%s): status=%s reason=%s",
+            watch_id,
+            symbol,
+            promo_scaffold.get("status"),
+            promo_scaffold.get("reason", ""),
+        )
+        _expire("promotion_blocked_geometry_failed")
+        return
+
+    promo_candidates = promo_scaffold.get("candidates", [])
+    if not promo_candidates:
+        logger.warning(
+            "Geometry scaffold ok but zero candidates for watch %s (%s)",
+            watch_id,
+            symbol,
+        )
+        _expire("promotion_blocked_no_geometry_candidates")
+        return
+
+    # -------------------------------------------------------------------------
+    # Build the PM candidate record from the first scaffold candidate
+    # -------------------------------------------------------------------------
+    pc = promo_candidates[0]
+    promo_candidate_id = str(uuid.uuid4())
+    promo_created_at = datetime.now(timezone.utc)
+    promo_expires_at = cycle_expires_at or (promo_created_at + timedelta(hours=1))
+    promo_direction = "BUY" if promo_scaffold["direction"] == "LONG" else "SHORT"
+    promo_signal_json = json.dumps(signal, default=str, sort_keys=True)
+    promo_record_dict = {
+        "candidate_id": promo_candidate_id,
+        "symbol": symbol,
+        "direction": promo_direction,
+        "entry_price": pc["entry_price"],
+        "stop_price": pc["stop_loss"],
+        "target_price": pc["target"],
+        "setup_type": signal.get("setup_type", "unknown"),
+        "profile_id": profile_id,
+        "cycle_id": cycle_id,
+    }
+    promo_hash = _compute_integrity_hash(promo_record_dict)
+    promo_record = CandidateRecord(
+        candidate_id=promo_candidate_id,
+        cycle_id=cycle_id,
+        profile_id=profile_id,
+        symbol=symbol,
+        direction=promo_direction,
+        setup_type=signal.get("setup_type", "unknown"),
+        geometry_name=pc["name"],
+        entry_price=pc["entry_price"],
+        stop_price=pc["stop_loss"],
+        target_price=pc["target"],
+        risk_reward=pc["risk_reward"],
+        trigger=pc["trigger"],
+        invalidation_basis=pc["invalidation_basis"],
+        target_basis=pc["target_basis"],
+        source_signal_id=watch_id,  # traceability
+        signal_snapshot_json=promo_signal_json,
+        created_at=promo_created_at,
+        expires_at=promo_expires_at,
+        integrity_hash=promo_hash,
+        candidate_type="intraday",
+    )
+
+    # -------------------------------------------------------------------------
+    # Register (fail-closed on registry error)
+    # -------------------------------------------------------------------------
+    try:
+        registry.register(promo_record)
+    except Exception as reg_exc:
+        logger.warning(
+            "Registry.register failed for promoted watch %s (%s): %s",
+            watch_id,
+            symbol,
+            reg_exc,
+        )
+        _expire("promotion_blocked_registry_error")
+        return
+
+    # -------------------------------------------------------------------------
+    # Success: transition promoted -> registered (fail-open on CAS failure).
+    # PM candidate is already persisted; a CAS failure only means the watch row
+    # was already consumed/transitioned — the idempotent dedup / stale cleanup
+    # covers correctness in that case.
+    # -------------------------------------------------------------------------
+    ok = _transition_watch_state(
+        engine,
+        watch_id,
+        "registered",
+        expected_state="promoted",
+    )
+    if not ok:
+        logger.warning(
+            "CAS promoted->registered failed for watch %s (PM candidate %s already created)",
+            watch_id,
+            promo_candidate_id,
+        )
+    else:
+        logger.info(
+            "Promoted watch candidate %s for %s -> PM candidate %s (registered)",
+            watch_id,
+            symbol,
+            promo_candidate_id,
+        )
+
+
 def build_candidate_set(
     db: Any,
     signals: dict[str, dict],
@@ -99,7 +380,11 @@ def build_candidate_set(
     min_signal_strength = profile.get("min_signal_strength", "moderate")
 
     # ---------------------------------------------------------------------------
-    # Watch Candidate Management (guarded by MARKET_STATE_MODE feature flag)
+    # Watch Candidate Management (EVALUATION ORDER IS CRITICAL)
+    # Guarded by MARKET_STATE_MODE feature flag.
+    # Mandated order: expire stale promoted -> evaluate -> consume -> create
+    # (see design.md §8). New watches created in Step 3 are NOT evaluated this
+    # pass — there is no same-cycle fast-path; they are first evaluated next cycle.
     # ---------------------------------------------------------------------------
     from utils.gate_config import MARKET_STATE_MODE
     if MARKET_STATE_MODE != "disabled":
@@ -107,88 +392,57 @@ def build_candidate_set(
             from utils.watch_candidates import (
                 evaluate_and_create_watch_candidates,
                 evaluate_active_watch_candidates,
+                expire_stale_promoted_watches,
                 get_promotable_candidates,
+                _transition_watch_state,
             )
-            # 13.1: Create watch candidates for eligible symbols
+
+            # Step 0: Expire stale promoted watches from prior cycles FIRST.
+            # Decisively retires promoted rows left over from a crashed prior
+            # cycle before any active watch is evaluated. Only runs when a
+            # cycle_id is available (the stale check is cycle-scoped).
+            if cycle_id is not None:
+                expire_stale_promoted_watches(
+                    engine=db,
+                    profile_id=profile_id,
+                    cycle_id=cycle_id,
+                )
+
+            # Step 1: Evaluate existing active watches
+            evaluate_active_watch_candidates(
+                engine=db,
+                signals=signals,
+                profile_id=profile_id,
+                cycle_id=cycle_id,
+            )
+
+            # Step 2: Consume promoted watches (enforcing mode only)
+            if MARKET_STATE_MODE == "enforcing":
+                promotable = get_promotable_candidates(
+                    engine=db,
+                    signals=signals,
+                    profile_id=profile_id,
+                    cycle_id=cycle_id,
+                )
+                for promo in promotable:
+                    _process_promoted_watch(
+                        db,
+                        promo,
+                        registry,
+                        held_symbols,
+                        min_signal_strength,
+                        profile_id,
+                        cycle_id,
+                        cycle_expires_at,
+                    )
+
+            # Step 3: Create new watches LAST (NOT evaluated this pass)
             evaluate_and_create_watch_candidates(
                 engine=db,
                 signals=signals,
                 cycle_id=cycle_id,
                 profile_id=profile_id,
             )
-            # 13.2: Evaluate active watch candidates
-            evaluate_active_watch_candidates(
-                engine=db,
-                signals=signals,
-                profile_id=profile_id,
-            )
-            # 13.3: Promotion (enforcing mode only)
-            if MARKET_STATE_MODE == "enforcing":
-                promotable = get_promotable_candidates(
-                    engine=db,
-                    signals=signals,
-                    profile_id=profile_id,
-                )
-                for promo in promotable:
-                    try:
-                        promo_signal = promo["signal"]
-                        promo_scaffold = build_entry_geometry_scaffold(promo_signal, profile_id=profile_id)
-                        if promo_scaffold.get("status") != "ok":
-                            continue
-                        promo_candidates = promo_scaffold.get("candidates", [])
-                        if not promo_candidates:
-                            continue
-                        # Use first scaffold candidate for promoted watch
-                        pc = promo_candidates[0]
-                        promo_candidate_id = str(uuid.uuid4())
-                        promo_created_at = datetime.now(timezone.utc)
-                        promo_expires_at = cycle_expires_at or (promo_created_at + timedelta(hours=1))
-                        promo_direction = "BUY" if promo_scaffold["direction"] == "LONG" else "SHORT"
-                        promo_signal_json = json.dumps(promo_signal, default=str, sort_keys=True)
-                        promo_record_dict = {
-                            "candidate_id": promo_candidate_id,
-                            "symbol": promo["symbol"],
-                            "direction": promo_direction,
-                            "entry_price": pc["entry_price"],
-                            "stop_price": pc["stop_loss"],
-                            "target_price": pc["target"],
-                            "setup_type": promo_signal.get("setup_type", "unknown"),
-                            "profile_id": profile_id,
-                            "cycle_id": cycle_id,
-                        }
-                        promo_hash = _compute_integrity_hash(promo_record_dict)
-                        promo_record = CandidateRecord(
-                            candidate_id=promo_candidate_id,
-                            cycle_id=cycle_id,
-                            profile_id=profile_id,
-                            symbol=promo["symbol"],
-                            direction=promo_direction,
-                            setup_type=promo_signal.get("setup_type", "unknown"),
-                            geometry_name=pc["name"],
-                            entry_price=pc["entry_price"],
-                            stop_price=pc["stop_loss"],
-                            target_price=pc["target"],
-                            risk_reward=pc["risk_reward"],
-                            trigger=pc["trigger"],
-                            invalidation_basis=pc["invalidation_basis"],
-                            target_basis=pc["target_basis"],
-                            source_signal_id=promo["watch_id"],  # traceability
-                            signal_snapshot_json=promo_signal_json,
-                            created_at=promo_created_at,
-                            expires_at=promo_expires_at,
-                            integrity_hash=promo_hash,
-                            candidate_type="intraday",
-                        )
-                        registry.register(promo_record)
-                        logger.info(
-                            "Promoted watch candidate %s for %s → PM candidate %s",
-                            promo["watch_id"], promo["symbol"], promo_candidate_id,
-                        )
-                    except Exception as promo_exc:
-                        logger.warning(
-                            "Watch candidate promotion failed for %s: %s",
-                            promo.get("symbol"), promo_exc,
-                        )
         except Exception as wc_exc:
             logger.warning("Watch candidate management failed: %s", wc_exc)
 
