@@ -753,9 +753,11 @@ def enforce_veto_accountability(signal: dict) -> dict:
 def repair_missing_veto_contract(signal: dict, symbol: str) -> dict:
     """Repair a conflicted HOLD once using the primary model.
 
-    This does not auto-promote deterministic bias into a signal. The primary
-    model must either accept that direction or return a concrete HOLD veto with
-    evidence. Invalid retries remain HOLD and are explicitly quarantined.
+    The primary model must either accept that direction or return a concrete
+    HOLD veto with evidence. If the retry still cannot justify HOLD and the
+    deterministic read is strong enough, the contract is enforced with a
+    bounded deterministic fallback so missing-veto HOLD rows do not silently
+    disappear before PM/candidate gates can evaluate them.
     """
     if not signal.get("llm_veto_missing"):
         return signal
@@ -858,18 +860,129 @@ def repair_missing_veto_contract(signal: dict, symbol: str) -> dict:
         signal["deterministic_sanity"] = updated_sanity
 
         if repaired_direction == deterministic_bias:
-            signal["llm_veto_required"] = False
-            signal["llm_veto_present"] = False
-            signal["llm_veto_missing"] = False
-            signal.pop("llm_veto_contract_error", None)
-            return signal
+            return _apply_deterministic_veto_fallback(
+                signal,
+                sanity,
+                method="primary_llm_direction",
+                repaired_strength=strength,
+                repaired_confidence=confidence,
+            )
         return enforce_veto_accountability(signal)
     except Exception as exc:
         log.warning("Analyst veto contract repair failed for %s: %s", symbol, exc)
+        fallback = _apply_deterministic_veto_fallback(
+            signal,
+            sanity,
+            method="deterministic_after_failed_repair",
+            repair_error=str(exc)[:300],
+        )
+        if fallback.get("deterministic_veto_fallback_applied"):
+            return fallback
         signal["veto_contract_repair_failed"] = True
         signal["analyst_contract_failure"] = "missing_veto_after_primary_retry"
         signal["veto_repair_error"] = str(exc)[:300]
         return signal
+
+
+def _apply_deterministic_veto_fallback(
+    signal: dict,
+    sanity: dict,
+    *,
+    method: str,
+    repaired_strength: str | None = None,
+    repaired_confidence: str | None = None,
+    repair_error: str | None = None,
+) -> dict:
+    """Convert an unjustified HOLD conflict into a bounded directional signal."""
+    enabled = os.getenv("ANALYST_DETERMINISTIC_VETO_FALLBACK_ENABLED", "true").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return signal
+
+    deterministic_bias = sanity.get("bias") if isinstance(sanity, dict) else None
+    if deterministic_bias not in {"LONG", "SHORT"}:
+        return signal
+
+    try:
+        threshold = int(os.getenv("ANALYST_DETERMINISTIC_VETO_FALLBACK_MIN_ABS_SCORE", "5"))
+    except ValueError:
+        threshold = 5
+    score = sanity.get("score", 0)
+    try:
+        abs_score = abs(int(score))
+    except (TypeError, ValueError):
+        abs_score = 0
+    if abs_score < threshold:
+        return signal
+
+    original_setup = signal.get("setup_type")
+    from utils.gate_config import CANDIDATE_EXECUTABLE_SETUP_TYPES
+
+    if original_setup not in CANDIDATE_EXECUTABLE_SETUP_TYPES:
+        signal["original_setup_type"] = original_setup
+        signal["setup_type"] = _infer_executable_setup_for_deterministic_bias(
+            signal,
+            deterministic_bias,
+        )
+        signal["setup_validation_warning"] = (
+            f"{original_setup or 'unknown'} could not carry deterministic "
+            f"{deterministic_bias}; remapped for PM candidate evaluation"
+        )
+        signal["needs_setup_type_review"] = True
+
+    signal["original_signal"] = signal.get("signal")
+    signal["signal"] = deterministic_bias
+    signal["strength"] = (
+        repaired_strength
+        if repaired_strength in {"moderate", "strong"}
+        else "moderate"
+    )
+    signal["confidence"] = (
+        repaired_confidence
+        if repaired_confidence in {"medium", "high"}
+        else "medium"
+    )
+    signal["llm_veto_reason"] = None
+    signal["veto_evidence"] = []
+    signal["llm_veto_required"] = False
+    signal["llm_veto_present"] = False
+    signal["llm_veto_missing"] = False
+    signal["veto_contract_repaired"] = True
+    signal["veto_repair_method"] = method
+    signal["deterministic_veto_fallback_applied"] = True
+    signal["deterministic_veto_fallback_reason"] = (
+        "LLM HOLD lacked concrete veto evidence against strong deterministic "
+        f"{deterministic_bias} sanity score={score}."
+    )
+    if repair_error:
+        signal["veto_contract_repair_failed"] = True
+        signal["veto_repair_error"] = repair_error
+    else:
+        signal.pop("veto_contract_repair_failed", None)
+        signal.pop("veto_repair_error", None)
+    signal.pop("analyst_contract_failure", None)
+    signal.pop("llm_veto_contract_error", None)
+
+    updated_sanity = dict(sanity)
+    updated_sanity["llm_signal"] = deterministic_bias
+    updated_sanity["conflict"] = False
+    signal["deterministic_sanity"] = updated_sanity
+    return signal
+
+
+def _infer_executable_setup_for_deterministic_bias(signal: dict, direction: str) -> str:
+    """Choose a conservative intraday setup label for deterministic fallback."""
+    if direction == "SHORT":
+        return "momentum_fade"
+
+    trigger_status = signal.get("trigger_status") if isinstance(signal.get("trigger_status"), dict) else {}
+    breakout = trigger_status.get("breakout") if isinstance(trigger_status.get("breakout"), dict) else {}
+    if breakout.get("status") in {"approaching", "confirmed"}:
+        return "technical_breakout"
+
+    indicators = signal.get("indicators") if isinstance(signal.get("indicators"), dict) else {}
+    if indicators.get("above_vwap") is False:
+        return "vwap_reclaim"
+    return "technical_breakout"
 
 
 def compute_deterministic_signal_sanity(signal: dict, quote: dict, indicators: dict) -> dict:

@@ -140,7 +140,7 @@ def test_repair_missing_veto_contract_accepts_deterministic_direction(monkeypatc
     assert repaired["deterministic_sanity"]["conflict"] is False
     assert repaired["llm_veto_required"] is False
     assert repaired["veto_contract_repaired"] is True
-    assert repaired["veto_repair_method"] == "primary_llm"
+    assert repaired["veto_repair_method"] == "primary_llm_direction"
 
 
 def test_repair_missing_veto_contract_accepts_justified_hold(monkeypatch):
@@ -181,7 +181,49 @@ def test_repair_missing_veto_contract_accepts_justified_hold(monkeypatch):
     assert repaired["veto_contract_repaired"] is True
 
 
-def test_repair_missing_veto_contract_quarantines_invalid_retry(monkeypatch):
+def test_repair_missing_veto_contract_falls_back_on_strong_invalid_retry(monkeypatch):
+    monkeypatch.setattr(
+        "agents.analyst.call_llm",
+        lambda *args, **kwargs: """
+        {
+          "signal": "HOLD",
+          "strength": "weak",
+          "confidence": "low",
+          "llm_veto_reason": "Still uncertain.",
+          "veto_evidence": []
+        }
+        """,
+    )
+    signal = {
+        "symbol": "MU",
+        "signal": "HOLD",
+        "strength": "weak",
+        "confidence": "low",
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "SHORT",
+            "score": -5,
+            "reasons": ["price_below_vwap_-0.40%"],
+        },
+        "setup_type": "unclear_direction",
+        "llm_veto_required": True,
+        "llm_veto_present": False,
+        "llm_veto_missing": True,
+    }
+
+    repaired = repair_missing_veto_contract(signal, "MU")
+
+    assert repaired["signal"] == "SHORT"
+    assert repaired["setup_type"] == "momentum_fade"
+    assert repaired["strength"] == "moderate"
+    assert repaired["confidence"] == "medium"
+    assert repaired["veto_contract_repair_failed"] is True
+    assert repaired["deterministic_veto_fallback_applied"] is True
+    assert repaired["llm_veto_missing"] is False
+
+
+def test_repair_missing_veto_contract_quarantines_weak_invalid_retry(monkeypatch):
     monkeypatch.setattr(
         "agents.analyst.call_llm",
         lambda *args, **kwargs: """
