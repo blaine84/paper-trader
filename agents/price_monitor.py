@@ -25,14 +25,23 @@ log = logging.getLogger(__name__)
 MAX_ANALYST_SIGNAL_AGE_MINUTES = 90
 _logged_stale_signal_symbols = set()
 _QUOTE_CACHE_SECONDS = int(os.getenv("PRICE_MONITOR_QUOTE_CACHE_SECONDS", "20"))
+_YFINANCE_CIRCUIT_BREAK_SECONDS = int(
+    os.getenv("PRICE_MONITOR_YFINANCE_CIRCUIT_BREAK_SECONDS", "600")
+)
 _quote_cache: dict[str, tuple[float, float]] = {}
+_yfinance_disabled_until = 0.0
 
 
 def _get_yfinance_quotes(symbols: list[str], now: float) -> dict:
+    global _yfinance_disabled_until
+
     quotes = {}
     if not symbols:
         return quotes
+    if now < _yfinance_disabled_until:
+        return quotes
 
+    failures = 0
     try:
         import yfinance as yf
         tickers = yf.Tickers(" ".join(symbols))
@@ -44,9 +53,22 @@ def _get_yfinance_quotes(symbols: list[str], now: float) -> dict:
                     quotes[sym] = round(float(price), 2)
                     _quote_cache[sym] = (now, quotes[sym])
             except Exception as e:
+                failures += 1
                 log.warning("yfinance quote fallback failed for %s: %s", sym, e)
     except Exception as e:
+        failures = len(symbols)
         log.warning("yfinance batch quote fallback failed: %s", e)
+
+    # Yahoo/yfinance occasionally enters a TLS-failure state and logs loudly for
+    # every symbol. Stop retrying briefly; Finnhub fallback below remains active.
+    if not quotes and failures >= min(3, len(symbols)):
+        _yfinance_disabled_until = now + _YFINANCE_CIRCUIT_BREAK_SECONDS
+        log.warning(
+            "yfinance quote path disabled for %ss after %s/%s quote failures",
+            _YFINANCE_CIRCUIT_BREAK_SECONDS,
+            failures,
+            len(symbols),
+        )
 
     return quotes
 
