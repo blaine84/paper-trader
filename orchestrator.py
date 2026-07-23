@@ -917,7 +917,8 @@ def _ensure_watch_candidate_tables(engine, inspector):
                     source_signal_snapshot_json TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'active',
                     state_changed_at TEXT,
-                    outcome_json TEXT
+                    outcome_json TEXT,
+                    promoted_cycle_id TEXT
                 )
                 """
             )
@@ -927,6 +928,13 @@ def _ensure_watch_candidate_tables(engine, inspector):
                 "CREATE INDEX IF NOT EXISTS idx_watch_candidates_active "
                 "ON watch_candidates (profile_id, state, symbol) "
                 "WHERE state = 'active'"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_watch_candidates_promoted_cycle "
+                "ON watch_candidates (profile_id, promoted_cycle_id) "
+                "WHERE state = 'promoted'"
             )
         )
         conn.execute(
@@ -991,6 +999,7 @@ def check_schema(engine):
         "cases": ["exit_category"],
         "pm_candidates": ["candidate_type", "holding_horizon", "normalized_setup_type", "rejection_reason_code"],
         "pm_candidate_events": ["candidate_type"],
+        "watch_candidates": ["promoted_cycle_id"],
     }
 
     missing = {}
@@ -1019,6 +1028,7 @@ def check_schema(engine):
         "holding_horizon": "INTEGER",
         "normalized_setup_type": "TEXT",
         "rejection_reason_code": "VARCHAR(64)",
+        "promoted_cycle_id": "TEXT",
     }
 
     with engine.begin() as conn:
@@ -1036,6 +1046,19 @@ def check_schema(engine):
                 "ON trade_events(event_type, trade_id, dedupe_key)"
             ))
         log.warning("Schema migration: created unique index ix_trade_events_dedupe on trade_events(event_type, trade_id, dedupe_key)")
+
+    # Create partial promoted-cycle index if promoted_cycle_id was just added
+    if "watch_candidates" in missing and "promoted_cycle_id" in missing["watch_candidates"]:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_watch_candidates_promoted_cycle "
+                "ON watch_candidates (profile_id, promoted_cycle_id) "
+                "WHERE state = 'promoted'"
+            ))
+        log.warning(
+            "Schema migration: created partial index idx_watch_candidates_promoted_cycle "
+            "on watch_candidates (profile_id, promoted_cycle_id) WHERE state = 'promoted'"
+        )
 
     # If stop_role was just added, backfill existing open trades
     if "trades" in missing and "stop_role" in missing["trades"]:

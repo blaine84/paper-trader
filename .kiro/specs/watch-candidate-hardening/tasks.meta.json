@@ -1,0 +1,720 @@
+{
+  "pbtResults": {
+    "6.1 Write property test for promoted-cycle scoping": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781939650
+    },
+    "6.2 Write property test for registered state query-invisibility": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781944140
+    },
+    "6.3 Write property test for successful promotion terminal state": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781945527
+    },
+    "6.4 Write property test for idempotent promotion consumption": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781946363
+    },
+    "6.5 Write property test for enforcing mode cycle_id requirement": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781948009
+    },
+    "6.6 Write property test for held-symbol exclusion with short-circuit": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781949268
+    },
+    "6.7 Write property test for signal strength threshold blocking": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781950262
+    },
+    "6.8 Write property test for promotion loop terminal failures": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781951700
+    },
+    "6.9 Write property test for structural degradation invalidation": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781952519
+    },
+    "6.10 Write property test for key-level drift invalidation": {
+      "status": "passed",
+      "lastRunTimestamp": 1784781953633
+    }
+  },
+  "executionHistory": {
+    "1.1 Add `WATCH_KEY_LEVEL_DRIFT_PCT` and `WATCH_SAME_CYCLE_PROMOTION_POLICY` constants to `utils/gate_config.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776633269
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776644398
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776807677
+      }
+    ],
+    "1.2 Add `promoted_cycle_id` column and partial index to schema migration in `orchestrator.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776633881
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776645384
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776808673
+      }
+    ],
+    "2.1 Modify `_transition_watch_state()` to accept `expected_state` and `promoted_cycle_id` parameters": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776633938
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776812806
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776905126
+      }
+    ],
+    "2.2 Implement `_check_structural_invalidation()` function in `utils/watch_candidates.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776633970
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776909463
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784777027324
+      }
+    ],
+    "2.3 Implement `_check_same_cycle_policy()` function in `utils/watch_candidates.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634034
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776910500
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784777101968
+      }
+    ],
+    "2.4 Modify `evaluate_active_watch_candidates()` for corrected per-watch order, cycle_id, and enforcing-mode promotion blocking": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634072
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784777344788
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780129387
+      }
+    ],
+    "2.5 Modify `get_promotable_candidates()` to accept and filter by `cycle_id`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634109
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780132739
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780223663
+      }
+    ],
+    "2.6 Implement `expire_stale_promoted_watches()` function in `utils/watch_candidates.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634153
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776911940
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784777173339
+      }
+    ],
+    "2.7 Modify `expire_session_watch_candidates()` TTL sweep to include stale promoted rows": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634188
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776912948
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784777338783
+      }
+    ],
+    "2.8 Write unit tests for `_check_structural_invalidation()` in `tests/test_watch_candidates.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634221
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780228199
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780357466
+      }
+    ],
+    "2.9 Write unit tests for `_check_same_cycle_policy()` in `tests/test_watch_candidates.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634254
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780358518
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780445591
+      }
+    ],
+    "2.10 Write unit tests for stale cleanup, TTL sweep, atomic transition, and enforcing cycle_id=None in `tests/test_watch_candidates.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634287
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780446974
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780591526
+      }
+    ],
+    "3. Checkpoint - Ensure all tests pass": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634321
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780610756
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780668326
+      }
+    ],
+    "4.1 Restructure the watch candidate management block in `utils/candidate_builder.py` to the mandated 4-step order": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634360
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780847509
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780972567
+      }
+    ],
+    "4.2 Implement `_process_promoted_watch()` helper function in `utils/candidate_builder.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634403
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780676328
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780846546
+      }
+    ],
+    "4.3 Write integration tests for 4-step order, stale-cycle recovery, and idempotent promotion in `tests/test_market_state_integration.py`": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634455
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780977022
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781261967
+      }
+    ],
+    "5. Checkpoint - Ensure all tests pass": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634488
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781265491
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781339097
+      }
+    ],
+    "6.1 Write property test for promoted-cycle scoping": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634536
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781350292
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811353442
+      }
+    ],
+    "6.2 Write property test for registered state query-invisibility": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634576
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781351676
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811354549
+      }
+    ],
+    "6.3 Write property test for successful promotion terminal state": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634611
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781352492
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811355615
+      }
+    ],
+    "6.4 Write property test for idempotent promotion consumption": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634653
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781353893
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811357024
+      }
+    ],
+    "6.5 Write property test for enforcing mode cycle_id requirement": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634690
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781354982
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811358033
+      }
+    ],
+    "6.6 Write property test for held-symbol exclusion with short-circuit": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634750
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781356363
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811359266
+      }
+    ],
+    "6.7 Write property test for signal strength threshold blocking": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634786
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781357613
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811360688
+      }
+    ],
+    "6.8 Write property test for promotion loop terminal failures": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634821
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781358676
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811361721
+      }
+    ],
+    "6.9 Write property test for structural degradation invalidation": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634857
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781360112
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811363156
+      }
+    ],
+    "6.10 Write property test for key-level drift invalidation": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634888
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781360852
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811364029
+      }
+    ],
+    "6.11 Write property test for drift computation skipping non-numeric levels": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634928
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781365622
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811368124
+      }
+    ],
+    "6.12 Write property test for same-cycle \"never\" policy": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634959
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781367072
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811369144
+      }
+    ],
+    "6.13 Write property test for same-cycle \"activation_pending_only\" policy": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776634994
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781368090
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811370601
+      }
+    ],
+    "6.14 Write property test for evaluation order (structural precedes price, same-cycle gates only after activation)": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635038
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781369324
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811371829
+      }
+    ],
+    "6.15 Write property test for disabled mode no-op": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635077
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781370773
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811373270
+      }
+    ],
+    "6.16 Write property test for hardening exceptions fail-open": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635118
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781371805
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811374299
+      }
+    ],
+    "6.17 Write property test for eligibility exceptions fail-closed": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635153
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781373304
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811375731
+      }
+    ],
+    "6.18 Write property test for stale promoted expiration at cycle start": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635189
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781374076
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811377172
+      }
+    ],
+    "6.19 Write property test for enforcing mode + cycle_id=None blocking all promotion": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635223
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781375518
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811378625
+      }
+    ],
+    "6.20 Write property test for TTL sweep expiring stale promoted rows": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635258
+      },
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781377429
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811379254
+      }
+    ],
+    "7. Final checkpoint - Ensure all tests pass": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776635304
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811384590
+      },
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811714441
+      }
+    ],
+    "1. Add configuration constants and schema migration": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784776808721
+      }
+    ],
+    "2. Implement watch_candidates.py hardening (structural invalidation, same-cycle policy, cycle scoping, stale cleanup, TTL sweep)": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784780591573
+      }
+    ],
+    "4. Restructure candidate_builder evaluation order and implement promotion helper": [
+      {
+        "executionId": "6b30dd8c-70b9-4fd6-834d-e01e33cb67ec",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784781262015
+      }
+    ],
+    "6. Property-based tests for correctness properties (in `tests/test_prop_watch_hardening.py`)": [
+      {
+        "executionId": "7727cd00-5741-465f-ab27-758b69e6a9ce",
+        "chatSessionId": "sess_515ff76b-ec6b-4aba-8f03-615dc0c9264c",
+        "timestamp": 1784811379293
+      }
+    ]
+  }
+}
