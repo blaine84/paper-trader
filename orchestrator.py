@@ -2334,10 +2334,12 @@ def run_position_timer():
     try:
         import agents.position_timer as position_timer
         result = position_timer.run(engine)
-        if result.get("force_closes"):
-            log.warning(f"Position timer: {len(result['force_closes'])} force closes")
-        if result.get("hard_wall_closes"):
-            log.warning(f"Position timer: {len(result['hard_wall_closes'])} hard wall closes")
+        if result.get("closes"):
+            log.warning(f"Position timer: {len(result['closes'])} closes")
+        if result.get("repairs"):
+            log.info(f"Position timer: {len(result['repairs'])} stop repairs")
+        if result.get("skipped"):
+            log.info(f"Position timer: {len(result['skipped'])} skipped")
     except Exception as e:
         log.error(f"Position timer error: {e}", exc_info=True)
 
