@@ -236,7 +236,12 @@ class TestProperty6FreshnessEnforcement:
         with patch(_FRESHNESS_PATCHES[alert_type], freshness_limit):
             result = dispatcher._check_freshness(intent, now)
 
-        if age_minutes < freshness_limit:
+        # float->timedelta conversion rounds to microseconds, which can nudge the
+        # age onto the exact boundary (e.g. 119.999...min becomes exactly 120min).
+        # Evaluate the expectation against the ACTUAL age the code compares, so the
+        # exclusive-`<` boundary semantics (age < limit -> fresh) are consistent.
+        actual_age_seconds = (now - last_seen_at).total_seconds()
+        if actual_age_seconds < freshness_limit * 60:
             assert result is True, (
                 f"alert_type='{alert_type}', age={age_minutes:.2f}min, "
                 f"limit={freshness_limit}min → should be fresh (True), got False"

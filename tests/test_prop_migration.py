@@ -171,7 +171,11 @@ class TestProperty4MigrationDataPreservation:
     """
 
     @given(rows=st.lists(trade_row_strategy, min_size=1, max_size=30))
-    @settings(max_examples=100)
+    # deadline=None: each example creates two on-disk SQLite databases and runs the
+    # full migration copy; wall-clock time varies with disk I/O and can spuriously
+    # trip Hypothesis's per-example deadline. This is a timing adjustment only --
+    # the asserted correctness invariant is unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_all_rows_preserved_after_copy(self, rows: list[dict]):
         """Every row in the source is present in the target after _copy_table."""
         from scripts.migrate_to_postgres import _copy_table
@@ -231,7 +235,9 @@ class TestProperty4MigrationDataPreservation:
                 target_engine.dispose()
 
     @given(rows=st.lists(trade_row_strategy, min_size=0, max_size=5))
-    @settings(max_examples=100)
+    # deadline=None: on-disk SQLite migration timing is I/O-dependent (see note above);
+    # timing-only adjustment, invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_row_count_exact_match(self, rows: list[dict]):
         """Row counts match exactly between source and target after copy."""
         from scripts.migrate_to_postgres import _copy_table
@@ -293,7 +299,9 @@ class TestProperty5MigrationAtomicityOnFailure:
         rows=st.lists(trade_row_strategy, min_size=3, max_size=20),
         fail_after=st.integers(min_value=0, max_value=2),
     )
-    @settings(max_examples=100)
+    # deadline=None: on-disk SQLite migration timing is I/O-dependent (see note above);
+    # timing-only adjustment, invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_target_unchanged_on_copy_failure(
         self, rows: list[dict], fail_after: int
     ):
@@ -350,7 +358,9 @@ class TestProperty5MigrationAtomicityOnFailure:
                 target_engine.dispose()
 
     @given(rows=st.lists(trade_row_strategy, min_size=2, max_size=15))
-    @settings(max_examples=100)
+    # deadline=None: on-disk SQLite migration timing is I/O-dependent (see note above);
+    # timing-only adjustment, invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_pre_existing_data_preserved_on_failure(self, rows: list[dict]):
         """If target has pre-existing data and migration fails, pre-existing data remains."""
         from scripts.migrate_to_postgres import _normalize_row
@@ -442,7 +452,9 @@ class TestProperty6MigrationIdempotence:
     """
 
     @given(rows=st.lists(trade_row_strategy, min_size=1, max_size=25))
-    @settings(max_examples=100)
+    # deadline=None: on-disk SQLite migration timing is I/O-dependent (see note above);
+    # timing-only adjustment, invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_double_migration_produces_same_result(self, rows: list[dict]):
         """Running migration twice yields identical row counts (no duplicates)."""
         from scripts.migrate_to_postgres import _copy_table
@@ -492,7 +504,10 @@ class TestProperty6MigrationIdempotence:
         rows=st.lists(trade_row_strategy, min_size=1, max_size=20),
         num_runs=st.integers(min_value=2, max_value=4),
     )
-    @settings(max_examples=100)
+    # deadline=None: this example runs the full migration up to 4 times over on-disk
+    # SQLite databases; wall-clock time varies with disk I/O and was the source of the
+    # DeadlineExceeded flakiness. Timing-only adjustment -- invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_n_migrations_produce_same_result(
         self, rows: list[dict], num_runs: int
     ):
@@ -564,7 +579,9 @@ class TestProperty7SnapshotImmutabilityDuringMigration:
     """
 
     @given(rows=st.lists(trade_row_strategy, min_size=1, max_size=25))
-    @settings(max_examples=100)
+    # deadline=None: on-disk SQLite migration timing is I/O-dependent (see note above);
+    # timing-only adjustment, invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_snapshot_hash_unchanged_after_migration(self, rows: list[dict]):
         """Snapshot file hash is identical before and after _copy_table reads it."""
         from scripts.migrate_to_postgres import _copy_table
@@ -606,7 +623,9 @@ class TestProperty7SnapshotImmutabilityDuringMigration:
                 target_engine.dispose()
 
     @given(rows=st.lists(trade_row_strategy, min_size=1, max_size=15))
-    @settings(max_examples=100)
+    # deadline=None: on-disk SQLite migration timing is I/O-dependent (see note above);
+    # timing-only adjustment, invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_snapshot_hash_unchanged_after_failed_migration(self, rows: list[dict]):
         """Snapshot hash unchanged even if migration fails mid-way."""
         from scripts.migrate_to_postgres import _normalize_row
@@ -663,7 +682,9 @@ class TestProperty7SnapshotImmutabilityDuringMigration:
                 target_engine.dispose()
 
     @given(rows=st.lists(trade_row_strategy, min_size=1, max_size=20))
-    @settings(max_examples=100)
+    # deadline=None: on-disk SQLite creation + hashing timing is I/O-dependent
+    # (see note above); timing-only adjustment, invariant unchanged.
+    @settings(max_examples=100, deadline=None)
     def test_compute_sha256_matches_validate_function(self, rows: list[dict]):
         """Our local _compute_sha256 matches the migration script's implementation."""
         from scripts.migrate_to_postgres import _compute_sha256 as migration_sha256

@@ -188,6 +188,16 @@ class TestProperty16NewsBreakoutNotClosedAtLegacy90MinThreshold:
 
         assume(stop_price > 0)
         assume(current_price > 0)
+        # Rounding entry/current to 2 decimals can collapse the intended
+        # "price above entry" margin at low entry prices (e.g. entry=1.0000...02,
+        # current rounds to 1.00 which is BELOW entry). That destroys the test's
+        # own premise ("price above entry") and correctly yields a force-close
+        # (no positive indicator), so exclude those knife-edge inputs and only
+        # exercise genuine positive-indicator cases.
+        if direction == "LONG":
+            assume(current_price > entry_price)
+        else:
+            assume(current_price < entry_price)
 
         trade = {
             "id": 1,
