@@ -297,7 +297,7 @@ class TestOriginalGateWithDefaultThreshold:
     """Assert original gate used default 1.25 threshold because signal metadata
     was dropped (metadata_wiring_defect)."""
 
-    def test_original_rejects_with_default_threshold(
+    def test_original_soft_warns_with_default_threshold(
         self,
         tsla_replay_context_without_metadata,
         tsla_gate_policy_config,
@@ -305,7 +305,16 @@ class TestOriginalGateWithDefaultThreshold:
         tsla_entry_timestamp,
     ):
         """When signal_strength is None, the gate uses the default 1.25 threshold
-        for aggressive profile and rejects R:R of 1.11."""
+        for aggressive profile against R:R of 1.11.
+
+        NOTE: Expected value changed from "reject" to "allow". Commit
+        "soften risk geometry rr gates" (1d0300a) made an R:R below the applicable
+        threshold a SOFT warning (decision="adjusted_allowed" / canonical "warn",
+        risk_geometry_soft_gate=True) rather than a hard rejection. The replay
+        adapter normalizes "adjusted_allowed" to "allow". The default 1.25 threshold
+        is still the one applied (metadata dropped) — visible in the reason string —
+        which is what this test guards.
+        """
         replay_clock = build_replay_clock(tsla_entry_timestamp)
         id_provider = build_deterministic_id_provider("test", "risk_geometry_gate", "tsla_001")
 
@@ -318,11 +327,14 @@ class TestOriginalGateWithDefaultThreshold:
             id_provider=id_provider,
         )
 
-        # Gate should REJECT because R:R is below default 1.25 threshold
-        assert entry.decision == "reject", (
-            f"Expected rejection with default threshold, got: {entry.decision}"
+        # Softened behavior: R:R below the default 1.25 threshold now soft-warns
+        # (adjusted_allowed), which the adapter normalizes to "allow" rather than
+        # the old hard "reject".
+        assert entry.decision == "allow", (
+            f"Expected soft-warn normalized to allow with default threshold, got: {entry.decision}"
         )
-        # The reason should mention R:R being below the 1.25 minimum
+        # The reason must still reflect the default 1.25 threshold being applied
+        # (i.e. metadata was dropped and the reduced 0.50 threshold was NOT used).
         assert "1.25" in entry.reason_code or "RISK_REWARD" in entry.reason_code, (
             f"Expected reason mentioning 1.25 threshold, got: {entry.reason_code}"
         )
@@ -598,8 +610,19 @@ class TestEndToEndPipeline:
             cutoff=tsla_entry_timestamp,
             diagnostic_mode=False,
         )
-        assert original_trace.final_decision == "reject"
-        assert original_trace.final_gate == "risk_geometry_gate"
+        # Expected value changed from "reject" to "allow": commit
+        # "soften risk geometry rr gates" (1d0300a) turned an R:R-below-threshold
+        # outcome into a soft warning (adjusted_allowed / canonical "warn") that the
+        # adapter normalizes to "allow", so the live pipeline no longer HARD-rejects
+        # the missing-metadata path. The historical hard rejection is still exercised
+        # via the explicit original_decision="reject" passed to classify_delta below.
+        assert original_trace.final_decision == "allow"
+        rg_entry = next(
+            e for e in original_trace.entries if e.gate_name == "risk_geometry_gate"
+        )
+        # The default 1.25 threshold is still applied (soft R:R warning) since
+        # metadata was dropped.
+        assert "1.25" in rg_entry.reason_code or "RISK_REWARD" in rg_entry.reason_code
 
         # --- Step 2: Replay evaluation (current policy with metadata) ---
         replay_trace = replay_gates(
@@ -689,15 +712,14 @@ class TestEndToEndPipeline:
                 f"(reason: {entry.reason_code})"
             )
 
-    def test_diagnostic_mode_evaluates_all_gates_after_rejection(
+    def test_diagnostic_mode_evaluates_all_gates(
         self,
         tsla_replay_context_without_metadata,
         tsla_gate_policy_config,
         tsla_policy_version,
         tsla_entry_timestamp,
     ):
-        """In diagnostic mode, all gates are evaluated even after a rejection,
-        and downstream gates are labeled non-executable."""
+        """In diagnostic mode, all four core gates are evaluated and recorded."""
         trace = replay_gates(
             context=tsla_replay_context_without_metadata,
             policy_config=tsla_gate_policy_config,
@@ -708,8 +730,12 @@ class TestEndToEndPipeline:
             diagnostic_mode=True,
         )
 
-        # Should still record final as reject
-        assert trace.final_decision == "reject"
+        # Expected value changed from "reject" to "allow": commit
+        # "soften risk geometry rr gates" (1d0300a) made the R:R-below-threshold
+        # outcome a soft warning (adjusted_allowed / canonical "warn") that the
+        # adapter normalizes to "allow", so the missing-metadata path no longer
+        # hard-rejects at risk_geometry_gate.
+        assert trace.final_decision == "allow"
         assert trace.diagnostic_mode is True
 
         # All 4 gates should be in the trace (diagnostic evaluates all)

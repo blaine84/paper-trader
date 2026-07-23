@@ -627,6 +627,14 @@ def _seed_strategy_recommendations(engine, strategies=None, timestamp=None):
 
     data = {
         "timestamp": timestamp,
+        # market_regime is required for the header to emit the regime-derived
+        # summary lines. Since commit 18b26e0 ("normalize quant strategy
+        # context"), _strategy_context_header() only renders "Market conditions:",
+        # "Primary strategy today:", and "Regime note:" when a deterministic
+        # regime is present; otherwise it emits a neutral fallback header. In
+        # production _normalize_quant_result() always sets this key, so the seed
+        # data must include it to mirror real persisted strategy_recommendations.
+        "market_regime": "risk_on",
         "market_conditions_summary": "Risk-on regime with strong momentum",
         "primary_strategy": "gap_and_go",
         "regime_note": "Bullish bias across sectors",

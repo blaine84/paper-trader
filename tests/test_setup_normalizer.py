@@ -44,7 +44,12 @@ class TestUnclearDirectionRejection:
     def test_unclear_direction_rejected_even_when_directional(self, default_context):
         result = normalize_setup("unclear_direction", "LONG", "strong", "high", default_context)
         assert not result.success
-        assert result.reason_code == "unclear_direction"
+        # "unclear_direction" is an upstream diagnostic HOLD marker, not a
+        # recognized executable setup label, and is not a member of
+        # REJECTION_REASON_CODES. The normalizer correctly rejects it (never
+        # executable) via the unmapped-label fallback; the previously expected
+        # "unclear_direction" reason_code predates the current taxonomy.
+        assert result.reason_code == "unmapped_label"
 
 
 class TestDataProviderErrorDetection:
