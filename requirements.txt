@@ -16,3 +16,4 @@ yfinance
 pytz
 PyYAML
 pytest
+hypothesis
