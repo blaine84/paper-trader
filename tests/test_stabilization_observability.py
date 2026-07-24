@@ -223,6 +223,36 @@ def test_repair_missing_veto_contract_falls_back_on_strong_invalid_retry(monkeyp
     assert repaired["llm_veto_missing"] is False
 
 
+def test_repair_missing_veto_contract_falls_back_when_llm_repair_disabled(monkeypatch):
+    monkeypatch.setenv("ANALYST_VETO_REPAIR_ENABLED", "false")
+    signal = {
+        "symbol": "TSLA",
+        "signal": "HOLD",
+        "strength": "weak",
+        "confidence": "low",
+        "setup_type": "none",
+        "deterministic_sanity": {
+            "conflict": True,
+            "llm_signal": "HOLD",
+            "bias": "SHORT",
+            "score": -5,
+            "reasons": ["price_below_vwap_-1.04%", "bearish_trend"],
+        },
+        "llm_veto_required": True,
+        "llm_veto_present": False,
+        "llm_veto_missing": True,
+    }
+
+    repaired = repair_missing_veto_contract(signal, "TSLA")
+
+    assert repaired["signal"] == "SHORT"
+    assert repaired["setup_type"] == "momentum_fade"
+    assert repaired["veto_contract_repair_skipped"] == "feature_disabled"
+    assert repaired["deterministic_veto_fallback_applied"] is True
+    assert repaired["veto_repair_method"] == "deterministic_after_repair_disabled"
+    assert repaired["llm_veto_missing"] is False
+
+
 def test_repair_missing_veto_contract_quarantines_weak_invalid_retry(monkeypatch):
     monkeypatch.setattr(
         "agents.analyst.call_llm",

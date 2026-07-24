@@ -778,6 +778,15 @@ def repair_missing_veto_contract(signal: dict, symbol: str) -> dict:
     enabled = os.getenv("ANALYST_VETO_REPAIR_ENABLED", "true").strip().lower()
     if enabled not in {"1", "true", "yes", "on"}:
         signal["veto_contract_repair_skipped"] = "feature_disabled"
+        sanity = signal.get("deterministic_sanity")
+        if isinstance(sanity, dict):
+            fallback = _apply_deterministic_veto_fallback(
+                signal,
+                sanity,
+                method="deterministic_after_repair_disabled",
+            )
+            if fallback.get("deterministic_veto_fallback_applied"):
+                return fallback
         return signal
 
     sanity = signal.get("deterministic_sanity")
