@@ -137,6 +137,7 @@ from utils.cycle_coordinator import (
     get_decision_window_end,
     _cycle_decision_window_end,
 )
+from models.pm_profiles import ACTIVE_PROFILES
 from utils.signal_freshness import FreshnessResult, StaleSignalSkip
 
 
@@ -213,7 +214,12 @@ class TestPhaseOrdering:
             override_symbols=["AAPL"],
         )
 
-        assert call_order == ["analyst", "freshness_gate", "pm", "safety_checks"]
+        assert call_order == [
+            "analyst",
+            "freshness_gate",
+            *["pm" for _ in ACTIVE_PROFILES],
+            "safety_checks",
+        ]
 
 
 # --- PM receives only fresh symbols ---
@@ -255,15 +261,15 @@ class TestFreshnessGating:
             override_symbols=["AAPL", "MSFT", "TSLA", "GOOG", "AMZN"],
         )
 
-        # PM should have been called with only fresh symbols
-        mock_pm_run_profile.assert_called_once()
-        pm_call_args = mock_pm_run_profile.call_args
-        # run_profile(engine, fresh_symbols, profile_id, *, cycle_id=...)
-        symbols_passed_to_pm = pm_call_args[0][1]
-        assert set(symbols_passed_to_pm) == {"AAPL", "MSFT"}
-        assert "TSLA" not in symbols_passed_to_pm
-        assert "GOOG" not in symbols_passed_to_pm
-        assert "AMZN" not in symbols_passed_to_pm
+        # PM should have been called for each active profile with only fresh symbols.
+        assert mock_pm_run_profile.call_count == len(ACTIVE_PROFILES)
+        for pm_call in mock_pm_run_profile.call_args_list:
+            # run_profile(engine, fresh_symbols, profile_id, *, cycle_id=...)
+            symbols_passed_to_pm = pm_call[0][1]
+            assert set(symbols_passed_to_pm) == {"AAPL", "MSFT"}
+            assert "TSLA" not in symbols_passed_to_pm
+            assert "GOOG" not in symbols_passed_to_pm
+            assert "AMZN" not in symbols_passed_to_pm
 
 
 # --- Timeout tests ---
@@ -302,14 +308,17 @@ class TestTimeoutAdvancement:
         mock_freshness.return_value = _make_freshness_result(fresh=("AAPL",))
 
         coordinator = CycleCoordinator(mem_engine)
+        started = time.monotonic()
         summary = coordinator.run_market_cycle(
             trigger_source="scheduled",
             override_symbols=["AAPL"],
         )
+        elapsed = time.monotonic() - started
 
         # Freshness gate and PM should still have been called despite analyst timeout
         mock_freshness.assert_called_once()
-        mock_pm_run_profile.assert_called_once()
+        assert mock_pm_run_profile.call_count == len(ACTIVE_PROFILES)
+        assert elapsed < 2.0
 
         # Analyst phase should be recorded as timeout
         analyst_phase = next(
@@ -556,7 +565,7 @@ class TestExceptionResilience:
 
         # Freshness gate and PM should still execute
         mock_freshness.assert_called_once()
-        mock_pm_run_profile.assert_called_once()
+        assert mock_pm_run_profile.call_count == len(ACTIVE_PROFILES)
         mock_bookkeeper.assert_called_once()
 
         # Analyst phase recorded as error

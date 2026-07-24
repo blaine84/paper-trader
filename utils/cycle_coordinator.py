@@ -392,6 +392,29 @@ class CycleCoordinator:
                 seen.add(s)
                 deduped.append(s)
 
+        focus_mode = os.getenv("ANALYST_FOCUS_MODE", "disabled").strip().lower()
+        if focus_mode == "enabled":
+            from utils.focus_list import select_focus_symbols
+
+            try:
+                max_symbols = int(os.getenv("ANALYST_FOCUS_MAX_SYMBOLS", "3"))
+            except ValueError:
+                max_symbols = 3
+
+            focused = select_focus_symbols(
+                self._engine,
+                deduped,
+                max_symbols=max(1, max_symbols),
+                context="coordinated_cycle",
+            )
+            logger.info(
+                "Focus selection: narrowed %d candidates to %d symbols: %s",
+                len(deduped),
+                len(focused),
+                focused,
+            )
+            return focused
+
         logger.info(
             "Focus selection: built watchlist with %d symbols: %s",
             len(deduped),
@@ -427,17 +450,21 @@ class CycleCoordinator:
                 )
                 return analyst.run(self._engine, symbols)
 
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="analyst") as executor:
-            future = executor.submit(_run_analyst)
-            done, _ = wait([future], timeout=ctx.analyst_timeout_seconds)
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="analyst")
+        future = executor.submit(_run_analyst)
+        done, _ = wait([future], timeout=ctx.analyst_timeout_seconds)
 
-            if not done:
-                raise _AnalystTimeoutError(
-                    f"Analyst did not complete within {ctx.analyst_timeout_seconds}s"
-                )
+        if not done:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise _AnalystTimeoutError(
+                f"Analyst did not complete within {ctx.analyst_timeout_seconds}s"
+            )
 
+        try:
             # Re-raise any exception from the analyst
             return future.result()
+        finally:
+            executor.shutdown(wait=True)
 
     def _phase_freshness_gate(self, ctx: CycleContext, symbols: list[str]) -> "FreshnessResult":
         """Phase 3: Validate signal freshness. Runs BEFORE PM.
@@ -509,34 +536,44 @@ class CycleCoordinator:
             _PmTimeoutError: If PM does not complete within timeout.
         """
         import agents.portfolio_manager as pm
+        from models.pm_profiles import ACTIVE_PROFILES
 
         def _run_pm() -> list[dict]:
-            # Try passing cycle_id; fall back gracefully if param not added yet
-            try:
-                result = pm.run_profile(
-                    self._engine,
-                    fresh_symbols,
-                    "default",
-                    cycle_id=ctx.cycle_id,
-                )
-            except TypeError:
-                logger.warning(
-                    "pm.run_profile() does not accept cycle_id yet. Calling without it."
-                )
-                result = pm.run_profile(self._engine, fresh_symbols, "default")
+            decisions: list[dict] = []
+            for profile_id in ACTIVE_PROFILES:
+                # Try passing cycle_id; fall back gracefully if param not added yet
+                try:
+                    result = pm.run_profile(
+                        self._engine,
+                        fresh_symbols,
+                        profile_id,
+                        cycle_id=ctx.cycle_id,
+                    )
+                except TypeError:
+                    logger.warning(
+                        "pm.run_profile() does not accept cycle_id yet. Calling without it."
+                    )
+                    result = pm.run_profile(self._engine, fresh_symbols, profile_id)
 
-            return result.get("decisions", []) if isinstance(result, dict) else []
+                if isinstance(result, dict):
+                    decisions.extend(result.get("decisions", []))
 
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="pm") as executor:
-            future = executor.submit(_run_pm)
-            done, _ = wait([future], timeout=ctx.pm_timeout_seconds)
+            return decisions
 
-            if not done:
-                raise _PmTimeoutError(
-                    f"PM did not complete within {ctx.pm_timeout_seconds}s"
-                )
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pm")
+        future = executor.submit(_run_pm)
+        done, _ = wait([future], timeout=ctx.pm_timeout_seconds)
 
+        if not done:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise _PmTimeoutError(
+                f"PM did not complete within {ctx.pm_timeout_seconds}s"
+            )
+
+        try:
             return future.result()
+        finally:
+            executor.shutdown(wait=True)
 
     def _phase_safety_checks(self, ctx: CycleContext) -> None:
         """Phase 5: Stop losses and position health.
