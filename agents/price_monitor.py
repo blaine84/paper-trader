@@ -32,6 +32,24 @@ _quote_cache: dict[str, tuple[float, float]] = {}
 _yfinance_disabled_until = 0.0
 
 
+def _is_within_decision_window() -> bool:
+    """Check if the current time is within the PM decision window.
+
+    During the decision window, non-critical Finnhub calls are suppressed
+    to preserve API budget for the coordinator's analyst/PM phases.
+    Returns False when the coordinator is disabled (window_end is None).
+    """
+    try:
+        from utils.cycle_coordinator import get_decision_window_end
+
+        window_end = get_decision_window_end()
+        if window_end is None:
+            return False
+        return datetime.now(timezone.utc) < window_end
+    except ImportError:
+        return False
+
+
 def _get_yfinance_quotes(symbols: list[str], now: float) -> dict:
     global _yfinance_disabled_until
 
@@ -128,7 +146,13 @@ def get_batch_quotes(symbols: list[str], *, prefer_finnhub: bool = False) -> dic
 
     # Monitoring fallback should be fast. Avoid Finnhub's 60s retry sleep when
     # the provider is already rate-limited.
-    quotes.update(_get_finnhub_quotes(missing, now, retries=0))
+    if not _is_within_decision_window():
+        quotes.update(_get_finnhub_quotes(missing, now, retries=0))
+    else:
+        log.debug(
+            "Suppressing Finnhub monitoring quotes for %d symbols during decision window",
+            len(missing),
+        )
 
     return quotes
 

@@ -1301,6 +1301,72 @@ def run_pipeline_evaluation():
     return results
 
 
+def run_coordinated_market_cycle():
+    """Coordinated market cycle — replaces independent analyst/PM jobs when enabled.
+
+    When PM_CYCLE_COORDINATOR_MODE == "enabled":
+        Runs a single sequential pipeline: focus → analyst → freshness gate → PM → safety.
+
+    When disabled:
+        Falls back to legacy independent jobs (run_analyst_refresh + run_intraday).
+    """
+    from utils.gate_config import PM_CYCLE_COORDINATOR_MODE
+
+    if PM_CYCLE_COORDINATOR_MODE != "enabled":
+        # Legacy path — run independent jobs sequentially
+        run_analyst_refresh()
+        run_intraday()
+        return
+
+    if _skip_outside_regular_market_job("coordinated_cycle"):
+        return
+
+    log.info("=== COORDINATED MARKET CYCLE ===")
+    engine = get_engine()
+
+    from utils.cycle_coordinator import CycleCoordinator
+
+    coordinator = CycleCoordinator(engine)
+    try:
+        summary = coordinator.run_market_cycle(trigger_source="scheduled")
+        log.info(
+            "Coordinated cycle completed: cycle_id=%s, duration=%.1fs, fresh=%d, stale=%d",
+            summary.cycle_id,
+            summary.total_duration_seconds,
+            summary.symbols_fresh,
+            summary.symbols_stale_skipped,
+        )
+    except Exception as exc:
+        log.error("Coordinated market cycle failed: %s", exc, exc_info=True)
+
+
+def _run_manual_coordinated_cycle():
+    """Manual coordinated market cycle triggered via SIGUSR2 or CLI.
+
+    Bypasses market-hours guard so the operator can test the coordinated path
+    at any time. Always uses trigger_source="manual".
+    """
+    log.info("=== MANUAL COORDINATED MARKET CYCLE ===")
+    engine = get_engine()
+
+    from utils.cycle_coordinator import CycleCoordinator
+
+    coordinator = CycleCoordinator(engine)
+    try:
+        summary = coordinator.run_market_cycle(trigger_source="manual")
+        log.info(
+            "Manual coordinated cycle completed: cycle_id=%s, duration=%.1fs, fresh=%d, stale=%d",
+            summary.cycle_id,
+            summary.total_duration_seconds,
+            summary.symbols_fresh,
+            summary.symbols_stale_skipped,
+        )
+        console.print(f"[green]Coordinated cycle completed: {summary.cycle_id} ({summary.total_duration_seconds:.1f}s)[/green]")
+    except Exception as exc:
+        log.error("Manual coordinated market cycle failed: %s", exc, exc_info=True)
+        console.print(f"[red]Coordinated cycle failed: {exc}[/red]")
+
+
 def run_analyst_refresh():
     """Analyst-only refresh — morning every 15 min, afternoon every 30 min."""
     if _skip_outside_regular_market_job("analyst_refresh"):
@@ -2047,8 +2113,17 @@ def run_once():
     check_schema(engine)
     ensure_shadow_ledger_schema(engine)
     console.print("[bold]Running single cycle...[/bold]")
-    run_pre_market()
-    run_intraday()
+
+    from utils.gate_config import PM_CYCLE_COORDINATOR_MODE
+
+    if PM_CYCLE_COORDINATOR_MODE == "enabled":
+        from utils.cycle_coordinator import CycleCoordinator
+        coordinator = CycleCoordinator(engine)
+        summary = coordinator.run_market_cycle(trigger_source="manual")
+        console.print(f"[green]Coordinated cycle completed: {summary.cycle_id} ({summary.total_duration_seconds:.1f}s)[/green]")
+    else:
+        run_pre_market()
+        run_intraday()
 
 
 def check_llm_connectivity():
@@ -2477,53 +2552,86 @@ def main():
         id="pre_market",
     )
 
-    # Analyst refresh: morning every 15 min (9:00–11:45 ET)
-    scheduler.add_job(
-        run_analyst_refresh,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-11",
-            minute=f"*/{LOOP_INTERVAL}",
-            timezone="America/New_York",
-        ),
-        id="analyst_refresh_morning",
-    )
+    # ===================================================================
+    # ANALYST + PM JOBS: coordinated cycle vs. legacy independent jobs
+    # When PM_CYCLE_COORDINATOR_MODE == "enabled", a single coordinated
+    # market cycle replaces the separate analyst_refresh + intraday jobs.
+    # ===================================================================
+    from utils.gate_config import PM_CYCLE_COORDINATOR_MODE
 
-    # Analyst refresh: afternoon every 30 min (12:00–15:30 ET)
-    scheduler.add_job(
-        run_analyst_refresh,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="12-15",
-            minute="0,30",
-            timezone="America/New_York",
-        ),
-        id="analyst_refresh_afternoon",
-    )
+    if PM_CYCLE_COORDINATOR_MODE == "enabled":
+        # Coordinated cycle: morning every 15 min (9:00–11:45 ET)
+        scheduler.add_job(
+            run_coordinated_market_cycle,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-11",
+                minute=f"*/{LOOP_INTERVAL}",
+                timezone="America/New_York",
+            ),
+            id="coordinated_cycle_morning",
+        )
 
-    # Intraday morning (PM decisions): every 15 min, 9:30 AM – 12:00 PM ET
-    scheduler.add_job(
-        run_intraday,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-11",
-            minute=f"*/{LOOP_INTERVAL}",
-            timezone="America/New_York",
-        ),
-        id="intraday_morning",
-    )
+        # Coordinated cycle: afternoon every 30 min (12:00–15:30 ET)
+        scheduler.add_job(
+            run_coordinated_market_cycle,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="12-15",
+                minute="0,30",
+                timezone="America/New_York",
+            ),
+            id="coordinated_cycle_afternoon",
+        )
+    else:
+        # Legacy: independent analyst and PM jobs
+        # Analyst refresh: morning every 15 min (9:00–11:45 ET)
+        scheduler.add_job(
+            run_analyst_refresh,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-11",
+                minute=f"*/{LOOP_INTERVAL}",
+                timezone="America/New_York",
+            ),
+            id="analyst_refresh_morning",
+        )
 
-    # Intraday afternoon: every 30 min, 12:00 PM – 4:00 PM ET
-    scheduler.add_job(
-        run_intraday,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="12-15",
-            minute="0,30",
-            timezone="America/New_York",
-        ),
-        id="intraday_afternoon",
-    )
+        # Analyst refresh: afternoon every 30 min (12:00–15:30 ET)
+        scheduler.add_job(
+            run_analyst_refresh,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="12-15",
+                minute="0,30",
+                timezone="America/New_York",
+            ),
+            id="analyst_refresh_afternoon",
+        )
+
+        # Intraday morning (PM decisions): every 15 min, 9:30 AM – 12:00 PM ET
+        scheduler.add_job(
+            run_intraday,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-11",
+                minute=f"*/{LOOP_INTERVAL}",
+                timezone="America/New_York",
+            ),
+            id="intraday_morning",
+        )
+
+        # Intraday afternoon: every 30 min, 12:00 PM – 4:00 PM ET
+        scheduler.add_job(
+            run_intraday,
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour="12-15",
+                minute="0,30",
+                timezone="America/New_York",
+            ),
+            id="intraday_afternoon",
+        )
 
     # Price monitor: every 60 seconds during market hours only (uses yfinance, free).
     # Offset from :00 to avoid colliding with analyst/PM batch jobs and quote-provider bursts.
@@ -2561,11 +2669,16 @@ def main():
             coalesce=True,
         )
 
+    # Lower-priority jobs: offset by 5 min when coordinator is active
+    # to avoid contention with the coordinated cycle's decision window.
+    # Requirements: 7.4, 9.4
+    _lp_offset = 5 if PM_CYCLE_COORDINATOR_MODE == "enabled" else 0
+
     # Sector Scout confirmation scan: 10:00 AM ET — NOW bounded shortlist retry
     # (Replaces former broad sector scan per requirement 12.5)
     scheduler.add_job(
         run_funnel_confirmation_retry_job,
-        CronTrigger(day_of_week="mon-fri", hour=10, minute=0, timezone="America/New_York"),
+        CronTrigger(day_of_week="mon-fri", hour=10, minute=_lp_offset, timezone="America/New_York"),
         id="funnel_confirmation_retry",
         max_instances=1,
         coalesce=True,
@@ -2578,14 +2691,14 @@ def main():
     # News monitor: every 2 hours during market hours (local LLM, free)
     scheduler.add_job(
         run_news_monitor,
-        CronTrigger(day_of_week="mon-fri", hour="10,12,14", minute=0, timezone="America/New_York"),
+        CronTrigger(day_of_week="mon-fri", hour="10,12,14", minute=_lp_offset, timezone="America/New_York"),
         id="news_monitor",
     )
 
     # Position health check: every hour during market hours (local LLM, free)
     scheduler.add_job(
         run_position_health,
-        CronTrigger(day_of_week="mon-fri", hour="10-15", minute=30, timezone="America/New_York"),
+        CronTrigger(day_of_week="mon-fri", hour="10-15", minute=30 + _lp_offset, timezone="America/New_York"),
         id="position_health",
     )
 
@@ -2751,9 +2864,18 @@ def main():
         scheduler.add_job(run_pre_market, id="manual_refresh", replace_existing=True)
 
     def _intraday_now(signum, frame):
-        log.info("SIGUSR2 received — triggering manual intraday cycle")
-        console.print("[bold cyan]⚡ Manual intraday cycle triggered...[/bold cyan]")
-        scheduler.add_job(run_intraday, id="manual_intraday", replace_existing=True)
+        from utils.gate_config import PM_CYCLE_COORDINATOR_MODE
+
+        if PM_CYCLE_COORDINATOR_MODE == "enabled":
+            log.info("SIGUSR2 received — triggering manual coordinated market cycle")
+            console.print("[bold cyan]⚡ Manual coordinated market cycle triggered...[/bold cyan]")
+            scheduler.add_job(
+                _run_manual_coordinated_cycle, id="manual_coordinated_cycle", replace_existing=True
+            )
+        else:
+            log.info("SIGUSR2 received — triggering manual intraday cycle")
+            console.print("[bold cyan]⚡ Manual intraday cycle triggered...[/bold cyan]")
+            scheduler.add_job(run_intraday, id="manual_intraday", replace_existing=True)
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -2786,5 +2908,29 @@ if __name__ == "__main__":
         ensure_initial_balance(engine)
         check_schema(engine)
         run_ceo_weekly()
+    elif len(sys.argv) > 2 and sys.argv[1] == "manual" and sys.argv[2] == "market-cycle":
+        # Always runs coordinated path regardless of PM_CYCLE_COORDINATOR_MODE flag
+        engine = get_engine()
+        ensure_initial_balance(engine)
+        check_schema(engine)
+        ensure_shadow_ledger_schema(engine)
+        console.print("[bold]Running manual coordinated market cycle...[/bold]")
+        _run_manual_coordinated_cycle()
+    elif len(sys.argv) > 2 and sys.argv[1] == "manual" and sys.argv[2] == "pm":
+        # Always calls run_intraday() directly (legacy path) regardless of flag
+        engine = get_engine()
+        ensure_initial_balance(engine)
+        check_schema(engine)
+        ensure_shadow_ledger_schema(engine)
+        console.print("[bold]Running manual PM (legacy intraday)...[/bold]")
+        run_intraday()
+    elif len(sys.argv) > 2 and sys.argv[1] == "manual" and sys.argv[2] == "analyst":
+        # Always calls run_analyst_refresh() directly (bypass coordinator)
+        engine = get_engine()
+        ensure_initial_balance(engine)
+        check_schema(engine)
+        ensure_shadow_ledger_schema(engine)
+        console.print("[bold]Running manual analyst refresh...[/bold]")
+        run_analyst_refresh()
     else:
         main()

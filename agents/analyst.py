@@ -1151,7 +1151,7 @@ def enrich_signal_with_quote_context(signal: dict, quote: dict, candles: dict) -
     return signal
 
 
-def run(engine, symbols: list[str]) -> dict:
+def run(engine, symbols: list[str], *, cycle_id: str | None = None) -> dict:
     fh = FinnhubClient()
     db = get_session(engine)
 
@@ -1447,6 +1447,7 @@ Produce your trading signal JSON for {sym}.
     # Save all signals to memory
     db2 = get_session(engine)
     for sym, signal in signals.items():
+        signal["_cycle_id"] = cycle_id
         db2.add(AgentMemory(
             agent="analyst",
             symbol=sym,

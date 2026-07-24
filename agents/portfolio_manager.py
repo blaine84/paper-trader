@@ -3987,7 +3987,7 @@ def _compute_shadow_agreement(candidate_results, legacy_results):
     })
 
 
-def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high", cycle_trigger_type: str = "scheduled", alert_intent_ids: list[str] | None = None, alert_contexts: list[dict] | None = None) -> dict:
+def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high", cycle_trigger_type: str = "scheduled", alert_intent_ids: list[str] | None = None, alert_contexts: list[dict] | None = None, cycle_id: str | None = None) -> dict:
     """
     Run a single PM profile for one cycle with two-tier review routing.
 
@@ -4009,6 +4009,8 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
     """
     profile = PM_PROFILES[profile_id]
     log.info(f"run_profile started: profile={profile_id}, cycle_trigger_type={cycle_trigger_type}, alert_intent_ids={alert_intent_ids}, alert_contexts={alert_contexts}")
+    if cycle_id:
+        log.info(f"run_profile cycle_id={cycle_id} for profile={profile_id}")
     fh = FinnhubClient()
     db = get_session(engine)
 
@@ -4534,8 +4536,9 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
         # Recover any stale reservations from prior cycles/crashes
         recover_stale_reservations(engine)
 
-        # Generate unique cycle ID
-        cycle_id = f"cycle_{profile_id}_{uuid.uuid4().hex[:12]}"
+        # Use externally provided cycle_id (coordinated mode) or generate internally (legacy mode)
+        if not cycle_id:
+            cycle_id = f"cycle_{profile_id}_{uuid.uuid4().hex[:12]}"
 
         # Capture frozen portfolio snapshot for consistent evaluation
         portfolio_snapshot = copy.deepcopy(portfolio)
