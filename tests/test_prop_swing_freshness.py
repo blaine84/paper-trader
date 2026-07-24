@@ -108,6 +108,34 @@ def test_signal_freshness_stale_when_age_missing(extra_fields: dict):
     assert result == "stale_signal"
 
 
+def test_signal_freshness_passes_with_matching_cycle_id_when_age_missing():
+    """Current-cycle coordinated signals are fresh even without legacy age metadata."""
+    signal = {
+        "symbol": "TSLA",
+        "_cycle_id": "cycle-current",
+        "catalyst_freshness": "fresh",
+        "direction": "SHORT",
+    }
+
+    result = _check_signal_freshness(signal, cycle_id="cycle-current")
+
+    assert result is None
+
+
+def test_signal_freshness_stale_when_cycle_id_does_not_match_and_age_missing():
+    """_cycle_id only proves freshness for the active PM cycle."""
+    signal = {
+        "symbol": "TSLA",
+        "_cycle_id": "cycle-prior",
+        "catalyst_freshness": "fresh",
+        "direction": "SHORT",
+    }
+
+    result = _check_signal_freshness(signal, cycle_id="cycle-current")
+
+    assert result == "stale_signal"
+
+
 @given(
     extra_fields=st.fixed_dictionaries({
         "symbol": st.text(min_size=1, max_size=5),
@@ -209,6 +237,32 @@ def test_catalyst_freshness_rejects_absent(extra_fields: dict):
     signal = {**extra_fields}
     assert "catalyst_freshness" not in signal
     result = _check_catalyst_freshness(signal)
+    assert result == "stale_catalyst"
+
+
+def test_catalyst_freshness_passes_with_matching_cycle_id_when_absent():
+    """Current-cycle coordinated signals can proceed without legacy catalyst age metadata."""
+    signal = {
+        "symbol": "TSLA",
+        "_cycle_id": "cycle-current",
+        "signal_age_hours": 0,
+    }
+
+    result = _check_catalyst_freshness(signal, cycle_id="cycle-current")
+
+    assert result is None
+
+
+def test_catalyst_freshness_rejects_absent_when_cycle_id_does_not_match():
+    """Missing catalyst metadata still fails outside the active coordinated cycle."""
+    signal = {
+        "symbol": "TSLA",
+        "_cycle_id": "cycle-prior",
+        "signal_age_hours": 0,
+    }
+
+    result = _check_catalyst_freshness(signal, cycle_id="cycle-current")
+
     assert result == "stale_catalyst"
 
 

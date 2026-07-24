@@ -307,7 +307,7 @@ class SwingBridgeResult:
     construction_succeeded: bool
 
 
-def _check_signal_freshness(signal: dict) -> str | None:
+def _check_signal_freshness(signal: dict, cycle_id: str | None = None) -> str | None:
     """Check if signal is fresh enough for swing evaluation.
 
     Returns None if fresh, or 'stale_signal' if stale.
@@ -316,7 +316,14 @@ def _check_signal_freshness(signal: dict) -> str | None:
     A signal is stale if:
     - signal_age_hours > threshold, OR
     - signal has no valid signal_age_hours field (None or missing) (Req 10.4)
+
+    Coordinated market cycles stamp Analyst payloads with _cycle_id. When that
+    matches the active PM cycle, treat the signal as fresh even if older
+    signal_age_hours metadata is absent.
     """
+    if cycle_id is not None and signal.get("_cycle_id") == cycle_id:
+        return None
+
     from utils.gate_config import SWING_SIGNAL_FRESHNESS_HOURS
 
     age = signal.get("signal_age_hours")
@@ -330,7 +337,7 @@ def _check_signal_freshness(signal: dict) -> str | None:
     return None
 
 
-def _check_catalyst_freshness(signal: dict) -> str | None:
+def _check_catalyst_freshness(signal: dict, cycle_id: str | None = None) -> str | None:
     """Check if catalyst/news context is fresh enough for swing hold.
 
     Consumes the existing `catalyst_freshness` field from the analyst signal.
@@ -348,6 +355,8 @@ def _check_catalyst_freshness(signal: dict) -> str | None:
     """
     catalyst_freshness = signal.get("catalyst_freshness")
     if catalyst_freshness is None:
+        if cycle_id is not None and signal.get("_cycle_id") == cycle_id:
+            return None
         return "stale_catalyst"
     if catalyst_freshness == "stale":
         return "stale_catalyst"
@@ -508,7 +517,7 @@ def process_swing_signals(
         raw_label = signal.get("setup_type", "")
 
         # --- Freshness checks (before normalization) — Req 10.3, 11.3, 3.4 ---
-        stale_reason = _check_signal_freshness(signal)
+        stale_reason = _check_signal_freshness(signal, cycle_id=cycle_id)
         if stale_reason:
             mapping = map_rejection_reason(stale_reason, symbol)
             entries.append(PerSymbolEntry(
@@ -533,7 +542,7 @@ def process_swing_signals(
             _safe_emit_log(result)
             continue
 
-        stale_catalyst = _check_catalyst_freshness(signal)
+        stale_catalyst = _check_catalyst_freshness(signal, cycle_id=cycle_id)
         if stale_catalyst:
             mapping = map_rejection_reason(stale_catalyst, symbol)
             entries.append(PerSymbolEntry(
