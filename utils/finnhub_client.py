@@ -4,15 +4,26 @@ Handles quotes, candles, news, and basic technicals.
 Free tier limit: 60 calls/minute — rate limiting is built in.
 """
 
+from __future__ import annotations
+
 import os
 import time
 import logging
 import threading
+from typing import TYPE_CHECKING
+
 import finnhub
 import requests
 from datetime import datetime, timedelta
 
+if TYPE_CHECKING:
+    from utils.finnhub_budget import CycleFinnhubBudget
+
 log = logging.getLogger(__name__)
+
+
+class FinnhubBudgetExhaustedError(Exception):
+    """Raised when the per-cycle Finnhub API budget is exceeded."""
 
 
 class FinnhubClient:
@@ -21,14 +32,21 @@ class FinnhubClient:
     _shared_lock = None
     _yfinance_lock = threading.Lock()
 
-    def __init__(self):
+    def __init__(self, cycle_budget: CycleFinnhubBudget | None = None):
         api_key = os.getenv("FINNHUB_API_KEY")
         if not api_key:
             raise ValueError("FINNHUB_API_KEY not set in environment")
         self.client = finnhub.Client(api_key=api_key)
+        self._cycle_budget = cycle_budget
 
     def _rate_limit(self):
         """Block if we're approaching the per-minute call limit. Shared across all instances."""
+        if self._cycle_budget is not None:
+            if not self._cycle_budget.increment():
+                raise FinnhubBudgetExhaustedError(
+                    f"Cycle Finnhub budget exhausted: used={self._cycle_budget.used}, "
+                    f"budget={self._cycle_budget.budget}"
+                )
         now = time.time()
         FinnhubClient._shared_call_times = [t for t in FinnhubClient._shared_call_times if now - t < 60]
         if len(FinnhubClient._shared_call_times) >= self.CALLS_PER_MINUTE:

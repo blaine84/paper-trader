@@ -612,6 +612,41 @@ PM_ALERT_CLAIM_STALE_MINUTES: int = int(
 )
 
 # ---------------------------------------------------------------------------
+# Coordinated Market Cycle Scheduler Feature Flags
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "enabled"
+PM_CYCLE_COORDINATOR_MODE: str = os.environ.get("PM_CYCLE_COORDINATOR_MODE", "disabled")
+
+# Phase timeout budgets (seconds)
+CYCLE_ANALYST_TIMEOUT_SECONDS: int = int(
+    os.environ.get("CYCLE_ANALYST_TIMEOUT_SECONDS", "180")
+)
+CYCLE_PM_TIMEOUT_SECONDS: int = int(
+    os.environ.get("CYCLE_PM_TIMEOUT_SECONDS", "300")
+)
+
+# Signal freshness window — signals older than this are excluded from the PM phase
+PM_SIGNAL_FRESHNESS_WINDOW_SECONDS: int = int(
+    os.environ.get("PM_SIGNAL_FRESHNESS_WINDOW_SECONDS", "120")
+)
+
+# Decision window — maximum seconds PM has to render a decision after receiving candidates
+CYCLE_DECISION_WINDOW_SECONDS: int = int(
+    os.environ.get("CYCLE_DECISION_WINDOW_SECONDS", "90")
+)
+
+# P1: Market snapshot TTL — cached snapshot expires after this many seconds
+CYCLE_SNAPSHOT_TTL_SECONDS: int = int(
+    os.environ.get("CYCLE_SNAPSHOT_TTL_SECONDS", "90")
+)
+
+# P1: Finnhub API call budget per cycle
+CYCLE_FINNHUB_BUDGET: int = int(
+    os.environ.get("CYCLE_FINNHUB_BUDGET", "40")
+)
+
+# ---------------------------------------------------------------------------
 # Pilot Controller
 # ---------------------------------------------------------------------------
 
