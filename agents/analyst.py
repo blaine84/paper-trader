@@ -58,6 +58,19 @@ _STALE_HISTORICAL_FEEDBACK_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CONFLUENT_MACD_EMA_RE = re.compile(
+    r"\b(?:The\s+)?MACD\s+is\s+(bullish|bearish),\s+but\s+"
+    r"(?:the\s+)?EMA\s+trend\s+is\s+also\s+\1\.?",
+    re.IGNORECASE,
+)
+
+_CONFLICTING_PRIOR_HIGH_VWAP_RE = re.compile(
+    r"(?:Additionally,\s+)?(?:there\s+are\s+)?conflicting\s+key\s+levels:\s+"
+    r"the\s+prior\s+high\s+is\s+([0-9]+(?:\.[0-9]+)?),\s+and\s+"
+    r"the\s+VWAP\s+is\s+at\s+([0-9]+(?:\.[0-9]+)?)\.?",
+    re.IGNORECASE,
+)
+
 
 SYSTEM_PROMPT = """You are a technical analyst for day trading.
 You receive price data, technical indicators, and research sentiment for a stock.
@@ -142,6 +155,11 @@ VETO ACCOUNTABILITY:
 - Acceptable veto reasons include: stale/missing catalyst for a catalyst-dependent setup, conflicting key levels, thin/invalid volume, overextension/chop, invalid symbol/setup mapping, or explicit reviewer mitigation.
 - Do not use vague vetoes like "risk-off", "uncertain market", or "mixed indicators" unless you name the exact conflicting indicators/levels.
 - If no concrete veto exists, output the deterministic direction as the signal with appropriate weak/moderate strength; PM decides whether to trade.
+
+REASONING QUALITY:
+- If MACD bias and EMA trend point the same direction, describe them as trend confluence. Do not write "MACD is bearish, but EMA trend is also bearish" or the bullish equivalent.
+- Separate structural levels from dynamic intraday indicators. Prior highs/lows, day highs/lows, support, and resistance are structural levels; VWAP and moving averages are dynamic intraday indicators. They are not "conflicting key levels" merely because they are far apart.
+- setup_reasoning should explain why the setup label was chosen. reasoning should add non-duplicative tape/indicator context. Do not repeat the same MACD/EMA/RSI/VWAP/key-level sentence in both fields.
 
 STRICT OUTPUT CONTRACT:
 - Return exactly the analyst signal object above.
@@ -344,6 +362,128 @@ def sanitize_historical_feedback_bleed(signal: dict) -> dict:
         signal["historical_feedback_redacted"] = True
         signal["historical_feedback_redacted_fields"] = redacted_fields
     return signal
+
+
+def sanitize_reasoning_quality(signal: dict) -> dict:
+    """Fix common LLM reasoning defects before analyst memory is persisted."""
+    if not isinstance(signal, dict):
+        return signal
+
+    _annotate_trend_confluence(signal)
+    _annotate_key_level_context(signal)
+
+    changed_fields = []
+    for field in ("setup_reasoning", "reasoning"):
+        value = signal.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        cleaned = _rewrite_reasoning_quality_text(value)
+        if cleaned != value:
+            signal[field] = cleaned
+            changed_fields.append(field)
+
+    deduped_reasoning = _dedupe_reasoning_against_setup(
+        signal.get("setup_reasoning"),
+        signal.get("reasoning"),
+    )
+    if deduped_reasoning != signal.get("reasoning"):
+        signal["reasoning"] = deduped_reasoning
+        changed_fields.append("reasoning")
+
+    if changed_fields:
+        signal["reasoning_quality_sanitized"] = True
+        signal["reasoning_quality_sanitized_fields"] = sorted(set(changed_fields))
+    return signal
+
+
+def _annotate_trend_confluence(signal: dict) -> None:
+    indicators = signal.get("indicators") if isinstance(signal.get("indicators"), dict) else {}
+    macd_bias = str(indicators.get("macd_bias") or "").lower()
+    ema_trend = str(indicators.get("ema_trend") or indicators.get("trend") or "").lower()
+    if macd_bias in {"bullish", "bearish"} and macd_bias == ema_trend:
+        signal["trend_confluence"] = {
+            "direction": macd_bias,
+            "signals": ["macd_bias", "ema_trend"],
+            "summary": f"MACD bias and EMA trend are both {macd_bias}.",
+        }
+
+
+def _annotate_key_level_context(signal: dict) -> None:
+    levels = signal.get("key_levels") if isinstance(signal.get("key_levels"), dict) else {}
+    structural_keys = (
+        "support", "resistance", "prior_high", "prior_low", "day_high", "day_low"
+    )
+    dynamic_keys = ("vwap", "ema9", "ema21", "ema50")
+    structural = {k: levels[k] for k in structural_keys if levels.get(k) is not None}
+    dynamic = {k: levels[k] for k in dynamic_keys if levels.get(k) is not None}
+    if structural or dynamic:
+        signal["key_level_context"] = {
+            "structural_levels": structural,
+            "dynamic_intraday_indicators": dynamic,
+        }
+
+
+def _rewrite_reasoning_quality_text(text: str) -> str:
+    def _confluence_repl(match: re.Match) -> str:
+        direction = match.group(1).lower()
+        return (
+            f"MACD and EMA trend are both {direction}, so trend signals are confluent."
+        )
+
+    def _level_repl(match: re.Match) -> str:
+        prior_high = match.group(1)
+        vwap = match.group(2)
+        return (
+            f"Key levels are multi-timeframe: prior high {prior_high} is structural resistance; "
+            f"VWAP {vwap} is dynamic intraday context."
+        )
+
+    cleaned = _CONFLUENT_MACD_EMA_RE.sub(_confluence_repl, text)
+    cleaned = _CONFLICTING_PRIOR_HIGH_VWAP_RE.sub(_level_repl, cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _dedupe_reasoning_against_setup(setup_reasoning: object, reasoning: object) -> object:
+    if not isinstance(setup_reasoning, str) or not isinstance(reasoning, str):
+        return reasoning
+    setup_sentences = _split_sentences(setup_reasoning)
+    reasoning_sentences = _split_sentences(reasoning)
+    if not setup_sentences or not reasoning_sentences:
+        return reasoning
+
+    kept = []
+    for sentence in reasoning_sentences:
+        if any(_sentence_similarity(sentence, existing) >= 0.78 for existing in setup_sentences):
+            continue
+        if any(_sentence_similarity(sentence, existing) >= 0.90 for existing in kept):
+            continue
+        kept.append(sentence)
+    return " ".join(kept) if kept else reasoning_sentences[-1]
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text.strip())
+        if sentence.strip()
+    ]
+
+
+def _sentence_similarity(left: str, right: str) -> float:
+    left_tokens = _reasoning_tokens(left)
+    right_tokens = _reasoning_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def _reasoning_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9.]+", text.lower())
+        if len(token) >= 4
+    }
 
 
 def _is_diagnostic_confusion_setup(setup_type: str) -> bool:
@@ -1474,6 +1614,7 @@ Produce your trading signal JSON for {sym}.
             signal = enforce_veto_accountability(signal)
             signal = repair_missing_veto_contract(signal, sym)
             signal = sanitize_historical_feedback_bleed(signal)
+            signal = sanitize_reasoning_quality(signal)
             if signal["deterministic_sanity"].get("conflict"):
                 log.warning(
                     "Analyst sanity conflict for %s: llm=%s deterministic=%s score=%s veto_required=%s veto_present=%s reasons=%s",

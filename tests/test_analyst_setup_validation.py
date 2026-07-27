@@ -3,6 +3,7 @@ from agents.analyst import (
     build_technical_data_quality_context,
     compute_intraday_indicators_with_warmup,
     normalize_analyst_signal_shape,
+    sanitize_reasoning_quality,
     sanitize_historical_feedback_bleed,
 )
 
@@ -299,3 +300,59 @@ def test_technical_data_quality_distinguishes_partial_mtf_availability():
     assert '"5m"' in prompt_block
     assert '"60m"' in prompt_block
     assert '"trend_available": true' in prompt_block
+
+
+def test_reasoning_quality_rewrites_confluent_macd_ema_and_key_level_context():
+    signal = {
+        "setup_reasoning": (
+            "The setup is unclear. The MACD is bearish, but the EMA trend is also bearish. "
+            "Additionally, there are conflicting key levels: the prior high is 574.01, "
+            "and the VWAP is at 498.98."
+        ),
+        "reasoning": (
+            "The technical indicators also support a bearish view: the MACD is bearish, "
+            "and the EMA trend is bearish. Additionally, there are conflicting key levels: "
+            "the prior high is 574.01, and the VWAP is at 498.98."
+        ),
+        "key_levels": {
+            "support": 476.93,
+            "resistance": 527.49,
+            "vwap": 498.98,
+            "prior_high": 574.01,
+            "prior_low": 460.29,
+        },
+        "indicators": {
+            "macd_bias": "bearish",
+            "ema_trend": "bearish",
+        },
+    }
+
+    result = sanitize_reasoning_quality(signal)
+    combined = result["setup_reasoning"] + " " + result["reasoning"]
+
+    assert "but the EMA trend is also bearish" not in combined
+    assert "conflicting key levels" not in combined.lower()
+    assert "trend signals are confluent" in result["setup_reasoning"]
+    assert result["trend_confluence"]["direction"] == "bearish"
+    assert result["key_level_context"]["structural_levels"]["prior_high"] == 574.01
+    assert result["key_level_context"]["dynamic_intraday_indicators"]["vwap"] == 498.98
+
+
+def test_reasoning_quality_removes_duplicate_reasoning_sentences():
+    signal = {
+        "setup_reasoning": (
+            "MACD and EMA trend are both bearish, so trend signals are confluent. "
+            "RSI is oversold near support."
+        ),
+        "reasoning": (
+            "MACD and EMA trend are both bearish, so trend signals are confluent. "
+            "Volume is elevated versus the same-time baseline."
+        ),
+        "key_levels": {},
+        "indicators": {},
+    }
+
+    result = sanitize_reasoning_quality(signal)
+
+    assert result["reasoning"] == "Volume is elevated versus the same-time baseline."
+    assert result["reasoning_quality_sanitized"] is True
