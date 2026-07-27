@@ -48,7 +48,11 @@ engine = init_db("db/paper_trader.db")
 ensure_shadow_ledger_schema(engine)
 
 _QUOTE_CACHE_SECONDS = int(os.getenv("DASHBOARD_QUOTE_CACHE_SECONDS", "25"))
+_YFINANCE_CIRCUIT_BREAK_SECONDS = int(
+    os.getenv("DASHBOARD_YFINANCE_CIRCUIT_BREAK_SECONDS", "600")
+)
 _quote_cache: dict[str, tuple[float, dict]] = {}
+_yfinance_disabled_until = 0.0
 
 
 def _parse_quote_timestamp(value: object, fallback: datetime) -> datetime:
@@ -201,11 +205,12 @@ def _add_market_data_reliability_fields(
 
 def get_quotes(symbols: list[str]) -> dict:
     """Get current prices via Finnhub, falling back to yfinance if Finnhub fails."""
-    import yfinance as yf
+    global _yfinance_disabled_until
     quotes = {}
     finnhub = None
-    yfinance_available = True
     now = time.time()
+    yfinance_available = now >= _yfinance_disabled_until
+    yf = None
     for sym in symbols:
         cached = _quote_cache.get(sym)
         if cached and now - cached[0] < _QUOTE_CACHE_SECONDS:
@@ -233,10 +238,15 @@ def get_quotes(symbols: list[str]) -> dict:
             _quote_cache[sym] = (now, quote)
             continue
         except Exception as e:
-            log.warning("Finnhub quote failed for %s; trying yfinance fallback: %s", sym, e)
+            if yfinance_available:
+                log.warning("Finnhub quote failed for %s; trying yfinance fallback: %s", sym, e)
+            else:
+                log.warning("Finnhub quote failed for %s; yfinance fallback circuit-open: %s", sym, e)
 
         if yfinance_available:
             try:
+                if yf is None:
+                    import yfinance as yf
                 t = yf.Ticker(sym)
                 info = t.fast_info
                 price = float(info.get("lastPrice", 0))
@@ -256,7 +266,13 @@ def get_quotes(symbols: list[str]) -> dict:
                 continue
             except Exception as e:
                 yfinance_available = False
-                log.warning("yfinance quote fallback failed for %s; disabling for this batch: %s", sym, e)
+                _yfinance_disabled_until = now + _YFINANCE_CIRCUIT_BREAK_SECONDS
+                log.warning(
+                    "yfinance quote fallback failed for %s; disabled for %ss: %s",
+                    sym,
+                    _YFINANCE_CIRCUIT_BREAK_SECONDS,
+                    e,
+                )
 
         quotes[sym] = {
             "price": 0,

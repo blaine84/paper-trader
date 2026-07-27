@@ -49,6 +49,10 @@ _PROHIBITED_FIELDS = {
     "target", "target_price", "quantity",
 }
 
+# Benign explanatory fields that some models add despite the contract.
+# Strip them quietly so execution warnings stay focused on actionable issues.
+_IGNORED_CONTEXT_FIELDS = {"symbol_context"}
+
 
 @dataclass
 class CandidateDecision:
@@ -214,6 +218,9 @@ def parse_decision_contract(
             if not entry.get("rationale"):
                 entry["rationale"] = entry["reason"]
             del entry["reason"]
+
+        for field in _IGNORED_CONTEXT_FIELDS & set(entry.keys()):
+            del entry[field]
 
         # 5a: Check for extra fields and log violation (strip them)
         extra_fields = set(entry.keys()) - _VALID_DECISION_FIELDS

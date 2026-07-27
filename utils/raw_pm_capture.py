@@ -267,6 +267,7 @@ _INSERT_RAW_RESPONSE_SQL = text("""
 _INSERT_LINEAGE_LINK_SQL = text("""
     INSERT INTO response_lineage_links (response_id, lineage_id, candidate_id)
     VALUES (:response_id, :lineage_id, :candidate_id)
+    ON CONFLICT (response_id, lineage_id) DO NOTHING
 """)
 
 
@@ -330,16 +331,15 @@ def persist_lineage_links(engine, links: list[ResponseLineageLink]) -> None:
     try:
         with engine.connect() as conn:
             for link in links:
-                try:
-                    conn.execute(
-                        _INSERT_LINEAGE_LINK_SQL,
-                        {
-                            "response_id": link.response_id,
-                            "lineage_id": link.lineage_id,
-                            "candidate_id": link.candidate_id,
-                        },
-                    )
-                except IntegrityError:
+                result = conn.execute(
+                    _INSERT_LINEAGE_LINK_SQL,
+                    {
+                        "response_id": link.response_id,
+                        "lineage_id": link.lineage_id,
+                        "candidate_id": link.candidate_id,
+                    },
+                )
+                if result.rowcount == 0:
                     log.warning(
                         "Duplicate lineage link skipped: response_id=%s, lineage_id=%s",
                         link.response_id,

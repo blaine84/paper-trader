@@ -25,6 +25,18 @@ def _date_cutoff_filter(engine: Engine, column: str, param_name: str = "cutoff")
         return f"{column} >= NOW() + CAST(:{param_name} AS interval)"
 
 
+def _timestamp_before_now(engine: Engine, column: str) -> str:
+    """Return a timestamp comparison fragment for text-backed ISO timestamps.
+
+    SQLite stores several runtime timestamp columns as ISO text. Postgres can
+    compare native timestamps directly, but text columns must be cast first.
+    """
+    if is_sqlite(engine):
+        return f"datetime({column}) < datetime('now')"
+    else:
+        return f"{column}::timestamptz < CURRENT_TIMESTAMP"
+
+
 def _json_field(engine: Engine, column: str, key: str) -> str:
     """Return SQL expression to extract a text value from a JSON column.
 

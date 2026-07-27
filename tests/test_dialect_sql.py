@@ -15,6 +15,7 @@ from utils.dialect_sql import (
     _default_timestamp,
     _json_field,
     _pk_column,
+    _timestamp_before_now,
     _upsert_outcome_sql,
 )
 
@@ -63,6 +64,19 @@ class TestDateCutoffFilter:
     def test_custom_param_name_postgres(self, pg_engine):
         result = _date_cutoff_filter(pg_engine, "t.updated_at", param_name="window")
         assert result == "t.updated_at >= NOW() + CAST(:window AS interval)"
+
+
+# ── _timestamp_before_now tests ─────────────────────────────────────────────
+
+
+class TestTimestampBeforeNow:
+    def test_sqlite_text_timestamp(self, sqlite_engine):
+        result = _timestamp_before_now(sqlite_engine, "expires_at")
+        assert result == "datetime(expires_at) < datetime('now')"
+
+    def test_postgres_text_timestamp(self, pg_engine):
+        result = _timestamp_before_now(pg_engine, "expires_at")
+        assert result == "expires_at::timestamptz < CURRENT_TIMESTAMP"
 
 
 # ── _json_field tests ───────────────────────────────────────────────────────

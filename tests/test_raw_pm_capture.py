@@ -401,6 +401,37 @@ class TestPersistRawResponse(unittest.TestCase):
             ).scalar()
         assert count == 1
 
+    @patch("utils.raw_pm_capture.PM_PROVENANCE_DETAIL", "full")
+    def test_duplicate_lineage_link_does_not_block_later_links(self):
+        resp = capture_raw_pm_response(
+            pm_cycle_id="cycle-014",
+            profile="moderate",
+            model_id="gpt-4",
+            prompt_version_id="v1",
+            candidate_ids_supplied=["c1", "c2"],
+            raw_payload='{"x": 1}',
+            parse_status="parse_success",
+        )
+        persist_raw_response(self.engine, resp)
+
+        first = link_response_to_lineages(resp.response_id, ["lin-1"], ["c1"])
+        persist_lineage_links(self.engine, first)
+
+        mixed_links = link_response_to_lineages(
+            resp.response_id, ["lin-1", "lin-2"], ["c1", "c2"]
+        )
+        persist_lineage_links(self.engine, mixed_links)
+
+        with self.engine.connect() as conn:
+            count = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM response_lineage_links "
+                    "WHERE response_id = :rid"
+                ),
+                {"rid": resp.response_id},
+            ).scalar()
+        assert count == 2
+
 
 if __name__ == "__main__":
     unittest.main()

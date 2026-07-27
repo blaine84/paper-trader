@@ -1699,6 +1699,7 @@ Put that idea in portfolio_notes instead.
 
 Forbidden inside decisions[]:
 - null values, zero quantities, placeholder prices, textual targets
+- symbol_context or other nested explanatory metadata
 - conditional actions: BUY ON DIP, ACCUMULATE, OVERWEIGHT, UNDERWEIGHT
 - non-entry actions: HOLD, PASS, AVOID, WATCH, CLOSE, SELL, TRIM
 - sector concepts, baskets, unsupported symbols

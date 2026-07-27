@@ -2451,13 +2451,15 @@ def main():
     if MARKET_STATE_MODE != "disabled":
         try:
             from sqlalchemy import text as _text
+            from utils.dialect_sql import _timestamp_before_now
+            expired_filter = _timestamp_before_now(engine, "expires_at")
             with engine.connect() as conn:
                 expired = conn.execute(
                     _text(
                         "UPDATE watch_candidates SET state = 'expired', "
                         "state_changed_at = CURRENT_TIMESTAMP, "
                         "updated_at = CURRENT_TIMESTAMP "
-                        "WHERE state = 'active' AND expires_at < CURRENT_TIMESTAMP"
+                        f"WHERE state = 'active' AND {expired_filter}"
                     )
                 )
                 if expired.rowcount > 0:

@@ -671,3 +671,40 @@ class TestBugConditionReasonFieldNormalization:
             f"Expected rationale='{reason_text}' but got '{result.accepted[0].rationale}'. "
             f"Bug confirmed: PM 'reason' field is not normalized to 'rationale'."
         )
+
+    def test_symbol_context_does_not_trigger_extra_fields_violation(self):
+        """PM explanatory symbol_context must be stripped without warning noise."""
+        candidate_id = str(uuid.uuid4())
+        valid_ids = {candidate_id}
+        metadata = {
+            candidate_id: {
+                "symbol": "AMD",
+                "source_signal_id": "sig_test",
+                "profile_id": "moderate",
+            }
+        }
+
+        raw_response = {
+            "decisions": [
+                {
+                    "candidate_id": candidate_id,
+                    "decision": "reject",
+                    "rationale": "Trend is mixed; waiting for confirmation.",
+                    "rejection_reason_code": "mixed_timeframes",
+                    "symbol_context": {
+                        "symbol": "AMD",
+                        "notes": "Model-added context, not contract data",
+                    },
+                }
+            ]
+        }
+
+        result = parse_decision_contract(raw_response, valid_ids, metadata)
+
+        extra_fields_violations = [
+            v for v in result.violations
+            if v.get("type") == "EXTRA_FIELDS"
+            and "symbol_context" in v.get("fields", [])
+        ]
+        assert extra_fields_violations == []
+        assert len(result.rejected) == 1
