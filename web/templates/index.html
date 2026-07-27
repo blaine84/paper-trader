@@ -416,6 +416,24 @@
       </div>`).join('');
   }
 
+  function humanizeState(value) {
+    return String(value || '')
+      .replace(/_/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  function setupLabel(w) {
+    if (w.setup_type === 'unclear_direction') {
+      if (w.setup_lifecycle_state && w.setup_lifecycle_state !== 'no_setup') {
+        return humanizeState(w.setup_lifecycle_state);
+      }
+      if (w.market_state && w.market_state !== 'confounded') {
+        return humanizeState(w.market_state);
+      }
+    }
+    return humanizeState(w.setup_type || '—');
+  }
+
   function renderWatchlist(watchlist, activeFocus) {
     renderActiveFocus(activeFocus);
     document.getElementById('watchlistBody').innerHTML = watchlist.map(w => {
@@ -424,6 +442,8 @@
       const exp = expandedRows.has(w.symbol);
       const safeSetupReasoning = escHtml(w.setup_reasoning || '');
       const safeReasoning = escHtml(w.reasoning || '');
+      const rawSetupType = escHtml(w.setup_type || '—');
+      const safeSetupLabel = escHtml(setupLabel(w));
       return `
         <tr>
           <td><strong class="sym-link" data-sym="${w.symbol}">${w.symbol}</strong> ${w.is_focus ? '<span class="badge badge-focus">FOCUS</span>' : ''}</td>
@@ -431,7 +451,7 @@
           <td class="right ${chgColor}">${w.change_pct >= 0 ? '+' : ''}${w.change_pct.toFixed(2)}%</td>
           <td class="center">${signalBadge(w.signal)}</td>
           <td class="center">${strengthBadge(w.strength)}</td>
-          <td><span class="setup-link" data-setup="${w.setup_type}">${w.setup_type}</span>${triggerBadge(w)}</td>
+          <td><span class="setup-link" data-setup="${rawSetupType}">${safeSetupLabel}</span>${triggerBadge(w)}</td>
           <td class="center dim">${w.confidence}</td>
           <td class="center">${sourceBadges(w)}</td>
           <td>${hasR ? `<span class="expand-btn" onclick="toggleReasoning('${w.symbol}')">${exp ? '▲' : '▼'}</span>` : ''}</td>

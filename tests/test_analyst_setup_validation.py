@@ -1,5 +1,7 @@
 from agents.analyst import (
     annotate_unregistered_setup,
+    build_technical_data_quality_context,
+    compute_intraday_indicators_with_warmup,
     normalize_analyst_signal_shape,
     sanitize_historical_feedback_bleed,
 )
@@ -245,3 +247,55 @@ def test_historical_feedback_bleed_redacts_stale_cpi_sentences():
     assert "scheduled macro catalyst" not in combined.lower()
     assert "economic calendar intersection" not in combined.lower()
     assert "Price is below VWAP" in result["setup_reasoning"]
+
+
+def test_intraday_indicators_use_warmup_when_session_is_thin(monkeypatch):
+    class FakeClient:
+        def get_candles(self, symbol, resolution, days):
+            assert symbol == "NVDA"
+            assert resolution == "5"
+            assert days == 20
+            return {
+                "open": list(range(100, 130)),
+                "high": list(range(101, 131)),
+                "low": list(range(99, 129)),
+                "close": list(range(100, 130)),
+                "volume": [1000] * 30,
+                "timestamps": [1_750_000_000 + i * 300 for i in range(30)],
+            }
+
+    thin_session = {
+        "open": [100, 101],
+        "high": [101, 102],
+        "low": [99, 100],
+        "close": [100, 101],
+        "volume": [1000, 1200],
+        "timestamps": [1_750_000_000, 1_750_000_300],
+    }
+
+    result = compute_intraday_indicators_with_warmup(FakeClient(), "NVDA", thin_session)
+
+    assert result["indicator_warmup_used"] is True
+    assert result["indicator_warmup_reason"] == "Not enough candles for indicators"
+    assert "rsi" in result
+    assert result.get("error") is None
+
+
+def test_technical_data_quality_distinguishes_partial_mtf_availability():
+    context = {
+        "timeframes": {
+            "5m": {"price": 202.28, "trend": None, "macd_bias": None, "rsi": None},
+            "60m": {"price": 202.28, "trend": "bearish", "macd_bias": "bearish", "rsi": 34.99},
+            "daily": {"price": 202.28, "trend": "bullish", "macd_bias": "bullish", "rsi": 46.9},
+        }
+    }
+
+    prompt_block = build_technical_data_quality_context(
+        {"indicator_warmup_used": True},
+        context,
+    )
+
+    assert "Do not say technical indicators are unavailable" in prompt_block
+    assert '"5m"' in prompt_block
+    assert '"60m"' in prompt_block
+    assert '"trend_available": true' in prompt_block

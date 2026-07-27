@@ -707,6 +707,71 @@ def build_deterministic_sanity_prompt_context(precheck: dict) -> str:
     }, indent=2)
 
 
+def compute_intraday_indicators_with_warmup(
+    client: FinnhubClient,
+    symbol: str,
+    candles_5m: dict,
+) -> dict:
+    """Compute 5m indicators, fetching warmup bars when today's session is thin."""
+    indicators = compute_indicators(candles_5m)
+    if not indicators.get("error"):
+        return indicators
+
+    if indicators.get("error") != "Not enough candles for indicators":
+        return indicators
+
+    try:
+        warmup_candles = client.get_candles(symbol, resolution="5", days=20)
+        warmup_indicators = compute_indicators(warmup_candles)
+    except Exception as exc:
+        result = dict(indicators)
+        result["warmup_error"] = str(exc)
+        return result
+
+    if warmup_indicators.get("error"):
+        result = dict(indicators)
+        result["warmup_error"] = warmup_indicators.get("error")
+        return result
+
+    warmup_indicators["indicator_warmup_used"] = True
+    warmup_indicators["indicator_warmup_reason"] = indicators.get("error")
+    return warmup_indicators
+
+
+def build_technical_data_quality_context(indicators: dict, multitimeframe_context: dict) -> str:
+    """Tell the Analyst exactly which technical inputs are usable."""
+    tf = (multitimeframe_context or {}).get("timeframes") or {}
+    availability = {}
+    for label in ("5m", "60m", "daily"):
+        row = tf.get(label) or {}
+        availability[label] = {
+            "price_structure_available": row.get("price") is not None,
+            "trend_available": row.get("trend") is not None,
+            "macd_available": row.get("macd_bias") is not None,
+            "rsi_available": row.get("rsi") is not None,
+        }
+
+    guidance = [
+        "Do not say technical indicators are unavailable when 60m/daily indicators or 5m price structure are present.",
+        "If 5m EMA/MACD/RSI are unavailable early in the session, say 5m momentum confirmation is incomplete.",
+        "Use 60m/daily trend, relative strength, volume, VWAP, support, and resistance as available evidence.",
+    ]
+    if indicators.get("indicator_warmup_used"):
+        guidance.append("5m indicators used a multi-session warmup; current-session levels still come from recent candles.")
+    elif indicators.get("error"):
+        guidance.append(f"Primary 5m indicator limitation: {indicators.get('error')}.")
+
+    return "TECHNICAL DATA QUALITY:\n" + json.dumps({
+        "primary_5m_indicators": {
+            "available": not bool(indicators.get("error")),
+            "error": indicators.get("error"),
+            "warmup_used": bool(indicators.get("indicator_warmup_used")),
+        },
+        "multitimeframe_availability": availability,
+        "guidance": guidance,
+    }, indent=2)
+
+
 def enforce_veto_accountability(signal: dict) -> dict:
     """Require a structured veto when LLM HOLD conflicts with deterministic sanity."""
     sanity = signal.get("deterministic_sanity")
@@ -1220,7 +1285,7 @@ def run(engine, symbols: list[str], *, cycle_id: str | None = None) -> dict:
         try:
             quote = fh.get_quote(sym)
             candles = fh.get_candles(sym, resolution="5", days=2)
-            indicators = compute_indicators(candles)
+            indicators = compute_intraday_indicators_with_warmup(fh, sym, candles)
             validate_candle_indicator_alignment(sym, quote, candles, indicators)
             try:
                 multitimeframe_context = build_multitimeframe_context(
@@ -1238,6 +1303,9 @@ def run(engine, symbols: list[str], *, cycle_id: str | None = None) -> dict:
                 }
             multitimeframe_prompt_context = format_multitimeframe_context_for_prompt(
                 multitimeframe_context
+            )
+            technical_data_quality_context = build_technical_data_quality_context(
+                indicators, multitimeframe_context
             )
             sentiment = recent_sentiment.get(sym, {})
 
@@ -1331,6 +1399,8 @@ TECHNICAL INDICATORS:
 {json.dumps(indicators, indent=2)}
 
 {multitimeframe_prompt_context}
+
+{technical_data_quality_context}
 
 DETERMINISTIC TECHNICAL SANITY CHECK:
 {deterministic_precheck_context}
