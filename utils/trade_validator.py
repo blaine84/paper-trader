@@ -6,6 +6,7 @@ Prevents null stops, bad R:R, and oversized positions.
 
 import logging
 from models.pm_profiles import PM_PROFILES
+from utils.gate_config import REDUCED_RR_THRESHOLDS_BY_PROFILE
 
 log = logging.getLogger(__name__)
 
@@ -13,6 +14,17 @@ log = logging.getLogger(__name__)
 class TradeValidationError(Exception):
     """Raised when a trade fails validation checks."""
     pass
+
+
+def _minimum_rr_for_profile(profile_id: str) -> float:
+    """Return final-validator R:R floor for the PM profile.
+
+    The risk-geometry gate already applies richer setup-specific rules. This
+    validator is the final database safety net, so it should not re-impose the
+    old hard 1:1 floor on aggressive/moderate trades that passed upstream.
+    """
+    profile_key = profile_id.lower() if isinstance(profile_id, str) else ""
+    return float(REDUCED_RR_THRESHOLDS_BY_PROFILE.get(profile_key, 1.0))
 
 
 def validate_trade(decision: dict, profile_id: str, cash: float, total_equity: float, direction: str):
@@ -54,7 +66,7 @@ def validate_trade(decision: dict, profile_id: str, cash: float, total_equity: f
     if direction == "SHORT" and target >= price:
         raise TradeValidationError(f"{symbol}: SHORT target ({target}) must be below entry ({price})")
 
-    # 6. R:R must be at least 1:1
+    # 6. R:R must satisfy the final profile-aware floor.
     if direction == "LONG":
         risk = price - stop
         reward = target - price
@@ -66,9 +78,10 @@ def validate_trade(decision: dict, profile_id: str, cash: float, total_equity: f
         raise TradeValidationError(f"{symbol}: zero or negative risk ({risk})")
 
     rr_ratio = reward / risk
-    if rr_ratio < 1.0:
+    min_rr = _minimum_rr_for_profile(profile_id)
+    if rr_ratio < min_rr:
         raise TradeValidationError(
-            f"{symbol}: R:R ratio {rr_ratio:.2f} is below minimum 1:1 "
+            f"{symbol}: R:R ratio {rr_ratio:.2f} is below minimum {min_rr:.2f}:1 "
             f"(risk={risk:.2f}, reward={reward:.2f})"
         )
 
