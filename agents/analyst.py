@@ -60,7 +60,16 @@ _STALE_HISTORICAL_FEEDBACK_RE = re.compile(
     r"explicit multi-day authorization|"
     r"hard contingency exit rule|"
     r"prior trade-review facts?|"
-    r"violating discipline"
+    r"violating discipline|"
+    r"(?:analyst|scout)\s+failed|"
+    r"(?:scout/analyst|analyst|scout)\s+failure|"
+    r"critical\s+conflict\s+in\s+prior\s+setups?|"
+    r"cross-reference\s+economic\s+calendar|"
+    r"holding\s+duration|"
+    r"rotation\s+setups?\s+are\s+inherently\s+intraday|"
+    r"\b480\s*min(?:utes)?\b|"
+    r"hard\s+exit\s+discipline|"
+    r"process\s+outcomes?"
     r")\b",
     re.IGNORECASE,
 )
@@ -343,6 +352,69 @@ def _remove_historical_feedback_sentences(text: str) -> tuple[str, bool]:
     return " ".join(kept), True
 
 
+def _format_level(value: object) -> str | None:
+    try:
+        if value is None:
+            return None
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_current_evidence_reasoning(signal: dict, field: str) -> str:
+    """Build a neutral replacement when stale process-review prose is redacted."""
+    symbol = signal.get("symbol") or "Symbol"
+    direction = str(signal.get("signal") or "HOLD").upper()
+    setup_type = signal.get("setup_type") or "unclear_direction"
+    market_state = signal.get("market_state")
+    sentiment = signal.get("sentiment")
+    strength = signal.get("strength")
+    confidence = signal.get("confidence")
+    levels = signal.get("key_levels") if isinstance(signal.get("key_levels"), dict) else {}
+    indicators = signal.get("indicators") if isinstance(signal.get("indicators"), dict) else {}
+
+    evidence = []
+    price = _format_level(signal.get("current_price") or signal.get("price"))
+    if price:
+        evidence.append(f"price {price}")
+    resistance = _format_level(levels.get("resistance"))
+    support = _format_level(levels.get("support"))
+    vwap = _format_level(levels.get("vwap") or signal.get("vwap"))
+    if resistance:
+        evidence.append(f"resistance {resistance}")
+    if support:
+        evidence.append(f"support {support}")
+    if vwap:
+        evidence.append(f"VWAP {vwap}")
+
+    macd = indicators.get("macd_bias")
+    ema = indicators.get("ema_trend")
+    rsi = _format_level(indicators.get("rsi"))
+    if macd:
+        evidence.append(f"MACD {macd}")
+    if ema:
+        evidence.append(f"EMA trend {ema}")
+    if rsi:
+        evidence.append(f"RSI {rsi}")
+    if market_state:
+        evidence.append(f"market_state {market_state}")
+    if sentiment:
+        evidence.append(f"sentiment {sentiment}")
+
+    evidence_text = "; ".join(evidence[:8]) if evidence else "current quote, technical, research, and catalyst freshness evidence"
+    if field == "invalidation":
+        if direction == "LONG" and support:
+            return f"{symbol} LONG thesis invalidates on loss of support near {support} or current VWAP/trigger failure."
+        if direction == "SHORT" and resistance:
+            return f"{symbol} SHORT thesis invalidates on reclaim of resistance near {resistance} or current VWAP/trigger failure."
+        return f"Use current technical invalidation levels for {symbol}; stale historical process-review reference removed."
+    return (
+        f"{symbol} current setup is {direction} / {setup_type}"
+        + (f" ({strength}/{confidence})" if strength or confidence else "")
+        + f" based on {evidence_text}."
+    )
+
+
 def sanitize_historical_feedback_bleed(signal: dict) -> dict:
     """Prevent historical reviewer feedback from becoming persisted current evidence."""
     if not isinstance(signal, dict):
@@ -360,18 +432,45 @@ def sanitize_historical_feedback_bleed(signal: dict) -> dict:
         elif field == "llm_veto_reason":
             signal[field] = None
             signal["veto_evidence"] = []
-        elif field == "invalidation":
-            signal[field] = "Use current technical invalidation levels; stale historical catalyst reference removed."
         else:
-            signal[field] = (
-                "Stale historical reviewer catalyst reference removed; reassess using "
-                "current quote, technical, research, and catalyst freshness evidence."
-            )
+            signal[field] = _build_current_evidence_reasoning(signal, field)
 
     if redacted_fields:
         signal["historical_feedback_redacted"] = True
         signal["historical_feedback_redacted_fields"] = redacted_fields
     return signal
+
+
+def sanitize_historical_context_for_prompt(text: object) -> str:
+    """Keep historical prompt context advisory and remove raw process-review prose."""
+    if not isinstance(text, str) or not text.strip():
+        return "None."
+
+    lines = []
+    changed_any = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        cleaned, changed = _remove_historical_feedback_sentences(line)
+        changed_any = changed_any or changed
+        if cleaned:
+            lines.append(cleaned[:800])
+
+    if not lines:
+        return (
+            "Historical context redacted: prior reviewer/process critique is not "
+            "current market evidence. Use only current quote, technical, research, "
+            "and catalyst freshness sections for setup reasoning."
+        )
+
+    prefix = (
+        "Historical advisory lessons only. Do not cite these as current facts or "
+        "prior trade events unless current audit/trade data confirms them."
+    )
+    if changed_any:
+        prefix += " Process-review prose was redacted."
+    return prefix + "\n" + "\n".join(f"- {line}" for line in lines[:8])
 
 
 def sanitize_reasoning_quality(signal: dict) -> dict:
@@ -1528,6 +1627,10 @@ CATALYST FRESHNESS:
             deterministic_precheck_context = build_deterministic_sanity_prompt_context(
                 deterministic_precheck
             )
+            safe_selection_feedback = sanitize_historical_context_for_prompt(lesson_text)
+            safe_meta_recommendations = sanitize_historical_context_for_prompt(meta_text)
+            safe_cases_text = sanitize_historical_context_for_prompt(cases_text)
+            safe_feedback_context = sanitize_historical_context_for_prompt(feedback_context)
 
             user_prompt = f"""
 Symbol: {sym}
@@ -1536,11 +1639,11 @@ Time: {datetime.now(dt_tz.utc).strftime('%Y-%m-%d %H:%M UTC')}
 VALID SETUP TYPES (use one of these):
 {', '.join(valid_setups)}
 
-SELECTION FEEDBACK (from Reviewer — your past signal quality):
-{lesson_text}
+SELECTION FEEDBACK (historical advisory only — not current evidence):
+{safe_selection_feedback}
 
-META-REVIEWER RECOMMENDATIONS (system-level feedback for you):
-{meta_text if meta_text else 'None yet'}
+META-REVIEWER RECOMMENDATIONS (historical advisory only — not current evidence):
+{safe_meta_recommendations if meta_text else 'None yet'}
 
 CURRENT QUOTE:
 {json.dumps(quote, indent=2)}
@@ -1563,11 +1666,11 @@ RESEARCH SENTIMENT:
 STRATEGY RECOMMENDATIONS (from Quant Researcher):
 {strategy_context}
 
-RELEVANT PAST CASES:
-{cases_text}
+RELEVANT PAST CASES (historical advisory only — not current evidence):
+{safe_cases_text}
 
-ANALYST FEEDBACK LOOP:
-{feedback_context}
+ANALYST FEEDBACK LOOP (structured advisory only — not current evidence):
+{safe_feedback_context}
 {freshness_context}
 Produce your trading signal JSON for {sym}.
 """

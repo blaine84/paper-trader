@@ -3,6 +3,7 @@ from agents.analyst import (
     build_technical_data_quality_context,
     compute_intraday_indicators_with_warmup,
     normalize_analyst_signal_shape,
+    sanitize_historical_context_for_prompt,
     sanitize_reasoning_quality,
     sanitize_historical_feedback_bleed,
 )
@@ -284,6 +285,57 @@ def test_historical_feedback_bleed_redacts_trade_review_crossover():
     assert "price below VWAP" in result["reasoning"]
     assert result["llm_veto_reason"] is None
     assert result["veto_evidence"] == []
+
+
+def test_historical_feedback_bleed_redacts_process_review_language():
+    signal = {
+        "symbol": "MSFT",
+        "signal": "LONG",
+        "strength": "moderate",
+        "confidence": "medium",
+        "setup_type": "technical_breakout",
+        "setup_reasoning": "The Analyst failed to flag this critical conflict in prior setups.",
+        "reasoning": (
+            "This is a Scout/Analyst failure to cross-reference economic calendar "
+            "against holding duration and setup type. Rotation setups are inherently "
+            "intraday (480min or less) and require hard exit discipline."
+        ),
+        "key_levels": {"support": 396.0, "resistance": 400.24, "vwap": 396.32},
+        "indicators": {"rsi": 54.2, "macd_bias": "bullish", "ema_trend": "bullish"},
+        "market_state": "breakout_retest_watch",
+        "sentiment": "bullish",
+    }
+
+    result = sanitize_historical_feedback_bleed(signal)
+    combined = " ".join(
+        result.get(field) or ""
+        for field in ("setup_reasoning", "reasoning", "invalidation", "llm_veto_reason")
+    )
+
+    assert result["historical_feedback_redacted"] is True
+    assert "Analyst failed" not in combined
+    assert "Scout/Analyst failure" not in combined
+    assert "holding duration" not in combined
+    assert "hard exit discipline" not in combined
+    assert "MSFT current setup is LONG / technical_breakout" in result["setup_reasoning"]
+    assert "resistance 400.24" in result["setup_reasoning"]
+    assert "VWAP 396.32" in result["setup_reasoning"]
+
+
+def test_historical_prompt_context_redacts_process_review_language():
+    raw_context = """
+    The Analyst failed to flag this critical conflict in prior setups.
+    This is a Scout/Analyst failure to cross-reference economic calendar against holding duration.
+    Strongest when price holds above VWAP with aligned 5m/60m trend.
+    """
+
+    result = sanitize_historical_context_for_prompt(raw_context)
+
+    assert "Analyst failed" not in result
+    assert "Scout/Analyst failure" not in result
+    assert "holding duration" not in result
+    assert "Strongest when price holds above VWAP" in result
+    assert "Historical advisory lessons only" in result
 
 
 def test_intraday_indicators_use_warmup_when_session_is_thin(monkeypatch):
