@@ -340,6 +340,28 @@ class TestCompactSignalForPm:
         assert "58.5" not in result  # rsi value from indicators
         assert "0.95" not in result  # macd signal_line value
 
+    def test_analyst_free_text_reasoning_omitted(self):
+        """Analyst narrative fields stay out of the PM decision prompt packet."""
+        sig = {
+            "signal": "LONG",
+            "strength": "moderate",
+            "setup_type": "technical_breakout",
+            "confidence": "medium",
+            "current_price": 400.0,
+            "reasoning": "The Analyst failed to flag this critical conflict in prior setups.",
+            "setup_reasoning": "Rotation setups require hard exit discipline.",
+            "llm_veto_reason": "Profitable exit masks execution risk.",
+        }
+
+        result = compact_signal_for_pm("MSFT", sig)
+
+        assert "Analyst failed" not in result
+        assert "hard exit discipline" not in result
+        assert "Profitable exit" not in result
+        assert "reasoning:" not in result
+        assert "setup_reasoning:" not in result
+        assert "llm_veto_reason:" not in result
+
     def test_missing_optional_fields(self):
         """Signal with missing optional fields still works."""
         sig = {

@@ -160,7 +160,8 @@ class TestProperty3WordBoundaryIndicatorMatching:
     """
     For any tactical context indicator string and any case variation,
     when that variation appears as a whole word (word-boundary delimited)
-    in trade metadata or rationale, _has_tactical_context SHALL return True.
+    in structured trade metadata or an explicit structured flag,
+    _has_tactical_context SHALL return True.
     Conversely, when the indicator appears only as a substring of a larger
     word (e.g., "support" within "unsupported"), the function SHALL return False.
 
@@ -188,12 +189,26 @@ class TestProperty3WordBoundaryIndicatorMatching:
         suffix_text=st_filler_word,
     )
     @settings(max_examples=100)
-    def test_whole_word_match_in_rationale_returns_true(self, indicator, prefix_text, suffix_text):
-        """Indicator as a whole word in rationale (second param) returns True."""
+    def test_whole_word_match_in_rationale_returns_false(self, indicator, prefix_text, suffix_text):
+        """PM rationale prose must not qualify tactical context."""
         text = f"{prefix_text} {indicator} {suffix_text}"
         result = _has_tactical_context([indicator], None, text)
+        assert result is False, (
+            f"Expected False for rationale-only match: indicator={indicator!r}, text={text!r}"
+        )
+
+    @given(indicator=st_indicator)
+    @settings(max_examples=100)
+    def test_structured_flag_match_returns_true(self, indicator):
+        """Explicit structured flags qualify tactical context."""
+        result = _has_tactical_context(
+            [indicator],
+            None,
+            "rationale text is display-only",
+            structured_flags=[indicator.upper()],
+        )
         assert result is True, (
-            f"Expected True for whole-word match in rationale: indicator={indicator!r}, text={text!r}"
+            f"Expected True for structured flag match: indicator={indicator!r}"
         )
 
     @given(
@@ -211,7 +226,8 @@ class TestProperty3WordBoundaryIndicatorMatching:
         larger_word = prefix_addition + indicator
         # Ensure the larger word is different from the indicator itself
         assume(larger_word.lower() != indicator.lower())
-        text = f"some text {larger_word} more text"
+        assume(indicator.lower() not in {"prefix", "suffix"})
+        text = f"prefix {larger_word} suffix"
         result = _has_tactical_context([indicator], text, None)
         assert result is False, (
             f"Expected False for substring-only (suffix): indicator={indicator!r}, "
@@ -1077,9 +1093,7 @@ class TestProperty9TacticalFailuresProduceEquivalentResultsToGlobalPath:
     """
     For any trade that is eligible for the tactical exception but fails tactical
     validation (stop too tight, R:R too low, or dollar risk too high), the gate
-    result SHALL produce the same decision, reason_code, adjusted prices/quantity,
-    risk fields, and absence of tactical metadata as the global path would produce
-    for the same trade inputs.
+    result SHALL reject the tactical exception without applying tactical metadata.
 
     **Validates: Requirements 4.2, 4.3**
     """
@@ -1163,18 +1177,9 @@ class TestProperty9TacticalFailuresProduceEquivalentResultsToGlobalPath:
             trade_rationale="Bouncing off support level with pullback",
         )
 
-        # Run with tactical config present (tactical failure should fall through to global)
+        # Run with tactical config present (tactical failure should reject rather
+        # than let the global path rewrite known-bad tactical geometry).
         result_with_tactical = evaluate_risk_geometry(**common_kwargs)
-
-        # Run with tactical config removed (pure global path)
-        rule = STOP_DISTANCE_RULES["high_beta_mega_cap_intraday"]
-        rule_without_tactical = {k: v for k, v in rule.items() if k != "tactical_stop_by_profile"}
-        patched_rules = {
-            **STOP_DISTANCE_RULES,
-            "high_beta_mega_cap_intraday": rule_without_tactical,
-        }
-        with patch.dict("utils.gate_config.STOP_DISTANCE_RULES", patched_rules):
-            result_without_tactical = evaluate_risk_geometry(**common_kwargs)
 
         # Assert tactical_stop_applied is NOT in either result
         assert "tactical_stop_applied" not in result_with_tactical, (
@@ -1182,57 +1187,11 @@ class TestProperty9TacticalFailuresProduceEquivalentResultsToGlobalPath:
             f"failure_mode={failure_mode}, decision={result_with_tactical.get('decision')}, "
             f"reason_code={result_with_tactical.get('reason_code')}"
         )
-        assert "tactical_stop_applied" not in result_without_tactical, (
-            f"tactical_stop_applied should NOT be present in global-only path. "
-            f"decision={result_without_tactical.get('decision')}"
-        )
 
-        # Compare key result fields for equivalence
-        assert result_with_tactical["decision"] == result_without_tactical["decision"], (
-            f"decision mismatch: tactical_failure={result_with_tactical['decision']}, "
-            f"global={result_without_tactical['decision']}, failure_mode={failure_mode}"
-        )
+        assert result_with_tactical["decision"] == "rejected"
+        assert result_with_tactical["reason_code"].startswith("TACTICAL_STOP_")
 
-        assert result_with_tactical["reason_code"] == result_without_tactical["reason_code"], (
-            f"reason_code mismatch: tactical_failure={result_with_tactical['reason_code']}, "
-            f"global={result_without_tactical['reason_code']}, failure_mode={failure_mode}"
-        )
-
-        assert result_with_tactical["entry_price"] == result_without_tactical["entry_price"], (
-            f"entry_price mismatch: {result_with_tactical['entry_price']} vs "
-            f"{result_without_tactical['entry_price']}"
-        )
-
-        assert result_with_tactical["stop_price"] == result_without_tactical["stop_price"], (
-            f"stop_price mismatch: {result_with_tactical['stop_price']} vs "
-            f"{result_without_tactical['stop_price']}"
-        )
-
-        assert result_with_tactical["target_price"] == result_without_tactical["target_price"], (
-            f"target_price mismatch: {result_with_tactical['target_price']} vs "
-            f"{result_without_tactical['target_price']}"
-        )
-
-        assert result_with_tactical["quantity"] == result_without_tactical["quantity"], (
-            f"quantity mismatch: {result_with_tactical['quantity']} vs "
-            f"{result_without_tactical['quantity']}"
-        )
-
-        # Compare adjusted fields (may be None or numeric)
-        assert result_with_tactical.get("adjusted_stop_price") == result_without_tactical.get("adjusted_stop_price"), (
-            f"adjusted_stop_price mismatch: {result_with_tactical.get('adjusted_stop_price')} vs "
-            f"{result_without_tactical.get('adjusted_stop_price')}"
-        )
-
-        assert result_with_tactical.get("adjusted_quantity") == result_without_tactical.get("adjusted_quantity"), (
-            f"adjusted_quantity mismatch: {result_with_tactical.get('adjusted_quantity')} vs "
-            f"{result_without_tactical.get('adjusted_quantity')}"
-        )
-
-        # Verify absence of tactical metadata in both
+        # Verify absence of tactical pass metadata.
         assert "tactical_min_stop_distance" not in result_with_tactical, (
             "tactical_min_stop_distance should not be present in tactical failure result"
-        )
-        assert "tactical_min_stop_distance" not in result_without_tactical, (
-            "tactical_min_stop_distance should not be present in global-only result"
         )

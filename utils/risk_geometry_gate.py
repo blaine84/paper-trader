@@ -435,18 +435,28 @@ def _has_tactical_context(
     indicators: list[str],
     metadata: str | None,
     rationale: str | None,
+    structured_flags: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> bool:
     """Case-insensitive word-boundary match for tactical context indicators.
 
     Uses \\b word boundaries to prevent false positives (e.g., "support" must not
     match "unsupported"). Returns True if any indicator is found as a whole word
-    in metadata or rationale.
+    in structured metadata, or exactly matches a structured tactical flag.
+
+    ``rationale`` is accepted for backward-compatible call sites, but is
+    intentionally ignored. Human-facing PM prose must not qualify a live risk
+    exception.
     """
     combined = ""
     if metadata:
         combined += metadata.lower()
-    if rationale:
-        combined += " " + rationale.lower()
+    flags = {
+        str(flag).strip().lower()
+        for flag in (structured_flags or [])
+        if str(flag).strip()
+    }
+    if any(ind.lower() in flags for ind in indicators):
+        return True
     if not combined.strip():
         return False
     return any(
@@ -477,6 +487,7 @@ def _evaluate_tactical_stop_exception(
     atr_source: str | None,
     rule_source: str | None,
     quantity_policy: str,
+    tactical_context_flags: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict | None:
     """Evaluate tactical stop exception for high-beta aggressive trades.
 
@@ -542,7 +553,12 @@ def _evaluate_tactical_stop_exception(
 
         if match_field is None:
             indicators = profile_cfg["tactical_context_indicators"]
-            has_context = _has_tactical_context(indicators, trade_metadata, trade_rationale)
+            has_context = _has_tactical_context(
+                indicators,
+                trade_metadata,
+                trade_rationale,
+                structured_flags=tactical_context_flags,
+            )
             for field, value in (("setup_type", setup_key), ("geometry_name", geometry_key)):
                 if value in conditional_setups and has_context:
                     match_field = field
@@ -840,6 +856,7 @@ def evaluate_risk_geometry(
     agent: str = "portfolio_manager",
     trade_metadata: str | None = None,
     trade_rationale: str | None = None,
+    tactical_context_flags: list[str] | tuple[str, ...] | set[str] | None = None,
     signal_strength: float | None = None,
     confidence_level: str | None = None,
     policy=None,
@@ -883,6 +900,7 @@ def evaluate_risk_geometry(
             agent=agent,
             trade_metadata=trade_metadata,
             trade_rationale=trade_rationale,
+            tactical_context_flags=tactical_context_flags,
             signal_strength=signal_strength,
             confidence_level=confidence_level,
             policy=policy,
@@ -966,6 +984,7 @@ def _evaluate_risk_geometry_inner(
     agent: str,
     trade_metadata: str | None = None,
     trade_rationale: str | None = None,
+    tactical_context_flags: list[str] | tuple[str, ...] | set[str] | None = None,
     signal_strength: float | None = None,
     confidence_level: str | None = None,
     policy=None,
@@ -1123,6 +1142,7 @@ def _evaluate_risk_geometry_inner(
             rule_name=rule_name,
             trade_metadata=trade_metadata,
             trade_rationale=trade_rationale,
+            tactical_context_flags=tactical_context_flags,
             atr_source=atr_source,
             rule_source=rule_source,
             quantity_policy=quantity_policy,
