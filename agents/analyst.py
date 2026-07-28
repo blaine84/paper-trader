@@ -54,6 +54,13 @@ _STALE_HISTORICAL_FEEDBACK_RE = re.compile(
     r"CPI|inflation print|July\s*15|Jul\s*15|"
     r"scheduled\s+(?:major\s+)?macro catalyst|"
     r"economic calendar intersection|intraday rotation setup mandate"
+    r"|profitable exit masks execution risk|"
+    r"held?\s+(?:intraday\s+rotation\s+trades?\s+)?\d{3,}\+?\s+minutes|"
+    r"1400\+?\s+minutes\s+overnight|"
+    r"explicit multi-day authorization|"
+    r"hard contingency exit rule|"
+    r"prior trade-review facts?|"
+    r"violating discipline"
     r")\b",
     re.IGNORECASE,
 )
@@ -350,6 +357,9 @@ def sanitize_historical_feedback_bleed(signal: dict) -> dict:
         redacted_fields.append(field)
         if cleaned:
             signal[field] = cleaned
+        elif field == "llm_veto_reason":
+            signal[field] = None
+            signal["veto_evidence"] = []
         elif field == "invalidation":
             signal[field] = "Use current technical invalidation levels; stale historical catalyst reference removed."
         else:
@@ -1611,6 +1621,7 @@ Produce your trading signal JSON for {sym}.
                     log.warning("Market state computation failed for %s: %s", sym, ms_exc)
                     signal["market_state"] = "confounded"
                     signal["setup_lifecycle_state"] = "no_setup"
+            signal = sanitize_historical_feedback_bleed(signal)
             signal = enforce_veto_accountability(signal)
             signal = repair_missing_veto_contract(signal, sym)
             signal = sanitize_historical_feedback_bleed(signal)

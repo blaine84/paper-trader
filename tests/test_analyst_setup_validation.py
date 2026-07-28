@@ -238,7 +238,7 @@ def test_historical_feedback_bleed_redacts_stale_cpi_sentences():
 
     result = sanitize_historical_feedback_bleed(signal)
     combined = " ".join(
-        result.get(field, "")
+        result.get(field) or ""
         for field in ("setup_reasoning", "reasoning", "invalidation", "llm_veto_reason")
     )
 
@@ -248,6 +248,42 @@ def test_historical_feedback_bleed_redacts_stale_cpi_sentences():
     assert "scheduled macro catalyst" not in combined.lower()
     assert "economic calendar intersection" not in combined.lower()
     assert "Price is below VWAP" in result["setup_reasoning"]
+    assert result["llm_veto_reason"] is None
+    assert result["veto_evidence"] == []
+
+
+def test_historical_feedback_bleed_redacts_trade_review_crossover():
+    signal = {
+        "symbol": "AMD",
+        "signal": "HOLD",
+        "strength": "weak",
+        "confidence": "low",
+        "setup_type": "unclear_direction",
+        "setup_reasoning": (
+            "The Analyst failed to flag this critical macro event in the past, "
+            "violating discipline-profitable exit masks execution risk: moderate "
+            "PM should NOT hold intraday rotation trades 1400+ minutes overnight "
+            "into major macro catalysts without explicit multi-day authorization "
+            "and hard contingency exit rule tied to catalyst outcome."
+        ),
+        "reasoning": (
+            "The setup is bearish due to price below VWAP (-0.92%), negative "
+            "change (-8.87%), and relative volume confirming (2.10x)."
+        ),
+        "llm_veto_reason": (
+            "Moderate PM should not hold 1400+ minutes overnight into a macro event."
+        ),
+        "veto_evidence": ["historical AMD review"],
+    }
+
+    result = sanitize_historical_feedback_bleed(signal)
+
+    assert result["historical_feedback_redacted"] is True
+    assert "profitable exit" not in result["setup_reasoning"].lower()
+    assert "1400" not in result["setup_reasoning"]
+    assert "price below VWAP" in result["reasoning"]
+    assert result["llm_veto_reason"] is None
+    assert result["veto_evidence"] == []
 
 
 def test_intraday_indicators_use_warmup_when_session_is_thin(monkeypatch):
