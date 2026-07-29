@@ -1356,6 +1356,55 @@ def _coerce_quantity(value, *, symbol: str = "UNKNOWN") -> int:
         log.warning("Ignoring invalid quantity for %s: %r", symbol, value)
         return 0
 
+
+STALE_ENTRY_MAX_FAVORABLE_MOVE_PCT = 0.01
+
+
+def _fresh_price_stale_entry_check(
+    *,
+    action: str,
+    symbol: str,
+    intended_entry,
+    fresh_price,
+    target,
+) -> tuple[bool, str | None]:
+    """Reject paper fills when the fresh quote has already outrun the candidate."""
+    if action not in {"BUY", "SHORT"}:
+        return True, None
+
+    entry = _try_positive_float(intended_entry)
+    fresh = _try_positive_float(fresh_price)
+    target_price = _try_positive_float(target)
+    if entry is None or fresh is None:
+        return True, None
+
+    if action == "BUY":
+        if target_price is not None and fresh >= target_price:
+            return (
+                False,
+                f"{symbol}: stale entry rejected - fresh price {fresh:.2f} "
+                f"already crossed BUY target {target_price:.2f}",
+            )
+        favorable_move_pct = (fresh - entry) / entry
+    else:
+        if target_price is not None and fresh <= target_price:
+            return (
+                False,
+                f"{symbol}: stale entry rejected - fresh price {fresh:.2f} "
+                f"already crossed SHORT target {target_price:.2f}",
+            )
+        favorable_move_pct = (entry - fresh) / entry
+
+    if favorable_move_pct > STALE_ENTRY_MAX_FAVORABLE_MOVE_PCT:
+        return (
+            False,
+            f"{symbol}: stale entry rejected - fresh price {fresh:.2f} moved "
+            f"{favorable_move_pct * 100:.2f}% beyond intended {action} entry {entry:.2f}",
+        )
+
+    return True, None
+
+
 # Max minutes after market open (9:30 AM ET) that each setup type may be entered.
 # Setup types NOT listed here have no entry-window restriction.
 ENTRY_WINDOW_LIMITS = {
@@ -3113,6 +3162,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
     quantity = _coerce_quantity(decision.get("quantity", 0), symbol=symbol)
     decision["quantity"] = quantity
     price = decision.get("price") or decision.get("entry_price") or 0
+    live_price = 0.0
     try:
         price = float(price) if price not in (None, "") else 0
     except (TypeError, ValueError):
@@ -3301,6 +3351,17 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             if m:
                 try: target = float(m.group(1))
                 except: pass
+
+    stale_ok, stale_reason = _fresh_price_stale_entry_check(
+        action=action,
+        symbol=symbol,
+        intended_entry=price,
+        fresh_price=live_price,
+        target=target,
+    )
+    if not stale_ok:
+        log.warning(stale_reason)
+        return False, stale_reason
 
     # If still no stop, derive from ATR or analyst key levels — never use flat %
     if action in ("BUY", "SHORT") and not stop and price:

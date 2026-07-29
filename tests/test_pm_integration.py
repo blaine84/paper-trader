@@ -123,6 +123,64 @@ def _base_decision(symbol: str = "AAPL", action: str = "BUY",
     }
 
 
+def test_execute_trade_rejects_buy_when_fresh_price_already_crossed_target():
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id)
+
+    decision = _base_decision(
+        symbol="MSFT",
+        action="BUY",
+        quantity=10,
+        price=388.75,
+        stop=387.97,
+        target=389.92,
+    )
+
+    with patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls:
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 400.16}
+        mock_fh_cls.return_value = mock_fh
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is False
+    assert "stale entry rejected" in msg
+    assert "already crossed BUY target" in msg
+    assert db.query(Trade).filter_by(symbol="MSFT", profile=profile_id).first() is None
+
+    db.close()
+
+
+def test_execute_trade_rejects_short_when_fresh_price_already_crossed_target():
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id)
+
+    decision = _base_decision(
+        symbol="AMD",
+        action="SHORT",
+        quantity=10,
+        price=435.87,
+        stop=442.41,
+        target=432.60,
+    )
+
+    with patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls:
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 431.25}
+        mock_fh_cls.return_value = mock_fh
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is False
+    assert "stale entry rejected" in msg
+    assert "already crossed SHORT target" in msg
+    assert db.query(Trade).filter_by(symbol="AMD", profile=profile_id).first() is None
+
+    db.close()
+
+
 # Common mock targets
 _FIND_SIMILAR = "agents.portfolio_manager.find_similar_cases"
 _COMPUTE_SIM_STATS = "agents.portfolio_manager.compute_similarity_stats"

@@ -26,6 +26,25 @@ def test_aggressive_final_validator_allows_reduced_rr_floor():
     )
 
 
+def test_aggressive_final_validator_allows_epsilon_at_reduced_rr_floor():
+    decision = {
+        "symbol": "MSFT",
+        "action": "BUY",
+        "price": 388.75,
+        "stop": 384.08,
+        "target": 391.084999,
+        "quantity": 1,
+    }
+
+    validate_trade(
+        decision,
+        profile_id="aggressive",
+        cash=10_000,
+        total_equity=10_000,
+        direction="LONG",
+    )
+
+
 def test_aggressive_final_validator_blocks_below_reduced_rr_floor():
     with pytest.raises(TradeValidationError, match="below minimum 0.50:1"):
         validate_trade(

@@ -9,6 +9,7 @@ from models.pm_profiles import PM_PROFILES
 from utils.gate_config import REDUCED_RR_THRESHOLDS_BY_PROFILE
 
 log = logging.getLogger(__name__)
+RR_EPSILON = 1e-6
 
 
 class TradeValidationError(Exception):
@@ -79,7 +80,7 @@ def validate_trade(decision: dict, profile_id: str, cash: float, total_equity: f
 
     rr_ratio = reward / risk
     min_rr = _minimum_rr_for_profile(profile_id)
-    if rr_ratio < min_rr:
+    if rr_ratio + RR_EPSILON < min_rr:
         raise TradeValidationError(
             f"{symbol}: R:R ratio {rr_ratio:.2f} is below minimum {min_rr:.2f}:1 "
             f"(risk={risk:.2f}, reward={reward:.2f})"
