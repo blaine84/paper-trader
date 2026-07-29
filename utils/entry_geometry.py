@@ -764,7 +764,7 @@ def _generate_short_candidates(
     # --- breakdown_continuation ---
     # Required level: support
     # Entry: support level
-    # Sanity: entry <= current_price and within max_entry_distance_pct
+    # Sanity: executable breakdown requires price already at/below support.
     if "support" in levels:
         entry_price = levels["support"]
         buffer = entry_price * stop_buffer_pct
@@ -779,10 +779,8 @@ def _generate_short_candidates(
             stop_distance = buffer
         stop_loss = entry_price + stop_distance
 
-        # Current-price sanity: entry must be at or below current_price
-        # and within max_entry_distance_pct of current_price
-        if entry_price <= current_price:
-            distance_pct = (current_price - entry_price) / current_price if current_price > 0 else float("inf")
+        if current_price <= entry_price:
+            distance_pct = (entry_price - current_price) / current_price if current_price > 0 else float("inf")
             if distance_pct <= max_entry_distance_pct:
                 # entry == stop discard
                 if stop_loss != entry_price:

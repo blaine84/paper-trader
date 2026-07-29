@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from utils.candidate_registry import CandidateRecord
 from utils.gate_config import (
@@ -50,6 +50,7 @@ def compute_preflight(
     portfolio: dict,
     open_positions: list[dict],
     now_utc: datetime,
+    recent_closed_trades: list[dict] | None = None,
 ) -> PreflightSummary:
     """Evaluate deterministic execution prerequisites.
 
@@ -133,6 +134,9 @@ def compute_preflight(
     if not same_symbol_allowed:
         blocking_reason_codes.append("same_symbol_exists")
 
+    if _has_recent_same_direction_stop_loss(candidate, recent_closed_trades or [], now_utc):
+        blocking_reason_codes.append("recent_same_symbol_direction_stop_loss")
+
     return PreflightSummary(
         candidate_id=candidate.candidate_id,
         has_entry_stop_target=has_entry_stop_target,
@@ -176,6 +180,7 @@ def compute_preflight_safe(
     portfolio: dict,
     open_positions: list[dict],
     now_utc: datetime,
+    recent_closed_trades: list[dict] | None = None,
 ) -> PreflightSummary:
     """Fail-open wrapper around compute_preflight().
 
@@ -195,7 +200,14 @@ def compute_preflight_safe(
         on error.
     """
     try:
-        return compute_preflight(candidate, profile, portfolio, open_positions, now_utc)
+        return compute_preflight(
+            candidate,
+            profile,
+            portfolio,
+            open_positions,
+            now_utc,
+            recent_closed_trades,
+        )
     except Exception:
         logger.error(
             "Preflight computation failed for %s, failing open",
@@ -203,3 +215,55 @@ def compute_preflight_safe(
             exc_info=True,
         )
         return _make_passing_preflight(candidate.candidate_id)
+
+
+def _has_recent_same_direction_stop_loss(
+    candidate: CandidateRecord,
+    recent_closed_trades: list[dict],
+    now_utc: datetime,
+    cooldown_minutes: int = 30,
+) -> bool:
+    """Block immediate re-entry after a same profile/symbol/direction stop or loss."""
+    cutoff = _as_aware_utc(now_utc) - timedelta(minutes=cooldown_minutes)
+    candidate_direction = "LONG" if candidate.direction == "BUY" else candidate.direction
+
+    for trade in recent_closed_trades:
+        if str(trade.get("symbol", "")).upper() != candidate.symbol.upper():
+            continue
+        if str(trade.get("profile", "")) != candidate.profile_id:
+            continue
+        if str(trade.get("direction", "")).upper() != candidate_direction:
+            continue
+
+        exit_time = _as_aware_utc(trade.get("exit_time"))
+        if exit_time is None or exit_time < cutoff:
+            continue
+
+        reason_exit = str(trade.get("reason_exit") or "").lower()
+        pnl = trade.get("pnl")
+        stopped = "stop" in reason_exit
+        try:
+            loss = pnl is not None and float(pnl) < 0
+        except (TypeError, ValueError):
+            loss = False
+
+        if stopped or loss:
+            return True
+
+    return False
+
+
+def _as_aware_utc(value) -> datetime | None:
+    """Normalize datetime-ish values to aware UTC datetimes."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

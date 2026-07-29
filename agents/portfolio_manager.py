@@ -1371,6 +1371,49 @@ MIN_HIGH_WR_INTRADAY_STOP_BUFFER_PCT = 0.015
 HIGH_MOMENTUM_ASSETS = {"AMD", "NVDA", "TSLA"}
 HIGH_MOMENTUM_COOLDOWN_MINUTES = 30
 
+
+def _get_recent_closed_trades_for_preflight(
+    engine,
+    profile_id: str,
+    now_utc: datetime,
+    minutes: int = 30,
+) -> list[dict]:
+    """Return recent closed trades for deterministic preflight re-entry checks."""
+    from sqlalchemy import text as _text
+
+    cutoff = now_utc - timedelta(minutes=minutes)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                _text(
+                    """
+                    SELECT profile, symbol, direction, exit_time, pnl, reason_exit
+                    FROM trades
+                    WHERE profile = :profile
+                      AND status = 'closed'
+                      AND exit_time IS NOT NULL
+                      AND exit_time >= :cutoff
+                    """
+                ),
+                {"profile": profile_id, "cutoff": cutoff.replace(tzinfo=None)},
+            ).fetchall()
+    except Exception:
+        log.error("Failed to load recent closed trades for preflight", exc_info=True)
+        return []
+
+    return [
+        {
+            "profile": row[0],
+            "symbol": row[1],
+            "direction": row[2],
+            "exit_time": row[3],
+            "pnl": row[4],
+            "reason_exit": row[5],
+        }
+        for row in rows
+    ]
+
+
 def _market_time_context() -> dict[str, str | int]:
     """Return explicit market/local time labels for LLM prompts.
 
@@ -4705,6 +4748,9 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                 }
 
                 now_utc = datetime.now(_tz.utc)
+                recent_closed_trades = _get_recent_closed_trades_for_preflight(
+                    engine_ref, profile_id_ref, now_utc, minutes=30
+                )
 
                 for summary in summaries:
                     cid = summary["candidate_id"]
@@ -4717,7 +4763,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
 
                         pf_summary = compute_preflight_safe(
                             candidate_record, profile_ref, preflight_portfolio,
-                            open_positions, now_utc,
+                            open_positions, now_utc, recent_closed_trades,
                         )
 
                         if pf_summary.passed:
