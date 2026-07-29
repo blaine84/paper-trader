@@ -802,7 +802,87 @@ def test_high_winrate_fast_intraday_stop_buffer_is_enforced():
 
 
 # ---------------------------------------------------------------------------
-# 11. test_high_momentum_asset_cooldown_blocks_cascading_reentry
+# 11. test_risk_geometry_adjusted_target_propagates_to_trade_record
+# ---------------------------------------------------------------------------
+
+def test_risk_geometry_adjusted_target_propagates_to_trade_record():
+    """
+    When risk geometry recalculates a target after stop adjustment, the PM must
+    persist that adjusted target on the decision and Trade record.
+    """
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=100_000.0)
+    _seed_analyst_signal(db, "AAPL", _strong_signal("AAPL"))
+
+    decision = _base_decision(
+        symbol="AAPL", action="SHORT", quantity=50, price=100.0,
+        stop=101.0, target=99.0,
+    )
+
+    good_conf = {
+        "modifier": 1.0, "block": False, "reason": "ok",
+        "win_rate": 0.80, "total_cases": 20,
+    }
+
+    _rg_adjusted = {
+        "decision": "adjusted_allowed",
+        "canonical_decision": "warn",
+        "reason": "Adjusted target to execution R:R floor",
+        "reason_code": "RISK_REWARD_AFTER_STOP_ADJUSTMENT",
+        "entry_price": 100.0,
+        "stop_price": 103.0,
+        "target_price": 98.5,
+        "quantity": 20,
+        "stop_distance": 1.0,
+        "min_stop_distance": 3.0,
+        "adjusted_stop_price": 103.0,
+        "adjusted_quantity": 20,
+        "original_dollar_risk": 50.0,
+        "adjusted_dollar_risk": 60.0,
+        "original_rr": 1.0,
+        "adjusted_rr": 0.5,
+        "target_distance": 1.5,
+        "atr_value": None,
+        "atr_source": None,
+        "atr_timestamp": None,
+        "atr_fallback": True,
+        "rule_name": "default",
+        "rule_source": "default",
+        "quantity_policy": "whole_share",
+        "risk_geometry_soft_gate": True,
+        "target_recalculated": True,
+    }
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=good_conf),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
+        patch("utils.risk_geometry_gate.evaluate_risk_geometry", return_value=_rg_adjusted),
+    ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 100.0}
+        mock_fh_cls.return_value = mock_fh
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is True, f"Trade should have succeeded: {msg}"
+    trade = db.query(Trade).filter_by(symbol="AAPL", profile=profile_id).first()
+    assert trade is not None
+    assert trade.stop_price == 103.0
+    assert trade.target_price == 98.5
+    assert decision["target"] == 98.5
+    assert decision["target_price"] == 98.5
+    assert decision["profit_target"] == 98.5
+
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 12. test_high_momentum_asset_cooldown_blocks_cascading_reentry
 # ---------------------------------------------------------------------------
 
 def test_high_momentum_asset_cooldown_blocks_cascading_reentry():

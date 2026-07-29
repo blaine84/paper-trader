@@ -829,6 +829,64 @@ def _reconstruct_trade(
     }
 
 
+def _minimum_execution_rr_for_profile(profile: str | None) -> float:
+    """Return the final-validator R:R floor used before execution."""
+    profile_key = profile.lower() if isinstance(profile, str) else ""
+    return float(REDUCED_RR_THRESHOLDS_BY_PROFILE.get(profile_key, 1.0))
+
+
+def _recalculate_target_to_execution_rr_floor(
+    *,
+    entry_price: float,
+    adjusted_stop_price: float,
+    target_price: float,
+    direction: str,
+    profile: str | None,
+) -> dict | None:
+    """Minimally move target so adjusted geometry clears the execution floor.
+
+    The risk-geometry gate may prefer a higher R:R, but that gate is currently
+    soft. The final trade validator is hard, so this only recalculates to the
+    final profile-aware execution floor.
+    """
+    execution_min_rr = _minimum_execution_rr_for_profile(profile)
+    if execution_min_rr <= 0:
+        return None
+
+    adjusted_risk = abs(adjusted_stop_price - entry_price)
+    if adjusted_risk <= 0:
+        return None
+
+    if direction == "LONG":
+        current_reward = target_price - entry_price
+        required_target_price = entry_price + (adjusted_risk * execution_min_rr)
+        target_needs_adjustment = current_reward < (adjusted_risk * execution_min_rr)
+    else:
+        current_reward = entry_price - target_price
+        required_target_price = entry_price - (adjusted_risk * execution_min_rr)
+        target_needs_adjustment = current_reward < (adjusted_risk * execution_min_rr)
+
+    if not target_needs_adjustment:
+        return None
+    if not math.isfinite(required_target_price) or required_target_price <= 0:
+        return None
+    if direction == "LONG" and required_target_price <= entry_price:
+        return None
+    if direction == "SHORT" and required_target_price >= entry_price:
+        return None
+
+    adjusted_target_distance = abs(required_target_price - entry_price)
+    adjusted_rr = adjusted_target_distance / adjusted_risk
+    return {
+        "target_price": required_target_price,
+        "target_distance": adjusted_target_distance,
+        "adjusted_rr": adjusted_rr,
+        "execution_min_reward_to_risk": execution_min_rr,
+        "target_recalculated": True,
+        "original_target_price": target_price,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1419,6 +1477,17 @@ def _evaluate_risk_geometry_inner(
             feature_flag_enabled=_ff_setup_specific_rr,
         )
         if adjusted_rr < min_rr:
+            target_recalc = _recalculate_target_to_execution_rr_floor(
+                entry_price=entry_price,
+                adjusted_stop_price=adjusted_stop_price,
+                target_price=target_price,
+                direction=norm_direction,
+                profile=profile,
+            )
+            if target_recalc is not None:
+                target_price = target_recalc["target_price"]
+                recon_target_distance = target_recalc["target_distance"]
+                adjusted_rr = target_recalc["adjusted_rr"]
             # --- Pilot R:R override check ---
             # If the original R:R was valid but adjustment degraded it,
             # moderate profiles with active pilot get a reduced-size pass.
@@ -1474,7 +1543,7 @@ def _evaluate_risk_geometry_inner(
                     "adjusted_dollar_risk": adjusted_dollar_risk,
                     "original_rr": original_rr,
                     "adjusted_rr": adjusted_rr,
-                    "target_distance": target_distance,
+                    "target_distance": recon_target_distance,
                     "atr_value": atr_5min,
                     "atr_source": atr_source,
                     "atr_timestamp": atr_timestamp,
@@ -1486,6 +1555,8 @@ def _evaluate_risk_geometry_inner(
                     "size_multiplier": size_multiplier,
                     "pilot_override": True,
                 }
+                if target_recalc is not None:
+                    result.update(target_recalc)
                 _log_gate_event(result, symbol=symbol, db=db, profile=profile, agent=agent, event_sink=event_sink)
                 return result
 
@@ -1502,6 +1573,11 @@ def _evaluate_risk_geometry_inner(
                     reduced_threshold=min_rr if _setup_specific_rr_applied else None,
                     default_threshold=default_threshold,
                 )
+            if target_recalc is not None:
+                _rr_extra_payload = {
+                    **(_rr_extra_payload or {}),
+                    **target_recalc,
+                }
             result = _build_soft_warning(
                 reason=f"Adjusted R:R {adjusted_rr:.2f} below minimum {min_rr:.2f} after stop adjustment",
                 reason_code="RISK_REWARD_AFTER_STOP_ADJUSTMENT",
@@ -1522,7 +1598,7 @@ def _evaluate_risk_geometry_inner(
                 agent=agent,
                 stop_distance=stop_distance,
                 min_stop_distance=min_stop_distance,
-                target_distance=target_distance,
+                target_distance=recon_target_distance,
                 original_rr=original_rr,
                 original_dollar_risk=original_dollar_risk,
                 adjusted_stop_price=adjusted_stop_price,
@@ -1535,6 +1611,9 @@ def _evaluate_risk_geometry_inner(
             result["decision"] = "adjusted_allowed"
             result["canonical_decision"] = "warn"
             result["risk_geometry_soft_gate"] = True
+            result["min_reward_to_risk"] = min_rr
+            if target_recalc is not None:
+                result.update(target_recalc)
             return result
 
         # Adjusted trade allowed

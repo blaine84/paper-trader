@@ -3024,6 +3024,9 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
                     decision["stop"] = geometry_result["stop_price"]
                     decision["stop_loss"] = geometry_result["stop_price"]
                     decision["stop_price"] = geometry_result["stop_price"]
+                    decision["target"] = geometry_result["target_price"]
+                    decision["target_price"] = geometry_result["target_price"]
+                    decision["profit_target"] = geometry_result["target_price"]
                     decision["quantity"] = geometry_result["quantity"]
 
     except Exception as exc:
@@ -3544,6 +3547,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         rg_note = next((n for n in _gate_notes if n.get("gate") == "risk_geometry_gate" and n.get("decision") == "adjusted_allowed"), None)
         if rg_note:
             stop = rg_note["stop_price"]
+            target = rg_note.get("target_price", target)
             rg_quantity = rg_note["quantity"]
             # Sizing invariant: geometry may reduce but never restore above reduced cap
             reduced_cap = max(1, int(pre_gate_qty * _gate_multiplier)) if _gate_multiplier < 1.0 else pre_gate_qty
@@ -3551,6 +3555,9 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             decision["stop"] = stop
             decision["stop_loss"] = stop
             decision["stop_price"] = stop
+            decision["target"] = target
+            decision["target_price"] = target
+            decision["profit_target"] = target
             decision["quantity"] = quantity
 
         # Extract gate_decision_id from gate_notes for correlation (recovery probes).
