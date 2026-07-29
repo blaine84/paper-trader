@@ -3614,17 +3614,37 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             log.warning(cooldown_msg)
             return False, cooldown_msg
 
-        # --- 3. Hard rejection check (fail-closed) ---
+        # --- 3. Setup win-rate warning check (warning-only) ---
+        setup_winrate_warning_only = False
         try:
             if check_hard_rejection(case_stats):
+                setup_winrate_warning_only = True
+                warning_message = (
+                    f"Setup winrate low ({case_stats['win_rate']:.2f} over "
+                    f"{case_stats['sample_size']} cases); allowing with warning "
+                    "because case-library history is not mature enough to block."
+                )
                 log.warning(
-                    "DECISION: status=REJECTED reason=hard_rejection "
+                    "DECISION: status=WARNING reason=setup_winrate_low "
                     "setup_winrate=%.2f sample_size=%d",
                     case_stats["win_rate"], case_stats["sample_size"],
                 )
-                return False, (
-                    f"Hard reject: setup winrate too low "
-                    f"({case_stats['win_rate']:.2f} over {case_stats['sample_size']} cases)"
+                log_trade_event(
+                    db,
+                    "gate_warned",
+                    agent=f"pm_{profile_id}",
+                    symbol=symbol,
+                    profile=profile_id,
+                    price=price,
+                    message=warning_message,
+                    payload={
+                        "gate_name": "setup_winrate_check",
+                        "decision": "warn",
+                        "canonical_decision": "warn",
+                        "reason_type": "setup_winrate_warning_only",
+                        "win_rate": case_stats["win_rate"],
+                        "sample_size": case_stats["sample_size"],
+                    },
                 )
         except Exception as exc:
             log.error("Hard rejection check failed (rejecting trade): %s", exc)
@@ -3656,11 +3676,17 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             _confluence, _sim_qual,
         )
 
-        if edge < 0.4:
+        if edge < 0.4 and not setup_winrate_warning_only:
             log.info(
                 "DECISION: status=REJECTED reason=edge_score_too_low (%.3f < 0.4)", edge
             )
             return False, f"Edge score too low ({edge:.3f})"
+        if edge < 0.4:
+            log.warning(
+                "DECISION: status=WARNING reason=edge_score_low_after_setup_winrate_warning "
+                "(%.3f < 0.4); allowing because setup win-rate is warning-only",
+                edge,
+            )
 
         # --- 5. Scale position size by edge score, cap at 1.2× base ---
         scaled_size = max(1, int(quantity * edge))

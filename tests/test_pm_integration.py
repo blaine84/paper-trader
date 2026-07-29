@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from db.schema import Base, Balance, Trade, Position, AgentMemory, get_session
+from db.schema import Base, Balance, Trade, Position, AgentMemory, TradeEvent, get_session
 from models.case import Case  # noqa: F401 — registers with Base
 from agents.portfolio_manager import execute_trade
 
@@ -184,13 +184,13 @@ def test_edge_score_rejection():
 
 
 # ---------------------------------------------------------------------------
-# 2. test_hard_rejection_for_proven_bad_setup
+# 2. test_low_setup_winrate_warns_without_blocking
 # ---------------------------------------------------------------------------
 
-def test_hard_rejection_for_proven_bad_setup():
+def test_low_setup_winrate_warns_without_blocking():
     """
-    case_stats with sample_size >= 10 and win_rate < 0.35 → hard rejection
-    before edge score is even computed.
+    case_stats with sample_size >= 10 and win_rate < 0.35 should warn but
+    should not block execution while the case library is still maturing.
     """
     engine = _make_engine()
     db = _make_session(engine)
@@ -224,8 +224,18 @@ def test_hard_rejection_for_proven_bad_setup():
         mock_fh_cls.return_value = mock_fh
         ok, msg = execute_trade(db, decision, profile_id)
 
-    assert ok is False
-    assert "hard reject" in msg.lower() or "Hard reject" in msg
+    assert ok is True, f"Low setup winrate should warn, not block: {msg}"
+
+    trade = db.query(Trade).filter_by(symbol="AAPL", profile=profile_id).first()
+    assert trade is not None
+
+    warning = (
+        db.query(TradeEvent)
+        .filter_by(symbol="AAPL", profile=profile_id, event_type="gate_warned")
+        .first()
+    )
+    assert warning is not None
+    assert "Setup winrate low" in warning.message
 
     db.close()
 
