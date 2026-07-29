@@ -638,9 +638,10 @@ class ExtendedGateAdapter:
         sample_size = case_stats.get("sample_size", 0)
         win_rate = case_stats.get("win_rate", 0.0)
 
-        # Replicate production logic thresholds
+        # Replicate production logic thresholds. Low case-library win rate is
+        # warning-only while historical data is immature.
         min_cases = 5
-        block_threshold = 0.35
+        warning_threshold = 0.35
         downgrade_threshold = 0.50
 
         if sample_size < min_cases:
@@ -656,19 +657,24 @@ class ExtendedGateAdapter:
                 },
             }
 
-        if win_rate < block_threshold:
+        if win_rate < warning_threshold:
+            modifier = win_rate / downgrade_threshold
             return {
-                "decision": "reject",
-                "reason_type": "confidence_block",
-                "reason": f"Win rate {win_rate:.2f} below block threshold {block_threshold}",
+                "decision": "reduce_size",
+                "reason_type": "confidence_warning",
+                "reason": (
+                    f"Win rate {win_rate:.2f} below warning threshold "
+                    f"{warning_threshold}; modifier={modifier:.2f}"
+                ),
+                "size_multiplier": modifier,
                 "threshold_applied": {
-                    "block_threshold": block_threshold,
+                    "warning_threshold": warning_threshold,
                     "min_cases": min_cases,
                 },
                 "inputs": {
                     "sample_size": sample_size,
                     "win_rate": win_rate,
-                    "modifier": 0.0,
+                    "modifier": modifier,
                 },
             }
 

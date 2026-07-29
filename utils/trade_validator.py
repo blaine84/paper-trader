@@ -133,7 +133,7 @@ def check_correlation(symbol: str, direction: str, profile_id: str, db) -> str:
 
 # ─── CONFIDENCE ADJUSTMENT BASED ON CASE LIBRARY ─────────────────────────────
 
-WIN_RATE_BLOCK_THRESHOLD = 0.35    # block trade if win rate below this
+WIN_RATE_BLOCK_THRESHOLD = 0.35    # warning-only until case history is mature
 WIN_RATE_DOWNGRADE_THRESHOLD = 0.50  # downgrade confidence if below this
 MIN_CASES_FOR_ADJUSTMENT = 5        # need at least this many cases to adjust
 
@@ -188,12 +188,18 @@ def adjust_confidence(engine, setup_type: str, market_regime: str = None) -> dic
     wins = sum(1 for c in cases if c.outcome == "success")
     win_rate = wins / total
 
-    # Block if win rate is terrible
+    # Warn and downgrade if win rate is poor. The case library is still too
+    # young to hard-block otherwise valid trades on historical win rate alone.
     if win_rate < WIN_RATE_BLOCK_THRESHOLD:
+        modifier = win_rate / WIN_RATE_DOWNGRADE_THRESHOLD
         return {
-            "modifier": 0.0,
-            "block": True,
-            "reason": f"{context}: win rate {win_rate:.0%} ({wins}/{total}) below {WIN_RATE_BLOCK_THRESHOLD:.0%} threshold — BLOCKED",
+            "modifier": round(modifier, 2),
+            "block": False,
+            "reason": (
+                f"{context}: win rate {win_rate:.0%} ({wins}/{total}) below "
+                f"{WIN_RATE_BLOCK_THRESHOLD:.0%} threshold — warning-only, "
+                f"confidence downgraded to {modifier:.0%}"
+            ),
             "win_rate": round(win_rate, 3),
             "total_cases": total,
         }
