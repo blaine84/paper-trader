@@ -3797,6 +3797,51 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         positions = db.query(Position).filter_by(profile=profile_id).all()
         pos_value = sum(p.quantity * p.avg_cost for p in positions)
         total_equity = cash + pos_value
+
+        profile = PM_PROFILES.get(profile_id, {})
+        max_position_pct = profile.get("max_position_pct")
+        if max_position_pct and total_equity > 0 and price > 0:
+            max_position_value = total_equity * max_position_pct
+            max_position_qty = int(max_position_value // price)
+            if max_position_qty < 1:
+                return (
+                    False,
+                    f"{symbol}: one-share position ${price:,.0f} exceeds "
+                    f"{max_position_pct*100:.0f}% max (${max_position_value:,.0f}) for {profile_id}",
+                )
+            if quantity > max_position_qty:
+                original_quantity = quantity
+                quantity = max_position_qty
+                decision["quantity"] = quantity
+                validated["quantity"] = quantity
+                log.warning(
+                    "Position allocation cap applied for %s/%s: %d → %d "
+                    "(max_value=$%.2f, price=$%.2f)",
+                    symbol, profile_id, original_quantity, quantity,
+                    max_position_value, price,
+                )
+                log_trade_event(
+                    db,
+                    "gate_warned",
+                    agent=f"pm_{profile_id}",
+                    symbol=symbol,
+                    profile=profile_id,
+                    price=price,
+                    message=(
+                        f"Position allocation cap reduced quantity from "
+                        f"{original_quantity} to {quantity}"
+                    ),
+                    payload={
+                        "gate_name": "position_allocation_cap",
+                        "decision": "reduce_size",
+                        "canonical_decision": "reduce_size",
+                        "reason_type": "max_position_pct_cap",
+                        "original_quantity": original_quantity,
+                        "quantity": quantity,
+                        "max_position_pct": max_position_pct,
+                        "max_position_value": max_position_value,
+                    },
+                )
         try:
             validate_trade(validated, profile_id, cash, total_equity, direction)
         except TradeValidationError as e:

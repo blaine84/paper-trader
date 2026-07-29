@@ -295,6 +295,65 @@ def test_position_size_scaling_with_cap():
 
 
 # ---------------------------------------------------------------------------
+# 3b. test_profile_allocation_cap_reduces_quantity
+# ---------------------------------------------------------------------------
+
+def test_profile_allocation_cap_reduces_quantity():
+    """
+    If post-gate quantity exceeds the profile's max allocation, reduce to the
+    largest executable whole-share quantity instead of rejecting at validation.
+    """
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=100_000.0)
+
+    _seed_analyst_signal(db, "AAPL", _strong_signal())
+
+    decision = _base_decision(
+        symbol="AAPL",
+        quantity=100,
+        price=1000.0,
+        stop=995.0,
+        target=1010.0,
+    )
+
+    good_conf = {
+        "modifier": 1.0, "block": False, "reason": "ok",
+        "win_rate": 0.80, "total_cases": 20,
+    }
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=good_conf),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
+    ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 1000.0}
+        mock_fh_cls.return_value = mock_fh
+        ok, msg = execute_trade(db, decision, profile_id)
+
+    assert ok is True, f"Allocation cap should reduce, not reject: {msg}"
+
+    trade = db.query(Trade).filter_by(symbol="AAPL", profile=profile_id).first()
+    assert trade is not None
+    assert trade.quantity == 35
+
+    warning = (
+        db.query(TradeEvent)
+        .filter_by(symbol="AAPL", profile=profile_id, event_type="gate_warned")
+        .filter(TradeEvent.message.like("Position allocation cap reduced%"))
+        .first()
+    )
+    assert warning is not None
+
+    db.close()
+
+
+# ---------------------------------------------------------------------------
 # 4. test_adaptive_risk_throttling_after_loss_streak
 # ---------------------------------------------------------------------------
 
