@@ -1752,6 +1752,8 @@ Produce your trading signal JSON for {sym}.
                 "confidence": "low",
                 "setup_type": "error",
                 "reasoning": safe_error,
+                "data_unavailable": True,
+                "skip_signal_memory": True,
             }
 
     # Run all symbols in parallel
@@ -1786,10 +1788,24 @@ Produce your trading signal JSON for {sym}.
             (reclassified_gap_and_go / raw_gap_and_go) * 100,
         )
 
-    # Save all signals to memory
+    # Save valid signals to memory. Provider failures are recorded separately
+    # so a data outage cannot masquerade as a fresh weak HOLD.
     db2 = get_session(engine)
     for sym, signal in signals.items():
         signal["_cycle_id"] = cycle_id
+        if signal.get("skip_signal_memory") or signal.get("data_unavailable"):
+            db2.add(AgentMemory(
+                agent="analyst",
+                symbol=sym,
+                key="signal_unavailable",
+                value=json.dumps(signal),
+            ))
+            log_trade_event(
+                db2, "signal_unavailable", agent="analyst", symbol=sym,
+                message=signal.get("reasoning"),
+                payload=signal,
+            )
+            continue
         db2.add(AgentMemory(
             agent="analyst",
             symbol=sym,

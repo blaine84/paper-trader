@@ -18,6 +18,7 @@ from db.schema import Trade, Position, AgentMemory, get_session
 from utils.finnhub_client import FinnhubClient
 from utils.stop_authority import should_stop_trigger
 from utils.trade_events import log_trade_event
+from utils.error_sanitizer import sanitize_error_text
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,10 @@ _YFINANCE_CIRCUIT_BREAK_SECONDS = int(
 )
 _quote_cache: dict[str, tuple[float, float]] = {}
 _yfinance_disabled_until = 0.0
+_last_empty_quote_batch_log = 0.0
+_EMPTY_QUOTE_BATCH_LOG_SECONDS = int(
+    os.getenv("PRICE_MONITOR_EMPTY_QUOTE_BATCH_LOG_SECONDS", "300")
+)
 
 
 def _is_within_decision_window() -> bool:
@@ -72,10 +77,10 @@ def _get_yfinance_quotes(symbols: list[str], now: float) -> dict:
                     _quote_cache[sym] = (now, quotes[sym])
             except Exception as e:
                 failures += 1
-                log.warning("yfinance quote fallback failed for %s: %s", sym, e)
+                log.warning("yfinance quote fallback failed for %s: %s", sym, sanitize_error_text(e))
     except Exception as e:
         failures = len(symbols)
-        log.warning("yfinance batch quote fallback failed: %s", e)
+        log.warning("yfinance batch quote fallback failed: %s", sanitize_error_text(e))
 
     # Yahoo/yfinance occasionally enters a TLS-failure state and logs loudly for
     # every symbol. Stop retrying briefly; Finnhub fallback below remains active.
@@ -106,9 +111,9 @@ def _get_finnhub_quotes(symbols: list[str], now: float, retries: int) -> dict:
                     quotes[sym] = price
                     _quote_cache[sym] = (now, price)
             except Exception as e:
-                log.warning("Finnhub quote failed for %s: %s", sym, e)
+                log.warning("Finnhub quote failed for %s: %s", sym, sanitize_error_text(e))
     except Exception as e:
-        log.warning("Finnhub quote client unavailable: %s", e)
+        log.warning("Finnhub quote client unavailable: %s", sanitize_error_text(e))
 
     return quotes
 
@@ -157,6 +162,48 @@ def get_batch_quotes(symbols: list[str], *, prefer_finnhub: bool = False) -> dic
     return quotes
 
 
+def _record_empty_quote_batch(engine, consumer: str, symbols: list[str]) -> None:
+    """Persist a throttled outage marker when every requested quote is missing."""
+    global _last_empty_quote_batch_log
+
+    if not symbols:
+        return
+
+    now = time.time()
+    if now - _last_empty_quote_batch_log < _EMPTY_QUOTE_BATCH_LOG_SECONDS:
+        return
+    _last_empty_quote_batch_log = now
+
+    payload = {
+        "consumer": consumer,
+        "symbols": list(dict.fromkeys(symbols)),
+        "reason": "all_quote_providers_unavailable",
+    }
+    log.error(
+        "Market data unavailable for %s: zero quotes returned for %d symbols",
+        consumer,
+        len(payload["symbols"]),
+    )
+    db = get_session(engine)
+    try:
+        db.add(AgentMemory(
+            agent="market_data",
+            symbol=None,
+            key="quote_outage",
+            value=json.dumps(payload),
+        ))
+        log_trade_event(
+            db,
+            "market_data_unavailable",
+            agent="price_monitor",
+            message=f"{consumer}: zero quotes returned",
+            payload=payload,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def check_stops_and_targets(engine) -> list[dict]:
     """Check open trades against their stop/target levels."""
     db = get_session(engine)
@@ -167,6 +214,8 @@ def check_stops_and_targets(engine) -> list[dict]:
 
         symbols = list(set(t.symbol for t in open_trades))
         quotes = get_batch_quotes(symbols, prefer_finnhub=True)
+        if symbols and not quotes:
+            _record_empty_quote_batch(engine, "stops_targets", symbols)
         triggers = []
 
         for trade in open_trades:
@@ -527,6 +576,8 @@ def check_entry_triggers(engine) -> list[dict]:
 
     symbols = list(signal_data.keys())
     quotes = get_batch_quotes(symbols)
+    if symbols and not quotes:
+        _record_empty_quote_batch(engine, "entry_triggers", symbols)
 
     for sym, sig in signal_data.items():
         price = quotes.get(sym)
@@ -623,6 +674,8 @@ def check_momentum(engine) -> list[dict]:
     all_symbols = list(set(watchlist + pos_symbols))
 
     quotes = get_batch_quotes(all_symbols)
+    if all_symbols and not quotes:
+        _record_empty_quote_batch(engine, "momentum", all_symbols)
 
     for sym, price in quotes.items():
         if not price:
