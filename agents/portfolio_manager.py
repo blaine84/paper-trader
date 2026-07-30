@@ -44,6 +44,7 @@ from utils.raw_pm_capture import (
     persist_lineage_links,
 )
 from utils.trigger_status import compute_trigger_status
+from utils.error_sanitizer import sanitize_error_text
 
 log = logging.getLogger(__name__)
 
@@ -4235,7 +4236,11 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                     {},
                 )
             except Exception as exc:
-                log.warning("Failed to derive trigger_status for %s in PM cycle: %s", sym, exc)
+                log.warning(
+                    "Failed to derive trigger_status for %s in PM cycle: %s",
+                    sym,
+                    sanitize_error_text(exc),
+                )
 
     # Get profile-specific execution feedback from Reviewer
     exec_fb = (

@@ -38,6 +38,7 @@ from utils.trigger_status import compute_trigger_status
 from utils.symbol_class import classify_symbol, validate_setup_for_symbol
 from utils.gate_config import MARKET_STATE_MODE
 from utils.market_state import compute_market_state
+from utils.error_sanitizer import sanitize_error_text
 
 log = logging.getLogger(__name__)
 
@@ -1743,8 +1744,15 @@ Produce your trading signal JSON for {sym}.
 
             signals[sym] = signal
         except Exception as e:
-            log.error(f"Analyst error for {sym}: {e}")
-            signals[sym] = {"signal": "HOLD", "strength": "weak", "confidence": "low", "setup_type": "error", "reasoning": str(e)}
+            safe_error = sanitize_error_text(e)
+            log.error("Analyst error for %s: %s", sym, safe_error)
+            signals[sym] = {
+                "signal": "HOLD",
+                "strength": "weak",
+                "confidence": "low",
+                "setup_type": "error",
+                "reasoning": safe_error,
+            }
 
     # Run all symbols in parallel
     from concurrent.futures import ThreadPoolExecutor, as_completed

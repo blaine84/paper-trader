@@ -42,6 +42,7 @@ from utils.market_data_reliability.snapshot import Snapshot
 from utils.market_data_reliability.trust import TrustClassifier
 from utils.market_data_reliability.validator import ResponseValidator
 from utils.trigger_status import compute_trigger_status
+from utils.error_sanitizer import sanitize_error_text
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
@@ -238,10 +239,11 @@ def get_quotes(symbols: list[str]) -> dict:
             _quote_cache[sym] = (now, quote)
             continue
         except Exception as e:
+            safe_error = sanitize_error_text(e)
             if yfinance_available:
-                log.warning("Finnhub quote failed for %s; trying yfinance fallback: %s", sym, e)
+                log.warning("Finnhub quote failed for %s; trying yfinance fallback: %s", sym, safe_error)
             else:
-                log.warning("Finnhub quote failed for %s; yfinance fallback circuit-open: %s", sym, e)
+                log.warning("Finnhub quote failed for %s; yfinance fallback circuit-open: %s", sym, safe_error)
 
         if yfinance_available:
             try:
