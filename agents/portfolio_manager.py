@@ -4210,6 +4210,31 @@ def _record_plan_candidate_event(engine, candidate_id, cycle_id, profile_id, eve
         conn.commit()
 
 
+def _get_cached_quote_for_staleness(symbol: str):
+    """Read a price for `symbol` from the shared quote cache. CACHE ONLY.
+
+    This is an acceptance-time sanity check, not an execution-time freshness
+    gate, so it must never call a quote provider — no provider budget is
+    consumed. Follows the cache-read convention in
+    ``utils/plan_monitor.py::_get_rate_limited_quotes`` (shared
+    ``agents.price_monitor._quote_cache`` holding ``{symbol: (ts, price)}``).
+
+    Returns:
+        (price, quote_age_seconds) if a usable cached price exists, else None.
+    """
+    import time as _time
+    from agents.price_monitor import _quote_cache
+
+    cached = _quote_cache.get(symbol)
+    if not cached:
+        return None
+    cache_ts, cache_price = cached
+    price = float(cache_price)
+    if price <= 0:
+        return None
+    return price, max(0.0, _time.time() - float(cache_ts))
+
+
 def _build_trade_plan_from_candidate(candidate_record, decision, profile_id: str, cycle_id: str):
     """Build a TradePlan (unsaved) from an accepted candidate record.
 
@@ -4283,6 +4308,11 @@ def _maybe_create_trade_plan(engine, registry, decision, profile_id: str, cycle_
       - "enabled":  plan created and returns True, signalling the caller to skip
                     immediate execution — the plan waits for a monitor trigger.
 
+    Before creating a plan, a cache-only staleness guard checks whether the
+    market has already moved past the candidate's target. If so, no plan is
+    created (a ``plan_rejected_at_creation`` candidate event is recorded) and
+    False is returned so the candidate follows its normal path.
+
     Fail-open: any failure while creating the plan is logged and False is
     returned so the candidate pipeline is never blocked.
 
@@ -4306,6 +4336,60 @@ def _maybe_create_trade_plan(engine, registry, decision, profile_id: str, cycle_
         plan, ez = _build_trade_plan_from_candidate(
             candidate_record, decision, profile_id, cycle_id,
         )
+
+        # Pre-creation staleness guard: if a cached price shows the market has
+        # already blown through the intended target, creating the plan only to
+        # have the monitor mark it MISSED on the next tick is pure churn.
+        # Cache-only (no provider budget), fail-open when no quote is cached.
+        rejected_for_staleness = False
+        try:
+            cached_quote = _get_cached_quote_for_staleness(candidate_record.symbol)
+            if cached_quote is not None:
+                from decimal import Decimal as _Dec
+                from utils.entry_zone import is_price_past_target
+
+                observed_price, quote_age_seconds = cached_quote
+                if is_price_past_target(
+                    _Dec(str(observed_price)),
+                    _Dec(str(candidate_record.target_price)),
+                    candidate_record.direction,
+                ):
+                    log.info(
+                        "Trade plan rejected at creation: %s price=%.2f already past "
+                        "target=%.2f (direction=%s, candidate=%s, mode=%s)",
+                        candidate_record.symbol, observed_price,
+                        candidate_record.target_price, candidate_record.direction,
+                        decision.candidate_id, _tpm,
+                    )
+                    _record_plan_candidate_event(
+                        engine, decision.candidate_id, cycle_id, profile_id,
+                        "plan_rejected_at_creation",
+                        {
+                            "reason": "price_already_past_target",
+                            "symbol": candidate_record.symbol,
+                            "direction": candidate_record.direction,
+                            "observed_price": observed_price,
+                            "target_price": candidate_record.target_price,
+                            "entry_zone_upper": float(ez.upper),
+                            "entry_zone_lower": float(ez.lower),
+                            "quote_age_seconds": round(quote_age_seconds, 1),
+                            "mode": _tpm,
+                        },
+                    )
+                    rejected_for_staleness = True
+        except Exception as stale_exc:
+            # Fail-open: a broken staleness check must never block plan creation
+            log.error(
+                "Pre-creation staleness check failed for candidate %s (%s): %s — "
+                "continuing with plan creation",
+                decision.candidate_id, candidate_record.symbol, stale_exc,
+            )
+
+        if rejected_for_staleness:
+            # False → caller does NOT skip normal execution. Observe mode is
+            # unchanged; enabled mode falls through to the existing pipeline,
+            # which has its own stale-entry protection.
+            return False
 
         # Expire duplicate active plans for the same key (Req 8.7)
         plan_registry.expire_duplicate_plans(

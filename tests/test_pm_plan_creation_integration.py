@@ -760,3 +760,266 @@ class TestPlanFieldDerivation:
         assert plan.risk_reward == 2.0
         assert plan.setup_type == "momentum_fade"
         assert plan.geometry_name == "standard"
+
+# ---------------------------------------------------------------------------
+# Tests: pre-creation staleness guard (price already past target)
+# ---------------------------------------------------------------------------
+
+
+def _cache(symbol: str, price: float, age_seconds: float = 5.0) -> dict:
+    """Build a shared-quote-cache payload: {symbol: (timestamp, price)}."""
+    import time as _time
+
+    return {symbol: (_time.time() - age_seconds, price)}
+
+
+def _patch_cache(cache: dict):
+    """Patch the shared quote cache AND the provider entry point.
+
+    ``get_batch_quotes`` is patched with a MagicMock so tests can assert the
+    staleness guard never consumes provider quota.
+    """
+    return (
+        patch("agents.price_monitor._quote_cache", cache),
+        patch("agents.price_monitor.get_batch_quotes", MagicMock()),
+    )
+
+
+class TestPreCreationStalenessGuard:
+    """A candidate whose cached price has already blown past its target must not
+    produce a plan — that only churns PLANNED → WATCHING → MISSED.
+
+    The guard is cache-only (no provider calls) and fail-open.
+    """
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_long_price_past_target_rejects_plan(self, engine, registry):
+        _insert_candidate(
+            engine, symbol="TSLA", direction="BUY",
+            entry_price=250.0, stop_price=245.0, target_price=260.0,
+        )
+        executed: list = []
+
+        cache_patch, provider_patch = _patch_cache(_cache("TSLA", 262.5))
+        with cache_patch, provider_patch as provider:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is False
+        assert _plan_ids(engine) == []
+        assert executed == []
+        provider.assert_not_called()
+
+        events = _candidate_events(engine, "cand-001", "plan_rejected_at_creation")
+        assert len(events) == 1
+        payload = json.loads(events[0]["event_data"])
+        assert payload["reason"] == "price_already_past_target"
+        assert payload["symbol"] == "TSLA"
+        assert payload["direction"] == "BUY"
+        assert payload["observed_price"] == 262.5
+        assert payload["target_price"] == 260.0
+        assert payload["entry_zone_upper"] == 250.0
+        assert payload["entry_zone_lower"] == 249.0
+        assert payload["quote_age_seconds"] >= 0
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_short_price_past_target_rejects_plan(self, engine, registry):
+        _insert_candidate(
+            engine, symbol="AAPL", direction="SHORT",
+            entry_price=200.0, stop_price=205.0, target_price=190.0,
+        )
+        executed: list = []
+
+        cache_patch, provider_patch = _patch_cache(_cache("AAPL", 188.0))
+        with cache_patch, provider_patch as provider:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is False
+        assert _plan_ids(engine) == []
+        assert executed == []
+        provider.assert_not_called()
+
+        payload = json.loads(
+            _candidate_events(engine, "cand-001", "plan_rejected_at_creation")[0]["event_data"]
+        )
+        assert payload["reason"] == "price_already_past_target"
+        assert payload["direction"] == "SHORT"
+        assert payload["observed_price"] == 188.0
+        assert payload["target_price"] == 190.0
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_price_not_past_target_creates_plan(self, engine, registry):
+        """Regression guard: a live setup still becomes a plan."""
+        _insert_candidate(
+            engine, symbol="TSLA", direction="BUY",
+            entry_price=250.0, stop_price=245.0, target_price=260.0,
+        )
+        executed: list = []
+
+        cache_patch, provider_patch = _patch_cache(_cache("TSLA", 250.4))
+        with cache_patch, provider_patch as provider:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is True
+        assert len(_plan_ids(engine)) == 1
+        assert _candidate_events(engine, "cand-001", "plan_rejected_at_creation") == []
+        provider.assert_not_called()
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_no_cached_quote_creates_plan(self, engine, registry):
+        """Fail-open: absence of a cached quote must not block plan creation."""
+        _insert_candidate(engine, symbol="TSLA", direction="BUY", target_price=260.0)
+        executed: list = []
+
+        cache_patch, provider_patch = _patch_cache({})
+        with cache_patch, provider_patch as provider:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is True
+        assert len(_plan_ids(engine)) == 1
+        assert _candidate_events(engine, "cand-001", "plan_rejected_at_creation") == []
+        provider.assert_not_called()
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_staleness_check_exception_creates_plan(self, engine, registry):
+        """Fail-open: a raising staleness check falls through to plan creation."""
+        _insert_candidate(engine, symbol="TSLA", direction="BUY", target_price=260.0)
+        executed: list = []
+
+        with patch(
+            "agents.portfolio_manager._get_cached_quote_for_staleness",
+            side_effect=RuntimeError("cache exploded"),
+        ):
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is True
+        assert len(_plan_ids(engine)) == 1
+        assert _candidate_events(engine, "cand-001", "plan_rejected_at_creation") == []
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "observe")
+    def test_observe_mode_also_rejects_stale_plan(self, engine, registry):
+        """Observe mode still skips the churn, and its return value (False) keeps
+        execution behavior identical."""
+        _insert_candidate(
+            engine, symbol="TSLA", direction="BUY",
+            entry_price=250.0, stop_price=245.0, target_price=260.0,
+        )
+        executed: list = []
+
+        cache_patch, provider_patch = _patch_cache(_cache("TSLA", 265.0))
+        with cache_patch, provider_patch:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is False
+        assert _plan_ids(engine) == []
+        assert executed == []
+        assert _candidate_state(engine, "cand-001") == CandidateState.REGISTERED.value
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "disabled")
+    def test_disabled_mode_never_reads_cache(self, engine, registry):
+        """The existing early return means the guard is not reached at all."""
+        _insert_candidate(engine, symbol="TSLA", target_price=260.0)
+
+        cache_patch, provider_patch = _patch_cache(_cache("TSLA", 999.0))
+        with cache_patch, provider_patch as provider:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, [],
+            )
+
+        assert skip is False
+        assert _plan_ids(engine) == []
+        assert _candidate_events(engine, "cand-001", "plan_rejected_at_creation") == []
+        provider.assert_not_called()
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_existing_active_plan_survives_stale_rejection(self, engine, registry):
+        """A rejected-at-creation candidate must not expire the active plan it
+        would have superseded."""
+        _insert_candidate(engine, candidate_id="cand-001", symbol="TSLA", target_price=260.0)
+        cache_patch, provider_patch = _patch_cache(_cache("TSLA", 250.4))
+        with cache_patch, provider_patch:
+            _maybe_create_trade_plan(
+                engine, registry, _make_decision("cand-001"), PROFILE_ID, CYCLE_ID, [],
+            )
+        plan_id_1 = _plan_ids(engine)[0]
+
+        _insert_candidate(engine, candidate_id="cand-002", symbol="TSLA", target_price=260.0)
+        cache_patch, provider_patch = _patch_cache(_cache("TSLA", 261.0))
+        with cache_patch, provider_patch:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision("cand-002"), PROFILE_ID, CYCLE_ID, [],
+            )
+
+        assert skip is False
+        assert _plan_ids(engine) == [plan_id_1]
+        assert TradePlanRegistry(engine).get_plan(plan_id_1).state == PlanState.PLANNED
+
+
+class TestProductionStalenessRegressions:
+    """Real cases observed in production on the day the guard was added: plans
+    were created and marked MISSED (reason_for_miss='price_past_target') on the
+    very next monitor tick."""
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_msft_buy_price_past_target(self, engine, registry):
+        """MSFT BUY: entry zone 450.56–450.74, target 452.09, price 457.86."""
+        _insert_candidate(
+            engine, symbol="MSFT", direction="BUY",
+            entry_price=450.74, stop_price=449.84, target_price=452.09,
+        )
+        executed: list = []
+
+        cache_patch, provider_patch = _patch_cache(_cache("MSFT", 457.86))
+        with cache_patch, provider_patch as provider:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is False
+        assert _plan_ids(engine) == []
+        provider.assert_not_called()
+
+        payload = json.loads(
+            _candidate_events(engine, "cand-001", "plan_rejected_at_creation")[0]["event_data"]
+        )
+        assert payload["reason"] == "price_already_past_target"
+        assert payload["observed_price"] == 457.86
+        assert payload["target_price"] == 452.09
+
+    @patch("utils.gate_config.TRIGGERED_PLAN_MODE", "enabled")
+    def test_mu_short_price_past_target(self, engine, registry):
+        """MU SHORT: entry zone 863.28–863.63, target 860.69, price 840.69."""
+        _insert_candidate(
+            engine, symbol="MU", direction="SHORT",
+            entry_price=863.28, stop_price=865.0, target_price=860.69,
+        )
+        executed: list = []
+
+        cache_patch, provider_patch = _patch_cache(_cache("MU", 840.69))
+        with cache_patch, provider_patch as provider:
+            skip = _maybe_create_trade_plan(
+                engine, registry, _make_decision(), PROFILE_ID, CYCLE_ID, executed,
+            )
+
+        assert skip is False
+        assert _plan_ids(engine) == []
+        provider.assert_not_called()
+
+        payload = json.loads(
+            _candidate_events(engine, "cand-001", "plan_rejected_at_creation")[0]["event_data"]
+        )
+        assert payload["reason"] == "price_already_past_target"
+        assert payload["observed_price"] == 840.69
+        assert payload["target_price"] == 860.69
+        assert payload["direction"] == "SHORT"

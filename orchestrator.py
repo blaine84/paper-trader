@@ -812,6 +812,54 @@ def _ensure_decision_snapshots_identity_default(engine, inspector):
     _ensure_postgres_identity_default(engine, inspector, "decision_snapshots")
 
 
+# --- Provenance namespace (db/provenance_schema.py declares bare integer PKs) ---
+
+def _ensure_pm_raw_responses_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "pm_raw_responses")
+
+
+def _ensure_response_lineage_links_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "response_lineage_links")
+
+
+def _ensure_provenance_events_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "provenance_events")
+
+
+def _ensure_provenance_findings_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "provenance_findings")
+
+
+# --- Replay namespace (db/replay_schema.py declares bare integer PKs) ---
+
+def _ensure_replay_audit_records_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "replay_audit_records")
+
+
+def _ensure_replay_batch_runs_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "replay_batch_runs")
+
+
+def _ensure_replay_batch_items_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "replay_batch_items")
+
+
+def _ensure_replay_annotations_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "replay_annotations")
+
+
+def _ensure_replay_counterfactual_outcomes_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(
+        engine, inspector, "replay_counterfactual_outcomes"
+    )
+
+
+# --- Triggered trade plans (db/schema.py) ---
+
+def _ensure_trade_plan_events_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "trade_plan_events")
+
+
 def _ensure_checkpoint_tables(engine, inspector):
     """Create checkpoint_events table if missing.
 
@@ -972,6 +1020,9 @@ def check_schema(engine):
     # --- Auto-create candidate-ID selection tables if missing (non-destructive) ---
     _ensure_candidate_tables(engine, inspector)
     _ensure_watch_candidate_tables(engine, inspector)
+    # Re-inspect: the calls above may have just created these tables, and a
+    # stale inspector would make the identity repair silently no-op.
+    inspector = sa_inspect(engine)
     _ensure_pm_candidates_identity_default(engine, inspector)
     _ensure_pm_candidate_events_identity_default(engine, inspector)
 
@@ -980,6 +1031,14 @@ def check_schema(engine):
 
     # --- Auto-create provenance tables if missing (non-destructive) ---
     init_provenance_schema(engine)
+    # Provenance DDL uses bare `id INTEGER PRIMARY KEY`, which auto-assigns on
+    # SQLite but leaves Postgres without a sequence default. Repair after init
+    # so the tables are guaranteed to exist; re-inspect because init created them.
+    inspector = sa_inspect(engine)
+    _ensure_pm_raw_responses_identity_default(engine, inspector)
+    _ensure_response_lineage_links_identity_default(engine, inspector)
+    _ensure_provenance_events_identity_default(engine, inspector)
+    _ensure_provenance_findings_identity_default(engine, inspector)
 
     # --- Auto-create blocker mitigation tables if missing (non-destructive) ---
     init_blocker_mitigation_schema(engine)
@@ -989,11 +1048,18 @@ def check_schema(engine):
     init_replay_db(engine)
     inspector = sa_inspect(engine)
     _ensure_decision_snapshots_identity_default(engine, inspector)
+    _ensure_replay_audit_records_identity_default(engine, inspector)
+    _ensure_replay_batch_runs_identity_default(engine, inspector)
+    _ensure_replay_batch_items_identity_default(engine, inspector)
+    _ensure_replay_annotations_identity_default(engine, inspector)
+    _ensure_replay_counterfactual_outcomes_identity_default(engine, inspector)
 
     # --- Auto-create triggered trade plan tables if missing (non-destructive) ---
     # Runs last so it never races the tables above; IF NOT EXISTS DDL makes this
     # idempotent, so a live DB is upgraded automatically on restart.
     init_trade_plan_schema(engine)
+    inspector = sa_inspect(engine)
+    _ensure_trade_plan_events_identity_default(engine, inspector)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —
