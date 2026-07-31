@@ -958,7 +958,7 @@ def _ensure_watch_candidate_tables(engine, inspector):
 def check_schema(engine):
     """Verify the DB schema has all expected columns. Fail fast if not."""
     from sqlalchemy import inspect as sa_inspect, text
-    from db.schema import verify_wal_mode, is_sqlite
+    from db.schema import verify_wal_mode, is_sqlite, init_trade_plan_schema
 
     # --- Verify WAL mode and busy_timeout (non-destructive, SQLite only) ---
     if is_sqlite(engine):
@@ -989,6 +989,11 @@ def check_schema(engine):
     init_replay_db(engine)
     inspector = sa_inspect(engine)
     _ensure_decision_snapshots_identity_default(engine, inspector)
+
+    # --- Auto-create triggered trade plan tables if missing (non-destructive) ---
+    # Runs last so it never races the tables above; IF NOT EXISTS DDL makes this
+    # idempotent, so a live DB is upgraded automatically on restart.
+    init_trade_plan_schema(engine)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —
@@ -2478,6 +2483,25 @@ def main():
     funnel_config = load_funnel_config()
     _check_missed_funnel_jobs(engine, funnel_config)
 
+    # ─── Triggered Trade Plans: startup orphan sweep ──────────────────
+    # Must run AFTER check_schema() so trade_plans table exists.
+    # Fail-open: sweep failure does not block orchestrator startup.
+    from utils.gate_config import TRIGGERED_PLAN_MODE, PLAN_MONITOR_INTERVAL_SECONDS
+
+    if TRIGGERED_PLAN_MODE != "disabled":
+        try:
+            from utils.trade_plan_registry import TradePlanRegistry
+            _plan_registry = TradePlanRegistry(engine)
+            swept = _plan_registry.finalize_orphaned_plans()
+            if swept:
+                log.info(
+                    "Startup: finalized %d orphaned trade plans: %s",
+                    len(swept),
+                    {k: v.value for k, v in swept.items()},
+                )
+        except Exception as exc:
+            log.warning("Startup trade plan orphan sweep failed (non-fatal): %s", exc)
+
     # ─── Alert Dispatcher Construction ─────────────────────────────────
     global _alert_dispatcher
     from utils.gate_config import PM_ALERT_DISPATCH_MODE, PM_ALERT_DISPATCHER_INTERVAL_SECONDS
@@ -2668,6 +2692,76 @@ def main():
             IntervalTrigger(seconds=PM_ALERT_DISPATCHER_INTERVAL_SECONDS),
             id="alert_dispatcher",
             max_instances=1,
+            coalesce=True,
+        )
+
+    # ─── Plan Monitor: triggered trade plan evaluation ─────────────────
+    # Runs every PLAN_MONITOR_INTERVAL_SECONDS (default 30s) during market
+    # hours. Independent of PM cycles. Only registered when feature is active.
+    if TRIGGERED_PLAN_MODE != "disabled":
+        from apscheduler.triggers.interval import IntervalTrigger as _PlanIntervalTrigger
+
+        def run_plan_monitor():
+            """Evaluate active trade plans against current prices."""
+            if _skip_outside_regular_market_job("plan_monitor"):
+                return
+            _engine_local = get_engine()
+            try:
+                import utils.plan_monitor as plan_monitor
+                result = plan_monitor.run(_engine_local)
+                if result.plans_triggered or result.plans_missed or result.plans_expired:
+                    log.info(
+                        "PLAN_MONITOR_TICK: checked=%d triggered=%d missed=%d "
+                        "expired=%d invalidated=%d quotes_fetched=%d "
+                        "cache_hits=%d duration_ms=%.1f",
+                        result.plans_checked,
+                        result.plans_triggered,
+                        result.plans_missed,
+                        result.plans_expired,
+                        result.plans_invalidated,
+                        result.quotes_fetched,
+                        result.quotes_from_cache,
+                        result.tick_duration_ms,
+                    )
+            except Exception as e:
+                log.error("Plan monitor error: %s", e, exc_info=True)
+
+        scheduler.add_job(
+            run_plan_monitor,
+            _PlanIntervalTrigger(seconds=PLAN_MONITOR_INTERVAL_SECONDS),
+            id="plan_monitor",
+            max_instances=1,
+            replace_existing=True,
+            coalesce=True,
+        )
+
+        # ─── Orphan Plan Sweep: safety net every 5 min ────────────────────
+        # Catches plans stranded in transient states (PLANNED/WATCHING/TRIGGERED)
+        # past their expiration. Supplements the startup sweep. Req 8.6.
+        def run_plan_orphan_sweep():
+            """Periodic safety-net sweep for orphaned trade plans."""
+            if _skip_outside_regular_market_job("plan_orphan_sweep"):
+                return
+            _engine_local = get_engine()
+            try:
+                from utils.trade_plan_registry import TradePlanRegistry
+                registry = TradePlanRegistry(_engine_local)
+                swept = registry.finalize_orphaned_plans()
+                if swept:
+                    log.info(
+                        "PLAN_ORPHAN_SWEEP: finalized %d orphaned plans: %s",
+                        len(swept),
+                        {k: v.value for k, v in swept.items()},
+                    )
+            except Exception as e:
+                log.error("Plan orphan sweep error: %s", e, exc_info=True)
+
+        scheduler.add_job(
+            run_plan_orphan_sweep,
+            _PlanIntervalTrigger(seconds=300),  # every 5 minutes
+            id="plan_orphan_sweep",
+            max_instances=1,
+            replace_existing=True,
             coalesce=True,
         )
 

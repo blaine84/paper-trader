@@ -4187,6 +4187,184 @@ def _compute_shadow_agreement(candidate_results, legacy_results):
     })
 
 
+def _record_plan_candidate_event(engine, candidate_id, cycle_id, profile_id, event_type, event_data):
+    """Append a single audit row to pm_candidate_events (module-level twin of the
+    nested helper in run_profile, usable from module-level plan helpers)."""
+    from sqlalchemy import text as _sql_text
+    with engine.connect() as conn:
+        conn.execute(
+            _sql_text("""
+                INSERT INTO pm_candidate_events
+                (candidate_id, cycle_id, profile_id, event_type, event_data, created_at)
+                VALUES (:cid, :cycle_id, :profile_id, :event_type, :event_data, :created_at)
+            """),
+            {
+                "cid": candidate_id,
+                "cycle_id": cycle_id,
+                "profile_id": profile_id,
+                "event_type": event_type,
+                "event_data": json.dumps(event_data, default=str) if event_data is not None else None,
+                "created_at": datetime.utcnow().isoformat(),
+            },
+        )
+        conn.commit()
+
+
+def _build_trade_plan_from_candidate(candidate_record, decision, profile_id: str, cycle_id: str):
+    """Build a TradePlan (unsaved) from an accepted candidate record.
+
+    Deterministic and side-effect free: derives the entry zone from the
+    candidate's geometry and populates every TradePlan field. The zone
+    carries no tolerance — tolerance is applied at trigger-evaluation time.
+
+    Requirements: 1.2, 1.3, 1.7, 2.9, 7.5
+    """
+    from uuid import uuid4
+    from decimal import Decimal as _Dec
+    from utils.gate_config import PLAN_DEFAULT_EXPIRATION_MINUTES
+    from utils.trade_plan_registry import TradePlan, PlanState
+    from utils.entry_zone import derive_entry_zone
+
+    ez = derive_entry_zone(
+        entry_reference=_Dec(str(candidate_record.entry_price)),
+        direction=candidate_record.direction,
+        stop_price=_Dec(str(candidate_record.stop_price)),
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    plan = TradePlan(
+        plan_id=str(uuid4()),
+        candidate_id=decision.candidate_id,
+        cycle_id=cycle_id,
+        profile_id=profile_id,
+        symbol=candidate_record.symbol,
+        direction=candidate_record.direction,
+        setup_type=candidate_record.setup_type,
+        geometry_name=candidate_record.geometry_name,
+        entry_reference=candidate_record.entry_price,
+        entry_zone_upper=float(ez.upper),
+        entry_zone_lower=float(ez.lower),
+        stop_price=candidate_record.stop_price,
+        target_price=candidate_record.target_price,
+        risk_reward=candidate_record.risk_reward,
+        trigger_type="price_in_zone",
+        trigger_condition_json=json.dumps({
+            "type": "price_in_zone",
+            "entry_zone_upper": float(ez.upper),
+            "entry_zone_lower": float(ez.lower),
+        }),
+        trigger_confirmation_required=True,
+        invalidation_logic_json=json.dumps({
+            "type": "stop_breach",
+            "stop_price": candidate_record.stop_price,
+        }),
+        analyst_reasoning=candidate_record.trigger,
+        pm_rationale=decision.rationale,
+        source_signal_id=candidate_record.source_signal_id,
+        signal_snapshot_json=candidate_record.signal_snapshot_json,
+        state=PlanState.PLANNED,
+        created_at=now_utc,
+        expires_at=now_utc + timedelta(minutes=PLAN_DEFAULT_EXPIRATION_MINUTES),
+        triggered_at=None,
+        executed_at=None,
+        missed_at=None,
+        integrity_hash="",  # computed by create_plan
+    )
+    return plan, ez
+
+
+def _maybe_create_trade_plan(engine, registry, decision, profile_id: str, cycle_id: str, executed: list) -> bool:
+    """Create a trade plan for a PM-accepted candidate, honoring TRIGGERED_PLAN_MODE.
+
+    Modes:
+      - "disabled": no-op, returns False (existing behavior unchanged).
+      - "observe":  plan created for telemetry, returns False so the candidate
+                    still runs the normal pipeline (no behavioral change).
+      - "enabled":  plan created and returns True, signalling the caller to skip
+                    immediate execution — the plan waits for a monitor trigger.
+
+    Fail-open: any failure while creating the plan is logged and False is
+    returned so the candidate pipeline is never blocked.
+
+    Returns:
+        True if immediate execution should be skipped, else False.
+
+    Requirements: 7.1–7.8, 11.1, 11.5
+    """
+    from utils.gate_config import TRIGGERED_PLAN_MODE as _tpm
+    if _tpm == "disabled":
+        return False
+
+    try:
+        from utils.trade_plan_registry import TradePlanRegistry
+
+        plan_registry = TradePlanRegistry(engine)
+        candidate_record = registry.get(decision.candidate_id)
+        if candidate_record is None:
+            return False
+
+        plan, ez = _build_trade_plan_from_candidate(
+            candidate_record, decision, profile_id, cycle_id,
+        )
+
+        # Expire duplicate active plans for the same key (Req 8.7)
+        plan_registry.expire_duplicate_plans(
+            profile_id=profile_id,
+            symbol=candidate_record.symbol,
+            direction=candidate_record.direction,
+            setup_type=candidate_record.setup_type,
+        )
+
+        plan_registry.create_plan(plan)
+        log.info(
+            "Trade plan created: plan_id=%s candidate=%s symbol=%s "
+            "direction=%s zone=[%.2f, %.2f] mode=%s",
+            plan.plan_id, decision.candidate_id,
+            candidate_record.symbol, candidate_record.direction,
+            float(ez.lower), float(ez.upper), _tpm,
+        )
+
+        if _tpm != "enabled":
+            # observe mode: telemetry only, fall through to normal execution
+            return False
+
+        # enabled mode: plan replaces immediate execution (Req 7.5, 7.7)
+        _record_plan_candidate_event(
+            engine, decision.candidate_id, cycle_id, profile_id,
+            "plan_created",
+            {
+                "plan_id": plan.plan_id,
+                "entry_zone_upper": float(ez.upper),
+                "entry_zone_lower": float(ez.lower),
+                "mode": "enabled",
+                "message": (
+                    f"PM accepted — plan created, watching for trigger at "
+                    f"entry zone [{float(ez.lower):.2f}–{float(ez.upper):.2f}]"
+                ),
+            },
+        )
+        executed.append({
+            "symbol": candidate_record.symbol,
+            "action": candidate_record.direction,
+            "executed": False,
+            "outcome": "plan_created",
+            "profile": profile_id,
+            "source": "candidate_pipeline",
+            "candidate_id": decision.candidate_id,
+            "plan_id": plan.plan_id,
+        })
+        return True
+
+    except Exception as plan_exc:
+        # Fail-open: plan creation failure never blocks the candidate pipeline
+        log.error(
+            "Trade plan creation failed for candidate %s (mode=%s): %s — "
+            "continuing with normal execution",
+            decision.candidate_id, _tpm, plan_exc,
+        )
+        return False
+
+
 def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high", cycle_trigger_type: str = "scheduled", alert_intent_ids: list[str] | None = None, alert_contexts: list[dict] | None = None, cycle_id: str | None = None) -> dict:
     """
     Run a single PM profile for one cycle with two-tier review routing.
@@ -5150,6 +5328,16 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                             {"reason": "observe_only_not_executable"},
                         )
                         continue
+
+                    # ── Triggered Trade Plan creation (Req 7.1–7.8, 11.1, 11.5) ──
+                    # Feature-flag guarded inside the helper. Returns True only in
+                    # "enabled" mode when a plan was created, in which case immediate
+                    # execution is skipped and the plan waits for a monitor trigger.
+                    if _maybe_create_trade_plan(
+                        engine, registry, decision, profile_id, cycle_id, executed,
+                    ):
+                        continue
+                    # ── End triggered trade plan creation ─────────────────────
 
                     pipeline_result = execute_candidate_pipeline(
                         db, engine, registry, decision,
