@@ -343,3 +343,177 @@ def verify_wal_mode(engine) -> bool:
         conn.commit()
 
     return not corrections_made
+
+# ---------------------------------------------------------------------------
+# Triggered trade plans schema (non-destructive, IF NOT EXISTS)
+#
+# Trade plans have their own lifecycle/state machine, separate from
+# pm_candidates. DDL below is idempotent and safe to run on every startup.
+#
+# Requirements: 1.8, 8.1, 9.1
+# ---------------------------------------------------------------------------
+
+_TRADE_PLANS_DDL = """
+CREATE TABLE IF NOT EXISTS trade_plans (
+    plan_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    cycle_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    setup_type TEXT NOT NULL,
+    geometry_name TEXT,
+
+    entry_reference REAL NOT NULL,
+    entry_zone_upper REAL NOT NULL,
+    entry_zone_lower REAL NOT NULL,
+
+    stop_price REAL NOT NULL,
+    target_price REAL NOT NULL,
+    risk_reward REAL NOT NULL,
+
+    trigger_type TEXT NOT NULL,
+    trigger_condition_json TEXT NOT NULL,
+    trigger_confirmation_required INTEGER NOT NULL DEFAULT 0,
+
+    invalidation_logic_json TEXT,
+
+    analyst_reasoning TEXT,
+    pm_rationale TEXT,
+    source_signal_id TEXT,
+    signal_snapshot_json TEXT,
+
+    state TEXT NOT NULL DEFAULT 'planned',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    triggered_at TEXT,
+    executed_at TEXT,
+    missed_at TEXT,
+    miss_reason TEXT,
+    rejection_reason TEXT,
+
+    integrity_hash TEXT NOT NULL
+)
+"""
+
+_TRADE_PLANS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_trade_plans_state ON trade_plans(state)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_plans_symbol_state ON trade_plans(symbol, state)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_plans_candidate ON trade_plans(candidate_id)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_plans_cycle ON trade_plans(cycle_id, profile_id)",
+]
+
+
+# ---------------------------------------------------------------------------
+# trade_plan_events (immutable, append-only audit trail)
+#
+# Every plan state transition emits a row here. Rows are never updated or
+# deleted — immutability is enforced by database triggers.
+#
+# Requirements: 8.5, 9.4, 9.5
+# ---------------------------------------------------------------------------
+
+_TRADE_PLAN_EVENTS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS trade_plan_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL,
+    cycle_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT,
+    fresh_price REAL,
+    from_state TEXT,
+    to_state TEXT,
+    created_at TEXT NOT NULL
+)
+"""
+
+_TRADE_PLAN_EVENTS_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS trade_plan_events (
+    id SERIAL PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    cycle_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT,
+    fresh_price DOUBLE PRECISION,
+    from_state TEXT,
+    to_state TEXT,
+    created_at TEXT NOT NULL
+)
+"""
+
+_TRADE_PLAN_EVENTS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_trade_plan_events_plan ON trade_plan_events(plan_id)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_plan_events_type ON trade_plan_events(event_type)",
+]
+
+_TRADE_PLAN_EVENTS_IMMUTABILITY_TRIGGERS = [
+    """
+    CREATE TRIGGER IF NOT EXISTS trade_plan_events_no_update
+        BEFORE UPDATE ON trade_plan_events
+    BEGIN
+        SELECT RAISE(ABORT, 'trade_plan_events is immutable: UPDATE prohibited');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trade_plan_events_no_delete
+        BEFORE DELETE ON trade_plan_events
+    BEGIN
+        SELECT RAISE(ABORT, 'trade_plan_events is immutable: DELETE prohibited');
+    END
+    """,
+]
+
+
+def init_trade_plan_schema(engine):
+    """Create triggered-trade-plan tables, indexes, and triggers if missing.
+
+    Non-destructive and idempotent: uses CREATE TABLE / CREATE INDEX /
+    CREATE TRIGGER IF NOT EXISTS so it can run on every orchestrator
+    startup. Existing rows and columns are never modified.
+
+    `trade_plan_events` is an append-only audit trail: UPDATE and DELETE
+    are blocked by immutability triggers, matching the pattern used by
+    decision_snapshots and provenance_events.
+
+    Requirements: 1.8, 8.1, 8.5, 9.1, 9.4, 9.5
+    """
+    sqlite = is_sqlite(engine)
+
+    with engine.begin() as conn:
+        conn.execute(text(_TRADE_PLANS_DDL))
+        for stmt in _TRADE_PLANS_INDEXES:
+            conn.execute(text(stmt))
+
+        conn.execute(text(
+            _TRADE_PLAN_EVENTS_DDL_SQLITE if sqlite
+            else _TRADE_PLAN_EVENTS_DDL_POSTGRES
+        ))
+        for stmt in _TRADE_PLAN_EVENTS_INDEXES:
+            conn.execute(text(stmt))
+
+        if sqlite:
+            for stmt in _TRADE_PLAN_EVENTS_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(stmt))
+        else:
+            # Postgres: shared raise_immutable() function + per-op triggers
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION '% is immutable: % prohibited', TG_TABLE_NAME, TG_OP;
+                END;
+                $$ LANGUAGE plpgsql
+            """))
+            for op in ("update", "delete"):
+                conn.execute(text(
+                    f"DROP TRIGGER IF EXISTS trade_plan_events_no_{op} "
+                    f"ON trade_plan_events"
+                ))
+                conn.execute(text(
+                    f"CREATE TRIGGER trade_plan_events_no_{op} "
+                    f"BEFORE {op.upper()} ON trade_plan_events "
+                    f"FOR EACH ROW EXECUTE FUNCTION raise_immutable()"
+                ))
+
+    logger.debug("Trade plan schema verified (trade_plans, trade_plan_events)")
