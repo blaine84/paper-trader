@@ -146,6 +146,7 @@ class CycleCoordinator:
             CYCLE_PM_TIMEOUT_SECONDS,
             PM_SIGNAL_FRESHNESS_WINDOW_SECONDS,
         )
+        from utils.resource_telemetry import fd_trace, log_fd_snapshot
 
         # Generate cycle identity
         cycle_id = generate_cycle_id(trigger_source)
@@ -159,11 +160,25 @@ class CycleCoordinator:
         self._pm_phase_completed = False
 
         cycle_logger = CycleLogger(cycle_id)
+        log_fd_snapshot(
+            logger,
+            event="cycle",
+            label="coordinated_cycle",
+            cycle_id=cycle_id,
+            status="start",
+            extra={"trigger_source": trigger_source},
+        )
 
         # Phase 1: Focus selection
         symbols: list[str] = []
         try:
-            symbols = self._phase_focus_selection(override_symbols)
+            with fd_trace(
+                logger,
+                label="coordinated_cycle_phase",
+                cycle_id=cycle_id,
+                phase="focus_selection",
+            ):
+                symbols = self._phase_focus_selection(override_symbols)
         except Exception as exc:
             logger.error(
                 "Phase focus_selection failed for cycle_id=%s: %s",
@@ -198,7 +213,14 @@ class CycleCoordinator:
         # Phase 2: Analyst refresh
         try:
             cycle_logger.log_phase_start("analyst_refresh")
-            self._phase_analyst_refresh(ctx, symbols)
+            with fd_trace(
+                logger,
+                label="coordinated_cycle_phase",
+                cycle_id=cycle_id,
+                phase="analyst_refresh",
+                extra={"symbols": len(symbols)},
+            ):
+                self._phase_analyst_refresh(ctx, symbols)
             cycle_logger.log_phase_complete(
                 "analyst_refresh",
                 symbols_processed=len(symbols),
@@ -232,7 +254,14 @@ class CycleCoordinator:
         fresh_symbols: list[str] = []
         try:
             cycle_logger.log_phase_start("freshness_gate")
-            freshness_result = self._phase_freshness_gate(ctx, symbols)
+            with fd_trace(
+                logger,
+                label="coordinated_cycle_phase",
+                cycle_id=cycle_id,
+                phase="freshness_gate",
+                extra={"symbols": len(symbols)},
+            ):
+                freshness_result = self._phase_freshness_gate(ctx, symbols)
             fresh_symbols = list(freshness_result.fresh_symbols)
             cycle_logger.set_symbols_fresh(len(fresh_symbols))
 
@@ -266,7 +295,14 @@ class CycleCoordinator:
         pm_decisions: list[dict] = []
         try:
             cycle_logger.log_phase_start("pm_decisioning")
-            pm_decisions = self._phase_pm_decisioning(ctx, fresh_symbols)
+            with fd_trace(
+                logger,
+                label="coordinated_cycle_phase",
+                cycle_id=cycle_id,
+                phase="pm_decisioning",
+                extra={"fresh_symbols": len(fresh_symbols)},
+            ):
+                pm_decisions = self._phase_pm_decisioning(ctx, fresh_symbols)
             self._pm_phase_completed = True
             cycle_logger.log_phase_complete(
                 "pm_decisioning",
@@ -303,7 +339,13 @@ class CycleCoordinator:
         # Phase 5: Safety checks
         try:
             cycle_logger.log_phase_start("safety_checks")
-            self._phase_safety_checks(ctx)
+            with fd_trace(
+                logger,
+                label="coordinated_cycle_phase",
+                cycle_id=cycle_id,
+                phase="safety_checks",
+            ):
+                self._phase_safety_checks(ctx)
             cycle_logger.log_phase_complete(
                 "safety_checks",
                 status="completed",
@@ -323,7 +365,13 @@ class CycleCoordinator:
         # Phase 6: Bookkeeping (P&L snapshot)
         try:
             cycle_logger.log_phase_start("bookkeeping")
-            self._phase_bookkeeping(ctx)
+            with fd_trace(
+                logger,
+                label="coordinated_cycle_phase",
+                cycle_id=cycle_id,
+                phase="bookkeeping",
+            ):
+                self._phase_bookkeeping(ctx)
             cycle_logger.log_phase_complete(
                 "bookkeeping",
                 status="completed",
@@ -344,6 +392,18 @@ class CycleCoordinator:
         _cycle_decision_window_end = None
 
         summary = cycle_logger.log_cycle_end()
+        log_fd_snapshot(
+            logger,
+            event="cycle",
+            label="coordinated_cycle",
+            cycle_id=cycle_id,
+            status="end",
+            extra={
+                "trigger_source": trigger_source,
+                "symbols_fresh": summary.symbols_fresh,
+                "symbols_stale": summary.symbols_stale_skipped,
+            },
+        )
         return summary
 
     # ------------------------------------------------------------------

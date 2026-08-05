@@ -12,6 +12,12 @@ import logging.handlers
 import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from apscheduler.events import (
+    EVENT_JOB_ERROR,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_MISSED,
+    EVENT_JOB_SUBMITTED,
+)
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from rich.console import Console
@@ -47,6 +53,7 @@ from utils.funnel_discovery import run_funnel_discovery
 from utils.funnel_researcher import run_funnel_qualification
 from utils.funnel_analyst import run_funnel_analysis
 from utils.funnel_confirmation import run_opening_confirmation, run_confirmation_retry
+from utils.resource_telemetry import log_fd_snapshot
 from db.provenance_schema import init_provenance_schema
 from db.blocker_mitigation_schema import init_blocker_mitigation_schema
 
@@ -88,6 +95,48 @@ def _pm_base_watchlist() -> list[str]:
 
 def _env_flag_enabled(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("true", "1", "yes", "enabled")
+
+
+def _resource_telemetry_enabled() -> bool:
+    return _env_flag_enabled("RESOURCE_TELEMETRY_ENABLED", "true")
+
+
+def _install_scheduler_resource_telemetry(scheduler: BlockingScheduler) -> None:
+    """Log FD snapshots at APScheduler job boundaries."""
+    if not _resource_telemetry_enabled():
+        return
+
+    def _listener(event) -> None:
+        code = getattr(event, "code", None)
+        if code == EVENT_JOB_SUBMITTED:
+            status = "submitted"
+            scheduled_runs = len(getattr(event, "scheduled_run_times", []) or [])
+        elif code == EVENT_JOB_EXECUTED:
+            status = "executed"
+            scheduled_runs = None
+        elif code == EVENT_JOB_ERROR:
+            status = "error"
+            scheduled_runs = None
+        elif code == EVENT_JOB_MISSED:
+            status = "missed"
+            scheduled_runs = None
+        else:
+            status = "unknown"
+            scheduled_runs = None
+
+        log_fd_snapshot(
+            log,
+            event="scheduler_job",
+            label="apscheduler",
+            job_id=getattr(event, "job_id", None),
+            status=status,
+            extra={"scheduled_runs": scheduled_runs},
+        )
+
+    scheduler.add_listener(
+        _listener,
+        EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
+    )
 
 
 def _analyst_focus_enabled() -> bool:
@@ -2587,6 +2636,7 @@ def main():
         _alert_dispatcher._recover_stale_intents()
 
     scheduler = BlockingScheduler(timezone="America/New_York")
+    _install_scheduler_resource_telemetry(scheduler)
 
     # ===================================================================
     # PREMARKET FUNNEL JOBS (earliest — before market open)
