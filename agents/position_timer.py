@@ -28,6 +28,10 @@ log = logging.getLogger(__name__)
 
 def _get_setup_type_for_trade(db, trade) -> str:
     """Look up the analyst's setup_type for this trade's symbol at entry time."""
+    persisted_setup = getattr(trade, "setup_type", None)
+    if persisted_setup:
+        return persisted_setup
+
     mem = (
         db.query(AgentMemory)
         .filter_by(agent="analyst", symbol=trade.symbol, key="signal")
@@ -647,12 +651,14 @@ def run(engine) -> dict:
             # time limit (via revalidation hold or explicit close) AND the
             # trade has a target_price, the trade has graduated to swing.
             # Reclassify setup_type to "swing" and skip the close action.
+            #
+            # Hard-wall overnight failures are intentionally excluded: once
+            # overnight authorization is missing, the only safe action is close.
             _RECLASSIFY_STATES = {
                 "setup_time_limit_exceeded",
                 "setup_pre_wall_buffer_close",
                 "setup_max_extension_reached",
                 "setup_revalidation_hold",
-                "overnight_unauthorized",
             }
             state = decision.get("state", "")
             reason_type = decision.get("reason_type", "")

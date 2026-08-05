@@ -401,6 +401,88 @@ def test_observe_hard_wall_no_target_close():
     assert len(result["closes"]) >= 1
 
 
+def test_hard_wall_with_target_and_no_overnight_auth_force_closes():
+    """
+    Regression: a target price is not swing authority. Past the 15:45 ET hard
+    wall, an intraday trade with no overnight authorization must close even if
+    target_price is set.
+    """
+    from agents.position_timer import run
+
+    engine = _make_engine()
+    db = _make_session(engine)
+
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 15, 46, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
+
+    entry_time = fake_now_utc - timedelta(minutes=30)
+
+    trade = _seed_trade(db, "HW_TARGET", "technical_breakout", 460.0, entry_time)
+    trade.setup_type = "technical_breakout"
+    db.commit()
+    db.close()
+
+    with (
+        patch("agents.position_timer._get_current_price", return_value=452.0),
+        patch("agents.position_timer._close_position") as mock_close,
+        patch("agents.position_timer.datetime") as mock_dt,
+    ):
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+        result = run(engine)
+
+    assert mock_close.call_count == 1
+    assert len(result["closes"]) == 1
+    assert result["closes"][0]["state"] == "overnight_unauthorized"
+
+
+def test_reclassified_swing_without_overnight_auth_still_force_closes():
+    """
+    Regression for AMD trade 339 shape: a row that drifted/reclassified to
+    swing is still not authorized for overnight carry unless an
+    overnight_authorized event exists.
+    """
+    from agents.position_timer import run
+
+    engine = _make_engine()
+    db = _make_session(engine)
+
+    _et = _tz("America/New_York")
+    fake_now_et = _et.localize(datetime(2025, 6, 25, 15, 46, 0))
+    fake_now_utc = fake_now_et.astimezone(_utc)
+
+    entry_time = fake_now_utc - timedelta(hours=2)
+
+    trade = _seed_trade(db, "AMD_SHAPE", "technical_breakout", 530.0, entry_time, profile="aggressive")
+    trade.setup_type = "swing"
+    db.commit()
+    db.close()
+
+    with (
+        patch("agents.position_timer._get_current_price", return_value=483.88),
+        patch("agents.position_timer._close_position") as mock_close,
+        patch("agents.position_timer.datetime") as mock_dt,
+    ):
+        def _mn(tz=None):
+            if tz is not None and "UTC" in str(tz):
+                return fake_now_utc
+            return fake_now_et
+        mock_dt.now.side_effect = _mn
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+        result = run(engine)
+
+    assert mock_close.call_count == 1
+    assert len(result["closes"]) == 1
+    assert result["closes"][0]["state"] == "overnight_unauthorized"
+
+
 def test_observe_momentum_fade_with_target_80min():
     """
     Observation: momentum_fade with target_price=450.0, held 80 min
