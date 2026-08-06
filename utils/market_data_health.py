@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from db.schema import AgentMemory, get_session
+from utils.market_data_remediation import maybe_restart_orchestrator_after_market_data_outage
 from utils.trade_events import log_trade_event
 
 log = logging.getLogger(__name__)
@@ -118,4 +119,5 @@ def record_market_data_health_alert(
     finally:
         db.close()
 
+    maybe_restart_orchestrator_after_market_data_outage(payload)
     return payload

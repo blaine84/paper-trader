@@ -72,6 +72,7 @@ def test_price_monitor_empty_quote_batch_records_market_data_outage(monkeypatch)
     engine = _engine()
     price_monitor._last_empty_quote_batch_log = 0.0
     reset_market_data_health_throttle()
+    monkeypatch.setenv("MARKET_DATA_OUTAGE_RESTART_ENABLED", "false")
 
     monkeypatch.setenv("WATCHLIST", "AMD,MSFT")
     monkeypatch.setattr(price_monitor, "get_batch_quotes", lambda symbols, **kwargs: {})
@@ -122,6 +123,7 @@ def test_price_monitor_run_returns_market_data_outages(monkeypatch):
     engine = _engine()
     price_monitor._last_empty_quote_batch_log = 0.0
     reset_market_data_health_throttle()
+    monkeypatch.setenv("MARKET_DATA_OUTAGE_RESTART_ENABLED", "false")
 
     monkeypatch.setenv("WATCHLIST", "AMD,MSFT")
     monkeypatch.setattr(price_monitor, "get_batch_quotes", lambda symbols, **kwargs: {})
@@ -137,6 +139,7 @@ def test_coordinator_all_symbol_analyst_outage_records_health_alert(monkeypatch)
 
     engine = _engine()
     reset_market_data_health_throttle()
+    monkeypatch.setenv("MARKET_DATA_OUTAGE_RESTART_ENABLED", "false")
 
     def fake_run(engine, symbols, cycle_id=None):
         return {
