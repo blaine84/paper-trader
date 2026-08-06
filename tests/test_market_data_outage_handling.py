@@ -3,6 +3,9 @@ import json
 from sqlalchemy import create_engine
 
 from db.schema import AgentMemory, Base, TradeEvent, get_session
+from utils.market_data_health import reset_market_data_health_throttle
+from utils.cycle_coordinator import CycleContext, CycleCoordinator
+from datetime import datetime, timedelta, timezone
 
 
 def _engine():
@@ -68,6 +71,7 @@ def test_price_monitor_empty_quote_batch_records_market_data_outage(monkeypatch)
 
     engine = _engine()
     price_monitor._last_empty_quote_batch_log = 0.0
+    reset_market_data_health_throttle()
 
     monkeypatch.setenv("WATCHLIST", "AMD,MSFT")
     monkeypatch.setattr(price_monitor, "get_batch_quotes", lambda symbols, **kwargs: {})
@@ -88,6 +92,16 @@ def test_price_monitor_empty_quote_batch_records_market_data_outage(monkeypatch)
             .filter_by(event_type="market_data_unavailable")
             .one()
         )
+        health = (
+            db.query(AgentMemory)
+            .filter_by(agent="market_data", key="health_alert")
+            .one()
+        )
+        live = (
+            db.query(AgentMemory)
+            .filter_by(agent="price_monitor", key="live_alerts")
+            .one()
+        )
     finally:
         db.close()
 
@@ -96,3 +110,82 @@ def test_price_monitor_empty_quote_batch_records_market_data_outage(monkeypatch)
     assert payload["reason"] == "all_quote_providers_unavailable"
     assert set(payload["symbols"]) == {"AMD", "MSFT"}
     assert event.agent == "price_monitor"
+    assert json.loads(health.value)["severity"] == "critical"
+    live_alert = json.loads(live.value)[0]
+    assert live_alert["type"] == "market_data_outage"
+    assert live_alert["symbol"] == "SYSTEM"
+
+
+def test_price_monitor_run_returns_market_data_outages(monkeypatch):
+    import agents.price_monitor as price_monitor
+
+    engine = _engine()
+    price_monitor._last_empty_quote_batch_log = 0.0
+    reset_market_data_health_throttle()
+
+    monkeypatch.setenv("WATCHLIST", "AMD,MSFT")
+    monkeypatch.setattr(price_monitor, "get_batch_quotes", lambda symbols, **kwargs: {})
+
+    result = price_monitor.run(engine)
+
+    assert result["market_data_outages"]
+    assert any(o["consumer"] == "momentum" for o in result["market_data_outages"])
+
+
+def test_coordinator_all_symbol_analyst_outage_records_health_alert(monkeypatch):
+    import agents.analyst as analyst
+
+    engine = _engine()
+    reset_market_data_health_throttle()
+
+    def fake_run(engine, symbols, cycle_id=None):
+        return {
+            sym: {"data_unavailable": True, "skip_signal_memory": True}
+            for sym in symbols
+        }
+
+    monkeypatch.setattr(analyst, "run", fake_run)
+
+    now = datetime.now(timezone.utc)
+    ctx = CycleContext(
+        cycle_id="cycle-dns",
+        trigger_source="scheduled",
+        started_at=now,
+        focused_symbols=("AMD", "MSFT"),
+        decision_window_end=now + timedelta(seconds=60),
+        analyst_timeout_seconds=5,
+        pm_timeout_seconds=5,
+        freshness_window_seconds=60,
+        finnhub_budget=10,
+    )
+
+    result = CycleCoordinator(engine)._phase_analyst_refresh(ctx, ["AMD", "MSFT"])
+
+    assert set(result) == {"AMD", "MSFT"}
+
+    db = get_session(engine)
+    try:
+        health = (
+            db.query(AgentMemory)
+            .filter_by(agent="market_data", key="health_alert")
+            .one()
+        )
+        live = (
+            db.query(AgentMemory)
+            .filter_by(agent="price_monitor", key="live_alerts")
+            .one()
+        )
+        event = (
+            db.query(TradeEvent)
+            .filter_by(event_type="market_data_unavailable")
+            .one()
+        )
+    finally:
+        db.close()
+
+    payload = json.loads(health.value)
+    assert payload["source"] == "cycle_coordinator"
+    assert payload["consumer"] == "analyst_refresh"
+    assert payload["details"]["cycle_id"] == "cycle-dns"
+    assert json.loads(live.value)[0]["type"] == "market_data_outage"
+    assert event.agent == "cycle_coordinator"

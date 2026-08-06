@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from db.schema import Trade, Position, AgentMemory, get_session
 from utils.finnhub_client import FinnhubClient
+from utils.market_data_health import record_market_data_health_alert
 from utils.stop_authority import should_stop_trigger
 from utils.trade_events import log_trade_event
 from utils.error_sanitizer import sanitize_error_text
@@ -35,6 +36,7 @@ _last_empty_quote_batch_log = 0.0
 _EMPTY_QUOTE_BATCH_LOG_SECONDS = int(
     os.getenv("PRICE_MONITOR_EMPTY_QUOTE_BATCH_LOG_SECONDS", "300")
 )
+_current_quote_outages: list[dict] = []
 
 
 def _is_within_decision_window() -> bool:
@@ -169,39 +171,32 @@ def _record_empty_quote_batch(engine, consumer: str, symbols: list[str]) -> None
     if not symbols:
         return
 
+    unique_symbols = list(dict.fromkeys(symbols))
+    _current_quote_outages.append({
+        "consumer": consumer,
+        "symbols": unique_symbols,
+        "reason": "all_quote_providers_unavailable",
+    })
+
     now = time.time()
     if now - _last_empty_quote_batch_log < _EMPTY_QUOTE_BATCH_LOG_SECONDS:
         return
     _last_empty_quote_batch_log = now
 
-    payload = {
-        "consumer": consumer,
-        "symbols": list(dict.fromkeys(symbols)),
-        "reason": "all_quote_providers_unavailable",
-    }
     log.error(
         "Market data unavailable for %s: zero quotes returned for %d symbols",
         consumer,
-        len(payload["symbols"]),
+        len(unique_symbols),
     )
-    db = get_session(engine)
-    try:
-        db.add(AgentMemory(
-            agent="market_data",
-            symbol=None,
-            key="quote_outage",
-            value=json.dumps(payload),
-        ))
-        log_trade_event(
-            db,
-            "market_data_unavailable",
-            agent="price_monitor",
-            message=f"{consumer}: zero quotes returned",
-            payload=payload,
-        )
-        db.commit()
-    finally:
-        db.close()
+    record_market_data_health_alert(
+        engine,
+        source="price_monitor",
+        consumer=consumer,
+        symbols=unique_symbols,
+        reason="all_quote_providers_unavailable",
+        message=f"{consumer}: zero quotes returned",
+        throttle_seconds=_EMPTY_QUOTE_BATCH_LOG_SECONDS,
+    )
 
 
 def check_stops_and_targets(engine) -> list[dict]:
@@ -747,6 +742,7 @@ def run(engine) -> dict:
     Full price monitor check. Returns all triggers found.
     Called every 60 seconds by the orchestrator.
     """
+    _current_quote_outages.clear()
     stop_triggers = check_stops_and_targets(engine)
     entry_triggers = check_entry_triggers(engine)
     momentum_alerts = check_momentum(engine)
@@ -784,6 +780,7 @@ def run(engine) -> dict:
         "stop_triggers": stop_triggers,
         "entry_triggers": entry_triggers,
         "momentum_alerts": momentum_alerts,
+        "market_data_outages": list(_current_quote_outages),
         "checked_at": datetime.utcnow().isoformat(),
     }
 

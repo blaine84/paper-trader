@@ -522,9 +522,46 @@ class CycleCoordinator:
 
         try:
             # Re-raise any exception from the analyst
-            return future.result()
+            result = future.result()
+            self._record_all_symbol_analyst_outage(ctx, symbols, result)
+            return result
         finally:
             executor.shutdown(wait=True)
+
+    def _record_all_symbol_analyst_outage(
+        self,
+        ctx: CycleContext,
+        symbols: list[str],
+        result: dict,
+    ) -> None:
+        """Emit a health alert when every analyst symbol lacked market data."""
+        if not symbols or not isinstance(result, dict):
+            return
+
+        unique_symbols = list(dict.fromkeys(symbols))
+        unavailable = [
+            sym
+            for sym in unique_symbols
+            if isinstance(result.get(sym), dict)
+            and result[sym].get("data_unavailable") is True
+        ]
+        if len(unavailable) != len(unique_symbols):
+            return
+
+        from utils.market_data_health import record_market_data_health_alert
+
+        record_market_data_health_alert(
+            self._engine,
+            source="cycle_coordinator",
+            consumer="analyst_refresh",
+            symbols=unique_symbols,
+            reason="all_symbols_data_unavailable",
+            message=(
+                f"Analyst refresh {ctx.cycle_id}: market data unavailable "
+                f"for all {len(unavailable)} symbols"
+            ),
+            details={"cycle_id": ctx.cycle_id, "trigger_source": ctx.trigger_source},
+        )
 
     def _phase_freshness_gate(self, ctx: CycleContext, symbols: list[str]) -> "FreshnessResult":
         """Phase 3: Validate signal freshness. Runs BEFORE PM.

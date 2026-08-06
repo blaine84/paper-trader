@@ -102,6 +102,8 @@
     .alert-chip.alert-entry .alert-sym { color: #58a6ff; }
     .alert-chip.alert-stop { background: #3a1a1a; border: 1px solid #f8514966; }
     .alert-chip.alert-stop .alert-sym { color: #f85149; }
+    .alert-chip.alert-outage { background: #3a1a1a; border: 1px solid #f85149; }
+    .alert-chip.alert-outage .alert-sym { color: #f85149; }
     .alerts-header { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 12px 0; }
     .focus-bar { padding: 8px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid #30363d; background: #0f1715; }
     .focus-label { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -497,6 +499,7 @@
       breakout: '🔵',
       stop: '🔴',
       thesis_invalidation: '🔴',
+      market_data_outage: '🔴',
     };
     const classMap = {
       rapid_move: 'alert-rapid',
@@ -506,14 +509,16 @@
       breakout: 'alert-entry',
       stop: 'alert-stop',
       thesis_invalidation: 'alert-stop',
+      market_data_outage: 'alert-outage',
     };
     const chips = alerts.map(a => {
       const icon = iconMap[a.type] || '⚡';
       const cls = classMap[a.type] || 'alert-entry';
       const time = a.timestamp ? new Date(a.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
+      const price = (a.price !== null && a.price !== undefined && a.price !== '') ? `<span class="alert-price">$${a.price}</span>` : '';
       return `<span class="alert-chip ${cls}">
-        ${icon} <span class="alert-sym">${a.symbol}</span>
-        <span class="alert-price">$${a.price}</span>
+        ${icon} <span class="alert-sym">${escHtml(a.symbol || 'SYSTEM')}</span>
+        ${price}
         <span class="alert-detail">${a.detail}</span>
         <span class="alert-detail">${time}</span>
       </span>`;

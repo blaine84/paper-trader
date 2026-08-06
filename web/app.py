@@ -957,7 +957,7 @@ def api_alerts():
         })
 
     # Sort: rapid_move and stop first, then entry, then approaching
-    type_order = {"rapid_move": 0, "stop": 0, "thesis_invalidation": 0,
+    type_order = {"market_data_outage": 0, "rapid_move": 0, "stop": 0, "thesis_invalidation": 0,
                   "entry": 1, "breakdown": 1, "breakout": 1, "approaching": 2}
     consolidated.sort(key=lambda a: type_order.get(a.get("type"), 3))
 

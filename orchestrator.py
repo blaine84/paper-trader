@@ -2300,9 +2300,27 @@ def run_price_monitor():
     try:
         import agents.price_monitor as price_monitor
         result = price_monitor.run(engine)
+        market_data_outages = result.get("market_data_outages") or []
+        if market_data_outages:
+            log.error(
+                "PRICE_MONITOR_HEALTH_ALERT: %d market-data outage consumer(s): %s",
+                len(market_data_outages),
+                ", ".join(o.get("consumer", "unknown") for o in market_data_outages),
+            )
 
         # Persist live alerts for the web UI
         all_live_alerts = []
+        for outage in market_data_outages:
+            all_live_alerts.append({
+                "type": "market_data_outage",
+                "symbol": "SYSTEM",
+                "price": None,
+                "detail": (
+                    f"{outage.get('consumer', 'market_data')}: zero quotes for "
+                    f"{len(outage.get('symbols') or [])} symbols"
+                ),
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            })
         for t in result.get("entry_triggers", []):
             all_live_alerts.append({
                 "type": t.get("type", "entry"),
