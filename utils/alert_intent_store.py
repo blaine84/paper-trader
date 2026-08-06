@@ -15,7 +15,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from sqlalchemy import text
@@ -43,6 +43,7 @@ class AlertIntent:
     first_seen_at: datetime        # UTC
     last_seen_at: datetime         # UTC
     occurrence_count: int          # >= 1
+    material_occurrence_count: int  # >= 1, occurrences since last dispatch
     expiration_at: datetime        # UTC
     dispatch_status: str           # "pending"|"dispatched"|"consumed"|"expired"|"suppressed"|"dispatch_failed"|"claimed_by_scheduled"
     dispatch_reason: Optional[str]  # suppression reason
@@ -127,6 +128,51 @@ def _parse_iso_dt(val: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(val.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
+def _detect_material_change(
+    *,
+    existing_source_level: str | None,
+    existing_direction: str | None,
+    existing_trigger_price: str | None,
+    new_source_level: str | None,
+    new_direction: str | None,
+    new_trigger_price,
+) -> bool:
+    """Determine if incoming observation represents a material change.
+
+    Null-safe rules:
+    - None == None → not material
+    - None != "value" → material (appeared or disappeared)
+    - "a" != "b" → material
+
+    Price threshold: > ALERT_MATERIAL_PRICE_THRESHOLD_PCT (default 0.5%)
+    - Either price None/zero → material (fail-open)
+    """
+    from utils.gate_config import ALERT_MATERIAL_PRICE_THRESHOLD_PCT
+
+    # Source level comparison (null-safe)
+    if existing_source_level != new_source_level:
+        return True
+
+    # Direction comparison (null-safe)
+    if existing_direction != new_direction:
+        return True
+
+    # Trigger price comparison (threshold-based)
+    try:
+        old_price = Decimal(str(existing_trigger_price)) if existing_trigger_price else None
+        cur_price = Decimal(str(new_trigger_price)) if new_trigger_price else None
+    except (InvalidOperation, ValueError, TypeError):
+        return True  # Cannot parse — treat as material (fail-open)
+
+    if old_price is None or cur_price is None:
+        return True  # Missing price — treat as material (fail-open)
+    if old_price == 0:
+        return True  # Cannot compute % from zero — material (fail-open)
+
+    pct_change = abs((cur_price - old_price) / old_price)
+    return pct_change > Decimal(str(ALERT_MATERIAL_PRICE_THRESHOLD_PCT))
+
+
 class AlertIntentStore:
     """Encapsulates all alert intent and cooldown DB operations."""
 
@@ -153,6 +199,7 @@ class AlertIntentStore:
         dedupe_key: Optional[str] = None,
         trigger_price=None,
         occurrence_count: Optional[int] = None,
+        material_occurrence_count: Optional[int] = None,
         dispatch_batch_symbols: Optional[str] = None,
     ) -> None:
         """Append an audit record to alert_dispatch_log. Fail-open on write failure.
@@ -168,13 +215,13 @@ class AlertIntentStore:
                          dispatch_attempt_count, freshness_age_seconds,
                          first_seen_age_seconds, configured_mode,
                          dedupe_key, trigger_price, occurrence_count,
-                         dispatch_batch_symbols)
+                         material_occurrence_count, dispatch_batch_symbols)
                     VALUES (:alert_intent_id, :symbol, :alert_type, :urgency, :dispatch_status,
                             :reason, :cooldown_remaining_seconds, :cycle_trigger_type,
                             :dispatch_attempt_count, :freshness_age_seconds,
                             :first_seen_age_seconds, :configured_mode,
                             :dedupe_key, :trigger_price, :occurrence_count,
-                            :dispatch_batch_symbols)
+                            :material_occurrence_count, :dispatch_batch_symbols)
                 """), {
                     "alert_intent_id": alert_intent_id,
                     "symbol": symbol,
@@ -191,6 +238,7 @@ class AlertIntentStore:
                     "dedupe_key": dedupe_key,
                     "trigger_price": str(trigger_price) if trigger_price is not None else None,
                     "occurrence_count": occurrence_count,
+                    "material_occurrence_count": material_occurrence_count,
                     "dispatch_batch_symbols": dispatch_batch_symbols,
                 })
             # Structured log at INFO level (Requirement 10.1)
@@ -406,6 +454,7 @@ class AlertIntentStore:
             first_seen_at=_parse_iso_dt(row.first_seen_at),
             last_seen_at=_parse_iso_dt(row.last_seen_at),
             occurrence_count=row.occurrence_count,
+            material_occurrence_count=getattr(row, "material_occurrence_count", 1),
             expiration_at=_parse_iso_dt(row.expiration_at),
             dispatch_status=row.dispatch_status,
             dispatch_reason=row.dispatch_reason,
@@ -418,11 +467,18 @@ class AlertIntentStore:
 
     @with_lock_retry
     def record_or_update_intent(self, intent_data: dict) -> AlertIntent:
-        """UPSERT via INSERT ... ON CONFLICT against partial unique index.
+        """UPSERT with material change detection via read-then-update.
 
-        Inserts a new alert intent or updates an existing one matching the
-        dedupe_key with active dispatch_status. On conflict: updates last_seen_at,
-        increments occurrence_count, and extends expiration_at via MAX.
+        Strategy:
+        1. Read existing row by dedupe_key (if any, active statuses only)
+        2. If exists: compute material change in Python (null-safe)
+        3. UPDATE: always bump occurrence_count, last_seen_at, trigger_price,
+           expiration_at, direction, source_level; conditionally bump
+           material_occurrence_count if material change detected
+        4. If not exists: INSERT with occurrence_count=1, material_occurrence_count=1
+
+        Both counters always populate regardless of feature flag mode
+        (flag gates dispatcher reads, not writes).
 
         Args:
             intent_data: dict with keys: symbol, alert_type, direction,
@@ -432,62 +488,98 @@ class AlertIntentStore:
         Returns:
             The resulting AlertIntent (newly inserted or updated).
         """
-        alert_intent_id = str(uuid.uuid4())
-
         # Apply defaults
         filter_status = intent_data.get("filter_status", "unclassified")
         urgency = intent_data.get("urgency", "medium")
+
+        # Dialect-specific MAX for expiration_at
         if self._engine.dialect.name == "postgresql":
-            occurrence_update = "alert_intents.occurrence_count + 1"
-            expiration_update = "GREATEST(alert_intents.expiration_at, excluded.expiration_at)"
+            expiration_expr = "GREATEST(expiration_at, :expiration_at)"
         else:
-            occurrence_update = "occurrence_count + 1"
-            expiration_update = "MAX(expiration_at, excluded.expiration_at)"
+            expiration_expr = "MAX(expiration_at, :expiration_at)"
 
         with self._engine.begin() as conn:
-            conn.execute(text(f"""
-                INSERT INTO alert_intents (
-                    alert_intent_id, symbol, alert_type, direction, trigger_price,
-                    source_level, urgency, reason, dedupe_key, filter_status,
-                    first_seen_at, last_seen_at, occurrence_count, expiration_at,
-                    dispatch_status, dispatch_attempt_count
-                )
-                VALUES (
-                    :alert_intent_id, :symbol, :alert_type, :direction, :trigger_price,
-                    :source_level, :urgency, :reason, :dedupe_key, :filter_status,
-                    :first_seen_at, :last_seen_at, 1, :expiration_at,
-                    'pending', 0
-                )
-                ON CONFLICT(dedupe_key)
-                    WHERE dispatch_status IN ('pending', 'dispatched', 'claimed_by_scheduled')
-                DO UPDATE SET
-                    last_seen_at = excluded.last_seen_at,
-                    occurrence_count = {occurrence_update},
-                    expiration_at = {expiration_update},
-                    trigger_price = excluded.trigger_price,
-                    direction = excluded.direction,
-                    source_level = excluded.source_level
-            """), {
-                "alert_intent_id": alert_intent_id,
-                "symbol": intent_data["symbol"],
-                "alert_type": intent_data["alert_type"],
-                "direction": intent_data.get("direction"),
-                "trigger_price": str(intent_data["trigger_price"]),
-                "source_level": intent_data.get("source_level"),
-                "urgency": urgency,
-                "reason": intent_data.get("reason"),
-                "dedupe_key": intent_data["dedupe_key"],
-                "filter_status": filter_status,
-                "first_seen_at": intent_data["first_seen_at"],
-                "last_seen_at": intent_data["last_seen_at"],
-                "expiration_at": intent_data["expiration_at"],
-            })
+            # Step 1: Read existing row by dedupe_key (active statuses only)
+            existing = conn.execute(text("""
+                SELECT id, source_level, direction, trigger_price, material_occurrence_count
+                FROM alert_intents
+                WHERE dedupe_key = :dk
+                  AND dispatch_status IN ('pending', 'dispatched', 'claimed_by_scheduled')
+            """), {"dk": intent_data["dedupe_key"]}).fetchone()
 
-            # SELECT the row back to return a full AlertIntent
+            if existing is not None:
+                # Step 2: Detect material change (Python, null-safe)
+                is_material = _detect_material_change(
+                    existing_source_level=existing.source_level,
+                    existing_direction=existing.direction,
+                    existing_trigger_price=existing.trigger_price,
+                    new_source_level=intent_data.get("source_level"),
+                    new_direction=intent_data.get("direction"),
+                    new_trigger_price=intent_data["trigger_price"],
+                )
+
+                # Step 3: UPDATE — always increment occurrence_count, always update
+                # freshness fields; increment material_occurrence_count only if material
+                material_increment = 1 if is_material else 0
+                conn.execute(text(f"""
+                    UPDATE alert_intents SET
+                        occurrence_count = occurrence_count + 1,
+                        material_occurrence_count = material_occurrence_count + :mat_inc,
+                        last_seen_at = :last_seen_at,
+                        trigger_price = :trigger_price,
+                        direction = :direction,
+                        source_level = :source_level,
+                        expiration_at = {expiration_expr}
+                    WHERE id = :id
+                """), {
+                    "mat_inc": material_increment,
+                    "last_seen_at": intent_data["last_seen_at"],
+                    "trigger_price": str(intent_data["trigger_price"]),
+                    "direction": intent_data.get("direction"),
+                    "source_level": intent_data.get("source_level"),
+                    "expiration_at": intent_data["expiration_at"],
+                    "id": existing.id,
+                })
+            else:
+                # Step 4: INSERT with occurrence_count=1, material_occurrence_count=1
+                alert_intent_id = str(uuid.uuid4())
+                conn.execute(text("""
+                    INSERT INTO alert_intents (
+                        alert_intent_id, symbol, alert_type, direction, trigger_price,
+                        source_level, urgency, reason, dedupe_key, filter_status,
+                        first_seen_at, last_seen_at, occurrence_count,
+                        material_occurrence_count, expiration_at,
+                        dispatch_status, dispatch_attempt_count
+                    )
+                    VALUES (
+                        :alert_intent_id, :symbol, :alert_type, :direction, :trigger_price,
+                        :source_level, :urgency, :reason, :dedupe_key, :filter_status,
+                        :first_seen_at, :last_seen_at, 1,
+                        1, :expiration_at,
+                        'pending', 0
+                    )
+                """), {
+                    "alert_intent_id": alert_intent_id,
+                    "symbol": intent_data["symbol"],
+                    "alert_type": intent_data["alert_type"],
+                    "direction": intent_data.get("direction"),
+                    "trigger_price": str(intent_data["trigger_price"]),
+                    "source_level": intent_data.get("source_level"),
+                    "urgency": urgency,
+                    "reason": intent_data.get("reason"),
+                    "dedupe_key": intent_data["dedupe_key"],
+                    "filter_status": filter_status,
+                    "first_seen_at": intent_data["first_seen_at"],
+                    "last_seen_at": intent_data["last_seen_at"],
+                    "expiration_at": intent_data["expiration_at"],
+                })
+
+            # Re-read the row to return a full AlertIntent
             row = conn.execute(text("""
                 SELECT id, alert_intent_id, symbol, alert_type, direction,
                     trigger_price, source_level, urgency, reason, dedupe_key,
                     filter_status, first_seen_at, last_seen_at, occurrence_count,
+                    material_occurrence_count,
                     expiration_at, dispatch_status, dispatch_reason, dispatched_at,
                     deferred_until, occurrence_count_at_deferral,
                     dispatch_attempt_count, last_dispatch_error
@@ -622,6 +714,7 @@ class AlertIntentStore:
                 SELECT id, alert_intent_id, symbol, alert_type, direction,
                     trigger_price, source_level, urgency, reason, dedupe_key,
                     filter_status, first_seen_at, last_seen_at, occurrence_count,
+                    material_occurrence_count,
                     expiration_at, dispatch_status, dispatch_reason, dispatched_at,
                     deferred_until, occurrence_count_at_deferral,
                     dispatch_attempt_count, last_dispatch_error
@@ -861,6 +954,7 @@ class AlertIntentStore:
                 SELECT id, alert_intent_id, symbol, alert_type, direction,
                     trigger_price, source_level, urgency, reason, dedupe_key,
                     filter_status, first_seen_at, last_seen_at, occurrence_count,
+                    material_occurrence_count,
                     expiration_at, dispatch_status, dispatch_reason, dispatched_at,
                     deferred_until, occurrence_count_at_deferral,
                     dispatch_attempt_count, last_dispatch_error
@@ -882,6 +976,7 @@ class AlertIntentStore:
                 SELECT id, alert_intent_id, symbol, alert_type, direction,
                     trigger_price, source_level, urgency, reason, dedupe_key,
                     filter_status, first_seen_at, last_seen_at, occurrence_count,
+                    material_occurrence_count,
                     expiration_at, dispatch_status, dispatch_reason, dispatched_at,
                     deferred_until, occurrence_count_at_deferral,
                     dispatch_attempt_count, last_dispatch_error
@@ -962,6 +1057,7 @@ class AlertIntentStore:
             SELECT id, alert_intent_id, symbol, alert_type, direction,
                 trigger_price, source_level, urgency, reason, dedupe_key,
                 filter_status, first_seen_at, last_seen_at, occurrence_count,
+                material_occurrence_count,
                 expiration_at, dispatch_status, dispatch_reason, dispatched_at,
                 deferred_until, occurrence_count_at_deferral,
                 dispatch_attempt_count, last_dispatch_error
@@ -1080,3 +1176,71 @@ class AlertIntentStore:
             return Decimal(row[0])
         except Exception:
             return None
+
+    def increment_material_occurrence(self, intent_id: int, *, reason: str = "") -> None:
+        """Bump material_occurrence_count by 1 for the given intent.
+
+        Used by the re-arm logic when a deferral window expires with no
+        independent material change — allows a new would_dispatch to be written.
+
+        Fail-open: wraps in try/except, logs warning on failure, returns
+        without raising so pipeline flow is never blocked.
+
+        Args:
+            intent_id: SQLite row id of the alert intent.
+            reason: Audit trail description of why the increment happened
+                (e.g. "deferral_expiry_rearm"). Logged at DEBUG level.
+
+        Requirements: 3.3, 3.4
+        """
+        logger.debug(
+            "increment_material_occurrence: intent_id=%d reason=%s",
+            intent_id, reason,
+        )
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(text("""
+                    UPDATE alert_intents
+                    SET material_occurrence_count = material_occurrence_count + 1
+                    WHERE id = :id
+                """), {"id": intent_id})
+        except Exception as exc:
+            logger.warning(
+                "increment_material_occurrence failed (fail-open): intent_id=%d reason=%s error=%s",
+                intent_id, reason, str(exc),
+            )
+
+    def get_intent_by_id(self, intent_id: int) -> AlertIntent:
+        """Retrieve a single alert intent by its SQLite row id.
+
+        Used by _check_rearm_on_deferral_expiry to re-read the intent
+        after incrementing material_occurrence_count.
+
+        Args:
+            intent_id: SQLite row id of the alert intent.
+
+        Returns:
+            AlertIntent dataclass for the row.
+
+        Raises:
+            ValueError: If no row found for the given id.
+
+        Requirements: 3.3
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT id, alert_intent_id, symbol, alert_type, direction,
+                    trigger_price, source_level, urgency, reason, dedupe_key,
+                    filter_status, first_seen_at, last_seen_at, occurrence_count,
+                    material_occurrence_count,
+                    expiration_at, dispatch_status, dispatch_reason, dispatched_at,
+                    deferred_until, occurrence_count_at_deferral,
+                    dispatch_attempt_count, last_dispatch_error
+                FROM alert_intents
+                WHERE id = :id
+            """), {"id": intent_id}).fetchone()
+
+        if row is None:
+            raise ValueError(f"No alert intent found with id={intent_id}")
+
+        return self._row_to_intent(row)

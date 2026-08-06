@@ -77,6 +77,7 @@ def _make_intent(
         first_seen_at=now - timedelta(minutes=30),
         last_seen_at=last_seen_at,
         occurrence_count=1,
+        material_occurrence_count=1,
         expiration_at=now + timedelta(hours=1),
         dispatch_status="pending",
         dispatch_reason=None,

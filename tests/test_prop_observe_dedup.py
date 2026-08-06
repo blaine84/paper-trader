@@ -348,3 +348,289 @@ class TestProperty5ObserveDeduplication:
             trigger_price=intent.trigger_price,
             occurrence_count=intent.occurrence_count + 1,
         ), "has_would_dispatch should be False for a new occurrence_count"
+
+
+# ---------------------------------------------------------------------------
+# Property 6: Material Occurrence Semantics (enabled mode)
+# ---------------------------------------------------------------------------
+
+
+class TestProperty6MaterialOccurrenceSemantics:
+    """
+    Property 6: Material occurrence semantics — enabled mode behavior.
+
+    Validates:
+    - N upserts with same source/direction/price-within-threshold → material_occurrence_count == 1
+    - Upsert with price > threshold → material_occurrence_count increments
+    - _is_deferred with stable material counter + active deferral → True
+    - _handle_observe with stable material_occurrence_count → at most 1 would_dispatch
+
+    **Validates: Requirements 0.1–0.5, 2.1–2.5, 4.1–4.5**
+    """
+
+    @given(
+        symbol=st_symbol,
+        alert_type=st_alert_type,
+        base_price=st.decimals(min_value=Decimal("10.00"), max_value=Decimal("5000.00"), places=2),
+        num_upserts=st.integers(min_value=2, max_value=10),
+        direction=st.sampled_from(["long", "short"]),
+    )
+    @settings(max_examples=200)
+    @patch("utils.gate_config.ALERT_MATERIAL_OCCURRENCE_MODE", "enabled")
+    def test_n_upserts_same_data_material_count_stays_one(
+        self,
+        symbol: str,
+        alert_type: str,
+        base_price: Decimal,
+        num_upserts: int,
+        direction: str,
+    ):
+        """N upserts with same source/direction/price-within-threshold → material_occurrence_count == 1.
+
+        Generates N repeated calls to record_or_update_intent with the same source_level,
+        direction, and prices within 0.4% of base. Asserts material_occurrence_count == 1
+        after all upserts.
+
+        **Validates: Requirements 0.1, 0.2, 0.5**
+        """
+        assume(base_price > 0)
+
+        engine, store, _ = _create_store_and_dispatcher()
+
+        source_level = f"resistance_{symbol}"
+        dedupe_key = f"{symbol}:{alert_type}:{uuid.uuid4().hex[:16]}"
+        now = _BASE_TIME
+
+        # First insert
+        data = {
+            "symbol": symbol,
+            "alert_type": alert_type,
+            "direction": direction,
+            "trigger_price": str(base_price),
+            "source_level": source_level,
+            "urgency": "medium",
+            "reason": None,
+            "dedupe_key": dedupe_key,
+            "filter_status": "passed",
+            "first_seen_at": now.strftime(_ISO_FMT),
+            "last_seen_at": now.strftime(_ISO_FMT),
+            "expiration_at": "2025-01-30T23:00:00.000Z",
+        }
+        intent = store.record_or_update_intent(data)
+        assert intent.material_occurrence_count == 1
+
+        # Subsequent upserts with prices within 0.4% of base (below 0.5% threshold)
+        for i in range(1, num_upserts):
+            # Generate price within 0.4% of base: base * (1 + drift)
+            # drift magnitude is at most 0.004 (0.4%)
+            drift_factor = Decimal("0.004") * Decimal(str(i)) / Decimal(str(num_upserts))
+            price_with_drift = (base_price * (Decimal("1") + drift_factor)).quantize(Decimal("0.01"))
+
+            tick_time = (now + timedelta(minutes=i)).strftime(_ISO_FMT)
+            data_update = {
+                "symbol": symbol,
+                "alert_type": alert_type,
+                "direction": direction,
+                "trigger_price": str(price_with_drift),
+                "source_level": source_level,
+                "urgency": "medium",
+                "reason": None,
+                "dedupe_key": dedupe_key,
+                "filter_status": "passed",
+                "first_seen_at": now.strftime(_ISO_FMT),
+                "last_seen_at": tick_time,
+                "expiration_at": "2025-01-30T23:00:00.000Z",
+            }
+            intent = store.record_or_update_intent(data_update)
+
+        # After all upserts, material_occurrence_count should still be 1
+        assert intent.material_occurrence_count == 1, (
+            f"Expected material_occurrence_count == 1 after {num_upserts} upserts "
+            f"with same source/direction/price-within-threshold, got {intent.material_occurrence_count}"
+        )
+        # But occurrence_count should have incremented
+        assert intent.occurrence_count == num_upserts
+
+    @given(
+        symbol=st_symbol,
+        alert_type=st_alert_type,
+        base_price=st.decimals(min_value=Decimal("10.00"), max_value=Decimal("5000.00"), places=2),
+        direction=st.sampled_from(["long", "short"]),
+    )
+    @settings(max_examples=200)
+    @patch("utils.gate_config.ALERT_MATERIAL_OCCURRENCE_MODE", "enabled")
+    def test_upsert_price_above_threshold_increments_material_count(
+        self,
+        symbol: str,
+        alert_type: str,
+        base_price: Decimal,
+        direction: str,
+    ):
+        """Upsert with price > 0.5% from base → material_occurrence_count increments to 2.
+
+        Generates two prices where the second is > 0.5% from the first.
+        Asserts material_occurrence_count == 2 after second upsert.
+
+        **Validates: Requirements 0.2, 3.5, 3.7**
+        """
+        assume(base_price > 0)
+
+        engine, store, _ = _create_store_and_dispatcher()
+
+        source_level = f"resistance_{symbol}"
+        dedupe_key = f"{symbol}:{alert_type}:{uuid.uuid4().hex[:16]}"
+        now = _BASE_TIME
+
+        # First insert
+        data = {
+            "symbol": symbol,
+            "alert_type": alert_type,
+            "direction": direction,
+            "trigger_price": str(base_price),
+            "source_level": source_level,
+            "urgency": "medium",
+            "reason": None,
+            "dedupe_key": dedupe_key,
+            "filter_status": "passed",
+            "first_seen_at": now.strftime(_ISO_FMT),
+            "last_seen_at": now.strftime(_ISO_FMT),
+            "expiration_at": "2025-01-30T23:00:00.000Z",
+        }
+        intent = store.record_or_update_intent(data)
+        assert intent.material_occurrence_count == 1
+
+        # Second upsert with price > 0.5% away (use 1% above to guarantee > threshold)
+        new_price = (base_price * Decimal("1.01")).quantize(Decimal("0.01"))
+
+        data_update = {
+            "symbol": symbol,
+            "alert_type": alert_type,
+            "direction": direction,
+            "trigger_price": str(new_price),
+            "source_level": source_level,
+            "urgency": "medium",
+            "reason": None,
+            "dedupe_key": dedupe_key,
+            "filter_status": "passed",
+            "first_seen_at": now.strftime(_ISO_FMT),
+            "last_seen_at": (now + timedelta(minutes=1)).strftime(_ISO_FMT),
+            "expiration_at": "2025-01-30T23:00:00.000Z",
+        }
+        intent = store.record_or_update_intent(data_update)
+
+        assert intent.material_occurrence_count == 2, (
+            f"Expected material_occurrence_count == 2 after price change > threshold "
+            f"({base_price} → {new_price}), got {intent.material_occurrence_count}"
+        )
+        assert intent.occurrence_count == 2
+
+    @given(
+        symbol=st_symbol,
+        alert_type=st_alert_type,
+        trigger_price=st.decimals(min_value=Decimal("1.00"), max_value=Decimal("9999.99"), places=2),
+        material_occ=st.integers(min_value=1, max_value=50),
+        cooldown_minutes=st.integers(min_value=5, max_value=60),
+    )
+    @settings(max_examples=200)
+    @patch("utils.gate_config.ALERT_MATERIAL_OCCURRENCE_MODE", "enabled")
+    def test_is_deferred_stable_material_counter_active_deferral(
+        self,
+        symbol: str,
+        alert_type: str,
+        trigger_price: Decimal,
+        material_occ: int,
+        cooldown_minutes: int,
+    ):
+        """_is_deferred with stable material counter + active deferral → True.
+
+        Generates an AlertIntent with deferred_until in the future and
+        material_occurrence_count == occurrence_count_at_deferral.
+        Asserts _is_deferred returns True (intent remains deferred).
+
+        **Validates: Requirements 4.1, 4.2, 4.3**
+        """
+        engine, store, dispatcher = _create_store_and_dispatcher()
+
+        now = _BASE_TIME + timedelta(minutes=1)
+        deferred_until = now + timedelta(minutes=cooldown_minutes)
+
+        # Build an AlertIntent with stable material counter matching deferral snapshot
+        intent = AlertIntent(
+            id=1,
+            alert_intent_id=str(uuid.uuid4()),
+            symbol=symbol,
+            alert_type=alert_type,
+            direction="long",
+            trigger_price=trigger_price,
+            source_level=f"level_{symbol}",
+            urgency="medium",
+            reason=None,
+            dedupe_key=f"{symbol}:{alert_type}:test",
+            filter_status="passed",
+            first_seen_at=_BASE_TIME,
+            last_seen_at=now,
+            occurrence_count=material_occ + 5,  # Raw count can be higher
+            material_occurrence_count=material_occ,
+            expiration_at=_BASE_TIME + timedelta(days=7),
+            dispatch_status="pending",
+            dispatch_reason=None,
+            dispatched_at=None,
+            deferred_until=deferred_until,
+            occurrence_count_at_deferral=material_occ,  # Same as material counter → stable
+            dispatch_attempt_count=0,
+            last_dispatch_error=None,
+        )
+
+        result = dispatcher._is_deferred(intent, now)
+        assert result is True, (
+            f"Expected _is_deferred=True when material_occurrence_count ({material_occ}) "
+            f"== occurrence_count_at_deferral ({material_occ}) and deferred_until in future"
+        )
+
+    @given(
+        symbol=st_symbol,
+        alert_type=st_alert_type,
+        trigger_price=st.decimals(min_value=Decimal("1.00"), max_value=Decimal("9999.99"), places=2),
+        num_calls=st.integers(min_value=2, max_value=10),
+    )
+    @settings(max_examples=200)
+    @patch("utils.gate_config.ALERT_MATERIAL_OCCURRENCE_MODE", "enabled")
+    @patch("utils.gate_config.PM_ALERT_SYMBOL_COOLDOWN_MINUTES", 15)
+    def test_handle_observe_stable_material_count_at_most_one_would_dispatch(
+        self,
+        symbol: str,
+        alert_type: str,
+        trigger_price: Decimal,
+        num_calls: int,
+    ):
+        """_handle_observe with stable material_occurrence_count → at most 1 would_dispatch.
+
+        Generates N calls to _handle_observe with same intent (material_occurrence_count=1).
+        Asserts exactly 1 would_dispatch row.
+
+        **Validates: Requirements 2.1, 2.2, 2.5**
+        """
+        engine, store, dispatcher = _create_store_and_dispatcher()
+
+        dedupe_key = f"{symbol}:{alert_type}:{uuid.uuid4().hex[:16]}"
+        intent = _insert_intent(
+            store,
+            symbol=symbol,
+            alert_type=alert_type,
+            trigger_price=trigger_price,
+            occurrence_count=1,
+            dedupe_key=dedupe_key,
+        )
+
+        now = _BASE_TIME + timedelta(minutes=1)
+
+        # Call _handle_observe N times with same intent (material_occurrence_count=1)
+        for _ in range(num_calls):
+            dispatcher._handle_observe(intent, now)
+
+        # Exactly 1 would_dispatch row should exist
+        count = _count_would_dispatch_rows(engine, intent.alert_intent_id)
+        assert count == 1, (
+            f"Expected exactly 1 would_dispatch row after {num_calls} calls "
+            f"with stable material_occurrence_count=1, got {count}"
+        )

@@ -259,7 +259,7 @@ def _migrate_alert_intents_columns(engine) -> None:
     Required for dispatch-once semantics (occurrence_count_at_deferral stores
     the occurrence_count at the time deferral was set, enabling material change detection).
 
-    Requirements: 2.1, 2.5
+    Requirements: 0.1, 0.2, 2.1, 2.5, 5.3, 6.6
     """
     inspector = sa_inspect(engine)
     existing_columns = {col["name"] for col in inspector.get_columns("alert_intents")}
@@ -271,6 +271,24 @@ def _migrate_alert_intents_columns(engine) -> None:
             ))
             logger.warning(
                 "Schema migration: added alert_intents.occurrence_count_at_deferral (INTEGER DEFAULT 0)"
+            )
+
+    if "material_occurrence_count" not in existing_columns:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE alert_intents ADD COLUMN material_occurrence_count INTEGER DEFAULT 1"
+            ))
+            # Backfill: preserve deferral snapshot semantics for existing rows
+            conn.execute(text("""
+                UPDATE alert_intents
+                SET material_occurrence_count = COALESCE(occurrence_count_at_deferral, 1)
+                WHERE material_occurrence_count = 1
+                  AND occurrence_count_at_deferral IS NOT NULL
+                  AND occurrence_count_at_deferral > 1
+            """))
+            logger.warning(
+                "Schema migration: added alert_intents.material_occurrence_count "
+                "(backfilled from occurrence_count_at_deferral)"
             )
 
 
@@ -290,6 +308,7 @@ def _add_dispatch_log_audit_columns(engine) -> None:
         ("dispatch_batch_symbols", "TEXT"),
         ("trigger_price", "REAL"),
         ("occurrence_count", "INTEGER"),
+        ("material_occurrence_count", "INTEGER"),
     ]
 
     inspector = sa_inspect(engine)
