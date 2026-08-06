@@ -82,6 +82,7 @@ def _make_intent(
         first_seen_at=datetime(2024, 6, 1, 10, 0, 0),
         last_seen_at=datetime(2024, 6, 1, 10, 5, 0),
         occurrence_count=occurrence_count,
+        material_occurrence_count=1,
         expiration_at=datetime(2024, 6, 1, 12, 0, 0),
         dispatch_status="pending",
         dispatch_reason=None,

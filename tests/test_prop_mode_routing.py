@@ -91,6 +91,7 @@ def _make_fresh_intent(
         first_seen_at=now - timedelta(minutes=2),
         last_seen_at=now - timedelta(minutes=1),
         occurrence_count=occurrence_count,
+        material_occurrence_count=1,
         expiration_at=now + timedelta(hours=2),
         dispatch_status="pending",
         dispatch_reason=None,

@@ -65,6 +65,7 @@ def _make_intent(
         first_seen_at=now - timedelta(minutes=5),
         last_seen_at=now - timedelta(minutes=1),  # Fresh (within 15min limit)
         occurrence_count=1,
+        material_occurrence_count=1,
         expiration_at=now + timedelta(hours=1),
         dispatch_status="pending",
         dispatch_reason=None,

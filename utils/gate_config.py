@@ -548,6 +548,29 @@ PM_ALERT_MODE_BREAKOUT: str = os.environ.get("PM_ALERT_MODE_BREAKOUT", "")
 PM_ALERT_MODE_RAPID_MOVE: str = os.environ.get("PM_ALERT_MODE_RAPID_MOVE", "")
 PM_ALERT_MODE_TARGET_HIT: str = os.environ.get("PM_ALERT_MODE_TARGET_HIT", "")
 
+# ---------------------------------------------------------------------------
+# Alert Material Occurrence Feature Flag
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "enabled"
+# Controls which counter the dispatcher uses for deferral/dedup decisions.
+# "disabled": occurrence_count drives decisions (existing behavior)
+# "enabled": material_occurrence_count drives decisions (fixed behavior)
+#
+# Invariant (both modes):
+#   - occurrence_count always increments on every upsert
+#   - material_occurrence_count always populates best-effort
+#   - Only dispatcher READS are gated by this flag
+ALERT_MATERIAL_OCCURRENCE_MODE: str = os.environ.get(
+    "ALERT_MATERIAL_OCCURRENCE_MODE", "disabled"
+)
+
+# Material price change threshold (decimal fraction, e.g. 0.005 = 0.5%)
+# Price changes at or below this threshold are NOT material.
+ALERT_MATERIAL_PRICE_THRESHOLD_PCT: float = float(
+    os.environ.get("ALERT_MATERIAL_PRICE_THRESHOLD_PCT", "0.005")
+)
+
 
 # ---------------------------------------------------------------------------
 # Alert Freshness Limits

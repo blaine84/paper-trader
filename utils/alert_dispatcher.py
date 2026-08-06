@@ -130,6 +130,11 @@ class AlertDispatcher:
                 if self._is_deferred(intent, now):
                     continue  # Silently skip deferred
 
+                # Re-arm check: if deferral just expired (not "never deferred"),
+                # bump material_occurrence_count so a new would_dispatch is allowed.
+                if intent.deferred_until is not None and intent.deferred_until <= now:
+                    intent = self._check_rearm_on_deferral_expiry(intent, now)
+
                 if effective == "observe":
                     self._handle_observe(intent, now)
                     observe_count += 1
@@ -568,24 +573,35 @@ class AlertDispatcher:
     def _is_deferred(self, intent: AlertIntent, now: datetime) -> bool:
         """Check if intent is deferred and unchanged.
 
+        When ALERT_MATERIAL_OCCURRENCE_MODE == "enabled":
+          Compares material_occurrence_count vs occurrence_count_at_deferral.
+        When "disabled":
+          Existing behavior (compares occurrence_count vs snapshot).
+
         Returns True (skip) if:
         - deferred_until > now AND
-        - occurrence_count has not incremented since deferral was set
+        - the relevant counter has not incremented since deferral was set
 
         Returns False (re-evaluate) if:
         - deferred_until is None (not deferred)
         - deferred_until <= now (deferral expired)
-        - occurrence_count > occurrence_count_at_deferral (material change)
+        - relevant counter > occurrence_count_at_deferral (material change)
 
-        Requirements: 2.5
+        Requirements: 2.5, 4.1–4.5
         """
+        from utils.gate_config import ALERT_MATERIAL_OCCURRENCE_MODE
+
         if intent.deferred_until is None:
             return False
         if intent.deferred_until <= now:
             return False  # Deferral expired — re-evaluate
-        # Check if occurrence changed since deferral
-        if intent.occurrence_count > intent.occurrence_count_at_deferral:
-            return False  # Material change — re-evaluate despite deferral
+
+        if ALERT_MATERIAL_OCCURRENCE_MODE == "enabled":
+            if intent.material_occurrence_count > intent.occurrence_count_at_deferral:
+                return False  # Material change — re-evaluate despite deferral
+        else:
+            if intent.occurrence_count > intent.occurrence_count_at_deferral:
+                return False  # Legacy behavior
         return True
 
     def _set_deferred(self, intent_id: int, cooldown_expiry: datetime, occurrence_count: int) -> None:
@@ -598,6 +614,44 @@ class AlertDispatcher:
             deferred_until=cooldown_expiry,
             occurrence_count_at_deferral=occurrence_count,
         )
+
+    def _check_rearm_on_deferral_expiry(self, intent: AlertIntent, now: datetime) -> AlertIntent:
+        """If deferral just expired with no independent material change, re-arm.
+
+        Conditions for re-arm:
+        - deferred_until WAS set and has now passed
+        - material_occurrence_count == occurrence_count_at_deferral (no other change)
+        - Intent is still pending/active
+
+        Effect: bumps material_occurrence_count by 1, allowing a new would_dispatch.
+        This means stable alerts produce at most one would_dispatch per cooldown interval.
+
+        Only active when ALERT_MATERIAL_OCCURRENCE_MODE == "enabled".
+
+        Requirements: 3.3, 3.4, 7.3
+        """
+        from utils.gate_config import ALERT_MATERIAL_OCCURRENCE_MODE
+
+        if ALERT_MATERIAL_OCCURRENCE_MODE != "enabled":
+            return intent
+
+        if intent.deferred_until is None:
+            return intent
+        if intent.deferred_until > now:
+            return intent  # Still deferred (shouldn't reach here, but defensive)
+        if intent.material_occurrence_count > intent.occurrence_count_at_deferral:
+            return intent  # Independent material change already — no extra bump needed
+
+        # Deferral expired, no independent change → re-arm
+        try:
+            self._store.increment_material_occurrence(intent.id, reason="deferral_expiry_rearm")
+            return self._store.get_intent_by_id(intent.id)
+        except Exception as exc:
+            logger.warning(
+                "REARM_FAILED: intent_id=%d error=%s — returning original intent (fail-open)",
+                intent.id, str(exc),
+            )
+            return intent
 
     @staticmethod
     def _is_material_price_change(current_price, previous_price) -> bool:
@@ -640,81 +694,121 @@ class AlertDispatcher:
     def _handle_observe(self, intent: AlertIntent, now: datetime) -> None:
         """Record would-dispatch for first observation, dedup subsequent unchanged.
 
-        Material change detection (Requirement 8.3, 8.4):
-        - dedupe_key refresh → new observation (handled by exact-match dedup)
-        - trigger_price change >0.5% → new observation
-        - occurrence_count increment → new observation (handled by exact-match dedup)
-        - cooldown expiry → new observation (deferral system handles this)
+        When ALERT_MATERIAL_OCCURRENCE_MODE == "enabled":
+          Uses material_occurrence_count for exact-match dedup. Since the material
+          counter is stable between raw ticks, has_would_dispatch will find the
+          existing row and skip silently. Skips the secondary _is_material_price_change()
+          check because material detection is already handled at upsert time.
 
-        If the exact-match dedup passes (unchanged dedupe_key, trigger_price,
-        occurrence_count), skip silently. If exact match fails (any field changed),
-        apply the 0.5% threshold for trigger_price: if only the price changed and
-        the change is <=0.5%, suppress the new observation.
+        When "disabled":
+          Existing behavior — uses occurrence_count for dedup, applies secondary
+          price-change threshold check.
 
-        Requirements: 2.1, 2.3, 8.1, 8.2, 8.3, 8.4
+        Requirements: 2.1–2.5, 4.4, 8.1, 8.2, 8.3, 8.4
         """
         from datetime import timedelta
-        from utils.gate_config import PM_ALERT_SYMBOL_COOLDOWN_MINUTES
+        from utils.gate_config import PM_ALERT_SYMBOL_COOLDOWN_MINUTES, ALERT_MATERIAL_OCCURRENCE_MODE
 
-        # Check if we already observed this exact occurrence (exact match on all fields)
-        if self._store.has_would_dispatch_for_occurrence(
-            alert_intent_id=intent.alert_intent_id,
-            dedupe_key=intent.dedupe_key,
-            trigger_price=intent.trigger_price,
-            occurrence_count=intent.occurrence_count,
-        ):
-            return  # Already observed this exact state — skip silently
-
-        # Exact match failed — something changed. Apply material change threshold.
-        # Get the latest observed trigger_price to check if the price change is material.
-        last_observed_price = self._store.get_latest_would_dispatch_trigger_price(
-            alert_intent_id=intent.alert_intent_id,
-        )
-
-        if last_observed_price is not None:
-            # A prior observation exists. Check what changed:
-            # - If dedupe_key or occurrence_count changed, that's always material
-            #   (the exact-match already failed, so at least one field differs).
-            #   We need to check if it's ONLY a price change within threshold.
-            # Query whether a would_dispatch exists with same dedupe_key & occurrence_count
-            # but different price. If so, only price changed — apply threshold.
-            has_same_key_and_count = self._store.has_would_dispatch_for_occurrence(
+        if ALERT_MATERIAL_OCCURRENCE_MODE == "enabled":
+            # --- Enabled mode: dedup on material_occurrence_count ---
+            # Since material counter only increments on genuine material change,
+            # stable raw ticks will match the existing would_dispatch row.
+            if self._store.has_would_dispatch_for_occurrence(
                 alert_intent_id=intent.alert_intent_id,
                 dedupe_key=intent.dedupe_key,
-                trigger_price=last_observed_price,  # Use the stored price for exact match
+                trigger_price=intent.trigger_price,
+                occurrence_count=intent.material_occurrence_count,
+            ):
+                return  # Already observed this material state — skip
+
+            # First observation of this material occurrence: write would_dispatch
+            age_seconds = (now - intent.last_seen_at).total_seconds() if intent.last_seen_at else -1
+            first_seen_age = (now - intent.first_seen_at).total_seconds() if intent.first_seen_at else -1
+            cooldown_expiry = now + timedelta(minutes=PM_ALERT_SYMBOL_COOLDOWN_MINUTES)
+
+            self._store.record_audit_log(
+                alert_intent_id=intent.alert_intent_id,
+                symbol=intent.symbol,
+                alert_type=intent.alert_type,
+                urgency=intent.urgency,
+                dispatch_status="would_dispatch",
+                reason="observe_mode",
+                freshness_age_seconds=age_seconds,
+                first_seen_age_seconds=first_seen_age,
+                configured_mode="observe",
+                dedupe_key=intent.dedupe_key,
+                trigger_price=intent.trigger_price,
                 occurrence_count=intent.occurrence_count,
+                material_occurrence_count=intent.material_occurrence_count,
             )
-            if has_same_key_and_count:
-                # Only price changed (dedupe_key and occurrence_count match prior observation)
-                # Apply 0.5% threshold
-                if not self._is_material_price_change(intent.trigger_price, last_observed_price):
-                    return  # Price change <=0.5% — not material, skip silently
+            self._set_deferred(intent.id, cooldown_expiry, intent.material_occurrence_count)
 
-        # Material change confirmed (or first observation): record
-        age_seconds = (now - intent.last_seen_at).total_seconds() if intent.last_seen_at else -1
-        first_seen_age = (now - intent.first_seen_at).total_seconds() if intent.first_seen_at else -1
-        cooldown_expiry = now + timedelta(minutes=PM_ALERT_SYMBOL_COOLDOWN_MINUTES)
+            logger.info(
+                "ALERT_OBSERVE_WOULD_DISPATCH: symbol=%s alert_type=%s urgency=%s age_seconds=%.1f material_occ=%d",
+                intent.symbol, intent.alert_type, intent.urgency, age_seconds, intent.material_occurrence_count,
+            )
+        else:
+            # --- Disabled mode: existing behavior unchanged ---
+            # Check if we already observed this exact occurrence (exact match on all fields)
+            if self._store.has_would_dispatch_for_occurrence(
+                alert_intent_id=intent.alert_intent_id,
+                dedupe_key=intent.dedupe_key,
+                trigger_price=intent.trigger_price,
+                occurrence_count=intent.occurrence_count,
+            ):
+                return  # Already observed this exact state — skip silently
 
-        self._store.record_audit_log(
-            alert_intent_id=intent.alert_intent_id,
-            symbol=intent.symbol,
-            alert_type=intent.alert_type,
-            urgency=intent.urgency,
-            dispatch_status="would_dispatch",
-            reason="observe_mode",
-            freshness_age_seconds=age_seconds,
-            first_seen_age_seconds=first_seen_age,
-            configured_mode="observe",
-            dedupe_key=intent.dedupe_key,
-            trigger_price=intent.trigger_price,
-            occurrence_count=intent.occurrence_count,
-        )
-        self._set_deferred(intent.id, cooldown_expiry, intent.occurrence_count)
+            # Exact match failed — something changed. Apply material change threshold.
+            # Get the latest observed trigger_price to check if the price change is material.
+            last_observed_price = self._store.get_latest_would_dispatch_trigger_price(
+                alert_intent_id=intent.alert_intent_id,
+            )
 
-        logger.info(
-            "ALERT_OBSERVE_WOULD_DISPATCH: symbol=%s alert_type=%s urgency=%s age_seconds=%.1f",
-            intent.symbol, intent.alert_type, intent.urgency, age_seconds,
-        )
+            if last_observed_price is not None:
+                # A prior observation exists. Check what changed:
+                # - If dedupe_key or occurrence_count changed, that's always material
+                #   (the exact-match already failed, so at least one field differs).
+                #   We need to check if it's ONLY a price change within threshold.
+                # Query whether a would_dispatch exists with same dedupe_key & occurrence_count
+                # but different price. If so, only price changed — apply threshold.
+                has_same_key_and_count = self._store.has_would_dispatch_for_occurrence(
+                    alert_intent_id=intent.alert_intent_id,
+                    dedupe_key=intent.dedupe_key,
+                    trigger_price=last_observed_price,  # Use the stored price for exact match
+                    occurrence_count=intent.occurrence_count,
+                )
+                if has_same_key_and_count:
+                    # Only price changed (dedupe_key and occurrence_count match prior observation)
+                    # Apply 0.5% threshold
+                    if not self._is_material_price_change(intent.trigger_price, last_observed_price):
+                        return  # Price change <=0.5% — not material, skip silently
+
+            # Material change confirmed (or first observation): record
+            age_seconds = (now - intent.last_seen_at).total_seconds() if intent.last_seen_at else -1
+            first_seen_age = (now - intent.first_seen_at).total_seconds() if intent.first_seen_at else -1
+            cooldown_expiry = now + timedelta(minutes=PM_ALERT_SYMBOL_COOLDOWN_MINUTES)
+
+            self._store.record_audit_log(
+                alert_intent_id=intent.alert_intent_id,
+                symbol=intent.symbol,
+                alert_type=intent.alert_type,
+                urgency=intent.urgency,
+                dispatch_status="would_dispatch",
+                reason="observe_mode",
+                freshness_age_seconds=age_seconds,
+                first_seen_age_seconds=first_seen_age,
+                configured_mode="observe",
+                dedupe_key=intent.dedupe_key,
+                trigger_price=intent.trigger_price,
+                occurrence_count=intent.occurrence_count,
+                material_occurrence_count=intent.material_occurrence_count,
+            )
+            self._set_deferred(intent.id, cooldown_expiry, intent.occurrence_count)
+
+            logger.info(
+                "ALERT_OBSERVE_WOULD_DISPATCH: symbol=%s alert_type=%s urgency=%s age_seconds=%.1f",
+                intent.symbol, intent.alert_type, intent.urgency, age_seconds,
+            )
 
     def _select_dispatch_set(self, eligible: list[AlertIntent]) -> list[AlertIntent]:
         """Apply urgency-based dispatch timing and 10-symbol cap.
