@@ -1246,9 +1246,10 @@
       ['pm_not_selected', 'PM Not Selected', 'dim'],
       ['pipeline_execution_failed', 'Exec Failed', 'red'],
     ];
-    const legacyHtml = legacyCards.map(([key, label, cls]) => `
+    const legacyHasValues = legacyCards.some(([key]) => s[key]);
+    const legacyHtml = legacyHasValues ? legacyCards.map(([key, label, cls]) => `
       <div class="stat-box"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${s[key] || 0}</div></div>
-    `).join('');
+    `).join('') : '';
     const telemetryHtml = telemetryCards.map(([key, label, cls]) => `
       <div class="stat-box"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${e[key] || 0}</div></div>
     `).join('');
