@@ -1231,16 +1231,28 @@
     const summaryEl = document.getElementById('shadowSummary');
     const bodyEl = document.getElementById('shadowBody');
     const s = data.summary || {};
-    const cards = [
+    const e = data.event_summary || {};
+    const legacyCards = [
       ['saved_us', 'Saved Us', 'green'],
       ['possibly_overblocked', 'Maybe Overblocked', 'yellow'],
       ['blocked_winner', 'Blocked Winner', 'red'],
       ['neutral', 'Neutral', 'dim'],
-      ['pending', 'Pending 60m', 'cyan'],
+      ['pending', 'Outcome Pending', 'cyan'],
     ];
-    summaryEl.innerHTML = cards.map(([key, label, cls]) => `
+    const telemetryCards = [
+      ['total', 'Telemetry Rows', 'cyan'],
+      ['preflight_excluded', 'Preflight Excluded', 'yellow'],
+      ['pm_reject', 'PM Reject', 'red'],
+      ['pm_not_selected', 'PM Not Selected', 'dim'],
+      ['pipeline_execution_failed', 'Exec Failed', 'red'],
+    ];
+    const legacyHtml = legacyCards.map(([key, label, cls]) => `
       <div class="stat-box"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${s[key] || 0}</div></div>
     `).join('');
+    const telemetryHtml = telemetryCards.map(([key, label, cls]) => `
+      <div class="stat-box"><div class="stat-label">${label}</div><div class="stat-value ${cls}">${e[key] || 0}</div></div>
+    `).join('');
+    summaryEl.innerHTML = legacyHtml + telemetryHtml;
 
     const rows = data.rows || [];
     if (!rows.length) {

@@ -1423,6 +1423,19 @@ def api_shadow_outcomes():
             {"cutoff": f"-{days} days"},
         ).scalar() or 0
 
+        event_summary_rows = conn.execute(
+            text(
+                f"""
+                SELECT e.event_type, COUNT(*) AS count
+                FROM pm_candidate_events e
+                WHERE {event_date_filter}
+                  AND e.event_type IN ({_SHADOW_EVENT_SQL_LIST})
+                GROUP BY e.event_type
+                """
+            ),
+            {"cutoff": f"-{days} days"},
+        ).mappings().all()
+
         event_rows = conn.execute(
             text(
                 f"""
@@ -1458,13 +1471,17 @@ def api_shadow_outcomes():
         ).mappings().all()
 
     summary = {r["gate_verdict"]: r["count"] for r in summary_rows}
-    if event_count:
-        summary["pending"] = summary.get("pending", 0) + event_count
+    event_summary = {r["event_type"]: r["count"] for r in event_summary_rows}
+    event_summary["total"] = event_count
 
     combined_rows = [dict(r) for r in rows]
     combined_rows.extend(_normalize_shadow_event(dict(r)) for r in event_rows)
     combined_rows.sort(key=_shadow_sort_key, reverse=True)
-    return jsonify({"summary": summary, "rows": combined_rows[:limit]})
+    return jsonify({
+        "summary": summary,
+        "event_summary": event_summary,
+        "rows": combined_rows[:limit],
+    })
 
 
 @app.route("/api/trade-events")
