@@ -55,6 +55,111 @@ _YFINANCE_CIRCUIT_BREAK_SECONDS = int(
 _quote_cache: dict[str, tuple[float, dict]] = {}
 _yfinance_disabled_until = 0.0
 
+_SHADOW_EVENT_TYPES = (
+    "pm_reject",
+    "pm_not_selected",
+    "preflight_excluded",
+    "pipeline_gate_rejected",
+    "pipeline_execution_failed",
+    "plan_rejected_at_creation",
+    "swing_candidate_rejected",
+    "contract_violation_missing_geometry_claim",
+)
+_SHADOW_EVENT_SQL_LIST = ", ".join(f"'{event_type}'" for event_type in _SHADOW_EVENT_TYPES)
+_SHADOW_EVENT_LABELS = {
+    "pm_reject": "PM Reject",
+    "pm_not_selected": "PM Not Selected",
+    "preflight_excluded": "Preflight Excluded",
+    "pipeline_gate_rejected": "Pipeline Gate",
+    "pipeline_execution_failed": "Execution Failed",
+    "plan_rejected_at_creation": "Plan Creation",
+    "swing_candidate_rejected": "Swing Candidate",
+    "contract_violation_missing_geometry_claim": "Contract Violation",
+}
+
+
+def _parse_shadow_event_data(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
+def _first_present(*values: object) -> object:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _first_text(*values: object) -> str | None:
+    value = _first_present(*values)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _normalize_shadow_event(row: dict) -> dict:
+    data = _parse_shadow_event_data(row.get("event_data"))
+    event_type = row.get("event_type")
+    raw_label = data.get("raw_label")
+    reason_code = data.get("reason_code") or data.get("rejection_reason_code")
+    reason = _first_text(
+        data.get("rationale"),
+        data.get("reason"),
+        data.get("block_reason"),
+        row.get("rejection_reason"),
+        reason_code,
+        data.get("error"),
+        raw_label,
+    )
+    if raw_label and reason_code and reason == str(reason_code):
+        reason = f"{reason_code}: {raw_label}"
+
+    return {
+        "id": f"event-{row.get('event_id')}",
+        "source": "pm_candidate_events",
+        "created_at": row.get("created_at"),
+        "symbol": _first_text(data.get("symbol"), row.get("symbol"), data.get("signal_id")),
+        "action": None,
+        "direction": _first_text(data.get("direction"), row.get("direction")),
+        "profile": _first_text(row.get("profile_id"), data.get("profile"), row.get("candidate_profile")),
+        "setup_type": _first_text(data.get("setup_type"), row.get("setup_type"), row.get("geometry_name"), raw_label),
+        "entry_price": _first_present(
+            data.get("entry_price"),
+            row.get("entry_price"),
+            data.get("observed_price"),
+            data.get("entry_zone_upper"),
+        ),
+        "stop_price": _first_present(data.get("stop_price"), row.get("stop_price")),
+        "target_price": _first_present(data.get("target_price"), row.get("target_price")),
+        "blocked_by": _SHADOW_EVENT_LABELS.get(str(event_type), str(event_type or "PM Telemetry")),
+        "block_reason": reason,
+        "eval_window": "telemetry",
+        "evaluated_at": None,
+        "eval_price": None,
+        "pnl_pct": None,
+        "mfe_pct": None,
+        "mae_pct": None,
+        "stop_hit": None,
+        "target_hit": None,
+        "first_hit": None,
+        "outcome_label": event_type,
+        "gate_verdict": "pending",
+    }
+
+
+def _shadow_sort_key(row: dict) -> str:
+    value = row.get("created_at")
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value or "")
+
 
 def _parse_quote_timestamp(value: object, fallback: datetime) -> datetime:
     """Parse dashboard quote timestamp values into timezone-aware UTC datetimes."""
@@ -1246,13 +1351,14 @@ def api_narratives():
 
 @app.route("/api/shadow-outcomes")
 def api_shadow_outcomes():
-    """Return blocked candidate outcomes for the dashboard shadow ledger view."""
+    """Return historical shadow outcomes plus current PM rejection telemetry."""
     days = request.args.get("days", default=7, type=int)
     days = max(1, min(days or 7, 30))
     limit = request.args.get("limit", default=100, type=int)
     limit = max(1, min(limit or 100, 500))
 
-    date_filter = _date_cutoff_filter(engine, "b.created_at")
+    blocked_date_filter = _date_cutoff_filter(engine, "b.created_at")
+    event_date_filter = _date_cutoff_filter(engine, "e.created_at")
     with engine.connect() as conn:
         summary_rows = conn.execute(
             text(
@@ -1263,7 +1369,7 @@ def api_shadow_outcomes():
                 FROM blocked_trade_candidates b
                 LEFT JOIN blocked_trade_candidate_outcomes o
                   ON o.blocked_candidate_id = b.id AND o.eval_window = '60m'
-                WHERE {date_filter}
+                WHERE {blocked_date_filter}
                 GROUP BY COALESCE(o.gate_verdict, 'pending')
                 """
             ),
@@ -1279,11 +1385,12 @@ def api_shadow_outcomes():
                   b.blocked_by, b.block_reason,
                   o.eval_window, o.evaluated_at, o.eval_price, o.pnl_pct,
                   o.mfe_pct, o.mae_pct, o.stop_hit, o.target_hit, o.first_hit,
-                  o.outcome_label, o.gate_verdict
+                  o.outcome_label, o.gate_verdict,
+                  'blocked_trade_candidates' AS source
                 FROM blocked_trade_candidates b
                 LEFT JOIN blocked_trade_candidate_outcomes o
                   ON o.blocked_candidate_id = b.id
-                WHERE {date_filter}
+                WHERE {blocked_date_filter}
                 ORDER BY b.created_at DESC, o.eval_window ASC
                 LIMIT :limit
                 """
@@ -1291,8 +1398,59 @@ def api_shadow_outcomes():
             {"cutoff": f"-{days} days", "limit": limit},
         ).mappings().all()
 
+        event_count = conn.execute(
+            text(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM pm_candidate_events e
+                WHERE {event_date_filter}
+                  AND e.event_type IN ({_SHADOW_EVENT_SQL_LIST})
+                """
+            ),
+            {"cutoff": f"-{days} days"},
+        ).scalar() or 0
+
+        event_rows = conn.execute(
+            text(
+                f"""
+                SELECT
+                  e.id AS event_id,
+                  e.created_at,
+                  e.candidate_id,
+                  e.cycle_id,
+                  e.profile_id,
+                  e.event_type,
+                  e.event_data,
+                  e.candidate_type,
+                  c.profile_id AS candidate_profile,
+                  c.symbol,
+                  c.direction,
+                  c.setup_type,
+                  c.geometry_name,
+                  c.entry_price,
+                  c.stop_price,
+                  c.target_price,
+                  c.rejection_reason
+                FROM pm_candidate_events e
+                LEFT JOIN pm_candidates c
+                  ON c.candidate_id = e.candidate_id
+                WHERE {event_date_filter}
+                  AND e.event_type IN ({_SHADOW_EVENT_SQL_LIST})
+                ORDER BY e.created_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"cutoff": f"-{days} days", "limit": limit},
+        ).mappings().all()
+
     summary = {r["gate_verdict"]: r["count"] for r in summary_rows}
-    return jsonify({"summary": summary, "rows": [dict(r) for r in rows]})
+    if event_count:
+        summary["pending"] = summary.get("pending", 0) + event_count
+
+    combined_rows = [dict(r) for r in rows]
+    combined_rows.extend(_normalize_shadow_event(dict(r)) for r in event_rows)
+    combined_rows.sort(key=_shadow_sort_key, reverse=True)
+    return jsonify({"summary": summary, "rows": combined_rows[:limit]})
 
 
 @app.route("/api/trade-events")

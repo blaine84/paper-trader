@@ -1244,13 +1244,19 @@
 
     const rows = data.rows || [];
     if (!rows.length) {
-      bodyEl.innerHTML = '<tr><td colspan="11" class="center dim">No blocked candidates yet.</td></tr>';
+      bodyEl.innerHTML = '<tr><td colspan="11" class="center dim">No blocked or rejected candidates in this window.</td></tr>';
       return;
     }
 
     const verdictClass = v => ({saved_us:'green', blocked_winner:'red', possibly_overblocked:'yellow', ambiguous:'yellow', neutral:'dim'}[v] || 'cyan');
     bodyEl.innerHTML = rows.map(r => {
-      const time = r.created_at ? new Date(r.created_at + 'Z').toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) : '—';
+      const timeRaw = r.created_at || '';
+      let time = '—';
+      if (timeRaw) {
+        let parsedTime = new Date(timeRaw);
+        if (Number.isNaN(parsedTime.getTime())) parsedTime = new Date(`${timeRaw}Z`);
+        time = Number.isNaN(parsedTime.getTime()) ? '—' : parsedTime.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+      }
       const reason = r.block_reason || '';
       const window = r.eval_window || 'pending';
       const verdict = r.gate_verdict || 'pending';
