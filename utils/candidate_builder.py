@@ -41,6 +41,11 @@ SWING_NO_CANDIDATES_REASONS = frozenset({
     "same_symbol_exposure",
     "profile_policy",
 })
+SWING_MAPPABLE_SETUP_TYPES = frozenset({
+    "sector_rotation",
+    "risk_off_macro_short",
+    "directional_confusion_breakout",
+})
 
 # Signal strength ordering — mirrors portfolio_manager.STRENGTH_ORDER
 STRENGTH_ORDER: dict[str, int] = {"weak": 1, "moderate": 2, "strong": 3}
@@ -625,8 +630,21 @@ def _build_swing_candidates(
     try:
         from utils.swing_candidate_bridge import process_swing_signals
 
+        swing_signals = {
+            signal_id: signal
+            for signal_id, signal in signals.items()
+            if signal.get("setup_type", "") in SWING_EXECUTABLE_SETUP_TYPES
+            or signal.get("setup_type", "") in SWING_MAPPABLE_SETUP_TYPES
+        }
+        if not swing_signals:
+            logger.debug(
+                "No swing-routable signals: profile=%s cycle=%s total_signals=%d",
+                profile_id, cycle_id, len(signals),
+            )
+            return
+
         swing_candidates = process_swing_signals(
-            signals=signals,
+            signals=swing_signals,
             profile_id=profile_id,
             profile=profile,
             portfolio=portfolio,
@@ -649,7 +667,7 @@ def _build_swing_candidates(
 
             # Build signal snapshot
             symbol = sc["symbol"]
-            original_signal = signals.get(symbol, {})
+            original_signal = swing_signals.get(symbol, {})
             signal_snapshot_json = json.dumps(original_signal, default=str, sort_keys=True)
 
             # Map direction

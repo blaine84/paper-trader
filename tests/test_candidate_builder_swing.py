@@ -776,3 +776,53 @@ class TestObserveModeIntegration:
             db=engine,
             engine=engine,
         )
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_intraday_labels_are_not_routed_to_swing_bridge(self, mock_mode, mock_bridge, engine):
+        """Known intraday setup labels stay out of swing processing."""
+        registry = CandidateRegistry(engine, "cycle-intraday-only", "moderate")
+        signals = {
+            "AMD": {"symbol": "AMD", "setup_type": "technical_breakout"},
+            "MSFT": {"symbol": "MSFT", "setup_type": "momentum_fade"},
+        }
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-intraday-only", registry=registry,
+        )
+
+        mock_bridge.assert_not_called()
+        assert registry.is_empty
+
+    @patch("utils.swing_candidate_bridge.process_swing_signals", return_value=[])
+    @patch("utils.gate_config.get_swing_candidate_mode", return_value="observe")
+    def test_mixed_signals_route_only_swing_relevant_subset(self, mock_mode, mock_bridge, engine):
+        """Swing bridge receives only swing-native or swing-mappable labels."""
+        registry = CandidateRegistry(engine, "cycle-mixed", "moderate")
+        signals = {
+            "AMD": {"symbol": "AMD", "setup_type": "technical_breakout"},
+            "XLE": {"symbol": "XLE", "setup_type": "breakout_retest"},
+            "MSFT": {"symbol": "MSFT", "setup_type": "sector_rotation"},
+        }
+        expected_swing_signals = {
+            "XLE": signals["XLE"],
+            "MSFT": signals["MSFT"],
+        }
+
+        _build_swing_candidates(
+            db=engine, signals=signals, profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"}, portfolio={"equity": 100000},
+            cycle_id="cycle-mixed", registry=registry,
+        )
+
+        mock_bridge.assert_called_once_with(
+            signals=expected_swing_signals,
+            profile_id="moderate",
+            profile={"risk_per_trade_pct": "0.01"},
+            portfolio={"equity": 100000},
+            cycle_id="cycle-mixed",
+            db=engine,
+            engine=engine,
+        )
