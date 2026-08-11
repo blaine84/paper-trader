@@ -7,6 +7,8 @@ from agents.daily_review import (
     NARRATIVE_SYSTEM_PROMPT,
     _NARRATIVE_FIELDS,
     _EMPTY_NARRATIVE,
+    normalize_daily_review_exit_policy,
+    normalize_exit_policy_language,
 )
 
 
@@ -296,3 +298,52 @@ class TestGenerateNarrative:
         result = generate_narrative(_make_summary())
         assert isinstance(result["executive_summary"], str)
         assert isinstance(result["primary_driver"], str)
+
+    def test_overbroad_time_decay_exit_recommendation_is_rewritten(self):
+        """Blanket timeout-first exit recommendations are normalized to signal-primary."""
+        text = (
+            "Implement mandatory hard stop exits based on time decay for all intraday "
+            "momentum fades and sector rotations."
+        )
+
+        result = normalize_exit_policy_language(text)
+
+        assert "signal-based exits as the primary rule" in result
+        assert "setup-specific max-hold/time-decay backstops" in result
+        assert "mandatory hard stop" not in result
+        assert "for all intraday" not in result
+
+    def test_signal_based_timeout_lesson_is_preserved(self):
+        """Lessons warning against timeout-driven exits should not be rewritten."""
+        text = (
+            "Exit should have been signal-based (invalidation breach or target "
+            "confirmation), not timeout-driven."
+        )
+
+        assert normalize_exit_policy_language(text) == text
+
+    def test_daily_review_exit_policy_normalizes_nested_lessons(self):
+        """Journal/API review payloads normalize bad nested lesson action text."""
+        review = {
+            "highest_leverage_fix": (
+                "Implement mandatory hard stop exits based on time decay for all "
+                "intraday momentum fades and sector rotations."
+            ),
+            "lessons_learned": [
+                {
+                    "category": "exit",
+                    "lesson": "Exit should have been signal-based, not timeout-driven.",
+                    "evidence": "Target confirmation remained valid.",
+                    "action": (
+                        "Add mandatory time-based exits for all intraday technical "
+                        "breakout trades."
+                    ),
+                }
+            ],
+        }
+
+        result = normalize_daily_review_exit_policy(review)
+
+        assert "signal-based exits as the primary rule" in result["highest_leverage_fix"]
+        assert result["lessons_learned"][0]["lesson"] == review["lessons_learned"][0]["lesson"]
+        assert "signal-based exits as the primary rule" in result["lessons_learned"][0]["action"]

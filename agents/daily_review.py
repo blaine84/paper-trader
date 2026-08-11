@@ -981,6 +981,10 @@ Voice rules:
 - Reference specific trades by symbol, setup type, and P&L.
 - Correlations are observational, never causal. Say "coincided with" not "caused by."
 - Separate process quality from outcomes — a good process can lose money.
+- Exit-policy recommendations must be signal-primary: stops, targets, invalidation breaches,
+  and failed confirmations come before any clock-based rule. Time decay/max-hold rules are
+  setup-specific backstops for fast intraday setups, not blanket timeout exits. Do not recommend
+  timeout-first exits for swing/thesis setups or sector rotations unless explicitly tagged intraday.
 - Be concise. Every sentence should earn its place.
 """
 
@@ -1070,6 +1074,70 @@ _EMPTY_NARRATIVE = {
     "email_subject": "",
     "email_preview": "",
 }
+
+
+_EXIT_POLICY_BACKSTOP_REWRITE = (
+    "Use signal-based exits as the primary rule, with setup-specific max-hold/time-decay "
+    "backstops only after a fast intraday setup's expected move window has expired; keep "
+    "sector rotations thesis/invalidation-driven unless they are explicitly tagged as fast "
+    "intraday rotations."
+)
+
+
+def _needs_exit_policy_rewrite(text: str) -> bool:
+    lowered = text.lower()
+    mentions_time_exit = any(
+        phrase in lowered
+        for phrase in ("time decay", "time-based", "time based", "timeout-driven", "timeout driven")
+    )
+    mentions_broad_exit_rule = any(
+        phrase in lowered
+        for phrase in ("mandatory", "hard stop", "all intraday", "for all")
+    )
+    mentions_setup_scope = any(
+        phrase in lowered
+        for phrase in ("intraday", "momentum fade", "technical breakout", "sector rotation")
+    )
+    return mentions_time_exit and mentions_broad_exit_rule and mentions_setup_scope
+
+
+def normalize_exit_policy_language(text: str) -> str:
+    """Keep review recommendations from turning time backstops into blanket exit rules."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    if _needs_exit_policy_rewrite(text):
+        return _EXIT_POLICY_BACKSTOP_REWRITE
+    return text
+
+
+def normalize_daily_review_exit_policy(review: dict) -> dict:
+    """Normalize overbroad exit-policy language in a generated or stored review."""
+    if not isinstance(review, dict):
+        return review
+
+    normalized = dict(review)
+    for field in [
+        "highest_leverage_fix",
+        "performance_story",
+        "system_observations",
+        "process_quality",
+    ]:
+        normalized[field] = normalize_exit_policy_language(normalized.get(field, ""))
+
+    lessons = normalized.get("lessons_learned")
+    if isinstance(lessons, list):
+        normalized_lessons = []
+        for item in lessons:
+            if not isinstance(item, dict):
+                normalized_lessons.append(item)
+                continue
+            normalized_item = dict(item)
+            for field in ["lesson", "evidence", "action"]:
+                normalized_item[field] = normalize_exit_policy_language(normalized_item.get(field, ""))
+            normalized_lessons.append(normalized_item)
+        normalized["lessons_learned"] = normalized_lessons
+
+    return normalized
 
 
 def _build_llm_prompt(summary: dict) -> str:
@@ -1224,4 +1292,4 @@ def generate_narrative(deterministic_summary: dict, tier: str = "medium") -> dic
         if not isinstance(review.get(str_field), str):
             review[str_field] = str(review.get(str_field, "")) if review.get(str_field) else ""
 
-    return review
+    return normalize_daily_review_exit_policy(review)

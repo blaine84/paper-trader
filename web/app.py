@@ -33,6 +33,7 @@ from utils.catalyst_freshness import (
     ET,
 )
 from feedback_loop.analyst_feedback import get_quality_metrics
+from agents.daily_review import normalize_daily_review_exit_policy
 from utils.shadow_ledger import ensure_shadow_ledger_schema
 from utils.dialect_sql import _date_cutoff_filter
 from utils.market_data_reliability.config import ReliabilityConfig
@@ -1275,7 +1276,7 @@ def api_journal():
         result = []
         for entry in entries:
             try:
-                review = json.loads(entry.value)
+                review = normalize_daily_review_exit_policy(json.loads(entry.value))
                 # Build a slim response with only UI-relevant fields
                 slim = {k: review[k] for k in _UI_FIELDS if k in review}
                 slim["date"] = entry.symbol
