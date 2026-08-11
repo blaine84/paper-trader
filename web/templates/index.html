@@ -270,7 +270,7 @@
         <thead><tr>
           <th>Time</th><th>Symbol</th><th>Profile</th><th>Blocked By</th>
           <th class="right">Entry</th><th class="center">Window</th><th class="right">P&L %</th>
-          <th class="right">MFE %</th><th class="right">MAE %</th><th>Verdict</th><th>Reason</th>
+          <th class="right">MFE %</th><th class="right">MAE %</th><th>Verdict</th><th>Trade</th><th>Reason</th>
         </tr></thead>
         <tbody id="shadowBody"></tbody>
       </table>
@@ -1241,6 +1241,7 @@
     ];
     const telemetryCards = [
       ['total', 'Telemetry Rows', 'cyan'],
+      ['pipeline_executed', 'Executed', 'green'],
       ['preflight_excluded', 'Preflight Excluded', 'yellow'],
       ['pm_reject', 'PM Reject', 'red'],
       ['pm_not_selected', 'PM Not Selected', 'dim'],
@@ -1257,11 +1258,11 @@
 
     const rows = data.rows || [];
     if (!rows.length) {
-      bodyEl.innerHTML = '<tr><td colspan="11" class="center dim">No blocked or rejected candidates in this window.</td></tr>';
+      bodyEl.innerHTML = '<tr><td colspan="12" class="center dim">No candidate telemetry in this window.</td></tr>';
       return;
     }
 
-    const verdictClass = v => ({saved_us:'green', blocked_winner:'red', possibly_overblocked:'yellow', ambiguous:'yellow', neutral:'dim'}[v] || 'cyan');
+    const verdictClass = v => ({saved_us:'green', blocked_winner:'red', possibly_overblocked:'yellow', ambiguous:'yellow', neutral:'dim', executed:'green'}[v] || 'cyan');
     bodyEl.innerHTML = rows.map(r => {
       const timeRaw = r.created_at || '';
       let time = '—';
@@ -1273,6 +1274,10 @@
       const reason = r.block_reason || '';
       const window = r.eval_window || 'pending';
       const verdict = r.gate_verdict || 'pending';
+      const tradePnlPct = r.trade_pnl_pct != null ? r.trade_pnl_pct : null;
+      const tradeBits = r.trade_id
+        ? `#${r.trade_id}<br><span class="${pnlColor(tradePnlPct)}">${tradePnlPct != null ? (tradePnlPct >= 0 ? '+' : '') + fmt(tradePnlPct) + '%' : (r.trade_status || 'trade')}</span>`
+        : '<span class="dim">—</span>';
       return `<tr>
         <td class="dim">${time}</td>
         <td><strong>${r.symbol || '—'}</strong></td>
@@ -1284,6 +1289,7 @@
         <td class="right green">${r.mfe_pct != null ? '+' + fmt(r.mfe_pct) : '—'}</td>
         <td class="right red">${r.mae_pct != null ? fmt(r.mae_pct) : '—'}</td>
         <td><span class="${verdictClass(verdict)}">${verdict}</span>${r.outcome_label ? `<br><span class="dim">${r.outcome_label}</span>` : ''}</td>
+        <td class="dim">${tradeBits}</td>
         <td class="dim" title="${reason.replace(/"/g, '&quot;')}">${reason.slice(0, 90)}${reason.length > 90 ? '…' : ''}</td>
       </tr>`;
     }).join('');

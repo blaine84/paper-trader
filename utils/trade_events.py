@@ -56,6 +56,7 @@ def log_trade_event(
     payload: dict | list | str | None = None,
     timestamp: datetime | None = None,
     candidate_lineage_id: str | None = None,
+    pm_candidate_id: str | None = None,
 ):
     """
     Add a normalized trade event to the current SQLAlchemy session.
@@ -83,6 +84,7 @@ def log_trade_event(
         message=message,
         payload_json=payload_json,
         candidate_lineage_id=candidate_lineage_id,
+        pm_candidate_id=pm_candidate_id,
     )
     db.add(event)
     return event

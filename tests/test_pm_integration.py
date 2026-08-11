@@ -198,6 +198,57 @@ _CONF_OK = {
 }
 
 
+def test_execute_trade_links_pm_candidate_id_to_trade_and_entry_events():
+    """Candidate-ID executions keep a direct link from PM candidate to trade."""
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    candidate_id = "1c5455bf-ad28-46fe-823f-a4cb00041175"
+    _seed_balance(db, profile_id)
+    _seed_analyst_signal(db, "AMD", _strong_signal("AMD"))
+
+    decision = _base_decision(
+        symbol="AMD",
+        action="BUY",
+        quantity=10,
+        price=150.0,
+        stop=147.0,
+        target=156.0,
+    )
+    decision["pm_candidate_id"] = candidate_id
+    decision["candidate_id"] = candidate_id
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=_CONF_OK),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
+    ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
+        ok, msg = execute_trade(db, decision, profile_id, normalized=True)
+
+    assert ok is True, f"Trade should have succeeded: {msg}"
+
+    trade = db.query(Trade).filter_by(symbol="AMD", profile=profile_id).first()
+    assert trade is not None
+    assert trade.pm_candidate_id == candidate_id
+
+    entry_event = (
+        db.query(TradeEvent)
+        .filter_by(trade_id=trade.id, event_type="entry_filled")
+        .first()
+    )
+    assert entry_event is not None
+    assert entry_event.pm_candidate_id == candidate_id
+    assert json.loads(entry_event.payload_json)["pm_candidate_id"] == candidate_id
+
+    db.close()
+
+
 # ---------------------------------------------------------------------------
 # 1. test_edge_score_rejection
 # ---------------------------------------------------------------------------

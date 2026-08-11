@@ -3430,6 +3430,7 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             _log.warning(f"No ATR or key level for {symbol}, using 1.5% fallback: {stop}")
 
     if action in ("BUY", "SHORT", "CLOSE"):
+        _pm_candidate_id = decision.get("pm_candidate_id") or decision.get("candidate_id")
         log_trade_event(
             db,
             "entry_requested" if action in ("BUY", "SHORT") else "exit_requested",
@@ -3445,7 +3446,10 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                 "target": target,
                 "decision": decision,
             },
+            pm_candidate_id=_pm_candidate_id,
         )
+    else:
+        _pm_candidate_id = decision.get("pm_candidate_id") or decision.get("candidate_id")
 
     starting = PM_PROFILES[profile_id]["starting_balance"]
     bal = (
@@ -4025,20 +4029,23 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             thesis=_entry_contract.get("thesis"),
             setup_type=_entry_contract.get("setup_type"),
             invalidators=json.dumps(_entry_contract["invalidators"]) if _entry_contract.get("invalidators") else None,
+            pm_candidate_id=_pm_candidate_id,
         )
         db.add(trade)
         db.flush()
         _entry_filled_payload = {"action": action, "quantity": quantity, "side": "long", "edge": _edge_data}
+        if _pm_candidate_id:
+            _entry_filled_payload["pm_candidate_id"] = _pm_candidate_id
         if _gate_decision_id is not None:
             _entry_filled_payload["gate_decision_id"] = _gate_decision_id
         if _pilot_override_info is not None:
             _entry_filled_payload["pilot_override"] = True
             _entry_filled_payload["pilot_size_multiplier"] = _pilot_override_info["pilot_size_multiplier"]
-        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
+        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload, pm_candidate_id=_pm_candidate_id)
         if stop:
-            log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
+            log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop}, pm_candidate_id=_pm_candidate_id)
         if target:
-            log_trade_event(db, "target_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(target), message="Initial target set", payload={"target_price": target})
+            log_trade_event(db, "target_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(target), message="Initial target set", payload={"target_price": target}, pm_candidate_id=_pm_candidate_id)
         db.add(Balance(cash=cash - cost, profile=profile_id))
 
     elif action == "SHORT":
@@ -4074,20 +4081,23 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             thesis=_entry_contract.get("thesis"),
             setup_type=_entry_contract.get("setup_type"),
             invalidators=json.dumps(_entry_contract["invalidators"]) if _entry_contract.get("invalidators") else None,
+            pm_candidate_id=_pm_candidate_id,
         )
         db.add(trade)
         db.flush()
         _entry_filled_payload = {"action": action, "quantity": quantity, "side": "short", "edge": _edge_data}
+        if _pm_candidate_id:
+            _entry_filled_payload["pm_candidate_id"] = _pm_candidate_id
         if _gate_decision_id is not None:
             _entry_filled_payload["gate_decision_id"] = _gate_decision_id
         if _pilot_override_info is not None:
             _entry_filled_payload["pilot_override"] = True
             _entry_filled_payload["pilot_size_multiplier"] = _pilot_override_info["pilot_size_multiplier"]
-        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload)
+        log_trade_event(db, "entry_filled", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=price, message=decision.get("rationale"), payload=_entry_filled_payload, pm_candidate_id=_pm_candidate_id)
         if stop:
-            log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop})
+            log_trade_event(db, "stop_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(stop), message="Initial stop set", payload={"stop_price": stop}, pm_candidate_id=_pm_candidate_id)
         if target:
-            log_trade_event(db, "target_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(target), message="Initial target set", payload={"target_price": target})
+            log_trade_event(db, "target_set", trade_id=trade.id, agent=f"pm_{profile_id}", symbol=symbol, profile=profile_id, price=float(target), message="Initial target set", payload={"target_price": target}, pm_candidate_id=_pm_candidate_id)
         # Deduct margin from cash (returned + P&L on close)
         db.add(Balance(cash=cash - margin_required, profile=profile_id))
 

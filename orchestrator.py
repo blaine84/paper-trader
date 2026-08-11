@@ -1114,8 +1114,11 @@ def check_schema(engine):
     # If a column is missing, the system will crash on first query anyway —
     # better to catch it here with a clear message and auto-fix.
     expected = {
-        "trades": ["thesis", "setup_type", "invalidators", "stop_role", "stop_updated_by", "stop_updated_at"],
-        "trade_events": ["dedupe_key"],
+        "trades": [
+            "thesis", "setup_type", "invalidators", "stop_role",
+            "stop_updated_by", "stop_updated_at", "pm_candidate_id",
+        ],
+        "trade_events": ["dedupe_key", "pm_candidate_id"],
         "cases": ["exit_category"],
         "pm_candidates": ["candidate_type", "holding_horizon", "normalized_setup_type", "rejection_reason_code"],
         "pm_candidate_events": ["candidate_type"],
@@ -1149,6 +1152,7 @@ def check_schema(engine):
         "normalized_setup_type": "TEXT",
         "rejection_reason_code": "VARCHAR(64)",
         "promoted_cycle_id": "TEXT",
+        "pm_candidate_id": "VARCHAR(36)",
     }
 
     with engine.begin() as conn:
@@ -1179,6 +1183,22 @@ def check_schema(engine):
             "Schema migration: created partial index idx_watch_candidates_promoted_cycle "
             "on watch_candidates (profile_id, promoted_cycle_id) WHERE state = 'promoted'"
         )
+
+    if "trades" in missing and "pm_candidate_id" in missing["trades"]:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_trades_pm_candidate_id "
+                "ON trades(pm_candidate_id)"
+            ))
+        log.warning("Schema migration: created index ix_trades_pm_candidate_id on trades(pm_candidate_id)")
+
+    if "trade_events" in missing and "pm_candidate_id" in missing["trade_events"]:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_trade_events_pm_candidate_id "
+                "ON trade_events(pm_candidate_id)"
+            ))
+        log.warning("Schema migration: created index ix_trade_events_pm_candidate_id on trade_events(pm_candidate_id)")
 
     # If stop_role was just added, backfill existing open trades
     if "trades" in missing and "stop_role" in missing["trades"]:

@@ -45,6 +45,31 @@ def test_check_schema_initializes_replay_lineage_columns():
     }
 
 
+def test_check_schema_initializes_pm_candidate_trade_links():
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE trades (id INTEGER PRIMARY KEY)"))
+        conn.execute(
+            text(
+                "CREATE TABLE trade_events ("
+                "id INTEGER PRIMARY KEY, "
+                "event_type VARCHAR(64), "
+                "trade_id INTEGER"
+                ")"
+            )
+        )
+
+    orchestrator.check_schema(engine)
+
+    inspector = inspect(engine)
+    assert "pm_candidate_id" in {
+        column["name"] for column in inspector.get_columns("trades")
+    }
+    assert "pm_candidate_id" in {
+        column["name"] for column in inspector.get_columns("trade_events")
+    }
+
+
 def test_check_schema_creates_candidate_events_with_generated_id():
     engine = create_engine("sqlite://")
 

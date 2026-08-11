@@ -224,6 +224,8 @@ def _build_gate_decision(resolved_order: ResolvedOrder, quantity: int) -> dict:
         "rationale": resolved_order.pm_rationale,
         "geometry_name": resolved_order.geometry_name,
         "execution_key": resolved_order.execution_key,
+        "pm_candidate_id": resolved_order.candidate_id,
+        "candidate_id": resolved_order.candidate_id,
     }
 
 

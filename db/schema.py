@@ -56,6 +56,7 @@ class Trade(Base):
     stop_updated_by = Column(String(64), nullable=True)     # agent that last modified stop
     stop_updated_at = Column(DateTime, nullable=True)       # when stop was last modified
     candidate_lineage_id = Column(String(36), nullable=True, index=True)
+    pm_candidate_id = Column(String(36), nullable=True, index=True)
 
 
 
@@ -75,6 +76,7 @@ class TradeEvent(Base):
     payload_json = Column(Text, nullable=True)
     dedupe_key = Column(String(256), nullable=True, index=True)
     candidate_lineage_id = Column(String(36), nullable=True, index=True)
+    pm_candidate_id = Column(String(36), nullable=True, index=True)
 
 
 class Position(Base):

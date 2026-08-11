@@ -60,6 +60,7 @@ _SHADOW_EVENT_TYPES = (
     "pm_reject",
     "pm_not_selected",
     "preflight_excluded",
+    "pipeline_executed",
     "pipeline_gate_rejected",
     "pipeline_execution_failed",
     "plan_rejected_at_creation",
@@ -71,6 +72,7 @@ _SHADOW_EVENT_LABELS = {
     "pm_reject": "PM Reject",
     "pm_not_selected": "PM Not Selected",
     "preflight_excluded": "Preflight Excluded",
+    "pipeline_executed": "Executed",
     "pipeline_gate_rejected": "Pipeline Gate",
     "pipeline_execution_failed": "Execution Failed",
     "plan_rejected_at_creation": "Plan Creation",
@@ -120,6 +122,7 @@ def _format_shadow_blocking_reasons(data: dict, row: dict) -> str | None:
 def _normalize_shadow_event(row: dict) -> dict:
     data = _parse_shadow_event_data(row.get("event_data"))
     event_type = row.get("event_type")
+    gate_verdict = "executed" if event_type == "pipeline_executed" else "pending"
     raw_label = data.get("raw_label")
     reason_code = data.get("reason_code") or data.get("rejection_reason_code")
     reason = _first_text(
@@ -157,14 +160,22 @@ def _normalize_shadow_event(row: dict) -> dict:
         "eval_window": "telemetry",
         "evaluated_at": None,
         "eval_price": None,
-        "pnl_pct": None,
+        "pnl_pct": row.get("trade_pnl_pct") if event_type == "pipeline_executed" else None,
         "mfe_pct": None,
         "mae_pct": None,
         "stop_hit": None,
         "target_hit": None,
         "first_hit": None,
         "outcome_label": event_type,
-        "gate_verdict": "pending",
+        "gate_verdict": gate_verdict,
+        "candidate_id": row.get("candidate_id"),
+        "trade_id": row.get("trade_id"),
+        "trade_status": row.get("trade_status"),
+        "trade_entry_time": row.get("trade_entry_time"),
+        "trade_exit_time": row.get("trade_exit_time"),
+        "trade_pnl": row.get("trade_pnl"),
+        "trade_pnl_pct": row.get("trade_pnl_pct"),
+        "trade_exit_reason": row.get("trade_exit_reason"),
     }
 
 
@@ -822,6 +833,8 @@ def api_trades():
             "status": t.status,
             "pnl": t.pnl,
             "pnl_pct": t.pnl_pct,
+            "pm_candidate_id": getattr(t, "pm_candidate_id", None),
+            "candidate_lineage_id": getattr(t, "candidate_lineage_id", None),
             "unrealized_pnl": unrealized_pnl,
             "unrealized_pct": unrealized_pct,
             "review_score": t.review_score,
@@ -1458,10 +1471,19 @@ def api_shadow_outcomes():
                   c.stop_price,
                   c.target_price,
                   c.risk_reward,
-                  c.rejection_reason
+                  c.rejection_reason,
+                  t.id AS trade_id,
+                  t.status AS trade_status,
+                  t.entry_time AS trade_entry_time,
+                  t.exit_time AS trade_exit_time,
+                  t.pnl AS trade_pnl,
+                  t.pnl_pct AS trade_pnl_pct,
+                  t.reason_exit AS trade_exit_reason
                 FROM pm_candidate_events e
                 LEFT JOIN pm_candidates c
                   ON c.candidate_id = e.candidate_id
+                LEFT JOIN trades t
+                  ON t.pm_candidate_id = e.candidate_id
                 WHERE {event_date_filter}
                   AND e.event_type IN ({_SHADOW_EVENT_SQL_LIST})
                 ORDER BY e.created_at DESC
@@ -1534,6 +1556,8 @@ def api_trade_events():
             "price": e.price,
             "message": e.message,
             "payload": payload,
+            "pm_candidate_id": getattr(e, "pm_candidate_id", None),
+            "candidate_lineage_id": getattr(e, "candidate_lineage_id", None),
         })
 
     db.close()
