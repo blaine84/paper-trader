@@ -1092,11 +1092,11 @@ def _needs_exit_policy_rewrite(text: str) -> bool:
     )
     mentions_broad_exit_rule = any(
         phrase in lowered
-        for phrase in ("mandatory", "hard stop", "all intraday", "for all")
+        for phrase in ("mandatory", "hard stop", "non-negotiable", "all intraday", "for all")
     )
     mentions_setup_scope = any(
         phrase in lowered
-        for phrase in ("intraday", "momentum fade", "technical breakout", "sector rotation")
+        for phrase in ("intraday", "momentum fade", "technical breakout", "sector rotation", "marginal setup")
     )
     return mentions_time_exit and mentions_broad_exit_rule and mentions_setup_scope
 

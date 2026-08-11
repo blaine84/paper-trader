@@ -340,6 +340,7 @@ class TestGenerateNarrative:
                     ),
                 }
             ],
+            "watchouts": [],
         }
 
         result = normalize_daily_review_exit_policy(review)
@@ -347,3 +348,25 @@ class TestGenerateNarrative:
         assert "signal-based exits as the primary rule" in result["highest_leverage_fix"]
         assert result["lessons_learned"][0]["lesson"] == review["lessons_learned"][0]["lesson"]
         assert "signal-based exits as the primary rule" in result["lessons_learned"][0]["action"]
+
+    def test_non_negotiable_time_decay_action_is_rewritten(self):
+        """Hard time-decay trigger actions are normalized even without the word intraday."""
+        review = {
+            "lessons_learned": [
+                {
+                    "category": "exit",
+                    "lesson": "Time decay matters for marginal setups.",
+                    "evidence": "The setup lost edge after the expected move window.",
+                    "action": (
+                        "Implement hard, non-negotiable exit triggers based on time decay "
+                        "or signal invalidation, regardless of current P&L. Prioritize "
+                        "exiting marginal setups early."
+                    ),
+                }
+            ],
+        }
+
+        result = normalize_daily_review_exit_policy(review)
+
+        assert "signal-based exits as the primary rule" in result["lessons_learned"][0]["action"]
+        assert "non-negotiable" not in result["lessons_learned"][0]["action"]
