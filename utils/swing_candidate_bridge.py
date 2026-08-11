@@ -33,6 +33,7 @@ CANONICAL_REJECTION_CODES: frozenset[str] = frozenset({
     "stale_catalyst",
     # --- Normalization stage (from setup_normalizer) ---
     "diagnostic_only",
+    "intraday_setup_not_swing_candidate",
     "unmapped_label",
     "insufficient_normalization_evidence",
     "context_mismatch",
@@ -69,6 +70,7 @@ _RAW_TO_CANONICAL: dict[str, str] = {
     "stale_signal": "stale_signal",
     "stale_catalyst": "stale_catalyst",
     "diagnostic_only": "diagnostic_only",
+    "intraday_setup_not_swing_candidate": "intraday_setup_not_swing_candidate",
     "unmapped_label": "unmapped_label",
     "insufficient_normalization_evidence": "insufficient_normalization_evidence",
     "context_mismatch": "context_mismatch",

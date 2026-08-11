@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from utils.gate_config import SWING_EXECUTABLE_SETUP_TYPES
+from utils.gate_config import CANDIDATE_EXECUTABLE_SETUP_TYPES, SWING_EXECUTABLE_SETUP_TYPES
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ REJECTION_REASON_CODES: frozenset[str] = frozenset({
     "insufficient_normalization_evidence",
     "context_mismatch",
     "diagnostic_only",
+    "intraday_setup_not_swing_candidate",
     "unmapped_label",
     "data_provider_error",
     "analyst_veto",
@@ -89,7 +90,15 @@ def normalize_setup(
     if raw_label in SWING_EXECUTABLE_SETUP_TYPES:
         return NormalizationResult(success=True, executable_type=raw_label, raw_label=raw_label)
 
-    # 8. Fallback — unmapped label
+    # 8. Known intraday labels are valid setup labels, just not swing candidates.
+    if raw_label in CANDIDATE_EXECUTABLE_SETUP_TYPES:
+        return NormalizationResult(
+            success=False,
+            reason_code="intraday_setup_not_swing_candidate",
+            raw_label=raw_label,
+        )
+
+    # 9. Fallback — unmapped label
     return NormalizationResult(
         success=False, reason_code="unmapped_label", raw_label=raw_label
     )

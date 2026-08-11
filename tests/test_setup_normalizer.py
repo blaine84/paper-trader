@@ -52,6 +52,17 @@ class TestUnclearDirectionRejection:
         assert result.reason_code == "unmapped_label"
 
 
+class TestIntradaySetupRejection:
+    """Known intraday setup labels are valid labels, but not swing candidates."""
+
+    @pytest.mark.parametrize("raw_label", ["technical_breakout", "momentum_fade"])
+    def test_intraday_setup_rejected_as_wrong_lane(self, default_context, raw_label):
+        result = normalize_setup(raw_label, "LONG", "strong", "high", default_context)
+        assert not result.success
+        assert result.reason_code == "intraday_setup_not_swing_candidate"
+        assert result.raw_label == raw_label
+
+
 class TestDataProviderErrorDetection:
     """Requirement 9.2: 429 fallback and data_source_error → data_provider_error."""
 

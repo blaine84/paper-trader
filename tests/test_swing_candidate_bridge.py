@@ -877,7 +877,7 @@ class TestExposureRejectionCategories:
         """
         freshness_codes = {"stale_signal", "stale_catalyst"}
         normalization_codes = {
-            "diagnostic_only", "unmapped_label",
+            "diagnostic_only", "intraday_setup_not_swing_candidate", "unmapped_label",
             "insufficient_normalization_evidence", "context_mismatch",
             "data_provider_error", "analyst_veto",
         }
