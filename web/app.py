@@ -104,6 +104,18 @@ def _first_text(*values: object) -> str | None:
     return str(value)
 
 
+def _format_shadow_blocking_reasons(data: dict, row: dict) -> str | None:
+    codes = data.get("blocking_reason_codes")
+    if not isinstance(codes, list) or not codes:
+        return None
+
+    reason = ", ".join(str(code) for code in codes if code)
+    risk_reward = _first_present(data.get("risk_reward"), row.get("risk_reward"))
+    if risk_reward is not None and "min_risk_reward_not_met" in reason:
+        reason = f"{reason} (R:R {risk_reward})"
+    return reason or None
+
+
 def _normalize_shadow_event(row: dict) -> dict:
     data = _parse_shadow_event_data(row.get("event_data"))
     event_type = row.get("event_type")
@@ -113,6 +125,7 @@ def _normalize_shadow_event(row: dict) -> dict:
         data.get("rationale"),
         data.get("reason"),
         data.get("block_reason"),
+        _format_shadow_blocking_reasons(data, row),
         row.get("rejection_reason"),
         reason_code,
         data.get("error"),
@@ -1430,6 +1443,7 @@ def api_shadow_outcomes():
                   c.entry_price,
                   c.stop_price,
                   c.target_price,
+                  c.risk_reward,
                   c.rejection_reason
                 FROM pm_candidate_events e
                 LEFT JOIN pm_candidates c
