@@ -36,7 +36,11 @@ from utils.pre_trade_quality_gate import evaluate_pre_trade_quality
 from utils.catalyst_specificity import evaluate_catalyst_specificity
 from utils.stop_authority import apply_stop_update
 from utils.shadow_ledger import record_blocked_candidate, write_pilot_counterfactual_row
-from utils.gate_config import PM_PROVENANCE_MODE, MARKET_STATE_MODE
+from utils.gate_config import (
+    PM_PROVENANCE_MODE,
+    MARKET_STATE_MODE,
+    PENDING_ORDER_MODE,
+)
 from utils.raw_pm_capture import (
     capture_raw_pm_response,
     link_response_to_lineages,
@@ -3138,7 +3142,14 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     return True, notes, cumulative_multiplier, multiplier_breakdown
 
 
-def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = False):
+def execute_trade(
+    db,
+    decision: dict,
+    profile_id: str,
+    *,
+    normalized: bool = False,
+    price_authoritative: bool = False,
+):
     """
     Apply a trade decision to the paper portfolio.
 
@@ -3152,6 +3163,28 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
             and stop/target are guaranteed present. Fallback stop derivation
             is skipped. If a normalized BUY/SHORT somehow reaches the fallback
             path without a stop, execution is REJECTED (fail closed).
+        price_authoritative: If True, the CALLER owns the entry price and the
+            live-quote deviation tiers are skipped entirely — no quote is
+            fetched, `price` is never reassigned, and stop/target are never
+            rescaled.
+
+            Used by the pending limit order filler, where the limit price is
+            authoritative by construction: it is a price the market demonstrably
+            traded through inside the order's active window, and its geometry was
+            validated at creation and re-validated by the gate pipeline
+            immediately before this call. Without this flag, a limit that sits
+            deliberately away from the live price would be repaired to the chased
+            price (5-10% deviation) or refused outright (>10%), both of which
+            defeat the purpose of a resting order.
+
+            Note that `normalized=True` alone does NOT provide this: it gates
+            only fallback stop derivation, while the deviation tiers run for
+            every non-CLOSE action regardless.
+
+            Freshness is still bounded on that path — the filler refuses to fill
+            from a crossing bar older than
+            PENDING_ORDER_MAX_FILL_BAR_AGE_SECONDS, which replaces the live-quote
+            sanity net. Gates, position sizing, and validate_trade() all still run.
     """
     action = str(decision["action"]).upper()
     decision["action"] = action
@@ -3170,12 +3203,29 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
         log.warning("Decision for %s had non-numeric price %r", symbol, price)
         price = 0
 
+    # Pending Limit Orders: capture the intended entry BEFORE the deviation
+    # tiers can mutate it. The Tier 2 repair below overwrites `price` with the
+    # live quote and rewrites decision["price"]/["entry_price"] plus a rescaled
+    # stop and target, so this snapshot is the only remaining record of what the
+    # PM actually intended. A limit sourced from the post-repair decision would
+    # rest at the chased price.
+    original_intended_entry = price
+
     # Sanity-check the LLM's price against a live quote. If the LLM omitted
     # price (or JSON repair produced price=0), use a live quote for valid
     # symbols instead of creating noisy "No price in decision" rejects.
+    #
+    # When price_authoritative is set, no quote is fetched and live_price stays
+    # 0.0. Every downstream branch here is already guarded on
+    # `live_price and live_price > 0`, so leaving it at zero disables the
+    # substitution and BOTH deviation tiers without altering any other logic —
+    # while the `price <= 0` rejection below still applies. The stale-entry check
+    # further down also no-ops on its own, because _try_positive_float(0.0)
+    # returns None and the function returns (True, None) when fresh_price is not
+    # positive. No special case is needed there.
     try:
-        fh = FinnhubClient()
-        live_quote = fh.get_quote(symbol)
+        fh = None if price_authoritative else FinnhubClient()
+        live_quote = {} if fh is None else fh.get_quote(symbol)
         live_price = live_quote.get("price", 0)
         try:
             live_price = float(live_price) if live_price not in (None, "") else 0
@@ -3327,6 +3377,44 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
                     target_ratio if original_target and original_entry else 0,
                 )
 
+                # ── Pending Limit Orders: measure the Repair_Band blind spot ──
+                # This repair has just re-anchored the trade to the live price,
+                # which means the stale-entry check below can no longer fire:
+                # intended_entry == fresh_price makes the runaway branch compute
+                # zero, and the repaired target now sits beyond the live price.
+                # So the runaway branch only ever observes roughly 1%-5%.
+                #
+                # v1 does not change that — the repaired trade still executes.
+                # It records the event so the volume of missed entries this band
+                # absorbs is measurable, which is the evidence needed before
+                # implementing PENDING_ORDER_DIVERT_REPAIR_BAND. Deliberately
+                # creates NO order: resting one alongside a repaired fill would
+                # double-book the same intent.
+                if PENDING_ORDER_MODE != "disabled":
+                    try:
+                        from utils.pending_order_creation import (
+                            emit_repair_band_decline,
+                        )
+
+                        emit_repair_band_decline(
+                            db=db,
+                            profile_id=profile_id,
+                            symbol=symbol,
+                            action=action,
+                            original_intended_entry=original_intended_entry,
+                            live_price=live_price,
+                            deviation=deviation,
+                            original_stop=original_stop,
+                            original_target=original_target,
+                            repaired_stop=new_stop,
+                            repaired_target=new_target,
+                        )
+                    except Exception:
+                        log.error(
+                            "Repair-band decline emission failed for %s "
+                            "(non-fatal)", symbol, exc_info=True,
+                        )
+
             # Tier 1 — ≤5% deviation: no change (existing passthrough)
 
     except Exception as exc:
@@ -3362,6 +3450,43 @@ def execute_trade(db, decision: dict, profile_id: str, *, normalized: bool = Fal
     )
     if not stale_ok:
         log.warning(stale_reason)
+
+        # ── Pending Limit Orders: additive, never substitutive ──
+        # The rejection below stands unchanged in every mode. All this does is
+        # preserve the discarded intent as a resting limit order, so a valid
+        # "wait for my price" idea stops being indistinguishable from an
+        # execution failure.
+        #
+        # intended_entry is the PRE-repair snapshot, not `price`: the Tier 2
+        # repair above may have overwritten `price` with the live quote, and a
+        # limit sourced from that would rest at the chased price.
+        #
+        # Fail-open by design. Nothing about the trading outcome depends on this
+        # succeeding, which puts it firmly in the fail-open column.
+        if PENDING_ORDER_MODE != "disabled":
+            try:
+                from utils.pending_order_creation import (
+                    maybe_create_pending_order,
+                )
+
+                maybe_create_pending_order(
+                    db=db,
+                    decision=decision,
+                    profile_id=profile_id,
+                    action=action,
+                    symbol=symbol,
+                    intended_entry=original_intended_entry,
+                    fresh_price=live_price,
+                    stop=stop,
+                    target=target,
+                    stale_reason=stale_reason,
+                )
+            except Exception:
+                log.error(
+                    "Pending order creation failed for %s (non-fatal)",
+                    symbol, exc_info=True,
+                )
+
         return False, stale_reason
 
     # If still no stop, derive from ATR or analyst key levels — never use flat %

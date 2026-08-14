@@ -1509,7 +1509,7 @@ def api_shadow_outcomes():
 
 @app.route("/api/trade-events")
 def api_trade_events():
-    """Return stop lifecycle events for a specific trade."""
+    """Return stop and pending-order lifecycle events for a specific trade."""
     trade_id = request.args.get("trade_id", type=int)
     if not trade_id:
         return jsonify({"error": "trade_id parameter required"}), 400
@@ -1526,11 +1526,24 @@ def api_trade_events():
         "stop_review_required",
     ]
 
+    # Pending-order events are unioned in from the shared constant rather than a
+    # second hardcoded list. Note this only surfaces POST-fill events: this
+    # endpoint requires a trade_id, and pending_order_created / _expired /
+    # _canceled / _declined are all pre-trade with trade_id = None. Those are
+    # served order-scoped by /api/pending_orders and
+    # /api/pending_orders/<order_id>/events instead.
+    try:
+        from utils.gate_config import PENDING_ORDER_EVENT_TYPES
+
+        event_types = STOP_EVENT_TYPES + sorted(PENDING_ORDER_EVENT_TYPES)
+    except Exception:
+        event_types = STOP_EVENT_TYPES
+
     events = (
         db.query(TradeEvent)
         .filter(
             TradeEvent.trade_id == trade_id,
-            TradeEvent.event_type.in_(STOP_EVENT_TYPES),
+            TradeEvent.event_type.in_(event_types),
         )
         .order_by(TradeEvent.timestamp.asc())
         .all()
@@ -1562,6 +1575,518 @@ def api_trade_events():
 
     db.close()
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Pending Limit Orders
+#
+# Deliberately separate from /api/decisions. A resting order is NOT a rejected
+# decision, and folding it into the notes-and-trades stream is exactly how the
+# two got conflated in the first place.
+#
+# Requirements: 8.8, 10.5, 11.1-11.10, 12.1-12.6
+# ---------------------------------------------------------------------------
+
+PENDING_ORDER_ACTIVE_STATES = ("pending", "filling")
+PENDING_ORDER_TERMINAL_STATES = ("filled", "expired", "canceled", "rejected")
+
+
+def _pending_orders_available() -> bool:
+    """Whether the pending_orders table exists.
+
+    Lets the dashboard degrade to an empty view instead of erroring when the
+    feature has never been initialized (Requirement 11.10).
+    """
+    try:
+        from sqlalchemy import inspect as sa_inspect
+
+        return sa_inspect(engine).has_table("pending_orders")
+    except Exception:
+        return False
+
+
+def _pending_order_current_prices(symbols: set[str]) -> dict[str, float]:
+    """Latest price per unique symbol, fail-open to an empty mapping.
+
+    Fetched once per symbol, matching how api_positions works.
+    """
+    prices: dict[str, float] = {}
+    if not symbols:
+        return prices
+    try:
+        fh = FinnhubClient()
+    except Exception:
+        return prices
+
+    for symbol in sorted(symbols):
+        try:
+            quote = fh.get_quote(symbol, retries=0)
+            price = float(quote.get("price") or 0)
+            if price > 0:
+                prices[symbol] = round(price, 2)
+        except Exception:
+            continue
+    return prices
+
+
+def _serialize_pending_order(order, current_price, events=None) -> dict:
+    """Shape one order for the dashboard.
+
+    `distance_to_limit` is signed from the perspective of "how far the market
+    still has to travel": positive means the limit has not been reached yet.
+    """
+    now = datetime.now(timezone.utc)
+    seconds_remaining = None
+    if order.expires_at is not None:
+        seconds_remaining = max(
+            0, int((order.expires_at - now).total_seconds())
+        )
+
+    distance = None
+    distance_pct = None
+    if current_price is not None and order.limit_price:
+        if order.side == "BUY":
+            distance = round(current_price - order.limit_price, 4)
+        else:
+            distance = round(order.limit_price - current_price, 4)
+        distance_pct = round(distance / order.limit_price * 100, 4)
+
+    payload = {
+        "order_id": order.order_id,
+        "profile": order.profile_id,
+        "symbol": order.symbol,
+        "side": order.side,
+        "setup_type": order.setup_type,
+        "state": order.state.value,
+        "is_active": order.state.value in PENDING_ORDER_ACTIVE_STATES,
+        "limit_price": order.limit_price,
+        "stop_price": order.stop_price,
+        "target_price": order.target_price,
+        "risk_reward": order.risk_reward,
+        "intended_quantity": order.intended_quantity,
+        "current_price": current_price,
+        "distance_to_limit": distance,
+        "distance_to_limit_pct": distance_pct,
+        "fresh_price_at_creation": order.fresh_price_at_creation,
+        "runaway_pct_at_creation": order.runaway_pct_at_creation,
+        "created_at": order.created_at.isoformat() if order.created_at else None,
+        "expires_at": order.expires_at.isoformat() if order.expires_at else None,
+        "seconds_remaining": seconds_remaining,
+        "reason": order.terminal_reason,
+        "rationale": order.pm_rationale,
+        "fill_price": order.fill_price,
+        "fill_policy": order.fill_policy,
+        "fill_bar_ts": (
+            order.fill_bar_ts.isoformat() if order.fill_bar_ts else None
+        ),
+        "filled_at": order.filled_at.isoformat() if order.filled_at else None,
+        "terminal_at": (
+            order.terminal_at.isoformat() if order.terminal_at else None
+        ),
+        "trade_id": order.trade_id,
+        "candidate_id": order.candidate_id,
+        "cycle_id": order.cycle_id,
+    }
+    if events is not None:
+        payload["recent_events"] = events
+    return payload
+
+
+def _serialize_pending_order_event(event: dict) -> dict:
+    return {
+        "id": event.get("id"),
+        "order_id": event.get("order_id"),
+        "event_type": event.get("event_type"),
+        "from_state": event.get("from_state"),
+        "to_state": event.get("to_state"),
+        "reference_price": event.get("reference_price"),
+        "created_at": event.get("created_at"),
+        "event_data": event.get("event_data"),
+    }
+
+
+@app.route("/api/pending_orders")
+def api_pending_orders():
+    """Resting limit orders plus recent terminal outcomes.
+
+    Query params:
+        profile        restrict to one profile (default: all ACTIVE_PROFILES)
+        include_terminal  "false" to return only active orders
+        limit          max orders per profile (default 100)
+
+    Returns an empty payload when the feature has never been initialized, so the
+    front end needs no conditional.
+
+    Pending orders are NOT included in position, exposure, or equity figures
+    anywhere — they are reported here as committed intent only (Requirement 8.8).
+    """
+    if not _pending_orders_available():
+        return jsonify({
+            "available": False,
+            "mode": os.getenv("PENDING_ORDER_MODE", "disabled"),
+            "orders": [],
+            "counts": {},
+        })
+
+    from utils.pending_order_registry import PendingOrderRegistry
+
+    requested_profile = request.args.get("profile")
+    include_terminal = request.args.get("include_terminal", "true") != "false"
+    limit = request.args.get("limit", default=100, type=int)
+    profiles = [requested_profile] if requested_profile else list(ACTIVE_PROFILES)
+
+    registry = PendingOrderRegistry(engine)
+
+    orders = []
+    try:
+        for profile_id in profiles:
+            orders.extend(
+                registry.get_orders_for_profile(
+                    profile_id, include_terminal=include_terminal, limit=limit
+                )
+            )
+    except Exception as exc:
+        log.warning("Could not load pending orders: %s", exc)
+        return jsonify({
+            "available": False,
+            "error": sanitize_error_text(str(exc)),
+            "orders": [],
+            "counts": {},
+        })
+
+    # Current prices only matter for orders still resting.
+    active_symbols = {
+        o.symbol for o in orders
+        if o.state.value in PENDING_ORDER_ACTIVE_STATES
+    }
+    prices = _pending_order_current_prices(active_symbols)
+
+    serialized = []
+    for order in orders:
+        events = []
+        try:
+            events = [
+                _serialize_pending_order_event(e)
+                for e in registry.get_events(order.order_id)[-10:]
+            ]
+        except Exception:
+            events = []
+        serialized.append(
+            _serialize_pending_order(
+                order, prices.get(order.symbol), events=events
+            )
+        )
+
+    serialized.sort(key=lambda o: o.get("created_at") or "", reverse=True)
+
+    counts: dict[str, int] = {}
+    for order in serialized:
+        counts[order["state"]] = counts.get(order["state"], 0) + 1
+
+    return jsonify({
+        "available": True,
+        "mode": os.getenv("PENDING_ORDER_MODE", "disabled"),
+        "orders": serialized,
+        "counts": counts,
+        "active_count": sum(
+            counts.get(state, 0) for state in PENDING_ORDER_ACTIVE_STATES
+        ),
+    })
+
+
+@app.route("/api/pending_orders/<order_id>/events")
+def api_pending_order_events(order_id: str):
+    """Full lifecycle history for one order.
+
+    This is the mechanism satisfying Requirement 11.5. /api/trade-events cannot
+    serve it: that endpoint requires a trade_id and returns HTTP 400 without one,
+    while pending_order_created / _expired / _canceled / _declined all carry
+    trade_id = None because log_trade_event() leaves it nullable precisely so
+    pre-fill events can be recorded.
+    """
+    if not _pending_orders_available():
+        return jsonify({"error": "pending orders are not initialized"}), 404
+
+    from utils.pending_order_registry import PendingOrderRegistry
+
+    registry = PendingOrderRegistry(engine)
+    try:
+        order = registry.get_order(order_id)
+        if order is None:
+            return jsonify({"error": f"unknown order_id {order_id}"}), 404
+        events = [
+            _serialize_pending_order_event(e)
+            for e in registry.get_events(order_id)
+        ]
+    except Exception as exc:
+        log.warning("Could not load events for order %s: %s", order_id, exc)
+        return jsonify({"error": sanitize_error_text(str(exc))}), 500
+
+    return jsonify({
+        "order_id": order_id,
+        "symbol": order.symbol,
+        "side": order.side,
+        "state": order.state.value,
+        "events": events,
+    })
+
+
+@app.route("/api/pending_orders/summary")
+def api_pending_orders_summary():
+    """Structured outcome rollup for reviewer and CEO inputs.
+
+    Distinguishes the four terminal outcomes plus declines, so case learning can
+    separate "bad idea" from "good idea, order did not fill" and "good idea,
+    filled later" (Requirements 12.1, 12.3, 12.4, 12.5).
+
+    Also surfaces the two decline rates that gate design decisions:
+      - target_already_exceeded  -> whether that branch should rest orders
+      - repaired_before_check    -> how much missed-entry volume the Tier 2
+                                    repair band absorbs, which is the evidence
+                                    for PENDING_ORDER_DIVERT_REPAIR_BAND
+    """
+    days = request.args.get("days", default=7, type=int)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    result = {
+        "available": _pending_orders_available(),
+        "window_days": days,
+        "mode": os.getenv("PENDING_ORDER_MODE", "disabled"),
+        "outcomes": {},
+        "declines": {},
+        "fill_rate_by_setup": {},
+        "fill_rate_by_profile": {},
+        "near_misses": [],
+        "fill_bar_age_seconds": {},
+    }
+
+    if not result["available"]:
+        return jsonify(result)
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT state, setup_type, profile_id, COUNT(*) AS n
+                    FROM pending_orders
+                    WHERE created_at >= :cutoff
+                    GROUP BY state, setup_type, profile_id
+                    """
+                ),
+                {"cutoff": cutoff.isoformat()},
+            ).mappings().all()
+    except Exception as exc:
+        log.warning("Could not summarize pending orders: %s", exc)
+        result["available"] = False
+        result["error"] = sanitize_error_text(str(exc))
+        return jsonify(result)
+
+    by_setup: dict[str, dict[str, int]] = {}
+    by_profile: dict[str, dict[str, int]] = {}
+    for row in rows:
+        state = row["state"]
+        result["outcomes"][state] = result["outcomes"].get(state, 0) + row["n"]
+        by_setup.setdefault(row["setup_type"], {})[state] = row["n"]
+        by_profile.setdefault(row["profile_id"], {})[state] = row["n"]
+
+    def _fill_rate(buckets: dict[str, int]) -> dict:
+        resolved = sum(
+            buckets.get(state, 0) for state in PENDING_ORDER_TERMINAL_STATES
+        )
+        filled = buckets.get("filled", 0)
+        return {
+            "filled": filled,
+            "resolved": resolved,
+            "fill_rate": round(filled / resolved, 4) if resolved else None,
+            "by_state": buckets,
+        }
+
+    result["fill_rate_by_setup"] = {k: _fill_rate(v) for k, v in by_setup.items()}
+    result["fill_rate_by_profile"] = {
+        k: _fill_rate(v) for k, v in by_profile.items()
+    }
+
+    # Decline reasons and near-miss telemetry come from the event stream, which
+    # is the only place declines are recorded (no order row is ever created).
+    try:
+        db = get_session(engine)
+        try:
+            events = (
+                db.query(TradeEvent)
+                .filter(
+                    TradeEvent.event_type.in_([
+                        "pending_order_declined", "pending_order_expired"
+                    ])
+                )
+                .filter(TradeEvent.timestamp >= cutoff.replace(tzinfo=None))
+                .all()
+            )
+        finally:
+            db.close()
+
+        near_misses = []
+        for event in events:
+            try:
+                payload = json.loads(event.payload_json or "{}")
+            except (ValueError, TypeError):
+                continue
+
+            if event.event_type == "pending_order_declined":
+                reason = payload.get("reason") or "unknown"
+                result["declines"][reason] = result["declines"].get(reason, 0) + 1
+                continue
+
+            distance = payload.get("closest_approach_distance")
+            if distance is not None:
+                near_misses.append({
+                    "order_id": payload.get("order_id"),
+                    "symbol": event.symbol,
+                    "side": payload.get("side"),
+                    "setup_type": payload.get("setup_type"),
+                    "limit_price": payload.get("limit_price"),
+                    "closest_approach_price": payload.get(
+                        "closest_approach_price"
+                    ),
+                    "closest_approach_distance": distance,
+                    "expired_at": payload.get("expires_at"),
+                })
+
+        near_misses.sort(key=lambda n: abs(n["closest_approach_distance"]))
+        result["near_misses"] = near_misses[:25]
+    except Exception as exc:
+        log.warning("Could not summarize pending order events: %s", exc)
+
+    # Opt-in, because it costs one provider call per expired symbol. Off by
+    # default so the common dashboard poll stays cheap.
+    if request.args.get("check_post_expiry") == "true":
+        result["post_expiry"] = _pending_order_post_expiry_report(cutoff)
+
+    return jsonify(result)
+
+
+def _pending_order_post_expiry_report(cutoff, grace_minutes: int = 30) -> dict:
+    """Did expired orders' limits get hit shortly after they expired?
+
+    This is the signal that says whether the active windows are too short
+    (Requirement 12.2). It distinguishes "good idea, order did not fill" from
+    "good idea, filled later" — which is the distinction case learning needs, and
+    the one that can't be inferred from the order rows alone.
+
+    Recomputed from bars rather than tracked, so it needs no extra column and no
+    background job.
+    """
+    report = {
+        "grace_minutes": grace_minutes,
+        "checked": 0,
+        "would_have_filled": 0,
+        "orders": [],
+    }
+
+    try:
+        from decimal import Decimal as _Decimal
+
+        from utils.finnhub_client import FinnhubClient
+        from utils.gate_config import (
+            PENDING_ORDER_BAR_RESOLUTION,
+            PENDING_ORDER_MAX_GAP_THROUGH_PCT,
+        )
+        from utils.pending_order_fill import (
+            bars_from_candles,
+            detect_crossing,
+            eligible_bars,
+        )
+        from utils.pending_order_registry import PendingOrderRegistry
+
+        registry = PendingOrderRegistry(engine)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT order_id FROM pending_orders
+                    WHERE state = 'expired' AND created_at >= :cutoff
+                    ORDER BY terminal_at DESC LIMIT 50
+                    """
+                ),
+                {"cutoff": cutoff.isoformat()},
+            ).fetchall()
+
+        if not rows:
+            return report
+
+        orders = [registry.get_order(r[0]) for r in rows]
+        orders = [o for o in orders if o is not None]
+
+        bars_by_symbol: dict[str, list] = {}
+        client = FinnhubClient()
+        for symbol in {o.symbol for o in orders}:
+            try:
+                bars_by_symbol[symbol] = bars_from_candles(
+                    client.get_candles(
+                        symbol, resolution=PENDING_ORDER_BAR_RESOLUTION, days=1
+                    )
+                )
+            except Exception:
+                continue
+
+        for order in orders:
+            bars = bars_by_symbol.get(order.symbol)
+            if not bars or order.expires_at is None:
+                continue
+
+            report["checked"] += 1
+            grace_end = order.expires_at + timedelta(minutes=grace_minutes)
+            try:
+                windowed = eligible_bars(
+                    bars,
+                    created_at=order.expires_at,   # strictly AFTER expiry
+                    expires_at=grace_end,
+                    watermark=None,
+                )
+                if not windowed:
+                    continue
+                crossing = detect_crossing(
+                    windowed,
+                    side=order.side,
+                    limit_price=_Decimal(str(order.limit_price)),
+                    gap_through_pct=_Decimal(
+                        str(PENDING_ORDER_MAX_GAP_THROUGH_PCT)
+                    ),
+                )
+            except Exception:
+                continue
+
+            if crossing.crossed:
+                report["would_have_filled"] += 1
+                report["orders"].append({
+                    "order_id": order.order_id,
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "setup_type": order.setup_type,
+                    "limit_price": order.limit_price,
+                    "expired_at": order.expires_at.isoformat(),
+                    "crossed_at": (
+                        crossing.bar.ts.isoformat() if crossing.bar else None
+                    ),
+                    "minutes_after_expiry": (
+                        round(
+                            (crossing.bar.ts - order.expires_at).total_seconds()
+                            / 60.0,
+                            1,
+                        )
+                        if crossing.bar else None
+                    ),
+                })
+
+        if report["checked"]:
+            report["would_have_filled_rate"] = round(
+                report["would_have_filled"] / report["checked"], 4
+            )
+    except Exception as exc:
+        log.warning("Could not build the post-expiry report: %s", exc)
+        report["error"] = sanitize_error_text(str(exc))
+
+    return report
 
 
 if __name__ == "__main__":

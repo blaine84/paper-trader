@@ -909,6 +909,12 @@ def _ensure_trade_plan_events_identity_default(engine, inspector):
     _ensure_postgres_identity_default(engine, inspector, "trade_plan_events")
 
 
+# --- Pending limit orders (db/schema.py) ---
+
+def _ensure_pending_order_events_identity_default(engine, inspector):
+    _ensure_postgres_identity_default(engine, inspector, "pending_order_events")
+
+
 def _ensure_checkpoint_tables(engine, inspector):
     """Create checkpoint_events table if missing.
 
@@ -1055,7 +1061,12 @@ def _ensure_watch_candidate_tables(engine, inspector):
 def check_schema(engine):
     """Verify the DB schema has all expected columns. Fail fast if not."""
     from sqlalchemy import inspect as sa_inspect, text
-    from db.schema import verify_wal_mode, is_sqlite, init_trade_plan_schema
+    from db.schema import (
+        verify_wal_mode,
+        is_sqlite,
+        init_trade_plan_schema,
+        init_pending_order_schema,
+    )
 
     # --- Verify WAL mode and busy_timeout (non-destructive, SQLite only) ---
     if is_sqlite(engine):
@@ -1109,6 +1120,15 @@ def check_schema(engine):
     init_trade_plan_schema(engine)
     inspector = sa_inspect(engine)
     _ensure_trade_plan_events_identity_default(engine, inspector)
+
+    # --- Auto-create pending limit order tables if missing (non-destructive) ---
+    # Same idempotent IF NOT EXISTS pattern. Runs unconditionally rather than
+    # behind PENDING_ORDER_MODE so that flipping the flag on a live system needs
+    # no schema step, and so the dashboard can query the tables even while the
+    # feature is disabled.
+    init_pending_order_schema(engine)
+    inspector = sa_inspect(engine)
+    _ensure_pending_order_events_identity_default(engine, inspector)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —
@@ -2655,6 +2675,29 @@ def main():
         except Exception as exc:
             log.warning("Startup trade plan orphan sweep failed (non-fatal): %s", exc)
 
+    # ─── Pending Limit Orders: startup orphan sweep ────────────────────
+    # Must run AFTER check_schema() so pending_orders exists. Guarantees no order
+    # survives a restart in PENDING or FILLING (Requirement 9.12).
+    # Fail-open: a sweep failure must not block orchestrator startup.
+    from utils.gate_config import PENDING_ORDER_MODE as _pending_mode
+
+    if _pending_mode != "disabled":
+        try:
+            from utils.pending_order_registry import PendingOrderRegistry
+
+            _pending_registry = PendingOrderRegistry(engine)
+            resolved = _pending_registry.finalize_orphaned_orders()
+            if resolved:
+                log.info(
+                    "Startup: finalized %d orphaned pending order(s): %s",
+                    len(resolved),
+                    {k: v.value for k, v in resolved.items()},
+                )
+        except Exception as exc:
+            log.warning(
+                "Startup pending order orphan sweep failed (non-fatal): %s", exc
+            )
+
     # ─── Alert Dispatcher Construction ─────────────────────────────────
     global _alert_dispatcher
     from utils.gate_config import PM_ALERT_DISPATCH_MODE, PM_ALERT_DISPATCHER_INTERVAL_SECONDS
@@ -2914,6 +2957,55 @@ def main():
             run_plan_orphan_sweep,
             _PlanIntervalTrigger(seconds=300),  # every 5 minutes
             id="plan_orphan_sweep",
+            max_instances=1,
+            replace_existing=True,
+            coalesce=True,
+        )
+
+    # ─── Pending Limit Order Monitor ───────────────────────────────────
+    # Evaluates resting limit orders against 1-minute OHLC bars. Independent of
+    # PM cycles and of TRIGGERED_PLAN_MODE. Registered only when the feature is
+    # active. No separate orphan-sweep job is needed: the tick runs the sweep
+    # itself as its final step, so a stranded FILLING order is recovered within
+    # one interval.
+    from utils.gate_config import (
+        PENDING_ORDER_MODE,
+        PENDING_ORDER_MONITOR_INTERVAL_SECONDS,
+    )
+
+    if PENDING_ORDER_MODE != "disabled":
+        from apscheduler.triggers.interval import (
+            IntervalTrigger as _PendingIntervalTrigger,
+        )
+
+        def run_pending_order_monitor():
+            """Evaluate resting pending limit orders against fresh bars."""
+            if _skip_outside_regular_market_job("pending_order_monitor"):
+                return
+            _engine_local = get_engine()
+            try:
+                import utils.pending_order_monitor as pending_order_monitor
+
+                result = pending_order_monitor.run(_engine_local)
+                if result.had_activity:
+                    log.info(
+                        "PENDING_ORDER_TICK: checked=%d filled=%d expired=%d "
+                        "canceled=%d bars=%d symbols=%d duration_ms=%.1f",
+                        result.orders_checked,
+                        result.orders_filled,
+                        result.orders_expired,
+                        result.orders_canceled,
+                        result.bars_fetched,
+                        result.symbols_fetched,
+                        result.tick_duration_ms,
+                    )
+            except Exception as e:
+                log.error("Pending order monitor error: %s", e, exc_info=True)
+
+        scheduler.add_job(
+            run_pending_order_monitor,
+            _PendingIntervalTrigger(seconds=PENDING_ORDER_MONITOR_INTERVAL_SECONDS),
+            id="pending_order_monitor",
             max_instances=1,
             replace_existing=True,
             coalesce=True,

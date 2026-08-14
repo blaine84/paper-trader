@@ -8,10 +8,21 @@ from __future__ import annotations
 
 import logging
 import os
-import resource
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator
+
+# `resource` is POSIX-only. It is present on the macOS and Linux hosts this runs
+# on, so nothing below changes there. The guard exists so that importing this
+# module — and therefore orchestrator.py, which imports it at module scope — does
+# not hard-fail on Windows during development. Every other function here already
+# degrades on platforms without the relevant facility (_fd_dir() returns None
+# when neither /dev/fd nor /proc/self/fd exists); this keeps the import itself
+# consistent with that.
+try:
+    import resource
+except ImportError:  # pragma: no cover - only taken on non-POSIX platforms
+    resource = None  # type: ignore[assignment]
 
 
 def _fd_dir() -> str | None:
@@ -39,10 +50,18 @@ def get_open_fd_count() -> int | None:
 
 
 def get_fd_limit() -> tuple[int | None, int | None]:
-    """Return the soft/hard RLIMIT_NOFILE values for this process."""
+    """Return the soft/hard RLIMIT_NOFILE values for this process.
+
+    Returns ``(None, None)`` where RLIMIT_NOFILE is unavailable, which callers
+    already handle: ``log_fd_snapshot()`` omits None values from its output and
+    skips the usage-percentage calculation.
+    """
+    if resource is None:
+        return None, None
+
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         return None, None
 
     def normalize(value: int) -> int | None:

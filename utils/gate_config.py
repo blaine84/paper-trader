@@ -235,6 +235,29 @@ REJECTION_REASONS: set[str] = {
     "signal_invalidated",
     "timeout_expired",
     "pm_override_missing",
+    # ── Pending limit order cancellations ──
+    # Added alongside rather than reusing price_target_missed /
+    # signal_invalidated / timeout_expired, so pending-order outcomes stay
+    # distinguishable from triggered-plan outcomes in queries.
+    "signal_flipped",
+    "superseded",
+    "position_already_open",
+    "cooldown_active",
+    "insufficient_buying_power",
+    "gap_through",
+    "sizing_rejected",
+    # ── Pending limit order creation declines ──
+    "target_already_exceeded",
+    "runaway_exceeds_max",
+    "incomplete_geometry",
+    "invalid_geometry_at_limit",
+    "window_too_short",
+    "active_order_cap_reached",
+    "duplicate_active_order",
+    "active_trade_plan_exists",
+    "repaired_before_check",
+    # ── Pending limit order fill-path observation ──
+    "stale_fill_bar",
 }
 
 # ---------------------------------------------------------------------------
@@ -784,6 +807,135 @@ if TRIGGERED_PLAN_MODE != "disabled":
         PLAN_DEFAULT_EXPIRATION_MINUTES,
         PLAN_ENTRY_ZONE_TOLERANCE_PCT,
         PLAN_TRIGGER_CONFIRMATION_TICKS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pending Limit Orders Feature Flags
+#
+# Converts the runaway-entry branch of _fresh_price_stale_entry_check() into a
+# resting paper limit order instead of discarding the intent. Independent of
+# TRIGGERED_PLAN_MODE by design — pending orders must be rollable without
+# enabling the (currently dormant) triggered-plan subsystem.
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enabled"
+# disabled: execute_trade() behavior unchanged; no orders, no monitor job
+# observe:  orders created and evaluated; fills are logged, never executed
+# enabled:  detected crossings execute through execute_trade() after full
+#           fill-time revalidation
+_raw_pending_order_mode = os.environ.get("PENDING_ORDER_MODE", "disabled")
+if _raw_pending_order_mode not in ("disabled", "observe", "enabled"):
+    logger.warning(
+        "Unrecognized PENDING_ORDER_MODE=%r, defaulting to 'disabled'",
+        _raw_pending_order_mode,
+    )
+    _raw_pending_order_mode = "disabled"
+PENDING_ORDER_MODE: str = _raw_pending_order_mode
+
+# Monitor cadence (seconds) — independent of PM cycles. Bars are 1-minute by
+# default, so polling faster than the bar interval gains nothing.
+PENDING_ORDER_MONITOR_INTERVAL_SECONDS: int = _int_env(
+    "PENDING_ORDER_MONITOR_INTERVAL_SECONDS", 60, minimum=15
+)
+
+# Fallback active-window length (minutes) for setup types absent from
+# PENDING_ORDER_EXPIRY_MINUTES_BY_SETUP. Always clamped to the session close.
+PENDING_ORDER_DEFAULT_EXPIRY_MINUTES: int = _int_env(
+    "PENDING_ORDER_DEFAULT_EXPIRY_MINUTES", 120, minimum=5
+)
+
+# Upper bound on how far price may have run beyond the intended entry and still
+# justify resting an order.
+#
+# NOTE: non-binding under current execute_trade() ordering. The live-quote
+# deviation tiers run BEFORE _fresh_price_stale_entry_check(): Tier 2 (>5%,
+# <=10%) overwrites price with the live quote and rewrites the geometry back
+# into the decision dict, and Tier 3 (>10%) returns outright. So the
+# runaway-entry branch only ever observes roughly the 1%-5% range and nothing
+# above ~5% reaches this guard. It becomes meaningful only if
+# PENDING_ORDER_DIVERT_REPAIR_BAND is implemented.
+PENDING_ORDER_MAX_RUNAWAY_PCT: float = _float_env(
+    "PENDING_ORDER_MAX_RUNAWAY_PCT", 0.05, minimum=0.0
+)
+
+# Gap-through threshold. When the crossing bar's OPEN is already beyond the
+# limit by more than this fraction, the market gapped past the level rather
+# than trading down to it, which invalidates the stop and target derived from
+# the pre-gap structure. Such orders cancel rather than fill.
+PENDING_ORDER_MAX_GAP_THROUGH_PCT: float = _float_env(
+    "PENDING_ORDER_MAX_GAP_THROUGH_PCT", 0.015, minimum=0.0
+)
+
+# Cap on concurrent active orders per profile. Buying power is NOT reserved at
+# creation (it is re-checked at fill), so this cap is what bounds the resulting
+# overcommitment risk.
+PENDING_ORDER_MAX_ACTIVE_PER_PROFILE: int = _int_env(
+    "PENDING_ORDER_MAX_ACTIVE_PER_PROFILE", 5, minimum=1
+)
+
+# OHLC resolution used for crossing detection. Passed straight to
+# FinnhubClient.get_candles(), which routes Alpaca -> yfinance -> Finnhub for
+# sub-daily resolutions.
+PENDING_ORDER_BAR_RESOLUTION: str = os.environ.get(
+    "PENDING_ORDER_BAR_RESOLUTION", "1"
+)
+
+# Maximum age of a crossing bar at the moment of the fill attempt. This is the
+# compensating control for bypassing execute_trade()'s deviation tiers on the
+# price-authoritative fill path: it is the only remaining guarantee that the
+# fill price reflects recent market reality. A slow tick, a restart, or an
+# order backlog can all surface a bar several minutes old.
+PENDING_ORDER_MAX_FILL_BAR_AGE_SECONDS: int = _int_env(
+    "PENDING_ORDER_MAX_FILL_BAR_AGE_SECONDS", 180, minimum=30
+)
+
+# Phase 3 lever, deliberately unimplemented in v1. Would divert Repair_Band
+# (>5%, <=10% deviation) decisions to a pending order at the original intended
+# entry instead of repairing to the live price and executing. That is a
+# behavior change to live execution rather than an additive one, so it needs
+# the pending_order_declined(repaired_before_check) evidence first.
+PENDING_ORDER_DIVERT_REPAIR_BAND: bool = os.environ.get(
+    "PENDING_ORDER_DIVERT_REPAIR_BAND", "false"
+).lower() == "true"
+
+# Setup-specific active-window lengths (minutes). Biased short because
+# intraday setup premises decay fast. Absent setup types fall back to
+# PENDING_ORDER_DEFAULT_EXPIRY_MINUTES. All values are further clamped by
+# ENTRY_WINDOW_LIMITS and by the regular session close.
+PENDING_ORDER_EXPIRY_MINUTES_BY_SETUP: dict[str, int] = {
+    "gap_and_go": 30,
+    "orb": 30,
+    "short_squeeze": 30,
+    "momentum_fade": 45,
+    "vwap_reclaim": 60,
+    "news_breakout": 60,
+    "technical_breakout": 120,
+}
+
+# Canonical pending-order event vocabulary. Shared so that web/app.py filters
+# against this constant instead of a second hardcoded list.
+PENDING_ORDER_EVENT_TYPES: frozenset[str] = frozenset({
+    "pending_order_created",
+    "pending_order_filled",
+    "pending_order_expired",
+    "pending_order_canceled",
+    "pending_order_rejected",
+    "pending_order_declined",
+    "pending_order_would_fill",
+})
+
+# Startup log reporting active mode
+if PENDING_ORDER_MODE != "disabled":
+    logger.info(
+        "Pending Limit Order Mode: %s (monitor_interval=%ss, bar_resolution=%s, "
+        "default_expiry=%smin, max_active_per_profile=%s, max_fill_bar_age=%ss)",
+        PENDING_ORDER_MODE,
+        PENDING_ORDER_MONITOR_INTERVAL_SECONDS,
+        PENDING_ORDER_BAR_RESOLUTION,
+        PENDING_ORDER_DEFAULT_EXPIRY_MINUTES,
+        PENDING_ORDER_MAX_ACTIVE_PER_PROFILE,
+        PENDING_ORDER_MAX_FILL_BAR_AGE_SECONDS,
     )
 
 
