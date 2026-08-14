@@ -519,3 +519,211 @@ def init_trade_plan_schema(engine):
                 ))
 
     logger.debug("Trade plan schema verified (trade_plans, trade_plan_events)")
+
+
+# ---------------------------------------------------------------------------
+# pending_orders (resting paper limit orders)
+#
+# A pending order is a PM-approved entry intent whose limit price was not
+# executable when the decision was made, because the fresh quote had already
+# run away from the intended entry. It rests until market data crosses the
+# limit inside its active window, or until it expires or is canceled.
+#
+# Deliberately a separate table from trade_plans rather than an extension of
+# it: trade_plans declares entry_zone_upper/lower, trigger_type and
+# trigger_condition_json NOT NULL, none of which mean anything for a
+# single-price resting order, and coupling the two would tie this feature's
+# rollout to the (currently dormant) TRIGGERED_PLAN_MODE subsystem.
+#
+# All linkage columns are nullable on purpose. The live PM path runs with
+# PM_CANDIDATE_MODE disabled and therefore produces no candidate_id.
+#
+# Requirements: 2.8, 2.12, 7.4
+# ---------------------------------------------------------------------------
+
+_PENDING_ORDERS_DDL = """
+CREATE TABLE IF NOT EXISTS pending_orders (
+    order_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    setup_type TEXT NOT NULL,
+    geometry_name TEXT,
+
+    candidate_id TEXT,
+    cycle_id TEXT,
+    source_signal_id TEXT,
+    plan_id TEXT,
+
+    limit_price REAL NOT NULL,
+    stop_price REAL NOT NULL,
+    target_price REAL NOT NULL,
+    risk_reward REAL NOT NULL,
+    intended_quantity INTEGER,
+
+    fresh_price_at_creation REAL NOT NULL,
+    runaway_pct_at_creation REAL NOT NULL,
+    pm_rationale TEXT,
+    signal_snapshot_json TEXT,
+
+    state TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_evaluated_bar_ts TEXT,
+    filled_at TEXT,
+    terminal_at TEXT,
+    fill_price REAL,
+    fill_policy TEXT,
+    fill_bar_ts TEXT,
+    terminal_reason TEXT,
+    trade_id INTEGER,
+
+    integrity_hash TEXT NOT NULL
+)
+"""
+
+_PENDING_ORDERS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_pending_orders_state "
+    "ON pending_orders(state)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_orders_symbol_state "
+    "ON pending_orders(symbol, state)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_orders_profile_state "
+    "ON pending_orders(profile_id, state)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_orders_candidate "
+    "ON pending_orders(candidate_id)",
+    # Enforces Requirement 7.4 at the storage layer rather than trusting
+    # application logic: at most one ACTIVE order per
+    # (profile_id, symbol, side, setup_type). Terminal rows are excluded, so
+    # history accumulates freely. Creation supersedes any existing active
+    # order for the key before inserting, so this only fires on a genuine
+    # race — where an IntegrityError is the correct, fail-closed outcome.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_orders_active_key "
+    "ON pending_orders(profile_id, symbol, side, setup_type) "
+    "WHERE state IN ('pending', 'filling')",
+]
+
+
+# ---------------------------------------------------------------------------
+# pending_order_events (immutable, append-only audit trail)
+#
+# Every state transition emits a row here. Rows are never updated or deleted —
+# immutability is enforced by database triggers, matching trade_plan_events,
+# decision_snapshots and provenance_events.
+#
+# Requirements: 2.9, 2.11, 9.10, 10.8
+# ---------------------------------------------------------------------------
+
+_PENDING_ORDER_EVENTS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS pending_order_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT,
+    from_state TEXT,
+    to_state TEXT,
+    reference_price REAL,
+    created_at TEXT NOT NULL
+)
+"""
+
+_PENDING_ORDER_EVENTS_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS pending_order_events (
+    id SERIAL PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT,
+    from_state TEXT,
+    to_state TEXT,
+    reference_price DOUBLE PRECISION,
+    created_at TEXT NOT NULL
+)
+"""
+
+_PENDING_ORDER_EVENTS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_pending_order_events_order "
+    "ON pending_order_events(order_id)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_order_events_type "
+    "ON pending_order_events(event_type)",
+]
+
+_PENDING_ORDER_EVENTS_IMMUTABILITY_TRIGGERS = [
+    """
+    CREATE TRIGGER IF NOT EXISTS pending_order_events_no_update
+        BEFORE UPDATE ON pending_order_events
+    BEGIN
+        SELECT RAISE(ABORT, 'pending_order_events is immutable: UPDATE prohibited');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS pending_order_events_no_delete
+        BEFORE DELETE ON pending_order_events
+    BEGIN
+        SELECT RAISE(ABORT, 'pending_order_events is immutable: DELETE prohibited');
+    END
+    """,
+]
+
+
+def init_pending_order_schema(engine):
+    """Create pending-limit-order tables, indexes, and triggers if missing.
+
+    Non-destructive and idempotent: uses CREATE TABLE / CREATE INDEX /
+    CREATE TRIGGER IF NOT EXISTS so it can run on every orchestrator startup.
+    Existing rows and columns are never modified.
+
+    `pending_order_events` is an append-only audit trail: UPDATE and DELETE are
+    blocked by immutability triggers, matching the pattern used by
+    trade_plan_events, decision_snapshots and provenance_events.
+
+    A partial UNIQUE index enforces at most one active order per
+    (profile_id, symbol, side, setup_type), which is Requirement 7.4 expressed
+    as a storage constraint instead of an application-layer convention.
+
+    Requirements: 2.8, 2.9, 2.10, 2.11, 2.12, 7.4
+    """
+    sqlite = is_sqlite(engine)
+
+    with engine.begin() as conn:
+        conn.execute(text(_PENDING_ORDERS_DDL))
+        for stmt in _PENDING_ORDERS_INDEXES:
+            conn.execute(text(stmt))
+
+        conn.execute(text(
+            _PENDING_ORDER_EVENTS_DDL_SQLITE if sqlite
+            else _PENDING_ORDER_EVENTS_DDL_POSTGRES
+        ))
+        for stmt in _PENDING_ORDER_EVENTS_INDEXES:
+            conn.execute(text(stmt))
+
+        if sqlite:
+            for stmt in _PENDING_ORDER_EVENTS_IMMUTABILITY_TRIGGERS:
+                conn.execute(text(stmt))
+        else:
+            # Postgres: shared raise_immutable() function + per-op triggers.
+            # CREATE OR REPLACE makes this safe alongside init_trade_plan_schema,
+            # which defines the same function.
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION '% is immutable: % prohibited', TG_TABLE_NAME, TG_OP;
+                END;
+                $$ LANGUAGE plpgsql
+            """))
+            for op in ("update", "delete"):
+                conn.execute(text(
+                    f"DROP TRIGGER IF EXISTS pending_order_events_no_{op} "
+                    f"ON pending_order_events"
+                ))
+                conn.execute(text(
+                    f"CREATE TRIGGER pending_order_events_no_{op} "
+                    f"BEFORE {op.upper()} ON pending_order_events "
+                    f"FOR EACH ROW EXECUTE FUNCTION raise_immutable()"
+                ))
+
+    logger.debug(
+        "Pending order schema verified (pending_orders, pending_order_events)"
+    )
