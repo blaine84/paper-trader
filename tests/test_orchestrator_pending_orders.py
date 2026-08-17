@@ -42,8 +42,7 @@ def _mock_main_infrastructure():
          patch("utils.alert_dispatch_schema.init_alert_dispatch_schema"), \
          patch("utils.gate_config.MARKET_STATE_MODE", "disabled"), \
          patch("utils.gate_config.PM_ALERT_DISPATCH_MODE", "disabled"), \
-         patch("utils.gate_config.PM_ALERT_DISPATCHER_INTERVAL_SECONDS", 60), \
-         patch("utils.gate_config.TRIGGERED_PLAN_MODE", "disabled"):
+         patch("utils.gate_config.PM_ALERT_DISPATCHER_INTERVAL_SECONDS", 60):
         yield mock_scheduler
 
 

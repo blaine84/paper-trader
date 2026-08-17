@@ -469,17 +469,21 @@ _TRADE_PLAN_EVENTS_IMMUTABILITY_TRIGGERS = [
 
 
 def init_trade_plan_schema(engine):
-    """Create triggered-trade-plan tables, indexes, and triggers if missing.
+    """Create trade_plans and trade_plan_events tables if they do not exist.
 
-    Non-destructive and idempotent: uses CREATE TABLE / CREATE INDEX /
-    CREATE TRIGGER IF NOT EXISTS so it can run on every orchestrator
-    startup. Existing rows and columns are never modified.
+    HISTORICAL COMPATIBILITY ONLY — the triggered-plan entry execution
+    architecture was retired in the limit-order-mode-cleanup spec.
+    No active runtime code inserts into these tables. They are retained so
+    that:
+    - Existing databases are not broken by a missing table reference.
+    - Historical review/CEO queries that read trade_plan_events continue to work.
+    - The immutability triggers remain in place protecting audit data.
 
-    `trade_plan_events` is an append-only audit trail: UPDATE and DELETE
-    are blocked by immutability triggers, matching the pattern used by
-    decision_snapshots and provenance_events.
+    The 'missed_setup' trade event type is likewise dormant vocabulary — all
+    three emitters (plan_monitor, plan_executor, TradePlanRegistry) were removed.
+    Historical rows remain queryable.
 
-    Requirements: 1.8, 8.1, 8.5, 9.1, 9.4, 9.5
+    Do not add new INSERT paths to these tables.
     """
     sqlite = is_sqlite(engine)
 
@@ -533,7 +537,7 @@ def init_trade_plan_schema(engine):
 # it: trade_plans declares entry_zone_upper/lower, trigger_type and
 # trigger_condition_json NOT NULL, none of which mean anything for a
 # single-price resting order, and coupling the two would tie this feature's
-# rollout to the (currently dormant) TRIGGERED_PLAN_MODE subsystem.
+# rollout to the (now-retired) triggered-plan subsystem.
 #
 # All linkage columns are nullable on purpose. The live PM path runs with
 # PM_CANDIDATE_MODE disabled and therefore produces no candidate_id.

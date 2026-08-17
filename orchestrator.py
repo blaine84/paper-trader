@@ -2656,25 +2656,6 @@ def main():
     funnel_config = load_funnel_config()
     _check_missed_funnel_jobs(engine, funnel_config)
 
-    # ─── Triggered Trade Plans: startup orphan sweep ──────────────────
-    # Must run AFTER check_schema() so trade_plans table exists.
-    # Fail-open: sweep failure does not block orchestrator startup.
-    from utils.gate_config import TRIGGERED_PLAN_MODE, PLAN_MONITOR_INTERVAL_SECONDS
-
-    if TRIGGERED_PLAN_MODE != "disabled":
-        try:
-            from utils.trade_plan_registry import TradePlanRegistry
-            _plan_registry = TradePlanRegistry(engine)
-            swept = _plan_registry.finalize_orphaned_plans()
-            if swept:
-                log.info(
-                    "Startup: finalized %d orphaned trade plans: %s",
-                    len(swept),
-                    {k: v.value for k, v in swept.items()},
-                )
-        except Exception as exc:
-            log.warning("Startup trade plan orphan sweep failed (non-fatal): %s", exc)
-
     # ─── Pending Limit Orders: startup orphan sweep ────────────────────
     # Must run AFTER check_schema() so pending_orders exists. Guarantees no order
     # survives a restart in PENDING or FILLING (Requirement 9.12).
@@ -2892,82 +2873,11 @@ def main():
             coalesce=True,
         )
 
-    # ─── Plan Monitor: triggered trade plan evaluation ─────────────────
-    # Runs every PLAN_MONITOR_INTERVAL_SECONDS (default 30s) during market
-    # hours. Independent of PM cycles. Only registered when feature is active.
-    if TRIGGERED_PLAN_MODE != "disabled":
-        from apscheduler.triggers.interval import IntervalTrigger as _PlanIntervalTrigger
-
-        def run_plan_monitor():
-            """Evaluate active trade plans against current prices."""
-            if _skip_outside_regular_market_job("plan_monitor"):
-                return
-            _engine_local = get_engine()
-            try:
-                import utils.plan_monitor as plan_monitor
-                result = plan_monitor.run(_engine_local)
-                if result.plans_triggered or result.plans_missed or result.plans_expired:
-                    log.info(
-                        "PLAN_MONITOR_TICK: checked=%d triggered=%d missed=%d "
-                        "expired=%d invalidated=%d quotes_fetched=%d "
-                        "cache_hits=%d duration_ms=%.1f",
-                        result.plans_checked,
-                        result.plans_triggered,
-                        result.plans_missed,
-                        result.plans_expired,
-                        result.plans_invalidated,
-                        result.quotes_fetched,
-                        result.quotes_from_cache,
-                        result.tick_duration_ms,
-                    )
-            except Exception as e:
-                log.error("Plan monitor error: %s", e, exc_info=True)
-
-        scheduler.add_job(
-            run_plan_monitor,
-            _PlanIntervalTrigger(seconds=PLAN_MONITOR_INTERVAL_SECONDS),
-            id="plan_monitor",
-            max_instances=1,
-            replace_existing=True,
-            coalesce=True,
-        )
-
-        # ─── Orphan Plan Sweep: safety net every 5 min ────────────────────
-        # Catches plans stranded in transient states (PLANNED/WATCHING/TRIGGERED)
-        # past their expiration. Supplements the startup sweep. Req 8.6.
-        def run_plan_orphan_sweep():
-            """Periodic safety-net sweep for orphaned trade plans."""
-            if _skip_outside_regular_market_job("plan_orphan_sweep"):
-                return
-            _engine_local = get_engine()
-            try:
-                from utils.trade_plan_registry import TradePlanRegistry
-                registry = TradePlanRegistry(_engine_local)
-                swept = registry.finalize_orphaned_plans()
-                if swept:
-                    log.info(
-                        "PLAN_ORPHAN_SWEEP: finalized %d orphaned plans: %s",
-                        len(swept),
-                        {k: v.value for k, v in swept.items()},
-                    )
-            except Exception as e:
-                log.error("Plan orphan sweep error: %s", e, exc_info=True)
-
-        scheduler.add_job(
-            run_plan_orphan_sweep,
-            _PlanIntervalTrigger(seconds=300),  # every 5 minutes
-            id="plan_orphan_sweep",
-            max_instances=1,
-            replace_existing=True,
-            coalesce=True,
-        )
-
     # ─── Pending Limit Order Monitor ───────────────────────────────────
     # Evaluates resting limit orders against 1-minute OHLC bars. Independent of
-    # PM cycles and of TRIGGERED_PLAN_MODE. Registered only when the feature is
-    # active. No separate orphan-sweep job is needed: the tick runs the sweep
-    # itself as its final step, so a stranded FILLING order is recovered within
-    # one interval.
+    # PM cycles. Registered only when the feature is active. No separate
+    # orphan-sweep job is needed: the tick runs the sweep itself as its final
+    # step, so a stranded FILLING order is recovered within one interval.
     from utils.gate_config import (
         PENDING_ORDER_MODE,
         PENDING_ORDER_MONITOR_INTERVAL_SECONDS,

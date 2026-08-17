@@ -39,7 +39,6 @@ from utils.gate_config import (
     PENDING_ORDER_MAX_ACTIVE_PER_PROFILE,
     PENDING_ORDER_MAX_RUNAWAY_PCT,
     PENDING_ORDER_MODE,
-    TRIGGERED_PLAN_MODE,
 )
 from utils.pending_order_expiry import resolve_expiry
 from utils.pending_order_registry import (
@@ -364,13 +363,7 @@ def maybe_create_pending_order(
 
     registry = PendingOrderRegistry(resolved_engine)
 
-    # ── Gate 6: an active trade plan already covers this idea ──
-    if TRIGGERED_PLAN_MODE != "disabled" and _has_active_trade_plan(
-        resolved_engine, profile_id, symbol, normalized_action
-    ):
-        return decline("active_trade_plan_exists")
-
-    # ── Gate 7: per-profile cap, discounting orders we are about to supersede ──
+    # ── Gate 6: per-profile cap, discounting orders we are about to supersede ──
     try:
         duplicates = registry.find_duplicate_active(
             profile_id, symbol, normalized_action, setup_type
@@ -662,8 +655,8 @@ def _emit_trade_event(
     Deliberately not the caller's session. ``execute_trade()`` returns
     ``(False, reason)`` on the stale-entry path without committing, so an event
     added to that session would either be discarded on rollback or ride along on
-    an unrelated later commit. Same reasoning as
-    ``plan_executor._record_missed_setup_event()``.
+    an unrelated later commit. A fresh session ensures the audit write is
+    committed independently of whatever transaction state the caller holds.
     """
     from db.schema import get_session
     from utils.trade_events import log_trade_event
@@ -777,45 +770,6 @@ def _capture_signal_snapshot(db: Any, symbol: str, decision: dict) -> str | None
             "Could not capture signal snapshot for %s", symbol, exc_info=True
         )
         return None
-
-
-def _has_active_trade_plan(
-    engine: Any, profile_id: str, symbol: str, side: str
-) -> bool:
-    """Whether an active trade plan already covers this symbol and side.
-
-    Read-only. Prevents two resting intents for one idea when the triggered-plan
-    subsystem is also enabled. Fail-open: on error, assume no plan, since
-    blocking creation on a failed read would be the wrong direction.
-    """
-    from sqlalchemy import text
-
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    """
-                    SELECT 1 FROM trade_plans
-                    WHERE profile_id = :profile_id
-                      AND symbol = :symbol
-                      AND direction = :direction
-                      AND state IN ('planned', 'watching', 'triggered')
-                    LIMIT 1
-                    """
-                ),
-                {
-                    "profile_id": profile_id,
-                    "symbol": symbol,
-                    "direction": side,
-                },
-            ).fetchone()
-        return row is not None
-    except Exception:
-        logger.debug(
-            "Could not check for an active trade plan for %s (assuming none)",
-            symbol, exc_info=True,
-        )
-        return False
 
 
 def _as_float(value: Any) -> float | None:

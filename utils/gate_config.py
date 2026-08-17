@@ -254,7 +254,6 @@ REJECTION_REASONS: set[str] = {
     "window_too_short",
     "active_order_cap_reached",
     "duplicate_active_order",
-    "active_trade_plan_exists",
     "repaired_before_check",
     # ── Pending limit order fill-path observation ──
     "stale_fill_bar",
@@ -739,84 +738,13 @@ def _float_env(name: str, default: float, minimum: float | None = None) -> float
     return value
 
 
-# Values: "disabled" | "observe" | "enabled"
-# disabled: existing single-pass candidate pipeline unchanged (zero behavior change)
-# observe:  trade plans created and trigger evaluations logged, execution unchanged
-# enabled:  PM acceptance creates plans; fills require plan trigger confirmation
-_raw_triggered_plan_mode = os.environ.get("TRIGGERED_PLAN_MODE", "disabled")
-if _raw_triggered_plan_mode not in ("disabled", "observe", "enabled"):
-    logger.warning(
-        "Unrecognized TRIGGERED_PLAN_MODE=%r, defaulting to 'disabled'",
-        _raw_triggered_plan_mode,
-    )
-    _raw_triggered_plan_mode = "disabled"
-TRIGGERED_PLAN_MODE: str = _raw_triggered_plan_mode
-
-# Plan monitor cadence (seconds) — independent of PM cycle scheduling.
-PLAN_MONITOR_INTERVAL_SECONDS: int = _int_env(
-    "PLAN_MONITOR_INTERVAL_SECONDS", 30, minimum=1
-)
-
-# Default plan TTL (minutes) — untriggered plans expire after this window.
-PLAN_DEFAULT_EXPIRATION_MINUTES: int = _int_env(
-    "PLAN_DEFAULT_EXPIRATION_MINUTES", 60, minimum=1
-)
-
-# Fractional tolerance applied to entry zone bounds at trigger evaluation time
-# only (never baked into derived zone bounds). 0.005 == 0.5% of entry reference.
-PLAN_ENTRY_ZONE_TOLERANCE_PCT: float = _float_env(
-    "PLAN_ENTRY_ZONE_TOLERANCE_PCT", 0.005, minimum=0.0
-)
-
-# Consecutive in-zone monitor ticks required when a plan demands confirmation.
-PLAN_TRIGGER_CONFIRMATION_TICKS: int = _int_env(
-    "PLAN_TRIGGER_CONFIRMATION_TICKS", 2, minimum=1
-)
-
-# Maximum acceptable quote age (seconds) for plan execution. Older quotes are
-# treated as unavailable — execution is fail-closed on quote freshness.
-PLAN_EXECUTION_MAX_QUOTE_AGE_SECONDS: int = _int_env(
-    "PLAN_EXECUTION_MAX_QUOTE_AGE_SECONDS", 5, minimum=1
-)
-
-# Maximum acceptable quote age (seconds) for trigger evaluation. Cached quotes
-# within this age are used instead of calling a provider.
-PLAN_TRIGGER_QUOTE_MAX_AGE_SECONDS: int = _int_env(
-    "PLAN_TRIGGER_QUOTE_MAX_AGE_SECONDS", 30, minimum=1
-)
-
-# Minimum interval (seconds) between provider calls for any single symbol,
-# enforced across monitor ticks.
-QUOTE_PROVIDER_MIN_SECONDS_PER_SYMBOL: int = _int_env(
-    "QUOTE_PROVIDER_MIN_SECONDS_PER_SYMBOL", 30, minimum=0
-)
-
-# Global cap on outbound quote provider calls per rolling minute from the
-# plan monitor / plan executor.
-QUOTE_PROVIDER_MAX_CALLS_PER_MINUTE: int = _int_env(
-    "QUOTE_PROVIDER_MAX_CALLS_PER_MINUTE", 40, minimum=1
-)
-
-# Startup log reporting active mode
-if TRIGGERED_PLAN_MODE != "disabled":
-    logger.info(
-        "Triggered Plan Mode: %s (monitor_interval=%ss, plan_ttl=%smin, "
-        "zone_tolerance=%s, confirmation_ticks=%s)",
-        TRIGGERED_PLAN_MODE,
-        PLAN_MONITOR_INTERVAL_SECONDS,
-        PLAN_DEFAULT_EXPIRATION_MINUTES,
-        PLAN_ENTRY_ZONE_TOLERANCE_PCT,
-        PLAN_TRIGGER_CONFIRMATION_TICKS,
-    )
-
 
 # ---------------------------------------------------------------------------
 # Pending Limit Orders Feature Flags
 #
 # Converts the runaway-entry branch of _fresh_price_stale_entry_check() into a
-# resting paper limit order instead of discarding the intent. Independent of
-# TRIGGERED_PLAN_MODE by design — pending orders must be rollable without
-# enabling the (currently dormant) triggered-plan subsystem.
+# resting paper limit order instead of discarding the intent. The triggered-plan
+# subsystem has been retired; pending orders are the sole deferred-entry system.
 # ---------------------------------------------------------------------------
 
 # Values: "disabled" | "observe" | "enabled"
