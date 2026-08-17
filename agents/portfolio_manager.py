@@ -40,6 +40,7 @@ from utils.gate_config import (
     PM_PROVENANCE_MODE,
     MARKET_STATE_MODE,
     PENDING_ORDER_MODE,
+    SETUP_WATCH_MODE,
 )
 from utils.raw_pm_capture import (
     capture_raw_pm_response,
@@ -2352,6 +2353,22 @@ def _meets_threshold(signal_strength: str, threshold: str) -> bool:
     sig_val = STRENGTH_ORDER.get(str(signal_strength).lower(), 0)
     thr_val = STRENGTH_ORDER.get(str(threshold).lower(), 0)
     return sig_val >= thr_val
+
+
+def _is_watchable_rejection(reason: str | None) -> bool:
+    """Return True if a PM rejection reason indicates timing/price and the thesis remains valid.
+
+    These candidates can be re-watched because the rejection is about when/where
+    to enter, not whether the underlying thesis is correct.
+
+    Requirements: 6.7.2, 6.9
+    """
+    if not reason:
+        return False
+    reason_lower = reason.lower()
+    # Timing/price keywords — thesis still valid, entry conditions not right yet
+    watchable_keywords = ("timing", "price", "runaway", "stale_entry", "entry")
+    return any(kw in reason_lower for kw in watchable_keywords)
 
 
 def summarize_entry_signal_filter(
@@ -5410,6 +5427,92 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
 
             # Finalize cycle (assign terminal states to remaining candidates)
             registry.finalize_cycle()
+
+            # ── Setup Watch Post-PM Hook (Req 6.7, 6.8, 12.11) ──
+            # Propagate candidate terminal states back to originating setup watches
+            # and create watches from watchable PM rejections. Only in "enabled" mode.
+            if SETUP_WATCH_MODE == "enabled":
+                try:
+                    from utils.setup_watch_manager import (
+                        propagate_candidate_results as _sw_propagate,
+                        create_setup_watch as _sw_create,
+                        _derive_maturation_conditions,
+                        _derive_invalidation_conditions,
+                    )
+                    from sqlalchemy import text as _sw_text
+
+                    # Build candidate results from the registry (all candidates
+                    # now have terminal states after finalize_cycle)
+                    _sw_results = []
+                    with engine.connect() as _sw_conn:
+                        _sw_rows = _sw_conn.execute(
+                            _sw_text(
+                                "SELECT candidate_id, state, signal_snapshot_json "
+                                "FROM pm_candidates "
+                                "WHERE cycle_id = :cycle_id AND profile_id = :profile_id"
+                            ),
+                            {"cycle_id": cycle_id, "profile_id": profile_id},
+                        ).fetchall()
+                        for _sw_row in _sw_rows:
+                            _sw_results.append({
+                                "candidate_id": _sw_row[0],
+                                "terminal_state": _sw_row[1],
+                                "signal_snapshot_json": _sw_row[2],
+                            })
+
+                    _sw_propagate(engine, cycle_id, profile_id, _sw_results)
+
+                    # Create watches from watchable PM rejections (Req 6.9, 6.11)
+                    for _sw_decision in parse_result.rejected:
+                        try:
+                            _sw_reason = (
+                                _sw_decision.rejection_reason_code
+                                or _sw_decision.rationale
+                                or ""
+                            )
+                            if not _is_watchable_rejection(_sw_reason):
+                                continue
+
+                            # Look up signal snapshot for the rejected candidate
+                            _sw_snapshot_json = None
+                            for _sw_r in _sw_results:
+                                if _sw_r["candidate_id"] == _sw_decision.candidate_id:
+                                    _sw_snapshot_json = _sw_r.get("signal_snapshot_json")
+                                    break
+                            if not _sw_snapshot_json:
+                                continue
+
+                            import json as _sw_json
+                            _sw_snapshot = _sw_json.loads(_sw_snapshot_json)
+                            _sw_signal = _sw_snapshot if isinstance(_sw_snapshot, dict) else {}
+
+                            _sw_create(
+                                engine,
+                                symbol=_sw_signal.get("symbol", ""),
+                                profile_id=profile_id,
+                                side=_sw_signal.get("direction", "BUY"),
+                                setup_type=_sw_signal.get("setup_type", "unknown"),
+                                thesis=_sw_signal.get("thesis", _sw_decision.rationale or ""),
+                                source_type="candidate_reject",
+                                source_id=_sw_decision.candidate_id,
+                                source_cycle_id=cycle_id,
+                                maturation_conditions=_derive_maturation_conditions(_sw_signal),
+                                invalidation_conditions=_derive_invalidation_conditions(_sw_signal),
+                                entry_zone=_sw_signal.get("entry_zone"),
+                                draft_geometry=_sw_signal.get("draft_geometry"),
+                                signal_strength=_sw_signal.get("signal_strength"),
+                                portfolio=portfolio_snapshot,
+                            )
+                        except Exception:
+                            log.warning(
+                                "Setup watch creation from rejection failed for candidate=%s",
+                                _sw_decision.candidate_id, exc_info=True,
+                            )
+                except Exception:
+                    log.error(
+                        "Setup watch post-PM propagation failed for cycle=%s profile=%s",
+                        cycle_id, profile_id, exc_info=True,
+                    )
 
             # Compute and persist daily loss summary (Req 8.4, 8.5, 8.6)
             # Must run AFTER finalize_cycle() but BEFORE downstream agents consume results.

@@ -1066,6 +1066,7 @@ def check_schema(engine):
         is_sqlite,
         init_trade_plan_schema,
         init_pending_order_schema,
+        init_setup_watch_schema,
     )
 
     # --- Verify WAL mode and busy_timeout (non-destructive, SQLite only) ---
@@ -1129,6 +1130,11 @@ def check_schema(engine):
     init_pending_order_schema(engine)
     inspector = sa_inspect(engine)
     _ensure_pending_order_events_identity_default(engine, inspector)
+
+    # --- Auto-create setup watch tables if missing (non-destructive) ---
+    # Same idempotent IF NOT EXISTS pattern. Runs unconditionally so that
+    # flipping SETUP_WATCH_MODE on a live system needs no schema step.
+    init_setup_watch_schema(engine)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —
@@ -2980,6 +2986,31 @@ def main():
         max_instances=1,
         coalesce=True,
     )
+
+    # Setup watch outcomes: counterfactual scoring for matured watches
+    from utils.gate_config import SETUP_WATCH_MODE, SETUP_WATCH_OUTCOME_SCORING_ENABLED
+    if SETUP_WATCH_MODE != "disabled" and SETUP_WATCH_OUTCOME_SCORING_ENABLED:
+        def run_setup_watch_outcomes():
+            """Score setup watches after their outcome windows mature."""
+            if _skip_outside_regular_market_job("setup_watch_outcomes"):
+                return
+            _engine = get_engine()
+            try:
+                from utils.setup_watch_outcomes import run_setup_watch_outcome_scoring
+                result = run_setup_watch_outcome_scoring(_engine)
+                total = sum(result.values())
+                if total:
+                    log.info(f"Setup watch outcomes: {result}")
+            except Exception as e:
+                log.error(f"Setup watch outcomes error: {e}", exc_info=True)
+
+        scheduler.add_job(
+            run_setup_watch_outcomes,
+            CronTrigger(day_of_week="mon-fri", hour="9-16", minute="*/5", timezone="America/New_York"),
+            id="setup_watch_outcomes",
+            max_instances=1,
+            coalesce=True,
+        )
 
     # Position-based news poll: every 30 min during market hours
     scheduler.add_job(
