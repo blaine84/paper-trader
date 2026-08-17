@@ -48,6 +48,7 @@ from typing import Any
 
 from sqlalchemy import text
 
+from db.schema import is_sqlite
 from utils.db_retry import with_lock_retry
 from utils.gate_config import SETUP_WATCH_MIN_CONDITION_COUNT
 from utils.pending_order_time import now_utc, to_iso, to_utc
@@ -233,6 +234,19 @@ def compute_watch_integrity_hash(watch: SetupWatch) -> str:
     }
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _ready_window_elapsed_sql(engine: Any) -> str:
+    """Dialect-aware predicate for outcome scoring window eligibility."""
+    if is_sqlite(engine):
+        return (
+            "datetime(w.ready_at, '+' || :window_minutes || ' minutes') "
+            "<= datetime(:cutoff)"
+        )
+    return (
+        "(w.ready_at::timestamptz + (CAST(:window_minutes AS integer) * INTERVAL '1 minute')) "
+        "<= CAST(:cutoff AS timestamptz)"
+    )
 
 
 class SetupWatchRegistryError(Exception):
@@ -726,19 +740,24 @@ class SetupWatchRegistry:
         """
         cutoff = to_iso(now_utc())
         columns = ", ".join(f"w.{c}" for c in _WATCH_COLUMNS)
+        ready_window_elapsed = _ready_window_elapsed_sql(self._engine)
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(
                     f"SELECT {columns} FROM setup_watches w "
                     f"WHERE w.ready_at IS NOT NULL "
-                    f"  AND datetime(w.ready_at, '+{window_minutes} minutes') <= datetime(:cutoff) "
+                    f"  AND {ready_window_elapsed} "
                     f"  AND NOT EXISTS ("
                     f"    SELECT 1 FROM setup_watch_outcomes o "
                     f"    WHERE o.watch_id = w.watch_id "
                     f"      AND o.window_label = :window_label"
                     f"  )"
                 ),
-                {"cutoff": cutoff, "window_label": window_label},
+                {
+                    "cutoff": cutoff,
+                    "window_label": window_label,
+                    "window_minutes": window_minutes,
+                },
             ).mappings().all()
         return [_row_to_watch(r) for r in rows]
 
