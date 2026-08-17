@@ -99,7 +99,6 @@ DECLINE_REASONS = frozenset({
     "window_too_short",
     "active_order_cap_reached",
     "duplicate_active_order",
-    "active_trade_plan_exists",
     "repaired_before_check",
 })
 
@@ -163,8 +162,8 @@ class PendingOrder:
     """Immutable pending limit order record.
 
     All linkage fields default to None: the live PM path runs with
-    PM_CANDIDATE_MODE disabled and therefore produces no candidate_id, cycle_id,
-    or plan_id.
+    PM_CANDIDATE_MODE disabled and therefore produces no candidate_id or cycle_id.
+    plan_id is permanently None after the triggered-plan retirement.
     """
 
     order_id: str
@@ -192,6 +191,8 @@ class PendingOrder:
     candidate_id: str | None = None
     cycle_id: str | None = None
     source_signal_id: str | None = None
+    # Retained for historical/linkage compatibility only. Always None for orders
+    # created after the triggered-plan architecture was retired (2025-01).
     plan_id: str | None = None
 
     intended_quantity: int | None = None

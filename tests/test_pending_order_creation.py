@@ -555,47 +555,6 @@ def test_cap_does_not_spuriously_decline_when_the_blocker_is_a_duplicate(
     assert first.order_id in second.superseded
 
 
-def test_active_trade_plan_declines_when_plans_are_enabled(engine, enabled):
-    with engine.connect() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO trade_plans
-                    (plan_id, candidate_id, cycle_id, profile_id, symbol,
-                     direction, setup_type, entry_reference, entry_zone_upper,
-                     entry_zone_lower, stop_price, target_price, risk_reward,
-                     trigger_type, trigger_condition_json,
-                     trigger_confirmation_required, state, created_at,
-                     expires_at, integrity_hash)
-                VALUES
-                    ('plan-1', 'cand-1', 'cycle-1', 'moderate', 'META',
-                     'BUY', 'technical_breakout', 593.87, 594.0, 593.0,
-                     585.0, 620.0, 2.9, 'price_in_zone', '{}', 0,
-                     'watching', :now, :later, 'hash')
-                """
-            ),
-            {
-                "now": datetime.now(timezone.utc).isoformat(),
-                "later": (
-                    datetime.now(timezone.utc) + timedelta(hours=1)
-                ).isoformat(),
-            },
-        )
-        conn.commit()
-
-    with patch("utils.pending_order_creation.TRIGGERED_PLAN_MODE", "enabled"):
-        outcome = create(engine)
-
-    assert outcome.decline_reason == "active_trade_plan_exists"
-    assert PendingOrderRegistry(engine).get_active_orders() == []
-
-
-def test_active_trade_plan_is_ignored_when_plans_are_disabled(engine, enabled):
-    """TRIGGERED_PLAN_MODE is disabled in production; the check must not run."""
-    with patch("utils.pending_order_creation.TRIGGERED_PLAN_MODE", "disabled"):
-        outcome = create(engine)
-    assert outcome.created is True
-
 
 # ---------------------------------------------------------------------------
 # Supersession
