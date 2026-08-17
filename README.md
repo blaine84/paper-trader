@@ -62,6 +62,33 @@ mega-caps, ETFs, and small-cap momentum setups.
 Phase 2 will add catalyst timing and concentration limit gates. See
 `.kiro/specs/trade-safety-gates/` for the full spec.
 
+
+### Pending Limit Orders
+
+The sole deferred-entry mechanism. When an approved trade has a stale entry price
+(runaway), the system creates a resting paper limit order instead of discarding
+the intent. The order waits for price to return to the intended entry zone.
+
+| Component | File | Purpose |
+|---|---|---|
+| Creation | `utils/pending_order_creation.py` | 6-gate validation pipeline before order placement |
+| Registry | `utils/pending_order_registry.py` | CAS state machine, lifecycle, duplicate detection |
+| Monitor | `utils/pending_order_monitor.py` | Evaluates resting orders against 1-min OHLC bars |
+| Fill Logic | `utils/pending_order_fill.py` | Bar-crossing detection, fill-time revalidation |
+| Filler | `utils/pending_order_filler.py` | Executes the paper trade on confirmed fill |
+
+**Lifecycle:** `PENDING` -> `FILLING` -> `FILLED` | `EXPIRED` | `CANCELLED` | `SUPERSEDED`
+
+**Key behaviors:**
+- Independent of PM cycles — runs on its own interval timer
+- Per-profile cap with duplicate detection and supersession
+- Fill requires full revalidation (geometry, exposure, cooldown, buying power)
+- Fail-closed on missing market data
+- Startup orphan sweep finalizes stranded orders from prior runs
+
+**Env vars:** `PENDING_ORDER_MODE` (disabled/observe/enabled),
+`PENDING_ORDER_MONITOR_INTERVAL_SECONDS` (default 60)
+
 ### Thesis-Anchored Exits
 
 Exit decisions are anchored to the original trade thesis, not signal freshness:
