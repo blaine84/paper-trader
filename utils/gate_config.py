@@ -868,6 +868,100 @@ if PENDING_ORDER_MODE != "disabled":
 
 
 # ---------------------------------------------------------------------------
+# Setup Watch Layer Feature Flags and Configuration
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enabled"
+# disabled: no setup watches created or evaluated; zero runtime cost
+# observe:  watches created and evaluated; maturation tracked but never
+#           promoted to PM candidates (zero trading behavior change)
+# enabled:  mature watches promote into the PM candidate pipeline
+_raw_setup_watch_mode = os.environ.get("SETUP_WATCH_MODE", "disabled")
+if _raw_setup_watch_mode not in ("disabled", "observe", "enabled"):
+    logger.warning(
+        "Unrecognized SETUP_WATCH_MODE=%r, defaulting to 'disabled'",
+        _raw_setup_watch_mode,
+    )
+    _raw_setup_watch_mode = "disabled"
+SETUP_WATCH_MODE: str = _raw_setup_watch_mode
+
+# Maturity score threshold for maturing → ready transition
+SETUP_WATCH_MATURITY_THRESHOLD: float = _float_env(
+    "SETUP_WATCH_MATURITY_THRESHOLD", 0.7, minimum=0.1
+)
+
+# Maximum TTL for a setup watch (hours)
+SETUP_WATCH_MAX_TTL_HOURS: int = _int_env(
+    "SETUP_WATCH_MAX_TTL_HOURS", 8, minimum=1
+)
+
+# Maximum active (non-terminal) watches per profile
+SETUP_WATCH_MAX_ACTIVE_PER_PROFILE: int = _int_env(
+    "SETUP_WATCH_MAX_ACTIVE_PER_PROFILE", 10, minimum=1
+)
+
+# Minimum evaluation cycles a watch must be observed before promotion.
+# Expressed in CYCLES, not minutes: PM cycles run every 15 min (9-11 ET) and
+# every 30 min (12-15 ET), so a wall-clock cooldown would be cadence-dependent.
+SETUP_WATCH_PROMOTION_MIN_CYCLES: int = _int_env(
+    "SETUP_WATCH_PROMOTION_MIN_CYCLES", 1, minimum=0
+)
+
+# Minimum maturation conditions required for watch creation
+SETUP_WATCH_MIN_CONDITION_COUNT: int = _int_env(
+    "SETUP_WATCH_MIN_CONDITION_COUNT", 2, minimum=1
+)
+
+# Minimum signal strength to create a watch — CATEGORICAL, not numeric.
+# Valid values: "weak" | "moderate" | "strong"
+# Compared through candidate_builder.STRENGTH_ORDER at runtime.
+_raw_setup_watch_min_strength = os.environ.get(
+    "SETUP_WATCH_MIN_CREATION_STRENGTH", "moderate"
+).lower()
+if _raw_setup_watch_min_strength not in ("weak", "moderate", "strong"):
+    logger.warning(
+        "Unrecognized SETUP_WATCH_MIN_CREATION_STRENGTH=%r, defaulting to 'moderate'",
+        _raw_setup_watch_min_strength,
+    )
+    _raw_setup_watch_min_strength = "moderate"
+SETUP_WATCH_MIN_CREATION_STRENGTH: str = _raw_setup_watch_min_strength
+
+# Maximum active watches per symbol (across all profiles)
+SETUP_WATCH_MAX_PER_SYMBOL: int = _int_env(
+    "SETUP_WATCH_MAX_PER_SYMBOL", 2, minimum=1
+)
+
+# Outcome scoring: enabled by default whenever the layer is active
+SETUP_WATCH_OUTCOME_SCORING_ENABLED: bool = os.environ.get(
+    "SETUP_WATCH_OUTCOME_SCORING_ENABLED", "true"
+).lower() == "true"
+
+# Fixed scoring windows, mirroring the shadow_outcomes scheme
+SETUP_WATCH_OUTCOME_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("w15", 15),
+    ("w30", 30),
+    ("w60", 60),
+)
+
+# Startup log reporting active mode
+if SETUP_WATCH_MODE != "disabled":
+    logger.info(
+        "Setup Watch Mode: %s (maturity=%.2f, max_ttl=%dh, max_active=%d, "
+        "min_conditions=%d, min_strength=%s, max_per_symbol=%d, "
+        "min_cycles=%d, outcome_scoring=%s)",
+        SETUP_WATCH_MODE,
+        SETUP_WATCH_MATURITY_THRESHOLD,
+        SETUP_WATCH_MAX_TTL_HOURS,
+        SETUP_WATCH_MAX_ACTIVE_PER_PROFILE,
+        SETUP_WATCH_MIN_CONDITION_COUNT,
+        SETUP_WATCH_MIN_CREATION_STRENGTH,
+        SETUP_WATCH_MAX_PER_SYMBOL,
+        SETUP_WATCH_PROMOTION_MIN_CYCLES,
+        SETUP_WATCH_OUTCOME_SCORING_ENABLED,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pilot Controller
 # ---------------------------------------------------------------------------
 

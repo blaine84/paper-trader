@@ -10,6 +10,7 @@ Requirements: 1.1, 1.2, 1.5, 2.1
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import uuid
@@ -25,6 +26,7 @@ from utils.entry_geometry import build_entry_geometry_scaffold
 from utils.gate_config import (
     PM_BENCHMARK_CONTEXT_ENABLED,
     CANDIDATE_EXECUTABLE_SETUP_TYPES,
+    SETUP_WATCH_MODE,
     SWING_EXECUTABLE_SETUP_TYPES,
     SWING_MAX_CANDIDATE_AGE_HOURS,
 )
@@ -342,6 +344,231 @@ def _process_promoted_watch(
         )
 
 
+def _process_promoted_setup_watch(
+    *,
+    engine: Any,
+    watch: Any,
+    registry: CandidateRegistry,
+    sw_registry: Any,
+    signals: dict[str, dict],
+    held_symbols: set[str],
+    min_signal_strength: str,
+    profile_id: str,
+    cycle_id: str,
+    cycle_expires_at: datetime | None,
+) -> None:
+    """Create a PM candidate from a promoted setup watch.
+
+    Geometry is rebuilt from the CURRENT cycle signal — the watch's
+    draft_geometry is never used for execution, only carried as prompt context.
+
+    Eligibility checks (fail-closed, short-circuit):
+    1. Current-cycle signal required — expire if absent
+    2. Held-symbol exclusion — reject
+    3. Signal strength threshold (categorical) — reject
+    4. CANDIDATE_EXECUTABLE_SETUP_TYPES allowlist — reject (Req 10.6)
+    5. Geometry scaffold from current signal — reject if empty/failed
+    6. Build signal snapshot with source_type="setup_watch" encoding
+    7. Register PM candidate — reject on registry error
+
+    Requirements: 6.3-6.6, 6.10, 7.1-7.10, 10.6, 12.2, 12.3
+    """
+    from utils.setup_watch_registry import WatchState as _SWState
+
+    watch_id = watch.watch_id
+    symbol = watch.symbol
+
+    def _expire_sw(reason: str) -> None:
+        """Transition promoted -> expired (fail-open CAS)."""
+        try:
+            sw_registry.transition_state(
+                watch_id, _SWState.PROMOTED, _SWState.EXPIRED,
+                terminal_reason=reason,
+            )
+        except Exception as exc:
+            logger.warning(
+                "CAS promoted->expired (%s) failed for setup watch %s: %s",
+                reason, watch_id, exc,
+            )
+
+    def _reject_sw(reason: str) -> None:
+        """Transition promoted -> rejected (fail-open CAS)."""
+        try:
+            sw_registry.transition_state(
+                watch_id, _SWState.PROMOTED, _SWState.REJECTED,
+                terminal_reason=reason,
+            )
+        except Exception as exc:
+            logger.warning(
+                "CAS promoted->rejected (%s) failed for setup watch %s: %s",
+                reason, watch_id, exc,
+            )
+
+    # -------------------------------------------------------------------------
+    # Check 1: Current-cycle signal required (Req 6.4.1)
+    # -------------------------------------------------------------------------
+    signal = signals.get(symbol)
+    if signal is None:
+        logger.info(
+            "Setup watch promotion blocked for %s (%s): no current signal",
+            watch_id, symbol,
+        )
+        _expire_sw("no_current_signal")
+        return
+
+    # -------------------------------------------------------------------------
+    # Check 2: Held-symbol exclusion
+    # -------------------------------------------------------------------------
+    if symbol in held_symbols:
+        logger.info(
+            "Setup watch promotion blocked for %s (%s): symbol held",
+            watch_id, symbol,
+        )
+        _reject_sw("promotion_blocked_held_symbol")
+        return
+
+    # -------------------------------------------------------------------------
+    # Check 3: Signal strength threshold (categorical via STRENGTH_ORDER)
+    # -------------------------------------------------------------------------
+    signal_strength = signal.get("strength", signal.get("signal_strength", ""))
+    if not _meets_threshold(signal_strength, min_signal_strength):
+        logger.info(
+            "Setup watch promotion blocked for %s (%s): weak signal (strength=%s < %s)",
+            watch_id, symbol, signal_strength, min_signal_strength,
+        )
+        _reject_sw("promotion_blocked_weak_signal")
+        return
+
+    # -------------------------------------------------------------------------
+    # Check 4: CANDIDATE_EXECUTABLE_SETUP_TYPES allowlist (Req 10.6)
+    # -------------------------------------------------------------------------
+    if watch.setup_type not in CANDIDATE_EXECUTABLE_SETUP_TYPES:
+        logger.info(
+            "Setup watch promotion blocked for %s (%s): non-executable setup_type=%s",
+            watch_id, symbol, watch.setup_type,
+        )
+        _reject_sw("non_executable_setup_type")
+        return
+
+    # -------------------------------------------------------------------------
+    # Check 5: Geometry scaffold from CURRENT signal (Req 6.4)
+    # -------------------------------------------------------------------------
+    try:
+        scaffold = build_entry_geometry_scaffold(signal, profile_id=profile_id)
+    except Exception as geo_exc:
+        logger.warning(
+            "Geometry scaffold raised for setup watch %s (%s): %s",
+            watch_id, symbol, geo_exc,
+        )
+        _reject_sw("promotion_blocked_no_geometry")
+        return
+
+    if scaffold.get("status") != "ok":
+        logger.info(
+            "Geometry scaffold not ok for setup watch %s (%s): status=%s",
+            watch_id, symbol, scaffold.get("status"),
+        )
+        _reject_sw("promotion_blocked_no_geometry")
+        return
+
+    candidates = scaffold.get("candidates", [])
+    if not candidates:
+        logger.info(
+            "Geometry scaffold ok but zero candidates for setup watch %s (%s)",
+            watch_id, symbol,
+        )
+        _reject_sw("promotion_blocked_no_geometry")
+        return
+
+    # -------------------------------------------------------------------------
+    # Build signal snapshot with explicit source encoding (Req 6.6)
+    # -------------------------------------------------------------------------
+    def _maybe_json(raw: str | None) -> Any:
+        """Parse JSON string if non-None, else None."""
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return raw
+
+    snapshot = {
+        "source_type": "setup_watch",
+        "watch_id": watch_id,
+        "thesis": watch.thesis,
+        "maturity_score": watch.maturity_score,
+        "observed_cycles": watch.observed_cycles,
+        "last_evaluation": _maybe_json(watch.last_evaluation_json),
+        "entry_zone": _maybe_json(watch.entry_zone_json),
+        "draft_geometry": _maybe_json(watch.draft_geometry_json),  # context only
+        "signal": copy.deepcopy(signal),
+    }
+    signal_snapshot_json = json.dumps(snapshot, default=str, sort_keys=True)
+
+    # -------------------------------------------------------------------------
+    # Build the PM candidate record from the first scaffold candidate
+    # -------------------------------------------------------------------------
+    pc = candidates[0]
+    candidate_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc)
+    expires_at = cycle_expires_at or (created_at + timedelta(hours=1))
+    direction = "BUY" if scaffold["direction"] == "LONG" else "SHORT"
+
+    record_dict = {
+        "candidate_id": candidate_id,
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": pc["entry_price"],
+        "stop_price": pc["stop_loss"],
+        "target_price": pc["target"],
+        "setup_type": watch.setup_type,
+        "profile_id": profile_id,
+        "cycle_id": cycle_id,
+    }
+    integrity_hash = _compute_integrity_hash(record_dict)
+
+    record = CandidateRecord(
+        candidate_id=candidate_id,
+        cycle_id=cycle_id,
+        profile_id=profile_id,
+        symbol=symbol,
+        direction=direction,
+        setup_type=watch.setup_type,
+        geometry_name=pc["name"],
+        entry_price=pc["entry_price"],
+        stop_price=pc["stop_loss"],
+        target_price=pc["target"],
+        risk_reward=pc["risk_reward"],
+        trigger=pc["trigger"],
+        invalidation_basis=pc["invalidation_basis"],
+        target_basis=pc["target_basis"],
+        source_signal_id=watch_id,  # traceability (Req 6.6)
+        signal_snapshot_json=signal_snapshot_json,
+        created_at=created_at,
+        expires_at=expires_at,
+        integrity_hash=integrity_hash,
+        candidate_type="intraday",
+    )
+
+    # -------------------------------------------------------------------------
+    # Register (fail-closed on registry error -> reject watch)
+    # -------------------------------------------------------------------------
+    try:
+        registry.register(record)
+    except Exception as reg_exc:
+        logger.warning(
+            "Registry.register failed for setup watch %s (%s): %s",
+            watch_id, symbol, reg_exc,
+        )
+        _expire_sw("promotion_blocked_registry_error")
+        return
+
+    logger.info(
+        "Promoted setup watch %s for %s -> PM candidate %s (registered)",
+        watch_id, symbol, candidate_id,
+    )
+
+
 def build_candidate_set(
     db: Any,
     signals: dict[str, dict],
@@ -450,6 +677,98 @@ def build_candidate_set(
             )
         except Exception as wc_exc:
             logger.warning("Watch candidate management failed: %s", wc_exc)
+
+    # ---------------------------------------------------------------------------
+    # Setup Watch Layer Evaluation (INDEPENDENT from watch_candidates above)
+    # Guarded by SETUP_WATCH_MODE feature flag. Uses lazy imports so that when
+    # mode is "disabled", setup watch modules never load.
+    # Mandated order: expire → invalidate → evaluate → promote → create
+    # (see design.md §Setup Watch Layer)
+    # ---------------------------------------------------------------------------
+    if SETUP_WATCH_MODE != "disabled":
+        try:
+            from utils.setup_watch_manager import (
+                evaluate_cycle as sw_evaluate_cycle,
+                get_promotable_watches as sw_get_promotable_watches,
+            )
+            from utils.setup_watch_registry import (
+                SetupWatchRegistry as _SWRegistry,
+                WatchState as _SWState,
+            )
+
+            # Run full evaluation cycle (expire, invalidate, mature, promote, create)
+            sw_eval_result = sw_evaluate_cycle(
+                engine=db,
+                profile_id=profile_id,
+                cycle_id=cycle_id,
+                signals=signals,
+                portfolio=portfolio,
+            )
+            logger.info(
+                "Setup watch eval: expired=%d invalidated=%d matured=%d "
+                "regressed=%d promoted=%d active=%d created=%d",
+                sw_eval_result.expired_ttl + sw_eval_result.expired_stale_promoted,
+                sw_eval_result.invalidated,
+                sw_eval_result.matured,
+                sw_eval_result.regressed,
+                sw_eval_result.promoted,
+                sw_eval_result.still_active,
+                sw_eval_result.created,
+            )
+
+            # Only enabled mode consumes promoted watches into PM candidates
+            if SETUP_WATCH_MODE == "enabled":
+                sw_promoted = sw_get_promotable_watches(db, profile_id, cycle_id)
+
+                # Cross-system dedupe (Req 7.9): build set of (symbol, direction)
+                # already registered this cycle (from market-state watch promotion
+                # or any other source that ran before us).
+                claimed_keys: set[tuple[str, str]] = set()
+                try:
+                    existing_candidates = registry.get_offered_summary()
+                    for c in existing_candidates:
+                        claimed_keys.add((c["symbol"], c["direction"]))
+                except Exception:
+                    # If registry lookup fails, proceed without dedup — fail-open
+                    pass
+
+                sw_registry = _SWRegistry(db)
+                for sw_watch in sw_promoted:
+                    try:
+                        # Dedupe: skip watches that collide with already-claimed keys
+                        if (sw_watch.symbol, sw_watch.side) in claimed_keys:
+                            sw_registry.transition_state(
+                                sw_watch.watch_id,
+                                _SWState.PROMOTED,
+                                _SWState.EXPIRED,
+                                terminal_reason="superseded_by_market_state_watch",
+                            )
+                            continue
+
+                        _process_promoted_setup_watch(
+                            engine=db,
+                            watch=sw_watch,
+                            registry=registry,
+                            sw_registry=sw_registry,
+                            signals=signals,
+                            held_symbols=held_symbols,
+                            min_signal_strength=min_signal_strength,
+                            profile_id=profile_id,
+                            cycle_id=cycle_id,
+                            cycle_expires_at=cycle_expires_at,
+                        )
+                        # Add to claimed keys after successful processing
+                        claimed_keys.add((sw_watch.symbol, sw_watch.side))
+                    except Exception as sw_promo_exc:
+                        logger.warning(
+                            "Setup watch promotion failed for watch %s (%s): %s",
+                            sw_watch.watch_id, sw_watch.symbol, sw_promo_exc,
+                        )
+
+        except Exception as sw_exc:
+            logger.warning(
+                "Setup watch evaluation failed (fail-open): %s", sw_exc
+            )
 
     # Filter eligible signals
     eligible_signals = _filter_eligible_signals(

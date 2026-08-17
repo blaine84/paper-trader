@@ -731,3 +731,343 @@ def init_pending_order_schema(engine):
     logger.debug(
         "Pending order schema verified (pending_orders, pending_order_events)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Setup Watch Layer — Tables, Indexes, Triggers
+#
+# The setup watch layer adds a structured intermediate stage between upstream
+# discovery (analyst, scout, market-state) and PM-approved trade execution.
+# Watches track thesis maturation through condition evaluation, independent of
+# the existing watch_candidates table.
+#
+# Three tables:
+#   - setup_watches: lifecycle state machine with CAS transitions
+#   - setup_watch_events: immutable audit trail of all state changes
+#   - setup_watch_outcomes: counterfactual scoring at 15/30/60-minute windows
+#
+# Requirements: 1.1–1.12
+# ---------------------------------------------------------------------------
+
+_SETUP_WATCHES_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS setup_watches (
+    watch_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    setup_type TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'watching',
+
+    thesis TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT,
+    source_cycle_id TEXT NOT NULL,
+
+    maturation_conditions_json TEXT NOT NULL,
+    invalidation_conditions_json TEXT NOT NULL,
+
+    last_evaluation_json TEXT,
+
+    entry_zone_json TEXT,
+    draft_geometry_json TEXT,
+
+    maturity_score REAL DEFAULT 0.0,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    state_changed_at TEXT,
+
+    observed_cycles INTEGER DEFAULT 0,
+
+    ready_at TEXT,
+    ready_reference_price REAL,
+
+    terminal_reason TEXT,
+    promoted_cycle_id TEXT,
+
+    execution_ref_type TEXT,
+    execution_ref_id TEXT,
+
+    integrity_hash TEXT NOT NULL
+)
+"""
+
+_SETUP_WATCHES_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS setup_watches (
+    watch_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    setup_type TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'watching',
+
+    thesis TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT,
+    source_cycle_id TEXT NOT NULL,
+
+    maturation_conditions_json TEXT NOT NULL,
+    invalidation_conditions_json TEXT NOT NULL,
+
+    last_evaluation_json TEXT,
+
+    entry_zone_json TEXT,
+    draft_geometry_json TEXT,
+
+    maturity_score DOUBLE PRECISION DEFAULT 0.0,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    state_changed_at TEXT,
+
+    observed_cycles INTEGER DEFAULT 0,
+
+    ready_at TEXT,
+    ready_reference_price DOUBLE PRECISION,
+
+    terminal_reason TEXT,
+    promoted_cycle_id TEXT,
+
+    execution_ref_type TEXT,
+    execution_ref_id TEXT,
+
+    integrity_hash TEXT NOT NULL
+)
+"""
+
+_SETUP_WATCHES_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_setup_watches_profile_state "
+    "ON setup_watches(profile_id, state)",
+
+    "CREATE INDEX IF NOT EXISTS idx_setup_watches_symbol_state "
+    "ON setup_watches(symbol, state)",
+
+    "CREATE INDEX IF NOT EXISTS idx_setup_watches_state_expires "
+    "ON setup_watches(state, expires_at)",
+
+    # At most one active watch per (profile, symbol, side, setup_type).
+    # Terminal rows excluded so history accumulates freely.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_watches_active_key "
+    "ON setup_watches(profile_id, symbol, side, setup_type) "
+    "WHERE state NOT IN ('expired', 'rejected', 'ordered')",
+]
+
+
+# ---------------------------------------------------------------------------
+# setup_watch_events (immutable, append-only audit trail)
+#
+# Every state transition emits a row here. Rows are never updated or deleted —
+# immutability is enforced by database triggers.
+#
+# Requirements: 1.4, 1.5
+# ---------------------------------------------------------------------------
+
+_SETUP_WATCH_EVENTS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS setup_watch_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT,
+    from_state TEXT,
+    to_state TEXT,
+    maturity_score REAL,
+    created_at TEXT NOT NULL
+)
+"""
+
+_SETUP_WATCH_EVENTS_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS setup_watch_events (
+    id SERIAL PRIMARY KEY,
+    watch_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT,
+    from_state TEXT,
+    to_state TEXT,
+    maturity_score DOUBLE PRECISION,
+    created_at TEXT NOT NULL
+)
+"""
+
+_SETUP_WATCH_EVENTS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_setup_watch_events_watch "
+    "ON setup_watch_events(watch_id)",
+
+    "CREATE INDEX IF NOT EXISTS idx_setup_watch_events_type "
+    "ON setup_watch_events(event_type)",
+]
+
+_SETUP_WATCH_EVENTS_IMMUTABILITY_TRIGGERS_SQLITE = [
+    """
+    CREATE TRIGGER IF NOT EXISTS setup_watch_events_no_update
+        BEFORE UPDATE ON setup_watch_events
+    BEGIN
+        SELECT RAISE(ABORT, 'setup_watch_events is immutable: UPDATE prohibited');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS setup_watch_events_no_delete
+        BEFORE DELETE ON setup_watch_events
+    BEGIN
+        SELECT RAISE(ABORT, 'setup_watch_events is immutable: DELETE prohibited');
+    END
+    """,
+]
+
+
+# ---------------------------------------------------------------------------
+# setup_watch_outcomes (immutable, counterfactual scoring)
+#
+# One row per (watch_id, window_label). Measures what price did after a watch
+# reached `ready`, independent of whether the watch was promoted or traded.
+#
+# Requirements: 1.7, 1.8
+# ---------------------------------------------------------------------------
+
+_SETUP_WATCH_OUTCOMES_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS setup_watch_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    window_label TEXT NOT NULL,
+    window_minutes INTEGER NOT NULL,
+    reference_price REAL NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    mfe_pct REAL,
+    mae_pct REAL,
+    entry_zone_touched INTEGER,
+    would_have_hit_target INTEGER,
+    would_have_hit_stop INTEGER,
+    scorable INTEGER NOT NULL,
+    unscorable_reason TEXT,
+    created_at TEXT NOT NULL
+)
+"""
+
+_SETUP_WATCH_OUTCOMES_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS setup_watch_outcomes (
+    id SERIAL PRIMARY KEY,
+    watch_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    window_label TEXT NOT NULL,
+    window_minutes INTEGER NOT NULL,
+    reference_price DOUBLE PRECISION NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    mfe_pct DOUBLE PRECISION,
+    mae_pct DOUBLE PRECISION,
+    entry_zone_touched INTEGER,
+    would_have_hit_target INTEGER,
+    would_have_hit_stop INTEGER,
+    scorable INTEGER NOT NULL,
+    unscorable_reason TEXT,
+    created_at TEXT NOT NULL
+)
+"""
+
+_SETUP_WATCH_OUTCOMES_INDEXES = [
+    # Idempotency: each watch scored at most once per window
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_watch_outcomes_watch_window "
+    "ON setup_watch_outcomes(watch_id, window_label)",
+
+    "CREATE INDEX IF NOT EXISTS idx_setup_watch_outcomes_profile_window "
+    "ON setup_watch_outcomes(profile_id, window_label)",
+]
+
+_SETUP_WATCH_OUTCOMES_IMMUTABILITY_TRIGGERS_SQLITE = [
+    """
+    CREATE TRIGGER IF NOT EXISTS setup_watch_outcomes_no_update
+        BEFORE UPDATE ON setup_watch_outcomes
+    BEGIN
+        SELECT RAISE(ABORT, 'setup_watch_outcomes is immutable: UPDATE prohibited');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS setup_watch_outcomes_no_delete
+        BEFORE DELETE ON setup_watch_outcomes
+    BEGIN
+        SELECT RAISE(ABORT, 'setup_watch_outcomes is immutable: DELETE prohibited');
+    END
+    """,
+]
+
+
+def init_setup_watch_schema(engine):
+    """Create setup watch tables, indexes, and triggers if missing.
+
+    Non-destructive and idempotent. Uses CREATE TABLE / INDEX / TRIGGER
+    IF NOT EXISTS. Existing rows and columns are never modified.
+
+    Three tables:
+      - setup_watches: lifecycle state machine
+      - setup_watch_events: immutable audit trail
+      - setup_watch_outcomes: counterfactual scoring
+
+    Requirements: 1.1–1.12
+    """
+    sqlite = is_sqlite(engine)
+
+    with engine.begin() as conn:
+        # --- setup_watches table ---
+        conn.execute(text(
+            _SETUP_WATCHES_DDL_SQLITE if sqlite else _SETUP_WATCHES_DDL_POSTGRES
+        ))
+        for stmt in _SETUP_WATCHES_INDEXES:
+            conn.execute(text(stmt))
+
+        # --- setup_watch_events table ---
+        conn.execute(text(
+            _SETUP_WATCH_EVENTS_DDL_SQLITE if sqlite
+            else _SETUP_WATCH_EVENTS_DDL_POSTGRES
+        ))
+        for stmt in _SETUP_WATCH_EVENTS_INDEXES:
+            conn.execute(text(stmt))
+
+        # --- setup_watch_outcomes table ---
+        conn.execute(text(
+            _SETUP_WATCH_OUTCOMES_DDL_SQLITE if sqlite
+            else _SETUP_WATCH_OUTCOMES_DDL_POSTGRES
+        ))
+        for stmt in _SETUP_WATCH_OUTCOMES_INDEXES:
+            conn.execute(text(stmt))
+
+        # --- Immutability triggers ---
+        if sqlite:
+            for stmt in _SETUP_WATCH_EVENTS_IMMUTABILITY_TRIGGERS_SQLITE:
+                conn.execute(text(stmt))
+            for stmt in _SETUP_WATCH_OUTCOMES_IMMUTABILITY_TRIGGERS_SQLITE:
+                conn.execute(text(stmt))
+        else:
+            # Postgres: shared raise_immutable() function + per-op triggers.
+            # CREATE OR REPLACE makes this safe alongside init_trade_plan_schema
+            # and init_pending_order_schema, which define the same function.
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION '% is immutable: % prohibited', TG_TABLE_NAME, TG_OP;
+                END;
+                $$ LANGUAGE plpgsql
+            """))
+            for table in ("setup_watch_events", "setup_watch_outcomes"):
+                for op in ("update", "delete"):
+                    conn.execute(text(
+                        f"DROP TRIGGER IF EXISTS {table}_no_{op} ON {table}"
+                    ))
+                    conn.execute(text(
+                        f"CREATE TRIGGER {table}_no_{op} "
+                        f"BEFORE {op.upper()} ON {table} "
+                        f"FOR EACH ROW EXECUTE FUNCTION raise_immutable()"
+                    ))
+
+    logger.debug(
+        "Setup watch schema verified "
+        "(setup_watches, setup_watch_events, setup_watch_outcomes)"
+    )
