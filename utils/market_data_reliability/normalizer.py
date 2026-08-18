@@ -224,6 +224,7 @@ class SnapshotNormalizer:
         provider: str,
         requested_at: datetime,
         fetched_at: datetime,
+        data_type: str = "candle",
     ) -> Snapshot:
         """Normalize a raw candle response into a Snapshot.
 
@@ -253,8 +254,6 @@ class SnapshotNormalizer:
             Fully classified frozen snapshot with Decimal prices from
             the most recent candle.
         """
-        data_type = "candle"
-
         # Step 1: Validate the raw response
         validation_result = self._validator.validate(raw, symbol, data_type)
 

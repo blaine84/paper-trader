@@ -278,6 +278,11 @@ class ResponseValidator:
 
     def _try_parse_timestamp(self, value: object) -> Optional[datetime]:
         """Try to parse a single timestamp value into a datetime."""
+        if isinstance(value, list):
+            if not value:
+                return None
+            return self._try_parse_timestamp(value[-1])
+
         # Integer/float → Unix epoch
         if isinstance(value, (int, float)):
             if value <= 0:

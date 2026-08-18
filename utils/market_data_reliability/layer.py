@@ -427,10 +427,16 @@ class ReliabilityLayer:
                 raw = self._fetch_from_provider(provider, symbol, data_type)
                 fetched_at = datetime.now(timezone.utc)
 
-                # Normalize the raw response into a Snapshot
-                if data_type == "candle":
+                # Normalize the raw response into a Snapshot. ATR and volume
+                # readiness are backed by fresh intraday candle context.
+                if data_type in {"candle", "atr", "volume"}:
                     snapshot = self._normalizer.normalize_candles(
-                        raw, symbol, provider, requested_at, fetched_at
+                        raw,
+                        symbol,
+                        provider,
+                        requested_at,
+                        fetched_at,
+                        data_type=data_type,
                     )
                 else:
                     snapshot = self._normalizer.normalize_quote(
