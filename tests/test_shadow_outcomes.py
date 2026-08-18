@@ -174,3 +174,156 @@ def test_update_blocked_candidate_outcomes_closes_preopen_window_without_fetchin
             {"id": candidate_id},
         ).fetchone()
     assert outcome == ("15m", "unscorable_no_regular_session", "unscorable")
+
+
+def _create_modern_candidate_tables(engine):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE pm_candidates (
+                    id INTEGER PRIMARY KEY,
+                    candidate_id VARCHAR(36) NOT NULL UNIQUE,
+                    cycle_id VARCHAR(64) NOT NULL,
+                    profile_id VARCHAR(64) NOT NULL,
+                    symbol VARCHAR(10) NOT NULL,
+                    direction VARCHAR(10) NOT NULL,
+                    setup_type VARCHAR(64) NOT NULL,
+                    geometry_name VARCHAR(64) NOT NULL,
+                    entry_price REAL NOT NULL,
+                    stop_price REAL NOT NULL,
+                    target_price REAL NOT NULL,
+                    risk_reward REAL NOT NULL,
+                    rejection_reason TEXT,
+                    created_at DATETIME
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE pm_candidate_events (
+                    id INTEGER PRIMARY KEY,
+                    candidate_id VARCHAR(36) NOT NULL,
+                    cycle_id VARCHAR(64) NOT NULL,
+                    profile_id VARCHAR(64) NOT NULL,
+                    event_type VARCHAR(64) NOT NULL,
+                    event_data TEXT,
+                    created_at DATETIME,
+                    candidate_type TEXT DEFAULT 'intraday'
+                )
+                """
+            )
+        )
+
+
+def test_update_blocked_candidate_outcomes_scores_modern_pm_events(tmp_path):
+    engine = init_db(str(tmp_path / "paper.db"))
+    ensure_shadow_ledger_schema(engine)
+    _create_modern_candidate_tables(engine)
+
+    created = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
+    now = created + timedelta(minutes=61)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO pm_candidates (
+                    candidate_id, cycle_id, profile_id, symbol, direction,
+                    setup_type, geometry_name, entry_price, stop_price,
+                    target_price, risk_reward, rejection_reason, created_at
+                ) VALUES (
+                    'cand-modern-1', 'cycle-1', 'moderate', 'AMD', 'short',
+                    'gap_and_go', 'gap_and_go_short', 100.0, 102.0,
+                    95.0, 2.5, 'PM gate rejected', :created
+                )
+                """
+            ),
+            {"created": created.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO pm_candidate_events (
+                    candidate_id, cycle_id, profile_id, event_type, event_data, created_at
+                ) VALUES (
+                    'cand-modern-1', 'cycle-1', 'moderate', 'pm_reject',
+                    :event_data, :created
+                )
+                """
+            ),
+            {
+                "created": created.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"),
+                "event_data": '{"rejection_reason_code":"risk_reward","rationale":"too thin"}',
+            },
+        )
+
+    def candle_fetcher(symbol, start, end):
+        assert symbol == "AMD"
+        return _candles(created, [100.0] * 10 + [98.0] * 10 + [96.0] * 20 + [94.9] * 25)
+
+    result = update_blocked_candidate_outcomes(engine, now=now, candle_fetcher=candle_fetcher)
+
+    assert result["modern_candidates_seen"] == 1
+    assert result["modern_inserted"] == 3
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT eval_window, gate_verdict, outcome_label, source_type, candidate_id
+                FROM modern_shadow_candidate_outcomes
+                ORDER BY eval_window
+                """
+            )
+        ).fetchall()
+
+    assert {row[0] for row in rows} == {"15m", "30m", "60m"}
+    assert {row[3] for row in rows} == {"pm_candidate_events"}
+    assert {row[4] for row in rows} == {"cand-modern-1"}
+    assert any(row[1] == "blocked_winner" for row in rows)
+
+    rerun = update_blocked_candidate_outcomes(engine, now=now, candle_fetcher=candle_fetcher)
+    assert rerun["modern_inserted"] == 0
+    with engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM modern_shadow_candidate_outcomes")).scalar()
+    assert count == 3
+
+
+def test_update_blocked_candidate_outcomes_leaves_executed_modern_events_as_telemetry(tmp_path):
+    engine = init_db(str(tmp_path / "paper.db"))
+    ensure_shadow_ledger_schema(engine)
+    _create_modern_candidate_tables(engine)
+
+    created = datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO pm_candidate_events (
+                    candidate_id, cycle_id, profile_id, event_type, event_data, created_at
+                ) VALUES (
+                    'cand-exec-1', 'cycle-1', 'moderate', 'pipeline_executed',
+                    :event_data,
+                    :created
+                )
+                """
+            ),
+            {
+                "created": created.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"),
+                "event_data": '{"symbol":"AMD","direction":"short","entry_price":100,"stop_price":102,"target_price":95}',
+            },
+        )
+
+    result = update_blocked_candidate_outcomes(
+        engine,
+        now=created + timedelta(minutes=61),
+        candle_fetcher=lambda *args: (_ for _ in ()).throw(AssertionError("executed events are telemetry only")),
+    )
+
+    assert result["modern_candidates_seen"] == 0
+    assert result["modern_inserted"] == 0
+    with engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM modern_shadow_candidate_outcomes")).scalar()
+    assert count == 0

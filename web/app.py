@@ -63,6 +63,7 @@ _SHADOW_EVENT_TYPES = (
     "pipeline_executed",
     "pipeline_gate_rejected",
     "pipeline_execution_failed",
+    "execution_failed",
     "plan_rejected_at_creation",
     "swing_candidate_rejected",
     "contract_violation_missing_geometry_claim",
@@ -75,6 +76,7 @@ _SHADOW_EVENT_LABELS = {
     "pipeline_executed": "Executed",
     "pipeline_gate_rejected": "Pipeline Gate",
     "pipeline_execution_failed": "Execution Failed",
+    "execution_failed": "Execution Failed",
     "plan_rejected_at_creation": "Plan Creation",
     "swing_candidate_rejected": "Swing Candidate",
     "contract_violation_missing_geometry_claim": "Contract Violation",
@@ -157,7 +159,9 @@ def _normalize_shadow_event(row: dict) -> dict:
         "target_price": _first_present(data.get("target_price"), row.get("target_price")),
         "blocked_by": _SHADOW_EVENT_LABELS.get(str(event_type), str(event_type or "PM Telemetry")),
         "block_reason": reason,
-        "eval_window": "telemetry",
+        "row_type": "event",
+        "display_window": "event",
+        "eval_window": None,
         "evaluated_at": None,
         "eval_price": None,
         "pnl_pct": row.get("trade_pnl_pct") if event_type == "pipeline_executed" else None,
@@ -1385,6 +1389,7 @@ def api_shadow_outcomes():
     limit = max(1, min(limit or 100, 500))
 
     blocked_date_filter = _date_cutoff_filter(engine, "b.created_at")
+    modern_date_filter = _date_cutoff_filter(engine, "m.candidate_created_at")
     event_date_filter = _date_cutoff_filter(engine, "e.created_at")
     with engine.connect() as conn:
         summary_rows = conn.execute(
@@ -1403,6 +1408,21 @@ def api_shadow_outcomes():
             {"cutoff": f"-{days} days"},
         ).mappings().all()
 
+        modern_summary_rows = conn.execute(
+            text(
+                f"""
+                SELECT
+                  COALESCE(m.gate_verdict, 'pending') AS gate_verdict,
+                  COUNT(*) AS count
+                FROM modern_shadow_candidate_outcomes m
+                WHERE m.eval_window = '60m'
+                  AND {modern_date_filter}
+                GROUP BY COALESCE(m.gate_verdict, 'pending')
+                """
+            ),
+            {"cutoff": f"-{days} days"},
+        ).mappings().all()
+
         rows = conn.execute(
             text(
                 f"""
@@ -1413,12 +1433,55 @@ def api_shadow_outcomes():
                   o.eval_window, o.evaluated_at, o.eval_price, o.pnl_pct,
                   o.mfe_pct, o.mae_pct, o.stop_hit, o.target_hit, o.first_hit,
                   o.outcome_label, o.gate_verdict,
-                  'blocked_trade_candidates' AS source
+                  'blocked_trade_candidates' AS source,
+                  'outcome' AS row_type,
+                  COALESCE(o.eval_window, 'pending') AS display_window
                 FROM blocked_trade_candidates b
                 LEFT JOIN blocked_trade_candidate_outcomes o
                   ON o.blocked_candidate_id = b.id
                 WHERE {blocked_date_filter}
                 ORDER BY b.created_at DESC, o.eval_window ASC
+                LIMIT :limit
+                """
+            ),
+            {"cutoff": f"-{days} days", "limit": limit},
+        ).mappings().all()
+
+        modern_rows = conn.execute(
+            text(
+                f"""
+                SELECT
+                  m.id,
+                  m.candidate_created_at AS created_at,
+                  m.symbol,
+                  m.action,
+                  m.direction,
+                  m.profile,
+                  m.setup_type,
+                  m.entry_price,
+                  m.stop_price,
+                  m.target_price,
+                  m.blocked_by,
+                  m.block_reason,
+                  m.eval_window,
+                  m.evaluated_at,
+                  m.eval_price,
+                  m.pnl_pct,
+                  m.mfe_pct,
+                  m.mae_pct,
+                  m.stop_hit,
+                  m.target_hit,
+                  m.first_hit,
+                  m.outcome_label,
+                  m.gate_verdict,
+                  'modern_shadow_candidate_outcomes' AS source,
+                  'outcome' AS row_type,
+                  m.eval_window AS display_window,
+                  m.candidate_id,
+                  m.event_type
+                FROM modern_shadow_candidate_outcomes m
+                WHERE {modern_date_filter}
+                ORDER BY m.candidate_created_at DESC, m.eval_window ASC
                 LIMIT :limit
                 """
             ),
@@ -1494,10 +1557,14 @@ def api_shadow_outcomes():
         ).mappings().all()
 
     summary = {r["gate_verdict"]: r["count"] for r in summary_rows}
+    for row in modern_summary_rows:
+        verdict = row["gate_verdict"]
+        summary[verdict] = summary.get(verdict, 0) + row["count"]
     event_summary = {r["event_type"]: r["count"] for r in event_summary_rows}
     event_summary["total"] = event_count
 
     combined_rows = [dict(r) for r in rows]
+    combined_rows.extend(dict(r) for r in modern_rows)
     combined_rows.extend(_normalize_shadow_event(dict(r)) for r in event_rows)
     combined_rows.sort(key=_shadow_sort_key, reverse=True)
     return jsonify({
