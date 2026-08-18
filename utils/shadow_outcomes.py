@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -151,6 +152,7 @@ _INVALID_SYMBOL_PATTERNS: set[str] = {
     "theme_",
     "ETF_",
 }
+_VALID_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 
 
 def validate_candidate_scorability(
@@ -204,6 +206,8 @@ def validate_candidate_scorability(
     # Reject sector/category placeholders
     if any(symbol.startswith(p) for p in _INVALID_SYMBOL_PATTERNS):
         return (False, "symbol_is_placeholder")
+    if not _VALID_SYMBOL_RE.fullmatch(symbol.upper()):
+        return (False, "invalid_symbol_format")
 
     # Check 3: Complete numeric geometry (Requirement 10.3)
     entry = candidate.get("entry_price")

@@ -84,6 +84,11 @@ class TestValidateCandidateScorability:
         valid_candidate["symbol"] = f"{prefix}tech"
         assert validate_candidate_scorability(valid_candidate) == (False, "symbol_is_placeholder")
 
+    @pytest.mark.parametrize("symbol", ["XLE|XLB", "Specific names or XLI", "A TECH ETF Placeholder"])
+    def test_invalid_symbol_format(self, valid_candidate, symbol):
+        valid_candidate["symbol"] = symbol
+        assert validate_candidate_scorability(valid_candidate) == (False, "invalid_symbol_format")
+
     def test_incomplete_geometry_no_entry(self, valid_candidate):
         valid_candidate["entry_price"] = None
         assert validate_candidate_scorability(valid_candidate) == (False, "incomplete_geometry")
