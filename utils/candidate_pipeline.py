@@ -1569,7 +1569,7 @@ def execute_candidate_pipeline(
                 required_data_types=["quote", "atr", "volume"],
                 consumer="PM",
             )
-            if readiness is not None and not readiness.ready:
+            if readiness is not None and not readiness.proceed:
                 # Market data unavailable/untrusted — block candidate
                 reason_codes_str = ", ".join(readiness.reason_codes) or "market_data_degraded"
                 error_msg = f"Market data readiness failed: {reason_codes_str}"
