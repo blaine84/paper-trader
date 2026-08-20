@@ -18,6 +18,15 @@ def test_registered_setup_type_has_no_warning():
     assert "needs_setup_type_review" not in result
 
 
+def test_canonical_swing_setup_type_has_no_warning_when_registry_list_is_stale():
+    signal = {"symbol": "META", "setup_type": "pullback_continuation"}
+
+    result = annotate_unregistered_setup(signal, ["technical_breakout", "orb"])
+
+    assert "setup_validation_warning" not in result
+    assert "needs_setup_type_review" not in result
+
+
 def test_unregistered_setup_type_is_preserved_with_warning():
     signal = {"symbol": "AAPL", "setup_type": "liquidity_sweep"}
 

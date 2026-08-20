@@ -704,7 +704,17 @@ def _infer_unclear_direction_swing_setup(signal: dict) -> str | None:
 def annotate_unregistered_setup(signal: dict, valid_setups: list[str]) -> dict:
     """Flag setup labels outside the registry without rewriting them."""
     setup_type = signal.get("setup_type")
-    if not setup_type or setup_type in set(valid_setups):
+    from utils.gate_config import (
+        CANDIDATE_EXECUTABLE_SETUP_TYPES,
+        SWING_EXECUTABLE_SETUP_TYPES,
+    )
+
+    canonical_setups = (
+        set(valid_setups)
+        | set(CANDIDATE_EXECUTABLE_SETUP_TYPES)
+        | set(SWING_EXECUTABLE_SETUP_TYPES)
+    )
+    if not setup_type or setup_type in canonical_setups:
         return signal
 
     signal.setdefault(

@@ -148,6 +148,46 @@ def test_check_candidate_readiness_all_ready():
     assert len(readiness.missing_data_types) == 0
 
 
+def test_check_candidate_readiness_quote_atr_volume_ready():
+    """PM readiness accepts fresh quote plus fresh intraday ATR/volume context."""
+    config = _make_config()
+    now = int(time.time())
+
+    def mock_provider(provider, symbol, data_type):
+        if data_type == "quote":
+            return {
+                "s": symbol,
+                "c": 150.0,
+                "h": 152.0,
+                "l": 149.0,
+                "o": 150.5,
+                "pc": 149.0,
+                "t": now,
+                "v": 1000000,
+            }
+        return {
+            "s": symbol,
+            "t": [now - 600, now - 300, now],
+            "o": [149.0, 149.5, 150.0],
+            "h": [150.0, 151.0, 152.0],
+            "l": [148.5, 149.0, 149.5],
+            "c": [149.5, 150.0, 151.0],
+            "v": [900000, 950000, 1000000],
+        }
+
+    layer = ReliabilityLayer(config, fetch_from_provider=mock_provider)
+    readiness = layer.check_candidate_readiness(
+        "AAPL", ["quote", "atr", "volume"], "PM"
+    )
+
+    assert readiness.ready is True
+    assert readiness.missing_data_types == ()
+    assert readiness.reason_codes == ()
+    assert readiness.snapshots["quote"].data_type == "quote"
+    assert readiness.snapshots["atr"].data_type == "atr"
+    assert readiness.snapshots["volume"].data_type == "volume"
+
+
 def test_get_snapshot_never_raises_on_internal_error():
     """get_snapshot always returns SnapshotResult, even on internal error."""
     config = _make_config()

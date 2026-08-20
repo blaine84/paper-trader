@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from utils.dialect_sql import _default_timestamp, _pk_column
+
 log = logging.getLogger(__name__)
 
 
@@ -22,6 +24,8 @@ def ensure_shadow_ledger_schema(engine) -> None:
     a schema failure must not prevent the system from starting.
     """
     try:
+        pk = _pk_column(engine)
+        ts_default = _default_timestamp(engine)
         with engine.connect() as conn:
             conn.execute(
                 text(
@@ -130,6 +134,74 @@ def ensure_shadow_ledger_schema(engine) -> None:
                     """
                     CREATE INDEX IF NOT EXISTS ix_blocked_outcomes_verdict_created
                     ON blocked_trade_candidate_outcomes (gate_verdict, created_at)
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS modern_shadow_candidate_outcomes (
+                        {pk},
+                        source_type VARCHAR(64) NOT NULL,
+                        source_id VARCHAR(64) NOT NULL,
+                        candidate_id VARCHAR(64),
+                        event_type VARCHAR(64),
+                        candidate_created_at DATETIME NOT NULL,
+                        profile VARCHAR(64),
+                        symbol VARCHAR(16),
+                        action VARCHAR(16),
+                        direction VARCHAR(16),
+                        setup_type VARCHAR(64),
+                        entry_price REAL,
+                        stop_price REAL,
+                        target_price REAL,
+                        quantity REAL,
+                        blocked_by VARCHAR(64),
+                        block_reason TEXT,
+                        eval_window VARCHAR(16) NOT NULL,
+                        evaluated_at DATETIME NOT NULL,
+                        eval_price REAL,
+                        pnl_pct REAL,
+                        mfe_pct REAL,
+                        mae_pct REAL,
+                        stop_hit BOOLEAN DEFAULT false,
+                        target_hit BOOLEAN DEFAULT false,
+                        first_hit VARCHAR(16),
+                        first_hit_at DATETIME,
+                        outcome_label VARCHAR(64),
+                        gate_verdict VARCHAR(64),
+                        notes_json TEXT,
+                        created_at DATETIME {ts_default},
+                        UNIQUE(source_type, source_id, eval_window)
+                    )
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_modern_shadow_outcomes_source
+                    ON modern_shadow_candidate_outcomes (source_type, source_id)
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_modern_shadow_outcomes_candidate_created
+                    ON modern_shadow_candidate_outcomes (candidate_created_at)
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_modern_shadow_outcomes_verdict_created
+                    ON modern_shadow_candidate_outcomes (gate_verdict, candidate_created_at)
                     """
                 )
             )

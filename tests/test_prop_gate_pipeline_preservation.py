@@ -19,6 +19,9 @@ from hypothesis import given, settings, assume
 from hypothesis import strategies as st
 
 from utils.candidate_pipeline import _build_gate_decision, ResolvedOrder
+from utils.market_data_reliability.pipeline_integration import (
+    MarketDataReadinessResult,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +305,87 @@ class TestProperty9GatePipelinePreservation:
             f"ResolvedOrder has alert-specific fields: {present_alert_fields}. "
             "Gate pipeline inputs must be origin-agnostic."
         )
+
+    def test_market_data_reliability_blocks_before_sizing(self):
+        """Enforcing-mode market-data failure blocks the candidate pipeline."""
+        from utils.candidate_pipeline import execute_candidate_pipeline
+        from utils.decision_contract import CandidateDecision
+
+        candidate_id = "cand_market_data_blocked"
+
+        mock_candidate = MagicMock()
+        mock_candidate.candidate_id = candidate_id
+        mock_candidate.symbol = "SMCI"
+        mock_candidate.direction = "SHORT"
+        mock_candidate.entry_price = 37.50
+        mock_candidate.stop_price = 39.00
+        mock_candidate.target_price = 34.50
+        mock_candidate.setup_type = "technical_breakout"
+        mock_candidate.risk_reward = 2.0
+        mock_candidate.geometry_name = "standard"
+        mock_candidate.signal_snapshot_json = '{"symbol": "SMCI", "signal": "SHORT"}'
+        mock_candidate.profile_id = "moderate"
+        mock_candidate.cycle_id = "test_cycle"
+        mock_candidate.candidate_type = "intraday"
+
+        mock_registry = MagicMock()
+        mock_registry.cycle_id = "test_cycle"
+        mock_registry.reserve.return_value = (True, None)
+
+        decision = CandidateDecision(
+            candidate_id=candidate_id,
+            decision="accept",
+            rationale="Test",
+            risk_multiplier=1.0,
+        )
+        db = MagicMock()
+        engine = MagicMock()
+        readiness = MarketDataReadinessResult(
+            proceed=False,
+            reason_codes=("market_data_unavailable",),
+            missing_data_types=("quote", "atr", "volume"),
+        )
+
+        with patch("utils.candidate_pipeline._resolve_candidate", return_value=(mock_candidate, None)), \
+             patch("utils.candidate_pipeline._generate_execution_key", return_value="exec_key_test"), \
+             patch("utils.candidate_pipeline.MARKET_DATA_RELIABILITY_MODE", "enforcing"), \
+             patch(
+                 "utils.market_data_reliability.pipeline_integration.check_market_data_readiness",
+                 return_value=readiness,
+             ) as mock_readiness, \
+             patch("utils.candidate_pipeline._write_candidate_event"), \
+             patch("utils.candidate_pipeline._commit_candidate_pipeline_session") as mock_commit, \
+             patch("utils.candidate_pipeline.calculate_position_size") as mock_size, \
+             patch("agents.portfolio_manager._run_gate_pipeline") as mock_gate:
+
+            result = execute_candidate_pipeline(
+                db,
+                engine,
+                mock_registry,
+                decision,
+                {"starting_balance": 100000, "daily_pnl": 0, "cash": 100000},
+                {"starting_balance": 100000, "max_position_pct": 0.1},
+                "moderate",
+            )
+
+        assert result.outcome == "gate_rejected"
+        assert result.error == "Market data readiness failed: market_data_unavailable"
+        mock_readiness.assert_called_once_with(
+            symbol="SMCI",
+            required_data_types=["quote", "atr", "volume"],
+            consumer="PM",
+        )
+        mock_commit.assert_called_once_with(
+            db,
+            candidate_id,
+            "market_data_blocked",
+        )
+        mock_registry.mark_gate_rejected.assert_called_once_with(
+            candidate_id,
+            "Market data readiness failed: market_data_unavailable",
+        )
+        mock_size.assert_not_called()
+        mock_gate.assert_not_called()
 
     @given(
         symbol=symbol_strategy,

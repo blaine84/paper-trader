@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -38,6 +39,20 @@ KNOWN_GATE_NAMES: set[str] = {
     "track_record_gate",
     "alert_cooldown",
 }
+
+MODERN_SHADOW_EVENT_TYPES: tuple[str, ...] = (
+    "pm_reject",
+    "pm_not_selected",
+    "preflight_excluded",
+    "pipeline_gate_rejected",
+    "pipeline_execution_failed",
+    "execution_failed",
+    "plan_rejected_at_creation",
+    "swing_candidate_rejected",
+    "contract_violation_missing_geometry_claim",
+)
+
+MODERN_SHADOW_SOURCE_TYPE = "pm_candidate_events"
 
 
 def classify_candidate_source(blocked_by: str | None) -> str:
@@ -82,6 +97,42 @@ def _num(value: Any) -> float | None:
         return None
 
 
+def _parse_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return {}
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _first_text(*values: Any) -> str | None:
+    value = _first_present(*values)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _action_from_direction(*values: Any) -> str | None:
+    for value in values:
+        raw = str(value or "").strip().upper()
+        if raw in {"BUY", "LONG"}:
+            return "BUY"
+        if raw in {"SHORT", "SELL_SHORT"}:
+            return "SHORT"
+    return None
+
+
 def _is_positive_number(value: Any) -> bool:
     """Check if value is a positive finite number."""
     if value is None:
@@ -101,6 +152,7 @@ _INVALID_SYMBOL_PATTERNS: set[str] = {
     "theme_",
     "ETF_",
 }
+_VALID_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 
 
 def validate_candidate_scorability(
@@ -154,6 +206,8 @@ def validate_candidate_scorability(
     # Reject sector/category placeholders
     if any(symbol.startswith(p) for p in _INVALID_SYMBOL_PATTERNS):
         return (False, "symbol_is_placeholder")
+    if not _VALID_SYMBOL_RE.fullmatch(symbol.upper()):
+        return (False, "invalid_symbol_format")
 
     # Check 3: Complete numeric geometry (Requirement 10.3)
     entry = candidate.get("entry_price")
@@ -275,6 +329,43 @@ def _unscorable_outcome(candidate: dict[str, Any], window_label: str, window_min
             "reason": "evaluation window does not overlap regular trading session",
             "candles_scored": 0,
         }),
+    }
+
+
+def _unscorable_outcome_for_reason(
+    candidate: dict[str, Any],
+    window_label: str,
+    window_minutes: int,
+    reason: str,
+) -> dict[str, Any]:
+    created_at = _parse_dt(candidate.get("created_at"))
+    if created_at is None:
+        created_at = datetime.now(timezone.utc)
+    evaluated_at = created_at + timedelta(minutes=window_minutes)
+    notes: dict[str, Any] = {
+        "reason": reason,
+        "candidate_source_classification": classify_candidate_source(candidate.get("blocked_by")),
+    }
+    if candidate.get("candidate_id"):
+        notes["candidate_id"] = candidate.get("candidate_id")
+    if candidate.get("event_type"):
+        notes["event_type"] = candidate.get("event_type")
+
+    return {
+        "blocked_candidate_id": candidate.get("id"),
+        "eval_window": window_label,
+        "evaluated_at": evaluated_at.replace(tzinfo=None),
+        "eval_price": None,
+        "pnl_pct": None,
+        "mfe_pct": None,
+        "mae_pct": None,
+        "stop_hit": 0,
+        "target_hit": 0,
+        "first_hit": None,
+        "first_hit_at": None,
+        "outcome_label": f"unscorable_{reason}",
+        "gate_verdict": "unscorable",
+        "notes_json": json.dumps(notes),
     }
 
 
@@ -616,6 +707,292 @@ def get_gate_effectiveness_summary(
     }
 
 
+def _modern_event_types_sql() -> str:
+    return ", ".join(f"'{event_type}'" for event_type in MODERN_SHADOW_EVENT_TYPES)
+
+
+def _modern_due_filter_sql(engine) -> str:
+    if engine.dialect.name == "postgresql":
+        return "e.created_at <= (CAST(:now AS timestamp) - INTERVAL '15 minutes')"
+    return "datetime(e.created_at) <= datetime(:now, '-15 minutes')"
+
+
+def _modern_outcome_upsert_sql() -> str:
+    return """
+        INSERT INTO modern_shadow_candidate_outcomes (
+            source_type, source_id, candidate_id, event_type, candidate_created_at,
+            profile, symbol, action, direction, setup_type, entry_price, stop_price,
+            target_price, quantity, blocked_by, block_reason, eval_window,
+            evaluated_at, eval_price, pnl_pct, mfe_pct, mae_pct, stop_hit,
+            target_hit, first_hit, first_hit_at, outcome_label, gate_verdict,
+            notes_json
+        ) VALUES (
+            :source_type, :source_id, :candidate_id, :event_type, :candidate_created_at,
+            :profile, :symbol, :action, :direction, :setup_type, :entry_price, :stop_price,
+            :target_price, :quantity, :blocked_by, :block_reason, :eval_window,
+            :evaluated_at, :eval_price, :pnl_pct, :mfe_pct, :mae_pct, :stop_hit,
+            :target_hit, :first_hit, :first_hit_at, :outcome_label, :gate_verdict,
+            :notes_json
+        ) ON CONFLICT (source_type, source_id, eval_window) DO NOTHING
+    """
+
+
+def _format_modern_reasons(data: dict[str, Any], row: dict[str, Any]) -> str | None:
+    codes = data.get("blocking_reason_codes")
+    if isinstance(codes, list) and codes:
+        reason = ", ".join(str(code) for code in codes if code)
+        risk_reward = _first_present(data.get("risk_reward"), row.get("risk_reward"))
+        if risk_reward is not None and "min_risk_reward_not_met" in reason:
+            reason = f"{reason} (R:R {risk_reward})"
+        return reason or None
+    return None
+
+
+def _modern_candidate_from_event(row: dict[str, Any]) -> dict[str, Any]:
+    data = _parse_json_dict(row.get("event_data"))
+    event_type = str(row.get("event_type") or "")
+    raw_label = data.get("raw_label")
+    reason_code = data.get("reason_code") or data.get("rejection_reason_code")
+    action = _action_from_direction(
+        data.get("intended_action"),
+        data.get("action"),
+        data.get("direction"),
+        row.get("direction"),
+    )
+    direction = _first_text(data.get("direction"), row.get("direction"), action)
+    block_reason = _first_text(
+        data.get("rationale"),
+        data.get("reason"),
+        data.get("block_reason"),
+        _format_modern_reasons(data, row),
+        row.get("rejection_reason"),
+        data.get("failure_reason"),
+        reason_code,
+        data.get("error"),
+        raw_label,
+    )
+    if raw_label and reason_code and block_reason == str(reason_code):
+        block_reason = f"{reason_code}: {raw_label}"
+
+    quantity = _first_present(data.get("attempted_quantity"), data.get("quantity"), row.get("quantity"))
+    if quantity is None:
+        quantity = 1.0
+
+    return {
+        "id": row.get("event_id"),
+        "source_type": MODERN_SHADOW_SOURCE_TYPE,
+        "source_id": str(row.get("event_id")),
+        "candidate_id": row.get("candidate_id"),
+        "event_type": event_type,
+        "created_at": row.get("created_at"),
+        "symbol": _first_text(data.get("symbol"), row.get("symbol"), data.get("signal_id")),
+        "action": action,
+        "direction": direction,
+        "profile": _first_text(row.get("profile_id"), data.get("profile"), row.get("candidate_profile")),
+        "setup_type": _first_text(
+            data.get("setup_type"),
+            row.get("setup_type"),
+            data.get("geometry_name"),
+            row.get("geometry_name"),
+            raw_label,
+        ),
+        "entry_price": _first_present(
+            data.get("entry_price"),
+            row.get("entry_price"),
+            data.get("observed_price"),
+            data.get("entry_zone_upper"),
+        ),
+        "stop_price": _first_present(data.get("stop_price"), row.get("stop_price")),
+        "target_price": _first_present(data.get("target_price"), row.get("target_price")),
+        "quantity": quantity,
+        "blocked_by": event_type or "pm_candidate_event",
+        "block_reason": block_reason or event_type or "modern PM candidate event",
+    }
+
+
+def _modern_outcome_row(candidate: dict[str, Any], scored: dict[str, Any]) -> dict[str, Any]:
+    notes = _parse_json_dict(scored.get("notes_json"))
+    notes.update({
+        "source_type": candidate.get("source_type"),
+        "source_id": candidate.get("source_id"),
+        "candidate_id": candidate.get("candidate_id"),
+        "event_type": candidate.get("event_type"),
+    })
+    return {
+        "source_type": candidate.get("source_type"),
+        "source_id": candidate.get("source_id"),
+        "candidate_id": candidate.get("candidate_id"),
+        "event_type": candidate.get("event_type"),
+        "candidate_created_at": _parse_dt(candidate.get("created_at")).replace(tzinfo=None),
+        "profile": candidate.get("profile"),
+        "symbol": candidate.get("symbol"),
+        "action": candidate.get("action"),
+        "direction": candidate.get("direction"),
+        "setup_type": candidate.get("setup_type"),
+        "entry_price": _num(candidate.get("entry_price")),
+        "stop_price": _num(candidate.get("stop_price")),
+        "target_price": _num(candidate.get("target_price")),
+        "quantity": _num(candidate.get("quantity")),
+        "blocked_by": candidate.get("blocked_by"),
+        "block_reason": candidate.get("block_reason"),
+        "eval_window": scored.get("eval_window"),
+        "evaluated_at": scored.get("evaluated_at"),
+        "eval_price": scored.get("eval_price"),
+        "pnl_pct": scored.get("pnl_pct"),
+        "mfe_pct": scored.get("mfe_pct"),
+        "mae_pct": scored.get("mae_pct"),
+        "stop_hit": bool(scored.get("stop_hit")),
+        "target_hit": bool(scored.get("target_hit")),
+        "first_hit": scored.get("first_hit"),
+        "first_hit_at": scored.get("first_hit_at"),
+        "outcome_label": scored.get("outcome_label"),
+        "gate_verdict": scored.get("gate_verdict"),
+        "notes_json": json.dumps(notes),
+    }
+
+
+def _select_due_modern_events_sql(engine) -> str:
+    due_filter = _modern_due_filter_sql(engine)
+    return f"""
+        SELECT
+          e.id AS event_id,
+          e.created_at,
+          e.candidate_id,
+          e.cycle_id,
+          e.profile_id,
+          e.event_type,
+          e.event_data,
+          e.candidate_type,
+          c.profile_id AS candidate_profile,
+          c.symbol,
+          c.direction,
+          c.setup_type,
+          c.geometry_name,
+          c.entry_price,
+          c.stop_price,
+          c.target_price,
+          c.risk_reward,
+          c.rejection_reason
+        FROM pm_candidate_events e
+        LEFT JOIN pm_candidates c
+          ON c.candidate_id = e.candidate_id
+        WHERE {due_filter}
+          AND e.event_type IN ({_modern_event_types_sql()})
+        ORDER BY e.created_at DESC
+        LIMIT :limit
+    """
+
+
+def update_modern_shadow_candidate_outcomes(
+    engine,
+    *,
+    now: datetime | None = None,
+    max_rows: int = 50,
+    candle_fetcher=_fetch_provider_candles,
+) -> dict[str, int]:
+    """Score modern PM candidate event rejections into outcome windows."""
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    inserted = 0
+    skipped = 0
+    candidates_seen = 0
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(_select_due_modern_events_sql(engine)),
+            {"now": now_utc.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S"), "limit": max_rows},
+        ).mappings().all()
+
+        for row in rows:
+            candidate = _modern_candidate_from_event(dict(row))
+            candidates_seen += 1
+            created_at = _parse_dt(candidate.get("created_at"))
+            if created_at is None:
+                skipped += 1
+                continue
+
+            due_windows: list[tuple[str, int]] = []
+            for label, minutes in OUTCOME_WINDOWS:
+                if created_at + timedelta(minutes=minutes) > now_utc:
+                    continue
+                exists = conn.execute(
+                    text(
+                        """
+                        SELECT 1 FROM modern_shadow_candidate_outcomes
+                        WHERE source_type = :source_type
+                          AND source_id = :source_id
+                          AND eval_window = :window
+                        LIMIT 1
+                        """
+                    ),
+                    {
+                        "source_type": candidate["source_type"],
+                        "source_id": candidate["source_id"],
+                        "window": label,
+                    },
+                ).scalar()
+                if not exists:
+                    due_windows.append((label, minutes))
+
+            if not due_windows:
+                continue
+
+            scorable, unscorable_reason = validate_candidate_scorability(candidate, engine=None)
+            if not scorable:
+                for label, minutes in due_windows:
+                    outcome = _unscorable_outcome_for_reason(candidate, label, minutes, unscorable_reason or "unknown")
+                    conn.execute(text(_modern_outcome_upsert_sql()), _modern_outcome_row(candidate, outcome))
+                    inserted += 1
+                continue
+
+            regular_session_windows: list[tuple[str, int]] = []
+            for label, minutes in due_windows:
+                if _overlaps_regular_session(created_at, created_at + timedelta(minutes=minutes)):
+                    regular_session_windows.append((label, minutes))
+                    continue
+                conn.execute(
+                    text(_modern_outcome_upsert_sql()),
+                    _modern_outcome_row(candidate, _unscorable_outcome(candidate, label, minutes)),
+                )
+                inserted += 1
+
+            if not regular_session_windows:
+                continue
+
+            max_minutes = max(minutes for _, minutes in regular_session_windows)
+            candles = candle_fetcher(
+                candidate["symbol"],
+                created_at - timedelta(minutes=1),
+                created_at + timedelta(minutes=max_minutes),
+            )
+            if not candles:
+                skipped += len(regular_session_windows)
+                continue
+
+            for label, minutes in regular_session_windows:
+                scored = score_blocked_candidate(
+                    candidate,
+                    window_label=label,
+                    window_minutes=minutes,
+                    candles=candles,
+                )
+                if not scored:
+                    skipped += 1
+                    continue
+                conn.execute(text(_modern_outcome_upsert_sql()), _modern_outcome_row(candidate, scored))
+                inserted += 1
+
+    return {
+        "modern_candidates_seen": candidates_seen,
+        "modern_inserted": inserted,
+        "modern_skipped": skipped,
+    }
+
+
 def update_blocked_candidate_outcomes(
     engine,
     *,
@@ -624,6 +1001,9 @@ def update_blocked_candidate_outcomes(
     candle_fetcher=_fetch_provider_candles,
 ) -> dict[str, int]:
     """Score due blocked candidates and insert companion outcome rows."""
+    from utils.shadow_ledger import ensure_shadow_ledger_schema
+
+    ensure_shadow_ledger_schema(engine)
     now_utc = now or datetime.now(timezone.utc)
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
@@ -725,4 +1105,17 @@ def update_blocked_candidate_outcomes(
                 )
                 inserted += 1
 
-    return {"candidates_seen": candidates_seen, "inserted": inserted, "skipped": skipped}
+    result = {"candidates_seen": candidates_seen, "inserted": inserted, "skipped": skipped}
+    try:
+        result.update(
+            update_modern_shadow_candidate_outcomes(
+                engine,
+                now=now_utc,
+                max_rows=max_rows,
+                candle_fetcher=candle_fetcher,
+            )
+        )
+    except Exception as exc:
+        log.error("Modern shadow outcome scoring failed: %s", exc, exc_info=True)
+        result.update({"modern_candidates_seen": 0, "modern_inserted": 0, "modern_skipped": 0})
+    return result

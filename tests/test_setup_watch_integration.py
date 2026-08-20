@@ -264,6 +264,79 @@ def _count_watches(engine, state=None) -> int:
         return conn.execute(text("SELECT COUNT(*) FROM setup_watches")).scalar()
 
 
+def test_hold_swing_setup_creates_non_executable_watch_from_live_payload_shape(engine):
+    signals = {
+        "META": {
+            "symbol": "META",
+            "signal": "HOLD",
+            "strength": "strong",
+            "signal_strength": "strong",
+            "confidence": "high",
+            "setup_type": "pullback_continuation",
+            "setup_reasoning": (
+                "META is pulling back toward VWAP while the broader trend remains constructive."
+            ),
+            "reasoning": "Worth watching, but confirmation has not arrived yet.",
+            "current_price": 575.0,
+            "market_regime": "bullish",
+            "deterministic_sanity": {"bias": "LONG"},
+            "key_levels": {
+                "support": 570.0,
+                "resistance": 590.0,
+                "vwap": 574.0,
+            },
+        }
+    }
+
+    result = evaluate_cycle(engine, PROFILE, CYCLE, signals, {"positions": {}})
+
+    assert result.created == 1
+    assert _count_watches(engine, "watching") == 1
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT symbol, side, setup_type, thesis, "
+                "maturation_conditions_json, invalidation_conditions_json "
+                "FROM setup_watches"
+            )
+        ).mappings().one()
+
+    assert row["symbol"] == "META"
+    assert row["side"] == "BUY"
+    assert row["setup_type"] == "pullback_continuation"
+    assert "pulling back toward VWAP" in row["thesis"]
+
+    maturation = json.loads(row["maturation_conditions_json"])
+    invalidation = json.loads(row["invalidation_conditions_json"])
+    assert len(maturation) >= 2
+    assert {
+        "type": "price_breach",
+        "params": {"level": 570.0, "direction": "below"},
+    } in invalidation
+
+
+def test_hold_swing_setup_without_directional_evidence_does_not_create_watch(engine):
+    signals = {
+        "META": {
+            "symbol": "META",
+            "signal": "HOLD",
+            "strength": "strong",
+            "confidence": "high",
+            "setup_type": "pullback_continuation",
+            "setup_reasoning": "Interesting but direction is not supported yet.",
+            "current_price": 575.0,
+            "market_regime": "bullish",
+            "key_levels": {"support": 570.0, "resistance": 590.0, "vwap": 574.0},
+        }
+    }
+
+    result = evaluate_cycle(engine, PROFILE, CYCLE, signals, {"positions": {}})
+
+    assert result.created == 0
+    assert _count_watches(engine) == 0
+
+
 def _insert_pending_order(engine, candidate_id: str, order_id: str = None,
                           state: str = "pending"):
     """Insert a minimal pending order row for propagation lookup tests."""

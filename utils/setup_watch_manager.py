@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import text
 
 from utils.gate_config import (
+    CANDIDATE_EXECUTABLE_SETUP_TYPES,
     MARKET_DATA_RELIABILITY_MODE,
     SETUP_WATCH_MATURITY_THRESHOLD,
     SETUP_WATCH_MAX_ACTIVE_PER_PROFILE,
@@ -31,6 +32,7 @@ from utils.gate_config import (
     SETUP_WATCH_MODE,
     SETUP_WATCH_PROMOTION_MIN_CYCLES,
     SETUP_WATCH_REALTIME_MODE,
+    SWING_EXECUTABLE_SETUP_TYPES,
 )
 from utils.pending_order_time import now_utc, to_iso
 from utils.setup_watch_evaluator import evaluate_watch, validate_draft_geometry
@@ -48,6 +50,8 @@ logger = logging.getLogger(__name__)
 
 # Signal strength ordering — mirrors candidate_builder.STRENGTH_ORDER
 STRENGTH_ORDER: dict[str, int] = {"weak": 1, "moderate": 2, "strong": 3}
+CONFIDENCE_ORDER: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
+WATCHABLE_SETUP_TYPES = CANDIDATE_EXECUTABLE_SETUP_TYPES | SWING_EXECUTABLE_SETUP_TYPES
 
 # Known source types for provenance validation (Req 11.6)
 _KNOWN_SOURCE_TYPES: frozenset[str] = frozenset({
@@ -1340,8 +1344,11 @@ def _derive_maturation_conditions(signal: dict) -> list[dict]:
     if key_levels and isinstance(key_levels, dict):
         # Check for support or resistance levels
         for level_type in ("support", "resistance"):
-            levels = key_levels.get(level_type)
-            if levels and isinstance(levels, list) and len(levels) > 0:
+            level = _nearest_level(
+                key_levels.get(level_type),
+                prefer="support" if level_type == "support" else "resistance",
+            )
+            if level is not None:
                 conditions.append({
                     "type": "key_level_proximity",
                     "params": {"level_type": level_type, "within_pct": 1.5},
@@ -1366,33 +1373,24 @@ def _derive_invalidation_conditions(signal: dict) -> list[dict]:
     key_levels = signal.get("key_levels")
     market_regime = signal.get("market_regime")
     catalyst_ts = signal.get("catalyst_timestamp")
-    side = signal.get("direction", signal.get("side", "BUY")).upper()
+    side = _infer_watch_side(signal) or "BUY"
 
     # price_breach below nearest support (for BUY) or above resistance (for SHORT)
     if key_levels and isinstance(key_levels, dict):
         if side == "BUY":
-            support_levels = key_levels.get("support", [])
-            if support_levels and isinstance(support_levels, list):
-                # Use the nearest (highest) support
-                try:
-                    nearest_support = max(float(s) for s in support_levels)
-                    conditions.append({
-                        "type": "price_breach",
-                        "params": {"level": nearest_support, "direction": "below"},
-                    })
-                except (ValueError, TypeError):
-                    pass
+            nearest_support = _nearest_level(key_levels.get("support"), prefer="support")
+            if nearest_support is not None:
+                conditions.append({
+                    "type": "price_breach",
+                    "params": {"level": nearest_support, "direction": "below"},
+                })
         else:  # SHORT
-            resistance_levels = key_levels.get("resistance", [])
-            if resistance_levels and isinstance(resistance_levels, list):
-                try:
-                    nearest_resistance = min(float(r) for r in resistance_levels)
-                    conditions.append({
-                        "type": "price_breach",
-                        "params": {"level": nearest_resistance, "direction": "above"},
-                    })
-                except (ValueError, TypeError):
-                    pass
+            nearest_resistance = _nearest_level(key_levels.get("resistance"), prefer="resistance")
+            if nearest_resistance is not None:
+                conditions.append({
+                    "type": "price_breach",
+                    "params": {"level": nearest_resistance, "direction": "above"},
+                })
 
     # regime_flip — blocked regimes depend on side
     if market_regime:
@@ -1413,6 +1411,82 @@ def _derive_invalidation_conditions(signal: dict) -> list[dict]:
         })
 
     return conditions
+
+
+def _nearest_level(raw_level: Any, *, prefer: str) -> float | None:
+    """Return one numeric support/resistance level from scalar or list input."""
+    if isinstance(raw_level, list):
+        values = []
+        for item in raw_level:
+            try:
+                values.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        if not values:
+            return None
+        return max(values) if prefer == "support" else min(values)
+
+    try:
+        return float(raw_level)
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_watch_side(signal: dict) -> str | None:
+    """Infer a non-executable watch side without making HOLD executable."""
+    for field in ("direction", "side", "signal", "original_signal"):
+        value = str(signal.get(field) or "").upper()
+        if value in {"BUY", "LONG"}:
+            return "BUY"
+        if value == "SHORT":
+            return "SHORT"
+
+    sanity = signal.get("deterministic_sanity")
+    if isinstance(sanity, dict):
+        bias = str(sanity.get("bias") or "").upper()
+        if bias == "LONG":
+            return "BUY"
+        if bias == "SHORT":
+            return "SHORT"
+
+    return None
+
+
+def _watch_thesis(signal: dict) -> str:
+    """Extract an analyst thesis from current live payload shapes."""
+    for field in ("thesis", "reason", "setup_reasoning", "reasoning", "invalidation"):
+        value = signal.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _is_watchable_signal(signal: dict) -> bool:
+    """Return True when a signal is worth tracking as non-executable setup state."""
+    setup_type = signal.get("setup_type", "unknown")
+    if setup_type not in WATCHABLE_SETUP_TYPES:
+        return False
+
+    direction = str(signal.get("signal", signal.get("direction", "")) or "").upper()
+    if direction == "BUY":
+        direction = "LONG"
+    strength = str(signal.get("signal_strength", signal.get("strength", "")) or "").lower()
+    confidence = str(signal.get("confidence", "") or "").lower()
+
+    if direction in {"LONG", "SHORT"}:
+        return STRENGTH_ORDER.get(strength, 0) >= STRENGTH_ORDER.get(
+            SETUP_WATCH_MIN_CREATION_STRENGTH, 0
+        )
+
+    if direction == "HOLD":
+        return (
+            setup_type in SWING_EXECUTABLE_SETUP_TYPES
+            and STRENGTH_ORDER.get(strength, 0) >= STRENGTH_ORDER.get(SETUP_WATCH_MIN_CREATION_STRENGTH, 0)
+            and CONFIDENCE_ORDER.get(confidence, 0) >= CONFIDENCE_ORDER["medium"]
+            and _infer_watch_side(signal) is not None
+        )
+
+    return False
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1452,15 +1526,20 @@ def _create_watches_from_signals(
     evicted_for_capacity = 0
 
     for symbol, signal in signals.items():
+        if not _is_watchable_signal(signal):
+            continue
+
         # Skip signals already watched
-        side = signal.get("direction", signal.get("side", "BUY")).upper()
+        side = _infer_watch_side(signal)
+        if side is None:
+            continue
         setup_type = signal.get("setup_type", "unknown")
         key = (profile_id, symbol, side, setup_type)
         if key in watched_keys:
             continue
 
         # Skip signals without a thesis or reason
-        thesis = signal.get("thesis", signal.get("reason", ""))
+        thesis = _watch_thesis(signal)
         if not thesis:
             continue
 

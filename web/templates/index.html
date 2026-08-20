@@ -269,7 +269,7 @@
       <table>
         <thead><tr>
           <th>Time</th><th>Symbol</th><th>Profile</th><th>Blocked By</th>
-          <th class="right">Entry</th><th class="center">Window</th><th class="right">P&L %</th>
+          <th class="right">Entry</th><th class="center">Type / Window</th><th class="right">P&L %</th>
           <th class="right">MFE %</th><th class="right">MAE %</th><th>Verdict</th><th>Trade</th><th>Reason</th>
         </tr></thead>
         <tbody id="shadowBody"></tbody>
@@ -1272,7 +1272,7 @@
         time = Number.isNaN(parsedTime.getTime()) ? '—' : parsedTime.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
       }
       const reason = r.block_reason || '';
-      const window = r.eval_window || 'pending';
+      const window = r.display_window || r.eval_window || (r.row_type === 'event' ? 'event' : 'pending');
       const verdict = r.gate_verdict || 'pending';
       const tradePnlPct = r.trade_pnl_pct != null ? r.trade_pnl_pct : null;
       const tradeBits = r.trade_id

@@ -56,9 +56,13 @@ def _get_reliability_layer():
     try:
         from utils.market_data_reliability.config import ReliabilityConfig
         from utils.market_data_reliability.layer import ReliabilityLayer
+        from utils.market_data_reliability.provider_adapter import fetch_market_data
 
         config = ReliabilityConfig.from_environment()
-        _reliability_layer_instance = ReliabilityLayer(config)
+        _reliability_layer_instance = ReliabilityLayer(
+            config,
+            fetch_from_provider=fetch_market_data,
+        )
         return _reliability_layer_instance
     except Exception:
         logger.error(
