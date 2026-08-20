@@ -27,8 +27,10 @@ Permitted transitions:
     READY     -> EXPIRED     (TTL elapsed or superseded)
     PROMOTED  -> REJECTED    (PM rejected / gate failure)
     PROMOTED  -> EXPIRED     (promotion not consumed)
+    READY     -> MISSED      (target already crossed)
+    PROMOTED  -> MISSED      (target already crossed)
 
-Terminal states are final: ORDERED, EXPIRED, REJECTED.
+Terminal states are final: ORDERED, EXPIRED, REJECTED, MISSED.
 
 Failure direction: state transitions fail CLOSED (raise
 ``SetupWatchRegistryError``), while event emission fails OPEN so an audit
@@ -66,12 +68,14 @@ class WatchState(Enum):
     ORDERED = "ordered"      # PM executed or created a pending order
     EXPIRED = "expired"      # TTL elapsed, superseded, or promotion not consumed
     REJECTED = "rejected"    # invalidation triggered or PM/gate rejection
+    MISSED = "missed"        # target already crossed before execution
 
 
 TERMINAL_STATES: frozenset[WatchState] = frozenset({
     WatchState.ORDERED,
     WatchState.EXPIRED,
     WatchState.REJECTED,
+    WatchState.MISSED,
 })
 
 ACTIVE_STATES: frozenset[WatchState] = frozenset({
@@ -100,6 +104,9 @@ PERMITTED_TRANSITIONS: frozenset[tuple[WatchState, WatchState]] = frozenset({
     (WatchState.READY, WatchState.EXPIRED),
     (WatchState.PROMOTED, WatchState.REJECTED),
     (WatchState.PROMOTED, WatchState.EXPIRED),
+    # Missed-move (READY and PROMOTED only — NOT from WATCHING or MATURING)
+    (WatchState.READY, WatchState.MISSED),
+    (WatchState.PROMOTED, WatchState.MISSED),
 })
 
 # Columns on setup_watches, in declaration order. Single source of truth for
@@ -670,7 +677,7 @@ class SetupWatchRegistry:
                 text(
                     f"SELECT {columns} FROM setup_watches "
                     f"WHERE profile_id = :profile_id "
-                    f"  AND state NOT IN ('ordered', 'expired', 'rejected') "
+                    f"  AND state NOT IN ('ordered', 'expired', 'rejected', 'missed') "
                     f"ORDER BY created_at ASC"
                 ),
                 {"profile_id": profile_id},
@@ -703,7 +710,7 @@ class SetupWatchRegistry:
                     text(
                         "SELECT COUNT(*) FROM setup_watches "
                         "WHERE profile_id = :profile_id "
-                        "  AND state NOT IN ('ordered', 'expired', 'rejected')"
+                        "  AND state NOT IN ('ordered', 'expired', 'rejected', 'missed')"
                     ),
                     {"profile_id": profile_id},
                 ).scalar()
@@ -718,7 +725,7 @@ class SetupWatchRegistry:
                     text(
                         "SELECT COUNT(*) FROM setup_watches "
                         "WHERE symbol = :symbol "
-                        "  AND state NOT IN ('ordered', 'expired', 'rejected')"
+                        "  AND state NOT IN ('ordered', 'expired', 'rejected', 'missed')"
                     ),
                     {"symbol": symbol},
                 ).scalar()
@@ -825,7 +832,7 @@ class SetupWatchRegistry:
                         "    state_changed_at = :now, "
                         "    updated_at = :now "
                         "WHERE profile_id = :profile_id "
-                        "  AND state NOT IN ('ordered', 'expired', 'rejected') "
+                        "  AND state NOT IN ('ordered', 'expired', 'rejected', 'missed') "
                         "  AND expires_at < :now"
                     ),
                     {"profile_id": profile_id, "now": now_iso},
@@ -915,7 +922,7 @@ class SetupWatchRegistry:
                         "  AND symbol = :symbol "
                         "  AND side = :side "
                         "  AND setup_type = :setup_type "
-                        "  AND state NOT IN ('ordered', 'expired', 'rejected')"
+                        "  AND state NOT IN ('ordered', 'expired', 'rejected', 'missed')"
                     ),
                     {
                         "profile_id": profile_id,

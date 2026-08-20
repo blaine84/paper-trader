@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,12 @@ _SUPPORTED_MATURATION_TYPES: frozenset[str] = frozenset({
     "catalyst_fresh",
     "time_window",
     "key_level_proximity",
+    # Realtime maturity condition types (Req 3.1-3.5)
+    "level_reclaim",
+    "level_rejection",
+    "support_hold",
+    "resistance_failure",
+    "trend_aligned",
 })
 
 _SUPPORTED_INVALIDATION_TYPES: frozenset[str] = frozenset({
@@ -64,6 +71,38 @@ _SUPPORTED_INVALIDATION_TYPES: frozenset[str] = frozenset({
     "catalyst_expired",
     "exposure_conflict",
 })
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Shared numeric parsing utility
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _safe_decimal(value: Any) -> Decimal | None:
+    """Parse a value to Decimal, returning None on failure.
+
+    Centralizes all numeric parsing for key levels. Handles int, float,
+    numeric strings, and Decimal pass-through. Returns None (with DEBUG log)
+    for None, empty string, non-numeric strings, dicts, lists, or any value
+    that raises InvalidOperation/TypeError/ValueError.
+
+    Requirements: 10.1-10.6
+    """
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (dict, list)):
+        logger.debug("_safe_decimal: rejecting %s value", type(value).__name__)
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        logger.debug("_safe_decimal: rejecting empty string")
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        logger.debug("_safe_decimal: failed to parse %r", value)
+        return None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -316,14 +355,13 @@ def _evaluate_single_maturation(
 def _handle_price_zone(params: dict, ctx: dict) -> tuple[bool, str | None]:
     """price_zone: price within [low, high] range (Decimal)."""
     current_price_raw = ctx.get("current_price")
-    if current_price_raw is None:
+    price = _safe_decimal(current_price_raw)
+    if price is None:
         return False, "current_price not available"
 
-    try:
-        price = Decimal(str(current_price_raw))
-        low = Decimal(str(params.get("low", 0)))
-        high = Decimal(str(params.get("high", 0)))
-    except (InvalidOperation, TypeError, ValueError):
+    low = _safe_decimal(params.get("low", 0))
+    high = _safe_decimal(params.get("high", 0))
+    if low is None or high is None:
         return False, "invalid numeric values"
 
     met = low <= price <= high
@@ -414,8 +452,8 @@ def _handle_key_level_proximity(params: dict, ctx: dict) -> tuple[bool, str | No
     if not level_type or within_pct is None:
         return False, "level_type or within_pct not specified"
 
-    current_price_raw = ctx.get("current_price")
-    if current_price_raw is None:
+    price = _safe_decimal(ctx.get("current_price"))
+    if price is None:
         return False, "current_price not available"
 
     key_levels = ctx.get("key_levels")
@@ -426,12 +464,18 @@ def _handle_key_level_proximity(params: dict, ctx: dict) -> tuple[bool, str | No
     if not levels_raw:
         return False, f"no {level_type} levels available"
 
-    try:
-        price = Decimal(str(current_price_raw))
-        threshold_pct = Decimal(str(within_pct))
-        levels = [Decimal(str(lv)) for lv in levels_raw]
-    except (InvalidOperation, TypeError, ValueError):
+    threshold_pct = _safe_decimal(within_pct)
+    if threshold_pct is None:
         return False, "invalid numeric values"
+
+    levels = []
+    for lv in levels_raw:
+        parsed = _safe_decimal(lv)
+        if parsed is not None:
+            levels.append(parsed)
+
+    if not levels:
+        return False, f"no valid {level_type} levels available"
 
     # Check if price is within threshold_pct of any level
     for level in levels:
@@ -449,6 +493,185 @@ def _handle_key_level_proximity(params: dict, ctx: dict) -> tuple[bool, str | No
     else:
         detail = f"no valid {level_type} levels to compare"
     return False, detail
+
+
+def _handle_level_reclaim(params: dict, ctx: dict) -> tuple[bool, str | None]:
+    """level_reclaim: price crossed back to favorable side of level.
+
+    BUY: current_price >= level. SHORT: current_price <= level.
+    Requirements: 3.1
+    """
+    level = _safe_decimal(params.get("level"))
+    if level is None:
+        return False, "level not parseable"
+
+    current_price = _safe_decimal(ctx.get("current_price"))
+    if current_price is None:
+        return False, "current_price not available"
+
+    side = str(params.get("side", ctx.get("side", ""))).upper()
+    if side not in ("BUY", "SHORT"):
+        return False, f"invalid side: {side}"
+
+    if side == "BUY":
+        met = current_price >= level
+        detail = f"price {current_price} {'>='}  level {level} (BUY reclaim {'confirmed' if met else 'not confirmed'})"
+    else:
+        met = current_price <= level
+        detail = f"price {current_price} {'<='} level {level} (SHORT reclaim {'confirmed' if met else 'not confirmed'})"
+
+    return met, detail
+
+
+def _handle_level_rejection(params: dict, ctx: dict) -> tuple[bool, str | None]:
+    """level_rejection: price tested level and moved away.
+
+    Price came within rejection_distance_pct of the level (using price_high
+    or current_price as the test point), then current price moved away by at
+    least rejection_distance_pct in the opposite direction. All Decimal arithmetic.
+    Requirements: 3.2
+    """
+    level = _safe_decimal(params.get("level"))
+    if level is None:
+        return False, "level not parseable"
+
+    rejection_distance_pct = _safe_decimal(params.get("rejection_distance_pct"))
+    if rejection_distance_pct is None:
+        return False, "rejection_distance_pct not parseable"
+
+    current_price = _safe_decimal(ctx.get("current_price"))
+    if current_price is None:
+        return False, "current_price not available"
+
+    if level == Decimal("0"):
+        return False, "level is zero"
+
+    # Use price_high as test point if available, otherwise current_price
+    test_price = _safe_decimal(ctx.get("price_high")) or current_price
+
+    # Distance from test point to level (as percentage of level)
+    test_distance_pct = abs(test_price - level) / level * Decimal("100")
+
+    # Price "tested" level if it came within rejection_distance_pct
+    tested = test_distance_pct <= rejection_distance_pct
+
+    # Current price "moved away" if it's at least rejection_distance_pct away from level
+    current_distance_pct = abs(current_price - level) / level * Decimal("100")
+    moved_away = current_distance_pct >= rejection_distance_pct
+
+    met = tested and moved_away
+    detail = (
+        f"test_distance={test_distance_pct:.2f}% "
+        f"current_distance={current_distance_pct:.2f}% "
+        f"threshold={rejection_distance_pct}% "
+        f"tested={tested} moved_away={moved_away}"
+    )
+    return met, detail
+
+
+def _handle_support_hold(params: dict, ctx: dict) -> tuple[bool, str | None]:
+    """support_hold: price came near support without closing below.
+
+    Met when price >= level * (1 - tolerance_pct/100). Decimal arithmetic.
+    Requirements: 3.3
+    """
+    level = _safe_decimal(params.get("level"))
+    if level is None:
+        return False, "level not parseable"
+
+    tolerance_pct = _safe_decimal(params.get("tolerance_pct"))
+    if tolerance_pct is None:
+        return False, "tolerance_pct not parseable"
+
+    current_price = _safe_decimal(ctx.get("current_price"))
+    if current_price is None:
+        return False, "current_price not available"
+
+    threshold = level * (Decimal("1") - tolerance_pct / Decimal("100"))
+    met = current_price >= threshold
+    detail = (
+        f"price {current_price} {'>='}  threshold {threshold:.4f} "
+        f"(level={level} - {tolerance_pct}%)"
+    )
+    return met, detail
+
+
+def _handle_resistance_failure(params: dict, ctx: dict) -> tuple[bool, str | None]:
+    """resistance_failure: price came near resistance without closing above.
+
+    Met when price <= level * (1 + tolerance_pct/100) and has reversed.
+    Since this is point-in-time, the threshold check itself is evidence of reversal.
+    Decimal arithmetic.
+    Requirements: 3.4
+    """
+    level = _safe_decimal(params.get("level"))
+    if level is None:
+        return False, "level not parseable"
+
+    tolerance_pct = _safe_decimal(params.get("tolerance_pct"))
+    if tolerance_pct is None:
+        return False, "tolerance_pct not parseable"
+
+    current_price = _safe_decimal(ctx.get("current_price"))
+    if current_price is None:
+        return False, "current_price not available"
+
+    threshold = level * (Decimal("1") + tolerance_pct / Decimal("100"))
+    met = current_price <= threshold
+    detail = (
+        f"price {current_price} {'<='} threshold {threshold:.4f} "
+        f"(level={level} + {tolerance_pct}%)"
+    )
+    return met, detail
+
+
+def _handle_trend_aligned(params: dict, ctx: dict) -> tuple[bool, str | None]:
+    """trend_aligned: net price movement over lookback consistent with side.
+
+    BUY: positive net change. SHORT: negative net change.
+    If price_history unavailable, treated as unmet.
+    Requirements: 3.5
+    """
+    price_history = ctx.get("price_history")
+    if not price_history or not isinstance(price_history, list):
+        return False, "price_history not available"
+
+    lookback_bars = params.get("lookback_bars")
+    if lookback_bars is None:
+        return False, "lookback_bars not specified"
+
+    try:
+        lookback = int(lookback_bars)
+    except (ValueError, TypeError):
+        return False, "lookback_bars not parseable"
+
+    if lookback <= 0:
+        return False, "lookback_bars must be positive"
+
+    # Take the most recent lookback_bars from price_history
+    history_slice = price_history[-lookback:] if len(price_history) >= lookback else price_history
+
+    if len(history_slice) < 2:
+        return False, "insufficient price_history entries"
+
+    first = _safe_decimal(history_slice[0])
+    last = _safe_decimal(history_slice[-1])
+
+    if first is None or last is None:
+        return False, "price_history contains unparseable values"
+
+    net_movement = last - first
+    side = str(params.get("side", ctx.get("side", ""))).upper()
+
+    if side == "BUY":
+        met = net_movement > Decimal("0")
+    elif side == "SHORT":
+        met = net_movement < Decimal("0")
+    else:
+        return False, f"invalid side: {side}"
+
+    detail = f"net_movement={net_movement} side={side} {'aligned' if met else 'not aligned'}"
+    return met, detail
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -477,14 +700,12 @@ def _handle_price_breach(params: dict, ctx: dict) -> tuple[bool, str | None]:
     if level_raw is None or direction not in ("above", "below"):
         return False, "invalid price_breach params"
 
-    current_price_raw = ctx.get("current_price")
-    if current_price_raw is None:
+    price = _safe_decimal(ctx.get("current_price"))
+    if price is None:
         return False, "current_price not available"
 
-    try:
-        price = Decimal(str(current_price_raw))
-        level = Decimal(str(level_raw))
-    except (InvalidOperation, TypeError, ValueError):
+    level = _safe_decimal(level_raw)
+    if level is None:
         return False, "invalid numeric values"
 
     if direction == "above":
@@ -567,6 +788,12 @@ _MATURATION_HANDLERS: dict[str, callable] = {
     "catalyst_fresh": _handle_catalyst_fresh,
     "time_window": _handle_time_window,
     "key_level_proximity": _handle_key_level_proximity,
+    # Realtime maturity condition types (Req 3.1-3.5)
+    "level_reclaim": _handle_level_reclaim,
+    "level_rejection": _handle_level_rejection,
+    "support_hold": _handle_support_hold,
+    "resistance_failure": _handle_resistance_failure,
+    "trend_aligned": _handle_trend_aligned,
 }
 
 _INVALIDATION_HANDLERS: dict[str, callable] = {
