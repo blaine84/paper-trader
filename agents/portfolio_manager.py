@@ -3159,6 +3159,190 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
     return True, notes, cumulative_multiplier, multiplier_breakdown
 
 
+def _check_target_crossed_guard(
+    db,
+    decision: dict,
+    action: str,
+    symbol: str,
+    fresh_price: float,
+) -> bool:
+    """Check if a pending order should be BLOCKED because the target is crossed.
+
+    Only applies to candidates originated from setup watches (where
+    signal_snapshot_json has source_type="setup_watch"). Uses Decimal
+    arithmetic with Context(prec=28, rounding=ROUND_HALF_UP) for all
+    price comparisons.
+
+    Returns True if the order should be BLOCKED, False if it should proceed.
+
+    Geometry cases (per Req 7.1-7.8):
+      - NULL geometry → skip check, allow order (return False)
+      - Malformed geometry (present but unparseable) → block order, log WARNING,
+        do NOT transition watch
+      - Valid geometry, target crossed → block order, CAS watch to MISSED
+
+    Fail-open: any unexpected exception logs WARNING and returns False (allow).
+    """
+    from utils.gate_config import SETUP_WATCH_MISSED_MOVE_ENABLED
+
+    # 9.2: Guard with feature flag
+    if not SETUP_WATCH_MISSED_MOVE_ENABLED:
+        return False
+
+    try:
+        # 9.1/9.3: Check if decision comes from a watch-originated candidate
+        candidate_id = decision.get("candidate_id") or decision.get("pm_candidate_id")
+        if not candidate_id:
+            return False
+
+        # Look up signal_snapshot_json from the candidate registry
+        from sqlalchemy import text as _tc_text
+
+        engine = db.bind
+        if engine is None:
+            return False
+
+        with engine.connect() as conn:
+            row = conn.execute(
+                _tc_text(
+                    "SELECT signal_snapshot_json FROM pm_candidates "
+                    "WHERE candidate_id = :cid"
+                ),
+                {"cid": candidate_id},
+            ).fetchone()
+
+        if not row or not row[0]:
+            return False
+
+        import json as _tc_json
+        try:
+            snapshot = _tc_json.loads(row[0])
+        except (ValueError, TypeError):
+            return False
+
+        # 9.1: Only applies to watch-originated candidates
+        if snapshot.get("source_type") != "setup_watch":
+            return False
+
+        # 9.3: Extract watch_id and retrieve watch
+        watch_id = snapshot.get("watch_id")
+        if not watch_id:
+            return False
+
+        from utils.setup_watch_registry import SetupWatchRegistry, WatchState
+        from utils.missed_move_detector import check_target_crossed_for_pending_order
+
+        registry = SetupWatchRegistry(engine)
+        watch = registry.get_watch(watch_id)
+        if watch is None:
+            return False
+
+        # 9.3/9.8: Call check_target_crossed_for_pending_order with Decimal precision
+        result = check_target_crossed_for_pending_order(watch, fresh_price)
+
+        if not result.missed:
+            # Target not crossed — allow order
+            return False
+
+        # 9.4: Handle malformed geometry — block but do NOT transition
+        if result.reason == "malformed_geometry":
+            log.warning(
+                "Target-crossed guard BLOCKED pending order for %s: "
+                "malformed geometry on watch %s (no state transition)",
+                symbol,
+                watch_id,
+            )
+            # 9.5: Emit event even for malformed geometry
+            _emit_target_crossed_event(
+                registry, watch, result, fresh_price,
+            )
+            return True
+
+        # 9.4: Valid geometry, target crossed — block and CAS to MISSED
+        log.warning(
+            "Target-crossed guard BLOCKED pending order for %s: "
+            "target already crossed (side=%s, target=%s, fresh=%s, watch=%s)",
+            symbol,
+            result.side,
+            result.target_price,
+            result.current_price,
+            watch_id,
+        )
+
+        # 9.5: Emit pending_order_target_crossed event
+        _emit_target_crossed_event(registry, watch, result, fresh_price)
+
+        # 9.4/9.6: CAS transition to MISSED
+        if watch.state in (WatchState.READY, WatchState.PROMOTED):
+            from utils.missed_move_detector import apply_missed_move_transition
+
+            transitioned = apply_missed_move_transition(registry, watch, result)
+            if not transitioned:
+                # 9.6: CAS failure — watch already terminal, log WARNING, still blocked
+                log.warning(
+                    "CAS transition to MISSED failed for watch %s "
+                    "(already terminal); pending order still blocked",
+                    watch_id,
+                )
+
+        return True
+
+    except Exception:
+        # 9.7: Fail-open — unexpected exception allows normal pending-order logic
+        log.warning(
+            "Target-crossed guard raised unexpected exception for %s "
+            "(fail-open, allowing pending order)",
+            symbol,
+            exc_info=True,
+        )
+        return False
+
+
+def _emit_target_crossed_event(
+    registry,
+    watch,
+    result,
+    fresh_price: float,
+) -> None:
+    """Emit pending_order_target_crossed event to setup_watch_events.
+
+    Fail-open: any error is logged and swallowed.
+    """
+    from datetime import datetime, timezone as _tz
+    import json as _evt_json
+
+    try:
+        # 9.5: Build event data with required fields
+        event_data = {
+            "fresh_price": str(result.current_price) if result.current_price else str(fresh_price),
+            "target_price": str(result.target_price) if result.target_price else None,
+            "side": result.side,
+            "timestamp": datetime.now(_tz.utc).isoformat(),
+            "reason": result.reason,
+            "summary": (
+                f"{watch.symbol} {result.side} pending order blocked: "
+                f"target {'crossed' if result.reason != 'malformed_geometry' else 'malformed'}"
+            )[:120],
+        }
+
+        registry._emit_event(
+            watch_id=watch.watch_id,
+            profile_id=watch.profile_id,
+            symbol=watch.symbol,
+            event_type="pending_order_target_crossed",
+            from_state=watch.state,
+            to_state=None,
+            maturity_score=watch.maturity_score,
+            event_data=_evt_json.dumps(event_data),
+        )
+    except Exception:
+        log.warning(
+            "Failed to emit pending_order_target_crossed event for watch %s (fail-open)",
+            watch.watch_id if watch else "unknown",
+            exc_info=True,
+        )
+
+
 def execute_trade(
     db,
     decision: dict,
@@ -3481,6 +3665,14 @@ def execute_trade(
         # Fail-open by design. Nothing about the trading outcome depends on this
         # succeeding, which puts it firmly in the fail-open column.
         if PENDING_ORDER_MODE != "disabled":
+            # ── Target-crossed guard for watch-originated candidates ──
+            # If the fresh price has already crossed the draft geometry target,
+            # block the pending order. Fail-open on unexpected errors.
+            if _check_target_crossed_guard(
+                db, decision, action, symbol, live_price,
+            ):
+                return False, stale_reason
+
             try:
                 from utils.pending_order_creation import (
                     maybe_create_pending_order,

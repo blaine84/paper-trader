@@ -962,6 +962,47 @@ if SETUP_WATCH_MODE != "disabled":
 
 
 # ---------------------------------------------------------------------------
+# Realtime Watch Maturity Configuration
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enabled"
+# disabled: no realtime maturity evaluation; zero runtime cost in price monitor
+# observe:  bridge evaluates conditions and emits events, but does NOT call
+#           transition_state() or invoke promotion from the realtime path
+# enabled:  bridge evaluates, transitions state, and invokes the shared
+#           promotion function when a watch reaches ready with all criteria met
+_raw_realtime_mode = os.environ.get("SETUP_WATCH_REALTIME_MODE", "disabled")
+if _raw_realtime_mode not in ("disabled", "observe", "enabled"):
+    logger.warning(
+        "Unrecognized SETUP_WATCH_REALTIME_MODE=%r, defaulting to 'disabled'",
+        _raw_realtime_mode,
+    )
+    _raw_realtime_mode = "disabled"
+SETUP_WATCH_REALTIME_MODE: str = _raw_realtime_mode
+
+# Distance threshold (%) for bridge matching — how close price must be to a
+# key level for the approaching-level alert to qualify for watch evaluation.
+SETUP_WATCH_REALTIME_APPROACH_PCT: float = _float_env(
+    "SETUP_WATCH_REALTIME_APPROACH_PCT", 1.0, minimum=0.1
+)
+
+# Whether missed-move detection runs during both scheduled and realtime
+# evaluation. Default True when realtime mode is not "disabled".
+SETUP_WATCH_MISSED_MOVE_ENABLED: bool = os.environ.get(
+    "SETUP_WATCH_MISSED_MOVE_ENABLED", "true"
+).lower() == "true"
+
+# Startup log reporting realtime mode when active
+if SETUP_WATCH_REALTIME_MODE != "disabled":
+    logger.info(
+        "Setup Watch Realtime Mode: %s (approach_pct=%.1f%%, missed_move=%s)",
+        SETUP_WATCH_REALTIME_MODE,
+        SETUP_WATCH_REALTIME_APPROACH_PCT,
+        SETUP_WATCH_MISSED_MOVE_ENABLED,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pilot Controller
 # ---------------------------------------------------------------------------
 

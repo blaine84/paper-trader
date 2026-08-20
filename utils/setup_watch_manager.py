@@ -4,8 +4,8 @@ Single entry point for the candidate builder. Handles the full evaluation
 sequence: expire → invalidate → evaluate maturity → promote.
 Also provides the noise-filtered creation interface for upstream sources.
 
-Requirements: 2.1-2.10, 4.1, 4.9-4.11, 5.4-5.8, 6.1-6.2, 6.7-6.8,
-              7.6, 8.2-8.3, 9.5-9.8, 10.1-10.8, 12.2, 12.4, 12.7
+Requirements: 2.1-2.10, 4.1, 4.9-4.11, 5.1-5.8, 6.1-6.7, 6.7-6.8,
+              7.6, 8.2-8.3, 9.5-9.8, 10.1-10.8, 11.1-11.8, 12.1-12.7
 """
 from __future__ import annotations
 
@@ -21,14 +21,17 @@ from sqlalchemy import text
 
 from utils.gate_config import (
     CANDIDATE_EXECUTABLE_SETUP_TYPES,
+    MARKET_DATA_RELIABILITY_MODE,
     SETUP_WATCH_MATURITY_THRESHOLD,
     SETUP_WATCH_MAX_ACTIVE_PER_PROFILE,
     SETUP_WATCH_MAX_PER_SYMBOL,
     SETUP_WATCH_MAX_TTL_HOURS,
     SETUP_WATCH_MIN_CONDITION_COUNT,
     SETUP_WATCH_MIN_CREATION_STRENGTH,
+    SETUP_WATCH_MISSED_MOVE_ENABLED,
     SETUP_WATCH_MODE,
     SETUP_WATCH_PROMOTION_MIN_CYCLES,
+    SETUP_WATCH_REALTIME_MODE,
     SWING_EXECUTABLE_SETUP_TYPES,
 )
 from utils.pending_order_time import now_utc, to_iso
@@ -49,6 +52,24 @@ logger = logging.getLogger(__name__)
 STRENGTH_ORDER: dict[str, int] = {"weak": 1, "moderate": 2, "strong": 3}
 CONFIDENCE_ORDER: dict[str, int] = {"low": 1, "medium": 2, "high": 3}
 WATCHABLE_SETUP_TYPES = CANDIDATE_EXECUTABLE_SETUP_TYPES | SWING_EXECUTABLE_SETUP_TYPES
+
+# Known source types for provenance validation (Req 11.6)
+_KNOWN_SOURCE_TYPES: frozenset[str] = frozenset({
+    "analyst",
+    "candidate_reject",
+    "market_state",
+    "pm_defer",
+    "price_monitor",
+    "scout",
+})
+
+# Legacy source types that tolerate null source_id (Req 11.8)
+_LEGACY_SOURCE_TYPES: frozenset[str] = frozenset({
+    "analyst",
+    "candidate_reject",
+    "market_state",
+    "pm_defer",
+})
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -87,6 +108,311 @@ class CycleEvaluationResult:
     promoted: int        # state changed to promoted (enabled mode only)
     still_active: int
     created: int
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Internal — source provenance validation (Req 11.6, 11.8)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _validate_source_provenance(source_type: str, source_id: str | None) -> bool:
+    """Validate source provenance for a new watch.
+
+    Rules:
+      - Unknown source_type → reject (return False)
+      - New types (price_monitor, scout) require source_id → reject if null
+      - Legacy types (analyst, candidate_reject, market_state, pm_defer)
+        tolerate null source_id with DEBUG log
+
+    Returns True if valid, False if rejected.
+    """
+    if source_type not in _KNOWN_SOURCE_TYPES:
+        logger.warning(
+            "Watch creation rejected: unknown source_type=%r", source_type
+        )
+        return False
+
+    if source_type not in _LEGACY_SOURCE_TYPES:
+        # New type — require source_id
+        if not source_id:
+            logger.warning(
+                "Watch creation rejected: source_type=%r requires source_id",
+                source_type,
+            )
+            return False
+    else:
+        # Legacy type — tolerate null source_id
+        if not source_id:
+            logger.debug(
+                "Legacy source_type=%r with null source_id (tolerated)",
+                source_type,
+            )
+
+    return True
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Internal — shared promotion function (Req 5.1-5.8, 6.1-6.7, 12.1-12.6)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _promote_ready_watch(
+    registry: SetupWatchRegistry,
+    watch: SetupWatch,
+    cycle_id: str | None = None,
+    signals: dict[str, dict] | None = None,
+) -> bool:
+    """Single promotion path shared by scheduled evaluator and realtime bridge.
+
+    Steps:
+      1. Idempotency check — skip if already promoted this cycle
+      2. Missed-move check — if target crossed, CAS → MISSED, skip
+      3. Market-data reliability gate — if unreliable, defer, emit event
+      4. CAS READY→PROMOTED with promoted_cycle_id
+      5. Emit promotion event with enhanced evidence package
+
+    Returns True if promotion succeeded, False otherwise.
+    """
+    # --- Step 1: Idempotency check (Req 12.1-12.6) ---
+    if cycle_id and watch.promoted_cycle_id == cycle_id:
+        logger.warning(
+            "Promotion skipped (idempotency): watch %s already promoted "
+            "in cycle %s",
+            watch.watch_id, cycle_id,
+        )
+        return False
+
+    # --- Step 2: Missed-move pre-promotion check (Req 4.2-4.5) ---
+    if SETUP_WATCH_MISSED_MOVE_ENABLED and watch.draft_geometry_json:
+        try:
+            from utils.missed_move_detector import (
+                apply_missed_move_transition,
+                check_missed_move,
+            )
+
+            # Get current price from signals
+            current_price = None
+            if signals and watch.symbol in signals:
+                current_price = signals[watch.symbol].get("current_price")
+
+            if current_price is not None:
+                missed_result = check_missed_move(watch, current_price)
+                if missed_result.missed:
+                    apply_missed_move_transition(registry, watch, missed_result)
+                    logger.warning(
+                        "Promotion blocked (missed move): watch %s symbol=%s "
+                        "side=%s target=%s current=%s",
+                        watch.watch_id, watch.symbol, missed_result.side,
+                        missed_result.target_price, missed_result.current_price,
+                    )
+                    return False
+        except Exception as exc:
+            # Missed-move is safety — log but continue with promotion
+            # (if we can't determine missed state, it's safer to allow promotion
+            # and let the pending-order guard catch it)
+            logger.warning(
+                "Missed-move check failed for watch %s (continuing): %s",
+                watch.watch_id, exc,
+            )
+
+    # --- Step 3: Market-data reliability gate (Req 5.1-5.8) ---
+    if MARKET_DATA_RELIABILITY_MODE != "disabled":
+        try:
+            from utils.market_data_reliability.pipeline_integration import (
+                check_market_data_readiness,
+            )
+
+            readiness = check_market_data_readiness(watch.symbol)
+
+            if not readiness.proceed:
+                # In "observe" realtime mode: evaluate for logging but do NOT block
+                if SETUP_WATCH_REALTIME_MODE == "observe":
+                    logger.info(
+                        "Market-data reliability would defer watch %s "
+                        "(observe mode, not blocking): reason_codes=%s",
+                        watch.watch_id, readiness.reason_codes,
+                    )
+                else:
+                    # Defer promotion, emit event
+                    _emit_promotion_deferred_event(
+                        registry, watch, readiness.reason_codes,
+                        readiness.missing_data_types,
+                    )
+                    logger.info(
+                        "Promotion deferred (market data): watch %s symbol=%s "
+                        "reason_codes=%s",
+                        watch.watch_id, watch.symbol, readiness.reason_codes,
+                    )
+                    return False
+        except Exception as exc:
+            # Exception → treat as unreliable, defer (Req 5.6)
+            if SETUP_WATCH_REALTIME_MODE == "observe":
+                logger.warning(
+                    "Market-data reliability check failed for watch %s "
+                    "(observe mode, not blocking): %s",
+                    watch.watch_id, exc,
+                )
+            else:
+                _emit_promotion_deferred_event(
+                    registry, watch,
+                    reason_codes=("reliability_check_error",),
+                    missing_data_types=(),
+                )
+                logger.warning(
+                    "Promotion deferred (reliability check error): watch %s "
+                    "symbol=%s error=%s",
+                    watch.watch_id, watch.symbol, exc,
+                )
+                return False
+
+    # --- Step 4: CAS READY→PROMOTED with promoted_cycle_id ---
+    try:
+        registry.transition_state(
+            watch.watch_id,
+            WatchState.READY,
+            WatchState.PROMOTED,
+            promoted_cycle_id=cycle_id,
+        )
+    except SetupWatchRegistryError as e:
+        logger.warning(
+            "CAS promotion failed for watch %s (race condition): %s",
+            watch.watch_id, e,
+        )
+        return False
+
+    # --- Step 5: Emit promotion event with evidence package ---
+    try:
+        evidence = _build_evidence_package(watch, cycle_id, signals)
+        registry._emit_event(
+            watch_id=watch.watch_id,
+            profile_id=watch.profile_id,
+            symbol=watch.symbol,
+            event_type="state_transition",
+            from_state=WatchState.READY,
+            to_state=WatchState.PROMOTED,
+            maturity_score=watch.maturity_score,
+            event_data=json.dumps({
+                "cycle_id": cycle_id,
+                "evidence_package": evidence,
+                "summary": _build_event_summary(
+                    watch.symbol, watch.side, "promoted to PM",
+                    watch.maturity_score,
+                ),
+            }),
+        )
+    except Exception as exc:
+        # Event emission is fail-open (Req 8.7)
+        logger.warning(
+            "Failed to emit promotion event for watch %s (fail-open): %s",
+            watch.watch_id, exc,
+        )
+
+    return True
+
+
+def _emit_promotion_deferred_event(
+    registry: SetupWatchRegistry,
+    watch: SetupWatch,
+    reason_codes: tuple[str, ...],
+    missing_data_types: tuple[str, ...],
+) -> None:
+    """Emit promotion_deferred_market_data event (Req 5.5)."""
+    try:
+        registry._emit_event(
+            watch_id=watch.watch_id,
+            profile_id=watch.profile_id,
+            symbol=watch.symbol,
+            event_type="promotion_deferred_market_data",
+            maturity_score=watch.maturity_score,
+            event_data=json.dumps({
+                "reason_codes": list(reason_codes),
+                "missing_data_types": list(missing_data_types),
+                "evaluation_timestamp": to_iso(now_utc()),
+                "summary": _build_event_summary(
+                    watch.symbol, watch.side, "promotion deferred",
+                    watch.maturity_score,
+                ),
+            }),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to emit promotion_deferred event for watch %s: %s",
+            watch.watch_id, exc,
+        )
+
+
+def _build_evidence_package(
+    watch: SetupWatch,
+    cycle_id: str | None,
+    signals: dict[str, dict] | None,
+) -> dict:
+    """Build enhanced evidence package for promoted candidate (Req 6.1-6.7).
+
+    All fields present — NULL values as JSON null, never omitted.
+    """
+    # Parse stored JSON fields (may be None)
+    last_eval = None
+    if watch.last_evaluation_json:
+        try:
+            last_eval = json.loads(watch.last_evaluation_json)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    entry_zone = None
+    if watch.entry_zone_json:
+        try:
+            entry_zone = json.loads(watch.entry_zone_json)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    draft_geometry = None
+    if watch.draft_geometry_json:
+        try:
+            draft_geometry = json.loads(watch.draft_geometry_json)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Current signal data
+    current_price = None
+    key_levels = None
+    if signals and watch.symbol in signals:
+        signal = signals[watch.symbol]
+        current_price = signal.get("current_price")
+        key_levels = signal.get("key_levels")
+
+    # Ready_at as ISO string or null
+    ready_at_str = to_iso(watch.ready_at) if watch.ready_at else None
+
+    return {
+        "source_type": "setup_watch",
+        "watch_id": watch.watch_id,
+        "setup_type": watch.setup_type,
+        "thesis": watch.thesis,
+        "maturity_score": watch.maturity_score,
+        "observed_cycles": watch.observed_cycles,
+        "last_evaluation_json": last_eval,
+        "ready_reference_price": watch.ready_reference_price,
+        "ready_at": ready_at_str,
+        "source_trigger": cycle_id,
+        "entry_zone": entry_zone,
+        "draft_geometry": draft_geometry,
+        "current_price": current_price,
+        "key_levels": key_levels,
+        "source_provenance": {
+            "source_type": watch.source_type,
+            "source_id": watch.source_id,
+            "source_cycle_id": watch.source_cycle_id,
+        },
+    }
+
+
+def _build_event_summary(
+    symbol: str, side: str, action: str, score: float | None
+) -> str:
+    """Build human-readable event summary (max 120 chars, Req 8.4)."""
+    score_str = f" score={score:.2f}" if score is not None else ""
+    raw = f"{symbol} {side} {action}{score_str}"
+    return raw[:120]
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -215,6 +541,15 @@ def _evaluate_cycle_inner(
                 eval_json,
             )
 
+            # --- Entry zone tightening (Req 2.5) ---
+            try:
+                _maybe_tighten_entry_zone(engine, watch, signals)
+            except Exception as ez_exc:
+                logger.debug(
+                    "Entry zone tightening failed for watch %s (non-critical): %s",
+                    watch.watch_id, ez_exc,
+                )
+
             # --- Invalidation check ---
             if eval_result.invalidated:
                 try:
@@ -334,6 +669,10 @@ def _evaluate_cycle_inner(
                 event_data=json.dumps({
                     "cycle_id": cycle_id,
                     "score": eval_result.maturity_score,
+                    "summary": _build_event_summary(
+                        watch.symbol, watch.side, "maturity evaluated",
+                        eval_result.maturity_score,
+                    ),
                 }),
             )
 
@@ -361,14 +700,12 @@ def _evaluate_cycle_inner(
         ]
         for watch in ready_watches:
             try:
-                registry.transition_state(
-                    watch.watch_id,
-                    WatchState.READY,
-                    WatchState.PROMOTED,
-                    promoted_cycle_id=cycle_id,
+                success = _promote_ready_watch(
+                    registry, watch, cycle_id=cycle_id, signals=signals
                 )
-                promoted += 1
-            except SetupWatchRegistryError as e:
+                if success:
+                    promoted += 1
+            except Exception as e:
                 logger.warning(
                     "Failed to promote watch %s: %s", watch.watch_id, e
                 )
@@ -416,10 +753,12 @@ def create_setup_watch(
     expires_at: datetime | None = None,
     signal_strength: str | None = None,
     portfolio: dict | None = None,
+    key_levels: dict | None = None,
 ) -> str | None:
     """Create a new setup watch after applying all noise filters.
 
     Noise filters are applied in this order:
+      0. Source provenance validation
       1. Categorical strength via STRENGTH_ORDER
       2. Maturation condition count
       3. Invalidation condition count >= 1
@@ -435,6 +774,10 @@ def create_setup_watch(
     applied here — it belongs at promotion time (Req 10.6).
     """
     registry = SetupWatchRegistry(engine)
+
+    # --- Filter 0: Source provenance validation (Req 11.6, 11.8) ---
+    if not _validate_source_provenance(source_type, source_id):
+        return None
 
     # --- Filter 1: Signal strength check (CATEGORICAL) ---
     if signal_strength is not None:
@@ -504,8 +847,38 @@ def create_setup_watch(
     watch_id = str(uuid.uuid4())
     normalized_side = side.upper()
 
-    entry_zone_json = json.dumps(entry_zone) if entry_zone else None
-    draft_geometry_json = json.dumps(draft_geometry) if draft_geometry else None
+    # --- Draft geometry computation at creation (Req 2.1-2.4, 7.6) ---
+    computed_entry_zone_json = json.dumps(entry_zone) if entry_zone else None
+    computed_draft_geometry_json = json.dumps(draft_geometry) if draft_geometry else None
+
+    # If key_levels provided and no explicit geometry passed, compute from levels
+    if key_levels and isinstance(key_levels, dict):
+        try:
+            from utils.draft_geometry import (
+                compute_draft_geometry,
+                compute_entry_zone,
+                entry_zone_to_json,
+                geometry_to_json,
+            )
+
+            # Compute entry zone if not explicitly provided
+            if not computed_entry_zone_json:
+                ez = compute_entry_zone(key_levels, normalized_side)
+                if ez is not None:
+                    computed_entry_zone_json = entry_zone_to_json(ez)
+
+            # Compute draft geometry if not explicitly provided
+            if not computed_draft_geometry_json:
+                dg = compute_draft_geometry(
+                    key_levels, setup_type, normalized_side
+                )
+                if dg is not None:
+                    computed_draft_geometry_json = geometry_to_json(dg)
+        except Exception as exc:
+            logger.debug(
+                "Draft geometry computation failed for %s (non-critical): %s",
+                symbol, exc,
+            )
 
     # Build the SetupWatch object
     watch = SetupWatch(
@@ -522,8 +895,8 @@ def create_setup_watch(
         maturation_conditions_json=json.dumps(maturation_conditions),
         invalidation_conditions_json=json.dumps(invalidation_conditions),
         last_evaluation_json=None,
-        entry_zone_json=entry_zone_json,
-        draft_geometry_json=draft_geometry_json,
+        entry_zone_json=computed_entry_zone_json,
+        draft_geometry_json=computed_draft_geometry_json,
         maturity_score=0.0,
         created_at=now,
         updated_at=now,
@@ -795,6 +1168,78 @@ def _has_exposure_conflict(
         )
 
     return False
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Internal — entry zone tightening (Req 2.5)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _maybe_tighten_entry_zone(
+    engine: Any,
+    watch: SetupWatch,
+    signals: dict[str, dict],
+) -> None:
+    """If current signal provides a narrower entry zone, replace the stored one.
+
+    Non-critical: logs and returns on error.
+    """
+    if not signals or watch.symbol not in signals:
+        return
+
+    signal = signals[watch.symbol]
+    key_levels = signal.get("key_levels")
+    if not key_levels or not isinstance(key_levels, dict):
+        return
+
+    try:
+        from utils.draft_geometry import (
+            compute_entry_zone,
+            entry_zone_to_json,
+            should_replace_entry_zone,
+        )
+
+        new_zone = compute_entry_zone(key_levels, watch.side)
+        if new_zone is None:
+            return
+
+        if should_replace_entry_zone(watch.entry_zone_json, new_zone):
+            new_json = entry_zone_to_json(new_zone)
+            _update_entry_zone_json(engine, watch.watch_id, new_json)
+            logger.debug(
+                "Entry zone tightened for watch %s: %s",
+                watch.watch_id, new_json,
+            )
+    except Exception as exc:
+        logger.debug(
+            "Entry zone tightening check failed for watch %s: %s",
+            watch.watch_id, exc,
+        )
+
+
+def _update_entry_zone_json(engine: Any, watch_id: str, entry_zone_json: str) -> None:
+    """Update entry_zone_json for a watch (non-CAS, fail-open)."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "UPDATE setup_watches "
+                    "SET entry_zone_json = :ez_json, "
+                    "    updated_at = :updated_at "
+                    "WHERE watch_id = :watch_id"
+                ),
+                {
+                    "ez_json": entry_zone_json,
+                    "updated_at": to_iso(now_utc()),
+                    "watch_id": watch_id,
+                },
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.warning(
+            "Failed to update entry_zone_json for watch %s (fail-open): %s",
+            watch_id, exc,
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────

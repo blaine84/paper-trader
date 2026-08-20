@@ -20,6 +20,7 @@ from utils.market_data_health import record_market_data_health_alert
 from utils.stop_authority import should_stop_trigger
 from utils.trade_events import log_trade_event
 from utils.error_sanitizer import sanitize_error_text
+from utils.gate_config import SETUP_WATCH_MODE, SETUP_WATCH_REALTIME_MODE
 
 log = logging.getLogger(__name__)
 
@@ -775,6 +776,23 @@ def run(engine) -> dict:
                     pass  # never block price monitoring
         elif a["type"] == "approaching_level":
             log.info(f"📊 APPROACHING: {a['symbol']} ${a['price']} within {a['distance_pct']}% of {a['level_name']}={a['level_value']}")
+
+    # ── Watch Maturity Bridge hook ──────────────────────────────────────────
+    if SETUP_WATCH_MODE != "disabled" and SETUP_WATCH_REALTIME_MODE != "disabled":
+        try:
+            from utils.setup_watch_bridge import evaluate_alerts
+            approaching = [a for a in momentum_alerts if a.get("type") == "approaching_level"]
+            if approaching:
+                bridge_result = evaluate_alerts(engine, approaching)
+                if bridge_result.state_transitions > 0 or bridge_result.missed_moves_detected > 0:
+                    log.info(
+                        "Watch bridge: %d alerts → %d transitions, %d missed",
+                        bridge_result.alerts_processed,
+                        bridge_result.state_transitions,
+                        bridge_result.missed_moves_detected,
+                    )
+        except Exception:
+            log.warning("Watch maturity bridge failed (fail-open)", exc_info=True)
 
     return {
         "stop_triggers": stop_triggers,
