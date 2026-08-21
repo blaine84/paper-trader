@@ -1067,6 +1067,8 @@ def check_schema(engine):
         init_trade_plan_schema,
         init_pending_order_schema,
         init_setup_watch_schema,
+        init_fast_path_triggers_schema,
+        init_fast_path_events_schema,
     )
 
     # --- Verify WAL mode and busy_timeout (non-destructive, SQLite only) ---
@@ -1135,6 +1137,12 @@ def check_schema(engine):
     # Same idempotent IF NOT EXISTS pattern. Runs unconditionally so that
     # flipping SETUP_WATCH_MODE on a live system needs no schema step.
     init_setup_watch_schema(engine)
+
+    # --- Auto-create fast-path deterministic execution tables if missing ---
+    # Runs unconditionally so observe/enabled mode can be flipped on a live
+    # system without a separate migration step.
+    init_fast_path_triggers_schema(engine)
+    init_fast_path_events_schema(engine)
 
     # Expected columns per table that have been added over time.
     # If a column is missing, the system will crash on first query anyway —

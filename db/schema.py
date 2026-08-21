@@ -1219,6 +1219,56 @@ CREATE TABLE IF NOT EXISTS fast_path_events (
 )
 """
 
+_FAST_PATH_EVENTS_DDL_POSTGRES = """
+CREATE TABLE IF NOT EXISTS fast_path_events (
+    id SERIAL PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    cycle_id TEXT,
+    candidate_id TEXT,
+    source_signal_id TEXT,
+    trigger_id TEXT NOT NULL,
+
+    symbol TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    setup_type TEXT,
+    direction TEXT,
+
+    -- Geometry at evaluation time
+    entry_price REAL,
+    stop_price REAL,
+    target_price REAL,
+    current_price REAL NOT NULL,
+    reward_to_risk REAL,
+
+    -- Outcome
+    outcome_type TEXT NOT NULL,
+    outcome_reason_code TEXT NOT NULL,
+    outcome_metadata_json TEXT,
+
+    -- Blocking rule (if stand_down)
+    blocking_rule_name TEXT,
+    blocking_rule_threshold TEXT,
+
+    -- Annotation state
+    annotation_status TEXT NOT NULL DEFAULT 'annotation_pending',
+    annotation_json TEXT,
+    annotation_timestamp TEXT,
+
+    -- Narration
+    narration TEXT,
+    narration_source TEXT,
+
+    -- Audit
+    evaluated_at TEXT NOT NULL,
+    market_data_age_ms INTEGER,
+    evaluation_duration_ms INTEGER,
+
+    created_at TEXT NOT NULL DEFAULT (
+        to_char(timezone('UTC', now()), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+    )
+)
+"""
+
 _FAST_PATH_EVENTS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_fpe_symbol_outcome "
     "ON fast_path_events(symbol, outcome_type)",
@@ -1286,7 +1336,7 @@ def init_fast_path_events_schema(engine):
     sqlite = is_sqlite(engine)
 
     with engine.begin() as conn:
-        conn.execute(text(_FAST_PATH_EVENTS_DDL))
+        conn.execute(text(_FAST_PATH_EVENTS_DDL if sqlite else _FAST_PATH_EVENTS_DDL_POSTGRES))
         for stmt in _FAST_PATH_EVENTS_INDEXES:
             conn.execute(text(stmt))
 
@@ -1299,7 +1349,9 @@ def init_fast_path_events_schema(engine):
             conn.execute(text("""
                 CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
                 BEGIN
-                    RAISE EXCEPTION '%% is immutable: %% prohibited', TG_TABLE_NAME, TG_OP;
+                    RAISE EXCEPTION USING MESSAGE = (
+                        TG_TABLE_NAME || ' is immutable: ' || TG_OP || ' prohibited'
+                    );
                 END;
                 $$ LANGUAGE plpgsql
             """))
