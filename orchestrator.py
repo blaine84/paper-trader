@@ -1581,6 +1581,19 @@ def run_analyst_refresh():
                     record_analyst_outcome(engine, sym, today, signal_direction)
                 except Exception as e:
                     log.debug(f"Outcome tracking (analyst) error for {sym}: {e}")
+
+        # Fast-path trigger registration (Req 2.11, 11.3):
+        # Register triggers from fresh analyst signals for each active profile.
+        # Fail-open: registration errors never block the analyst refresh.
+        if signals:
+            from utils.gate_config import FAST_PATH_MODE
+            if FAST_PATH_MODE != "disabled":
+                try:
+                    from utils.fast_path_registry import register_triggers_from_signals
+                    for profile_id in pm.ACTIVE_PROFILES:
+                        register_triggers_from_signals(signals, profile_id, engine)
+                except Exception as e:
+                    log.warning(f"Fast-path trigger registration error: {e}", exc_info=True)
     except Exception as e:
         log.error(f"Analyst error: {e}", exc_info=True)
 
@@ -2926,6 +2939,13 @@ def main():
             replace_existing=True,
             coalesce=True,
         )
+
+    # ─── Fast-Path Deterministic Monitor ──────────────────────────────
+    # Evaluates registered triggers against live quotes on a fast cadence.
+    # Self-guards: no-op when FAST_PATH_MODE == "disabled".
+    from utils.fast_path_monitor import register_fast_path_job
+
+    register_fast_path_job(scheduler, get_engine(), list(pm.ACTIVE_PROFILES))
 
     # Lower-priority jobs: offset by 5 min when coordinator is active
     # to avoid contention with the coordinated cycle's decision window.

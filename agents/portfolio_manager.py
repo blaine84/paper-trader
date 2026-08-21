@@ -4637,6 +4637,37 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
         db.close()
         return {"decisions": [], "portfolio_notes": stored_notes, "profile": profile_id}
 
+    # ── Fast-path annotation loop (Req 7.1, 7.3, 7.5, 11.4, 11.5) ──
+    # When fast-path is enabled, the PM shifts from blocking gatekeeper to
+    # async annotator/reviewer.  Fetch unannotated fast-path events and mark
+    # them with a stub annotation so the PM cycle acknowledges them without
+    # blocking on full LLM-mediated annotation (wired in a follow-up).
+    from utils.gate_config import FAST_PATH_MODE  # lazy import avoids circular deps
+    if FAST_PATH_MODE == "enabled":
+        try:
+            from utils.fast_path_annotation import get_unannotated_events, annotate_event
+
+            unannotated = get_unannotated_events(engine, profile_id)
+            if unannotated:
+                log.info(
+                    "run_profile[%s]: %d fast-path events awaiting annotation",
+                    profile_id,
+                    len(unannotated),
+                )
+                # TODO: include event summaries in PM prompt context for full LLM annotation
+                # For now, mark as annotation_skipped (full PM integration pending)
+                for event in unannotated:
+                    annotate_event(engine, event["event_id"], {
+                        "source": "pm_auto_skip",
+                        "reason": "Full PM annotation loop not yet wired",
+                    })
+        except Exception as exc:
+            log.warning(
+                "run_profile[%s]: fast-path annotation loop error: %s",
+                profile_id,
+                exc,
+            )
+
     # ── PHASE 1: Two-tier review for existing open positions ──
     # Track signal usage for audit logging (Req 4.4)
     signal_usage_log = []  # list of {"symbol", "usage": "advisory"|"authoritative"}

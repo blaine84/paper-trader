@@ -648,6 +648,63 @@ def build_candidate_set(
                 cycle_id=cycle_id,
             )
 
+            # Fast-path trigger registration for promoted watches.
+            # Fail-open: registration errors never block watch evaluation.
+            from utils.gate_config import FAST_PATH_MODE
+            if FAST_PATH_MODE != "disabled":
+                try:
+                    from utils.fast_path_registry import register_triggers_from_watches
+                    from sqlalchemy import text as _fp_text
+
+                    # Query watches promoted in this cycle (or all promoted for
+                    # the profile when cycle_id is None / non-enforcing mode).
+                    _fp_query = (
+                        "SELECT watch_id, symbol, direction_watch, "
+                        "       source_signal_snapshot_json "
+                        "FROM watch_candidates "
+                        "WHERE profile_id = :profile_id AND state = 'promoted'"
+                    )
+                    _fp_params: dict[str, Any] = {"profile_id": profile_id}
+                    if cycle_id is not None:
+                        _fp_query += " AND promoted_cycle_id = :cycle_id"
+                        _fp_params["cycle_id"] = cycle_id
+
+                    with db.connect() as _fp_conn:
+                        _fp_rows = _fp_conn.execute(
+                            _fp_text(_fp_query), _fp_params
+                        ).fetchall()
+
+                    _promoted_watches: list[dict[str, Any]] = []
+                    for _fp_row in _fp_rows:
+                        _fp_symbol = _fp_row[1]
+                        _fp_signal = signals.get(_fp_symbol, {})
+                        _promoted_watches.append({
+                            "watch_id": _fp_row[0],
+                            "symbol": _fp_symbol,
+                            "direction": _fp_row[2],
+                            "setup_type": _fp_signal.get("setup_type", ""),
+                            "entry_price": _fp_signal.get("entry_price"),
+                            "stop_price": _fp_signal.get("stop_price"),
+                            "target_price": _fp_signal.get("target_price"),
+                            "entry_zone_upper": _fp_signal.get("entry_zone_upper"),
+                            "entry_zone_lower": _fp_signal.get("entry_zone_lower"),
+                            "signal_id": _fp_signal.get("signal_id"),
+                            "geometry_name": _fp_signal.get("geometry_name"),
+                            "invalidation_basis": _fp_signal.get("invalidation_basis"),
+                            "target_basis": _fp_signal.get("target_basis"),
+                        })
+
+                    if _promoted_watches:
+                        register_triggers_from_watches(
+                            _promoted_watches, profile_id, db
+                        )
+                except Exception as _fp_exc:
+                    logger.warning(
+                        "Fast-path trigger registration from watch promotions "
+                        "failed: %s",
+                        _fp_exc,
+                    )
+
             # Step 2: Consume promoted watches (enforcing mode only)
             if MARKET_STATE_MODE == "enforcing":
                 promotable = get_promotable_candidates(
@@ -784,6 +841,72 @@ def build_candidate_set(
             len(held_symbols),
         )
         return registry
+
+    # ---------------------------------------------------------------------------
+    # Fast-path candidate suppression (P1 — enabled mode only)
+    # Skip signals that have a confirmed active fast-path trigger for this profile.
+    # Safety rule: suppress ONLY when an active trigger exists — setup-type
+    # eligibility alone is insufficient. If the query fails, include all signals
+    # (fail-open: double-processing is safe, CAS prevents double-execution).
+    # See design.md §Candidate Suppression Safety Rule.
+    # Requirements: 11.3, 11.5
+    # ---------------------------------------------------------------------------
+    from utils.gate_config import FAST_PATH_MODE as _fp_mode_check
+    if _fp_mode_check == "enabled":
+        try:
+            from sqlalchemy import text as _sql_text
+
+            with db.connect() as _fp_conn:
+                _active_triggers = _fp_conn.execute(
+                    _sql_text(
+                        "SELECT symbol, direction FROM fast_path_triggers "
+                        "WHERE profile_id = :profile_id AND state = 'active'"
+                    ),
+                    {"profile_id": profile_id},
+                ).fetchall()
+
+            # Build set of (symbol, direction) with confirmed active triggers
+            _active_trigger_keys: set[tuple[str, str]] = set()
+            for _row in _active_triggers:
+                _active_trigger_keys.add((_row[0], _row[1]))
+
+            if _active_trigger_keys:
+                _suppressed: list[str] = []
+                _kept_signals: dict[str, dict] = {}
+                for _sym, _sig in eligible_signals.items():
+                    # Normalize signal direction to match trigger format (BUY/SHORT)
+                    _raw_dir = (
+                        _sig.get("direction")
+                        or _sig.get("side")
+                        or _sig.get("signal", "")
+                    ).upper()
+                    _norm_dir = "BUY" if _raw_dir in ("LONG", "BUY") else "SHORT"
+
+                    if (_sym, _norm_dir) in _active_trigger_keys:
+                        _suppressed.append(_sym)
+                    else:
+                        _kept_signals[_sym] = _sig
+
+                if _suppressed:
+                    logger.info(
+                        "Fast-path suppression: excluded %d signal(s) with "
+                        "active triggers from PM candidate set: %s "
+                        "(profile=%s cycle=%s)",
+                        len(_suppressed),
+                        _suppressed,
+                        profile_id,
+                        cycle_id,
+                    )
+                    eligible_signals = _kept_signals
+
+        except Exception as _fp_exc:
+            # Fail-open: if trigger lookup fails, include all signals in PM set.
+            # Double-processing is safe (CAS prevents double-execution).
+            logger.warning(
+                "Fast-path suppression query failed (fail-open, including "
+                "all signals): %s",
+                _fp_exc,
+            )
 
     # Process each eligible signal through geometry scaffold
     now = datetime.now(timezone.utc)

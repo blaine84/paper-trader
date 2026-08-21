@@ -1071,3 +1071,246 @@ def init_setup_watch_schema(engine):
         "Setup watch schema verified "
         "(setup_watches, setup_watch_events, setup_watch_outcomes)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fast-Path Deterministic Execution — Trigger Registry
+#
+# Triggers are registered from Analyst signals, promoted watches, or alert
+# contexts. The fast-path monitor evaluates active triggers against fresh
+# market data every FAST_PATH_MONITOR_INTERVAL_SECONDS.
+#
+# This is a mutable lifecycle table (active → fired | expired | invalidated),
+# NOT an append-only audit table. State transitions use CAS (compare-and-swap).
+#
+# Requirements: 2.1, 2.11
+# ---------------------------------------------------------------------------
+
+_FAST_PATH_TRIGGERS_DDL = """
+CREATE TABLE IF NOT EXISTS fast_path_triggers (
+    trigger_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    setup_type TEXT NOT NULL,
+
+    -- Trigger condition
+    trigger_type TEXT NOT NULL,
+    trigger_level REAL NOT NULL,
+    trigger_zone_upper REAL,
+    trigger_zone_lower REAL,
+
+    -- Geometry (frozen at registration time)
+    entry_price REAL NOT NULL,
+    stop_price REAL NOT NULL,
+    target_price REAL NOT NULL,
+    geometry_name TEXT,
+
+    -- Metadata
+    source_signal_id TEXT,
+    source_watch_id TEXT,
+    invalidation_basis TEXT,
+    target_basis TEXT,
+
+    -- Lifecycle
+    state TEXT NOT NULL DEFAULT 'active',
+    registered_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    fired_at TEXT,
+    resolved_at TEXT,
+    resolution_event_id TEXT,
+
+    -- Context
+    signal_snapshot_json TEXT,
+    context_json TEXT
+)
+"""
+
+_FAST_PATH_TRIGGERS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_fpt_state "
+    "ON fast_path_triggers(state)",
+    "CREATE INDEX IF NOT EXISTS idx_fpt_symbol_state "
+    "ON fast_path_triggers(symbol, state)",
+    "CREATE INDEX IF NOT EXISTS idx_fpt_expires "
+    "ON fast_path_triggers(expires_at)",
+]
+
+
+def init_fast_path_triggers_schema(engine):
+    """Create fast_path_triggers table and indexes if they do not exist.
+
+    Non-destructive and idempotent: uses CREATE TABLE / CREATE INDEX
+    IF NOT EXISTS so it can run on every orchestrator startup.
+    Existing rows and columns are never modified.
+
+    This is a mutable lifecycle table — triggers transition through states
+    (active → fired | expired | invalidated) via CAS updates. No immutability
+    triggers are applied.
+
+    Requirements: 2.1, 2.11
+    """
+    with engine.begin() as conn:
+        conn.execute(text(_FAST_PATH_TRIGGERS_DDL))
+        for stmt in _FAST_PATH_TRIGGERS_INDEXES:
+            conn.execute(text(stmt))
+
+    logger.debug("Fast-path triggers schema verified (fast_path_triggers)")
+
+
+# ---------------------------------------------------------------------------
+# Fast-Path Deterministic Execution — Event Log (immutable, append-only)
+#
+# Every trigger evaluation that produces an outcome writes one row here.
+# The table is INSERT-only; triggers block UPDATE and DELETE to preserve
+# the audit trail.
+#
+# Annotation columns (annotation_status, annotation_json, annotation_timestamp,
+# narration, narration_source) are currently also immutable. Task 9.5 will
+# refine the trigger to allow updates on those specific columns.
+#
+# Requirements: 9.1, 9.4, 9.5
+# ---------------------------------------------------------------------------
+
+_FAST_PATH_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS fast_path_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    cycle_id TEXT,
+    candidate_id TEXT,
+    source_signal_id TEXT,
+    trigger_id TEXT NOT NULL,
+
+    symbol TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    setup_type TEXT,
+    direction TEXT,
+
+    -- Geometry at evaluation time
+    entry_price REAL,
+    stop_price REAL,
+    target_price REAL,
+    current_price REAL NOT NULL,
+    reward_to_risk REAL,
+
+    -- Outcome
+    outcome_type TEXT NOT NULL,
+    outcome_reason_code TEXT NOT NULL,
+    outcome_metadata_json TEXT,
+
+    -- Blocking rule (if stand_down)
+    blocking_rule_name TEXT,
+    blocking_rule_threshold TEXT,
+
+    -- Annotation state
+    annotation_status TEXT NOT NULL DEFAULT 'annotation_pending',
+    annotation_json TEXT,
+    annotation_timestamp TEXT,
+
+    -- Narration
+    narration TEXT,
+    narration_source TEXT,
+
+    -- Audit
+    evaluated_at TEXT NOT NULL,
+    market_data_age_ms INTEGER,
+    evaluation_duration_ms INTEGER,
+
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)
+"""
+
+_FAST_PATH_EVENTS_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_fpe_symbol_outcome "
+    "ON fast_path_events(symbol, outcome_type)",
+    "CREATE INDEX IF NOT EXISTS idx_fpe_profile_outcome "
+    "ON fast_path_events(profile_id, outcome_type)",
+    "CREATE INDEX IF NOT EXISTS idx_fpe_trigger "
+    "ON fast_path_events(trigger_id)",
+    "CREATE INDEX IF NOT EXISTS idx_fpe_evaluated "
+    "ON fast_path_events(evaluated_at)",
+]
+
+_FAST_PATH_EVENTS_IMMUTABILITY_TRIGGERS_SQLITE = [
+    """
+    CREATE TRIGGER IF NOT EXISTS fast_path_events_no_update
+        BEFORE UPDATE ON fast_path_events
+        WHEN (
+            NEW.event_id != OLD.event_id OR
+            NEW.trigger_id != OLD.trigger_id OR
+            NEW.symbol != OLD.symbol OR
+            NEW.profile_id != OLD.profile_id OR
+            NEW.outcome_type != OLD.outcome_type OR
+            NEW.outcome_reason_code != OLD.outcome_reason_code OR
+            NEW.current_price != OLD.current_price OR
+            NEW.entry_price IS NOT OLD.entry_price OR
+            NEW.stop_price IS NOT OLD.stop_price OR
+            NEW.target_price IS NOT OLD.target_price OR
+            NEW.direction IS NOT OLD.direction OR
+            NEW.setup_type IS NOT OLD.setup_type OR
+            NEW.evaluated_at != OLD.evaluated_at OR
+            NEW.created_at != OLD.created_at OR
+            NEW.market_data_age_ms IS NOT OLD.market_data_age_ms OR
+            NEW.evaluation_duration_ms IS NOT OLD.evaluation_duration_ms OR
+            NEW.blocking_rule_name IS NOT OLD.blocking_rule_name OR
+            NEW.blocking_rule_threshold IS NOT OLD.blocking_rule_threshold OR
+            NEW.source_signal_id IS NOT OLD.source_signal_id OR
+            NEW.cycle_id IS NOT OLD.cycle_id OR
+            NEW.candidate_id IS NOT OLD.candidate_id OR
+            NEW.reward_to_risk IS NOT OLD.reward_to_risk
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'fast_path_events is immutable: only annotation columns may be updated');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS fast_path_events_no_delete
+        BEFORE DELETE ON fast_path_events
+    BEGIN
+        SELECT RAISE(ABORT, 'fast_path_events is immutable');
+    END
+    """,
+]
+
+
+def init_fast_path_events_schema(engine):
+    """Create fast_path_events table, indexes, and immutability triggers.
+
+    Non-destructive and idempotent: uses CREATE TABLE / CREATE INDEX /
+    CREATE TRIGGER IF NOT EXISTS so it can run on every orchestrator startup.
+    Existing rows and columns are never modified.
+
+    This is an immutable append-only table — triggers block UPDATE and DELETE.
+
+    Requirements: 9.1, 9.4, 9.5
+    """
+    sqlite = is_sqlite(engine)
+
+    with engine.begin() as conn:
+        conn.execute(text(_FAST_PATH_EVENTS_DDL))
+        for stmt in _FAST_PATH_EVENTS_INDEXES:
+            conn.execute(text(stmt))
+
+        # Immutability triggers (SQLite-specific)
+        if sqlite:
+            for stmt in _FAST_PATH_EVENTS_IMMUTABILITY_TRIGGERS_SQLITE:
+                conn.execute(text(stmt))
+        else:
+            # Postgres: shared raise_immutable() function + per-op triggers.
+            conn.execute(text("""
+                CREATE OR REPLACE FUNCTION raise_immutable() RETURNS trigger AS $$
+                BEGIN
+                    RAISE EXCEPTION '%% is immutable: %% prohibited', TG_TABLE_NAME, TG_OP;
+                END;
+                $$ LANGUAGE plpgsql
+            """))
+            for op in ("update", "delete"):
+                conn.execute(text(
+                    f"DROP TRIGGER IF EXISTS fast_path_events_no_{op} ON fast_path_events"
+                ))
+                conn.execute(text(
+                    f"CREATE TRIGGER fast_path_events_no_{op} "
+                    f"BEFORE {op.upper()} ON fast_path_events "
+                    f"FOR EACH ROW EXECUTE FUNCTION raise_immutable()"
+                ))
+
+    logger.debug("Fast-path events schema verified (fast_path_events)")

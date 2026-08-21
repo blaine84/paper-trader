@@ -384,6 +384,103 @@ def _check_same_cycle_policy(
 # ---------------------------------------------------------------------------
 
 
+def create_watch_candidate(
+    engine,
+    *,
+    symbol: str,
+    profile_id: str,
+    direction: str,
+    entry_price: float | None = None,
+    stop_price: float | None = None,
+    target_price: float | None = None,
+    setup_type: str = "",
+    reason: str = "",
+    source_cycle_id: str = "",
+    activation_conditions: list[dict] | None = None,
+    invalidation_conditions: list[dict] | None = None,
+    key_levels: dict | None = None,
+    signal_snapshot: dict | None = None,
+    expires_hours: int = DEFAULT_WATCH_TTL_HOURS,
+) -> str | None:
+    """Create a single watch candidate from explicit parameters.
+
+    Public entry point for creating a watch candidate outside the bulk
+    evaluate_and_create flow. Used by fast-path execution delegation when
+    outcome is ``watch_created``.
+
+    Returns the watch_id on success, None on failure.
+    """
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(hours=expires_hours)).isoformat()
+
+    # Build activation/invalidation from entry geometry if not provided
+    if activation_conditions is None:
+        activation_conditions = []
+        if entry_price is not None:
+            if direction.upper() in ("LONG", "BUY"):
+                activation_conditions.append({
+                    "condition": "price above entry",
+                    "threshold": entry_price,
+                })
+            else:
+                activation_conditions.append({
+                    "condition": "price below entry",
+                    "threshold": entry_price,
+                })
+
+    if invalidation_conditions is None:
+        invalidation_conditions = []
+        if stop_price is not None:
+            if direction.upper() in ("LONG", "BUY"):
+                invalidation_conditions.append({
+                    "condition": "price below stop",
+                    "threshold": stop_price,
+                })
+            else:
+                invalidation_conditions.append({
+                    "condition": "price above stop",
+                    "threshold": stop_price,
+                })
+
+    # Normalize direction to watch direction format
+    dir_normalized = direction.upper()
+    if dir_normalized == "BUY":
+        dir_normalized = "LONG"
+    elif dir_normalized == "SHORT":
+        dir_normalized = "SHORT"
+
+    watch = WatchCandidate(
+        watch_id=str(uuid.uuid4()),
+        symbol=symbol,
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+        expires_at=expires_at,
+        source_cycle_id=source_cycle_id,
+        profile_id=profile_id,
+        market_state="",
+        setup_lifecycle_state="activation_pending",
+        timeframe_authority_json=json.dumps({}),
+        direction_watch=dir_normalized,
+        trade_posture="flat",
+        activation_conditions_json=json.dumps(activation_conditions),
+        invalidation_conditions_json=json.dumps(invalidation_conditions),
+        key_levels_json=json.dumps(key_levels or {}),
+        trigger_status_json=json.dumps({}),
+        reason=reason or f"Fast-path watch: {setup_type} on {symbol}",
+        source_signal_snapshot_json=json.dumps(signal_snapshot or {}),
+        state="active",
+    )
+
+    if _insert_watch_candidate(engine, watch):
+        logger.info(
+            "create_watch_candidate: created watch %s for %s (%s)",
+            watch.watch_id, symbol, dir_normalized,
+        )
+        return watch.watch_id
+
+    return None
+
+
 def evaluate_and_create_watch_candidates(
     engine,
     signals: dict[str, dict],

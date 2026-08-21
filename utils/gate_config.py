@@ -1003,6 +1003,86 @@ if SETUP_WATCH_REALTIME_MODE != "disabled":
 
 
 # ---------------------------------------------------------------------------
+# Fast-Path Deterministic Execution Feature Flags
+# ---------------------------------------------------------------------------
+
+# Values: "disabled" | "observe" | "enabled"
+# disabled: no fast-path evaluation; existing PM cycle unchanged
+# observe:  triggers evaluated and outcomes recorded; no trades, orders, or
+#           watch modifications from the fast path — PM remains authoritative
+# enabled:  fast-path outcomes execute (trades, pending orders, watches) and
+#           the PM cycle shifts to annotation/review for fast-path events
+_raw_fast_path_mode = os.environ.get("FAST_PATH_MODE", "disabled")
+if _raw_fast_path_mode not in ("disabled", "observe", "enabled"):
+    logger.warning(
+        "Unrecognized FAST_PATH_MODE=%r, defaulting to 'disabled'",
+        _raw_fast_path_mode,
+    )
+    _raw_fast_path_mode = "disabled"
+FAST_PATH_MODE: str = _raw_fast_path_mode
+
+# Monitor cadence (seconds) — how often the fast-path monitor evaluates
+# registered triggers against fresh market data. Minimum 5s to avoid
+# overwhelming the quote provider.
+FAST_PATH_MONITOR_INTERVAL_SECONDS: int = _int_env(
+    "FAST_PATH_MONITOR_INTERVAL_SECONDS", 15, minimum=5
+)
+
+# Maximum age (seconds) for a registered trigger before it is automatically
+# expired. Prevents stale triggers from lingering across sessions.
+FAST_PATH_MAX_TRIGGER_AGE_SECONDS: int = _int_env(
+    "FAST_PATH_MAX_TRIGGER_AGE_SECONDS", 300, minimum=30
+)
+
+# Maximum entry deviation (fraction) — when price is further than this from
+# the trigger's entry and the setup is NOT eligible for a pending limit order,
+# the outcome is stand_down(entry_too_far_from_price).
+FAST_PATH_MAX_ENTRY_DEVIATION_PCT: float = _float_env(
+    "FAST_PATH_MAX_ENTRY_DEVIATION_PCT", 0.05, minimum=0.0
+)
+
+# Closed set of setup types eligible for fast-path trigger registration.
+# Mirrors CANDIDATE_EXECUTABLE_SETUP_TYPES — only these types may be
+# registered as fast-path triggers.
+FAST_PATH_ELIGIBLE_SETUP_TYPES: frozenset[str] = frozenset({
+    "momentum_fade",
+    "news_breakout",
+    "gap_and_go",
+    "technical_breakout",
+    "vwap_reclaim",
+})
+
+# Closed set of setup types enabled for execution delegation in enabled mode.
+# Starts narrow (single type) for safe rollout; expanded after observe-mode
+# validation confirms agreement with PM decisions.
+FAST_PATH_ENABLED_SETUP_TYPES: frozenset[str] = frozenset({
+    "momentum_fade",
+})
+
+# Maximum execution-path outcomes (trade_executed, pending_order_created)
+# delegated per single monitor tick. Prevents a burst of triggers from
+# stampeding the gate pipeline and SQLite with concurrent execution.
+FAST_PATH_MAX_OUTCOMES_PER_TICK: int = _int_env(
+    "FAST_PATH_MAX_OUTCOMES_PER_TICK", 5, minimum=1
+)
+
+# Startup log reporting active mode
+if FAST_PATH_MODE != "disabled":
+    logger.info(
+        "Fast-Path Deterministic Execution Mode: %s (monitor_interval=%ss, "
+        "max_trigger_age=%ss, max_entry_deviation=%.2f%%, "
+        "max_outcomes_per_tick=%d, eligible_types=%s, enabled_types=%s)",
+        FAST_PATH_MODE,
+        FAST_PATH_MONITOR_INTERVAL_SECONDS,
+        FAST_PATH_MAX_TRIGGER_AGE_SECONDS,
+        FAST_PATH_MAX_ENTRY_DEVIATION_PCT * 100,
+        FAST_PATH_MAX_OUTCOMES_PER_TICK,
+        sorted(FAST_PATH_ELIGIBLE_SETUP_TYPES),
+        sorted(FAST_PATH_ENABLED_SETUP_TYPES),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pilot Controller
 # ---------------------------------------------------------------------------
 
