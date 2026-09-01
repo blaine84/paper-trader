@@ -249,6 +249,50 @@ def test_execute_trade_links_pm_candidate_id_to_trade_and_entry_events():
     db.close()
 
 
+def test_execute_trade_uses_reconciled_cash_over_poisoned_balance():
+    """Execution should not reject valid entries because the balance cache drifted."""
+    engine = _make_engine()
+    db = _make_session(engine)
+    profile_id = "aggressive"
+    _seed_balance(db, profile_id, cash=500.0)
+    _seed_analyst_signal(db, "AMD", _strong_signal("AMD"))
+
+    decision = _base_decision(
+        symbol="AMD",
+        action="BUY",
+        quantity=10,
+        price=150.0,
+        stop=147.0,
+        target=156.0,
+    )
+
+    with (
+        patch(_FIND_SIMILAR, return_value=[]),
+        patch(_COMPUTE_SIM_STATS, return_value=_good_sim_stats()),
+        patch(_ADJUST_CONFIDENCE, return_value=_CONF_OK),
+        patch(_VALIDATE_TRADE),
+        patch(_CHECK_CORRELATION, return_value=""),
+        patch("agents.portfolio_manager.FinnhubClient") as mock_fh_cls,
+    ):
+        mock_fh = MagicMock()
+        mock_fh.get_quote.return_value = {"price": 150.0}
+        mock_fh_cls.return_value = mock_fh
+        ok, msg = execute_trade(db, decision, profile_id, normalized=True)
+
+    assert ok is True, f"Trade should have used reconciled cash: {msg}"
+    trade = db.query(Trade).filter_by(symbol="AMD", profile=profile_id).first()
+    assert trade is not None
+    latest_balance = (
+        db.query(Balance)
+        .filter_by(profile=profile_id)
+        .order_by(Balance.timestamp.desc())
+        .first()
+    )
+    assert latest_balance.cash == 100_000.0 - trade.quantity * trade.entry_price
+
+    db.close()
+
+
 # ---------------------------------------------------------------------------
 # 1. test_edge_score_rejection
 # ---------------------------------------------------------------------------

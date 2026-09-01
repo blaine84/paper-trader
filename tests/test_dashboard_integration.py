@@ -22,6 +22,7 @@ from utils.market_data_reliability.snapshot import Snapshot
 from web.app import (
     _add_market_data_reliability_fields,
     _build_dashboard_market_data_snapshot,
+    get_dashboard_quotes,
 )
 
 
@@ -328,6 +329,75 @@ class TestEnrichFailOpen:
 
 class TestDashboardApiRowWiring:
     """Tests for dashboard row reliability wiring in web.app."""
+
+    def test_dashboard_quotes_use_persisted_signal_quote_context(self):
+        """Dashboard quote rows come from analyst cache data, not providers."""
+        signals = {
+            "AAPL": {
+                "current_price": 187.432,
+                "quote_timestamp": "2026-08-31T13:45:00+00:00",
+                "day_open": 186.50,
+                "day_high": 188.00,
+                "day_low": 185.50,
+                "prev_close": 186.00,
+                "change_pct": 0.77,
+            }
+        }
+
+        result = get_dashboard_quotes(["AAPL"], signals)
+
+        assert result["AAPL"] == {
+            "price": 187.43,
+            "change_pct": 0.77,
+            "_provider": "analyst_cache",
+            "_timestamp": "2026-08-31T13:45:00+00:00",
+            "_open": 186.50,
+            "_high": 188.00,
+            "_low": 185.50,
+            "_prev_close": 186.00,
+        }
+
+    def test_dashboard_quotes_fall_back_to_price_monitor_cache(self):
+        """Symbols without fresh analyst signals can still show monitor prices."""
+        monitor_quotes = {
+            "QQQ": {
+                "price": 716.47,
+                "change_pct": -0.64,
+                "_provider": "price_monitor_cache",
+                "_timestamp": "2026-08-31T13:45:00+00:00",
+                "_open": None,
+                "_high": None,
+                "_low": None,
+                "_prev_close": None,
+            }
+        }
+
+        result = get_dashboard_quotes(["QQQ"], {}, monitor_quotes)
+
+        assert result["QQQ"]["price"] == 716.47
+        assert result["QQQ"]["_provider"] == "price_monitor_cache"
+
+    def test_dashboard_quotes_prefer_newer_monitor_cache(self):
+        """Fresh monitor prices beat older analyst quote context for display."""
+        signals = {
+            "SPY": {
+                "current_price": 769.35,
+                "quote_timestamp": "2026-08-31T13:45:00+00:00",
+            }
+        }
+        monitor_quotes = {
+            "SPY": {
+                "price": 766.43,
+                "change_pct": 0,
+                "_provider": "price_monitor_cache",
+                "_timestamp": "2026-08-31T13:57:52+00:00",
+            }
+        }
+
+        result = get_dashboard_quotes(["SPY"], signals, monitor_quotes)
+
+        assert result["SPY"]["price"] == 766.43
+        assert result["SPY"]["_provider"] == "price_monitor_cache"
 
     def test_observe_mode_adds_market_data_fields_without_overwriting_catalyst_label(
         self, monkeypatch

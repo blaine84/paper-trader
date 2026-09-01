@@ -44,12 +44,16 @@ from utils.market_data_reliability.trust import TrustClassifier
 from utils.market_data_reliability.validator import ResponseValidator
 from utils.trigger_status import compute_trigger_status
 from utils.error_sanitizer import sanitize_error_text
+from utils.portfolio_accounting import compute_portfolio_accounting
 
 app = Flask(__name__)
 engine = init_db("db/paper_trader.db")
 ensure_shadow_ledger_schema(engine)
 
 _QUOTE_CACHE_SECONDS = int(os.getenv("DASHBOARD_QUOTE_CACHE_SECONDS", "25"))
+_DASHBOARD_QUOTE_CACHE_MAX_AGE_SECONDS = int(
+    os.getenv("DASHBOARD_QUOTE_CACHE_MAX_AGE_SECONDS", "1800")
+)
 _YFINANCE_CIRCUIT_BREAK_SECONDS = int(
     os.getenv("DASHBOARD_YFINANCE_CIRCUIT_BREAK_SECONDS", "600")
 )
@@ -419,11 +423,136 @@ def get_quotes(symbols: list[str]) -> dict:
     return quotes
 
 
-def get_market_open() -> bool:
+def _quote_from_signal(symbol: str, signal: dict) -> dict | None:
+    """Build a dashboard quote from persisted analyst quote context."""
+    if not isinstance(signal, dict):
+        return None
+
+    price = _to_decimal(signal.get("current_price") or signal.get("price"))
+    if price is None or price <= 0:
+        return None
+
+    prev_close = _to_decimal(signal.get("prev_close"))
+    change_pct = signal.get("change_pct")
+    if change_pct is None and prev_close and prev_close > 0:
+        change_pct = round(float((price - prev_close) / prev_close * 100), 2)
+
+    return {
+        "price": round(float(price), 2),
+        "change_pct": float(change_pct or 0),
+        "_provider": "analyst_cache",
+        "_timestamp": signal.get("quote_timestamp"),
+        "_open": signal.get("day_open"),
+        "_high": signal.get("day_high"),
+        "_low": signal.get("day_low"),
+        "_prev_close": signal.get("prev_close"),
+    }
+
+
+def get_price_monitor_quote_cache(db, symbols: list[str]) -> dict[str, dict]:
+    """Return recent price-monitor quotes for dashboard display."""
+    cutoff = datetime.utcnow() - timedelta(seconds=_DASHBOARD_QUOTE_CACHE_MAX_AGE_SECONDS)
+    quotes = {}
+    for sym in symbols:
+        mem = (
+            db.query(AgentMemory)
+            .filter_by(agent="price_monitor", symbol=sym, key="quote_cache")
+            .filter(AgentMemory.timestamp >= cutoff)
+            .order_by(AgentMemory.timestamp.desc())
+            .first()
+        )
+        if not mem:
+            continue
+        try:
+            data = json.loads(mem.value)
+        except Exception:
+            continue
+        price = _to_decimal(data.get("price"))
+        if price is None or price <= 0:
+            continue
+        quotes[sym] = {
+            "price": round(float(price), 2),
+            "change_pct": float(data.get("change_pct") or 0),
+            "_provider": data.get("provider") or "price_monitor_cache",
+            "_timestamp": data.get("timestamp") or mem.timestamp.isoformat(),
+            "_open": data.get("open"),
+            "_high": data.get("high"),
+            "_low": data.get("low"),
+            "_prev_close": data.get("prev_close"),
+        }
+    return quotes
+
+
+def _quote_observed_at(quote: dict | None) -> datetime | None:
+    if not isinstance(quote, dict) or not quote.get("_timestamp"):
+        return None
     try:
-        return FinnhubClient().is_market_open(retries=0)
+        return _parse_quote_timestamp(
+            quote.get("_timestamp"),
+            datetime.fromtimestamp(0, tz=timezone.utc),
+        )
     except Exception:
+        return None
+
+
+def _choose_dashboard_quote(signal_quote: dict | None, monitor_quote: dict | None) -> dict | None:
+    if not signal_quote:
+        return monitor_quote
+    if not monitor_quote:
+        return signal_quote
+
+    signal_time = _quote_observed_at(signal_quote)
+    monitor_time = _quote_observed_at(monitor_quote)
+    if monitor_time and (not signal_time or monitor_time > signal_time):
+        return monitor_quote
+    return signal_quote
+
+
+def get_dashboard_quotes(
+    symbols: list[str],
+    signals: dict[str, dict],
+    monitor_quotes: dict[str, dict] | None = None,
+) -> dict:
+    """Return live-ish dashboard quotes without provider fanout.
+
+    The analyst cycle already persists quote context alongside each signal. The
+    dashboard is display-only, so it should read that cache instead of spending
+    provider budget and making page loads wait on Finnhub/yfinance.
+    """
+    now = time.time()
+    quotes = {}
+    monitor_quotes = monitor_quotes or {}
+    for sym in symbols:
+        quote = _choose_dashboard_quote(
+            _quote_from_signal(sym, signals.get(sym, {})),
+            monitor_quotes.get(sym),
+        )
+        if quote:
+            quotes[sym] = quote
+            _quote_cache[sym] = (now, quote)
+            continue
+
+        cached = _quote_cache.get(sym)
+        if cached:
+            quotes[sym] = cached[1]
+            continue
+
+        quotes[sym] = {
+            "price": 0,
+            "change_pct": 0,
+            "_provider": "none",
+            "_timestamp": None,
+        }
+    return quotes
+
+
+def get_market_open() -> bool:
+    now_et = datetime.now(ET)
+    if now_et.weekday() >= 5:
         return False
+    market_start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_end = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_start <= now_et < market_end
 
 
 def get_analyst_signals(db, symbols: list[str]) -> dict:
@@ -512,16 +641,10 @@ def get_portfolio_summary(db) -> dict:
     summaries = {}
     for profile_id in ACTIVE_PROFILES:
         positions = db.query(Position).filter_by(profile=profile_id).all()
-        bal = (
-            db.query(Balance)
-            .filter_by(profile=profile_id)
-            .order_by(Balance.timestamp.desc())
-            .first()
-        )
         starting = float(PM_PROFILES[profile_id]["starting_balance"])
-        cash = bal.cash if bal else starting
-        pos_value = sum(p.quantity * p.avg_cost for p in positions)
-        equity = cash + pos_value
+        accounting = compute_portfolio_accounting(db, profile_id, starting)
+        cash = accounting.cash
+        equity = accounting.total_equity
         pnl = equity - starting
 
         summaries[profile_id] = {
@@ -532,6 +655,8 @@ def get_portfolio_summary(db) -> dict:
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl / starting * 100, 2),
             "position_count": len(positions),
+            "realized_pnl": round(accounting.realized_pnl, 2),
+            "unrealized_pnl": round(accounting.unrealized_pnl, 2),
         }
     return summaries
 
@@ -561,7 +686,11 @@ def api_data():
     signals = get_analyst_signals(db, all_symbols)
     sentiment = get_researcher_sentiment(db, all_symbols)
     portfolio = get_portfolio_summary(db)
-    quotes = get_quotes(all_symbols)
+    quotes = get_dashboard_quotes(
+        all_symbols,
+        signals,
+        get_price_monitor_quote_cache(db, all_symbols),
+    )
     market_open = get_market_open()
 
     # Compute now_et ONCE and thread it through all freshness calls

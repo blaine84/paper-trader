@@ -50,6 +50,7 @@ from utils.raw_pm_capture import (
 )
 from utils.trigger_status import compute_trigger_status
 from utils.error_sanitizer import sanitize_error_text
+from utils.portfolio_accounting import compute_portfolio_accounting
 
 log = logging.getLogger(__name__)
 
@@ -2216,7 +2217,7 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
     """Build portfolio snapshot for a specific profile."""
     positions = db.query(Position).filter_by(profile=profile_id).all()
     pos_data = []
-    total_pos_value = 0.0
+    current_prices = {}
 
     for p in positions:
         try:
@@ -2224,12 +2225,12 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
             price = quote["price"]
         except Exception:
             price = p.avg_cost
+        current_prices[p.symbol] = price
         market_value = p.quantity * price
         if p.side == "short":
             unrealized_pnl = (p.avg_cost - price) * p.quantity
         else:
             unrealized_pnl = (price - p.avg_cost) * p.quantity
-        total_pos_value += market_value
 
         # Get stop/target from the open trade
         open_trade = (
@@ -2257,15 +2258,10 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
             "drifting": drifting,
         })
 
-    bal = (
-        db.query(Balance)
-        .filter_by(profile=profile_id)
-        .order_by(Balance.timestamp.desc())
-        .first()
-    )
     starting = PM_PROFILES[profile_id]["starting_balance"]
-    cash = bal.cash if bal else float(starting)
-    total_equity = cash + total_pos_value
+    accounting = compute_portfolio_accounting(db, profile_id, float(starting), current_prices)
+    cash = accounting.cash
+    total_equity = accounting.total_equity
 
     # Today's realized P&L
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0)
@@ -2286,6 +2282,8 @@ def get_portfolio_for_profile(db, fh, profile_id: str) -> dict:
         "daily_pnl": round(daily_pnl, 2),
         "daily_pnl_pct": round(daily_pnl / starting * 100, 2),
         "starting_balance": starting,
+        "realized_pnl": round(accounting.realized_pnl, 2),
+        "unrealized_pnl": round(accounting.unrealized_pnl, 2),
     }
 
 
@@ -3052,18 +3050,12 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
                 # Compute ATR for the symbol
                 atr_data = compute_intraday_atr(symbol)
 
-                # Compute total_equity for max_dollar_risk
+                # Compute total_equity for max_dollar_risk from the trade ledger,
+                # not the last balance snapshot.
                 starting = PM_PROFILES[profile_id]["starting_balance"]
-                bal = (
-                    db.query(Balance)
-                    .filter_by(profile=profile_id)
-                    .order_by(Balance.timestamp.desc())
-                    .first()
-                )
-                cash = bal.cash if bal else float(starting)
-                positions = db.query(Position).filter_by(profile=profile_id).all()
-                pos_value = sum(p.quantity * p.avg_cost for p in positions)
-                total_equity = cash + pos_value
+                total_equity = compute_portfolio_accounting(
+                    db, profile_id, float(starting)
+                ).total_equity
 
                 max_dollar_risk = _compute_max_dollar_risk(profile_id, total_equity)
                 tactical_context_flags: set[str] = set()
@@ -3786,13 +3778,9 @@ def execute_trade(
         _pm_candidate_id = decision.get("pm_candidate_id") or decision.get("candidate_id")
 
     starting = PM_PROFILES[profile_id]["starting_balance"]
-    bal = (
-        db.query(Balance)
-        .filter_by(profile=profile_id)
-        .order_by(Balance.timestamp.desc())
-        .first()
-    )
-    cash = bal.cash if bal else float(starting)
+    accounting = compute_portfolio_accounting(db, profile_id, float(starting))
+    cash = accounting.cash
+    total_equity = accounting.total_equity
 
     # ── Gate Pipeline: deterministic pre-trade safety gates ──
     _gate_notes = []
@@ -3816,8 +3804,7 @@ def execute_trade(
 
             # Compute account equity for snapshot
             _snap_positions = db.query(Position).filter_by(profile=profile_id).all()
-            _snap_pos_value = sum(p.quantity * p.avg_cost for p in _snap_positions)
-            _snap_equity = cash + _snap_pos_value
+            _snap_equity = total_equity
             _snap_open_positions = [
                 {
                     "symbol": p.symbol,
@@ -4193,8 +4180,6 @@ def execute_trade(
                 {"symbol": p.symbol, "quantity": p.quantity, "avg_cost": p.avg_cost, "side": p.side}
                 for p in positions
             ]
-            pos_value = sum(p.quantity * p.avg_cost for p in positions)
-            total_equity = cash + pos_value
 
             risk_result = compute_portfolio_risk(pos_list, total_equity)
 
@@ -4238,8 +4223,6 @@ def execute_trade(
         # Build a normalized decision for validation
         validated = {**decision, "price": price, "stop": stop, "target": target, "quantity": quantity}
         positions = db.query(Position).filter_by(profile=profile_id).all()
-        pos_value = sum(p.quantity * p.avg_cost for p in positions)
-        total_equity = cash + pos_value
 
         profile = PM_PROFILES.get(profile_id, {})
         max_position_pct = profile.get("max_position_pct")

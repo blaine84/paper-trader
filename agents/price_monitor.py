@@ -165,6 +165,76 @@ def get_batch_quotes(symbols: list[str], *, prefer_finnhub: bool = False) -> dic
     return quotes
 
 
+def _persist_dashboard_quote_cache(db, quotes: dict, now: datetime) -> None:
+    """Persist latest monitor quotes for display-only dashboard reads."""
+    try:
+        for symbol, price in quotes.items():
+            try:
+                price_value = float(price)
+            except (TypeError, ValueError):
+                continue
+            if price_value <= 0:
+                continue
+            db.add(AgentMemory(
+                agent="price_monitor",
+                symbol=symbol,
+                key="quote_cache",
+                timestamp=now,
+                value=json.dumps({
+                    "price": round(price_value, 2),
+                    "timestamp": now.replace(tzinfo=timezone.utc).isoformat(),
+                    "provider": "price_monitor_cache",
+                }),
+            ))
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        log.warning("Failed to persist dashboard quote cache: %s", sanitize_error_text(exc))
+
+
+def _get_dashboard_extra_symbols(db) -> list[str]:
+    """Return current scout/focus symbols that can appear on the dashboard."""
+    symbols: list[str] = []
+    today = datetime.utcnow().date().isoformat()
+
+    scout_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="scout", key="daily_picks")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if scout_mem:
+        try:
+            data = json.loads(scout_mem.value)
+            if data.get("date") == today:
+                for pick in data.get("picks", []):
+                    sym = str((pick or {}).get("symbol") or "").strip().upper()
+                    if sym:
+                        symbols.append(sym)
+        except Exception:
+            pass
+
+    focus_mem = (
+        db.query(AgentMemory)
+        .filter(AgentMemory.agent == "scout")
+        .filter(AgentMemory.key.like(f"focus_list:{today}:%"))
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    if focus_mem:
+        try:
+            data = json.loads(focus_mem.value)
+            if data.get("date") == today:
+                for symbol in data.get("selected", []):
+                    sym = str(symbol or "").strip().upper()
+                    if sym:
+                        symbols.append(sym)
+        except Exception:
+            pass
+
+    return list(dict.fromkeys(symbols))
+
+
 def _record_empty_quote_batch(engine, consumer: str, symbols: list[str]) -> None:
     """Persist a throttled outage marker when every requested quote is missing."""
     global _last_empty_quote_batch_log
@@ -667,9 +737,10 @@ def check_momentum(engine) -> list[dict]:
     # Add symbols from open positions
     positions = db.query(Position).all()
     pos_symbols = [p.symbol for p in positions]
-    all_symbols = list(set(watchlist + pos_symbols))
+    all_symbols = list(dict.fromkeys(watchlist + pos_symbols + _get_dashboard_extra_symbols(db)))
 
     quotes = get_batch_quotes(all_symbols)
+    _persist_dashboard_quote_cache(db, quotes, now)
     if all_symbols and not quotes:
         _record_empty_quote_batch(engine, "momentum", all_symbols)
 

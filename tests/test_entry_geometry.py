@@ -40,7 +40,7 @@ def test_short_scaffold_produces_valid_executable_candidates():
     signal = {
         "symbol": "XYZ",
         "signal": "SHORT",
-        "current_price": 100.0,
+        "current_price": 100.3,
         "key_levels": {
             "support": 98.0,
             "resistance": 101.0,
@@ -66,6 +66,34 @@ def test_short_scaffold_produces_valid_executable_candidates():
         assert candidate["trigger"]
         assert candidate["invalidation_basis"]
         assert candidate["target_basis"]
+
+
+def test_short_scaffold_excludes_candidates_already_past_target():
+    signal = {
+        "symbol": "AMD",
+        "signal": "SHORT",
+        "current_price": 465.62,
+        "key_levels": {
+            "support": 464.06,
+            "resistance": 475.35,
+            "vwap": 469.64,
+            "day_high": 475.35,
+            "day_low": 464.06,
+        },
+    }
+
+    result = build_entry_geometry_scaffold(
+        signal,
+        profile_context={
+            "stop_buffer_pct": 0.002,
+            "target_multiplier": 1.5,
+            "min_risk_reward": 1.0,
+            "max_entry_distance_pct": 0.05,
+        },
+    )
+
+    assert result["status"] == "insufficient_data"
+    assert result["candidates"] == []
 
 
 def test_hold_scaffold_is_not_tradeable_and_has_no_candidates():
