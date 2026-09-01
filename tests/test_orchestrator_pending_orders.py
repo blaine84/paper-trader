@@ -26,7 +26,8 @@ from sqlalchemy import create_engine, inspect
 def _mock_main_infrastructure():
     """Patch heavyweight orchestrator infrastructure so main() runs cheaply.
 
-    Mirrors the fixture in test_orchestrator_plan_monitor.py.
+    Patches the same orchestrator infrastructure the scheduler-registration
+    tests rely on.
     """
     mock_scheduler = MagicMock()
     mock_scheduler.start.side_effect = SystemExit(0)

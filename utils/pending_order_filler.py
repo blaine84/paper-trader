@@ -1,12 +1,9 @@
 """Fill-time revalidation and execution for claimed pending limit orders.
 
-Structurally mirrors ``utils/plan_executor.py::execute_triggered_plan()``, the
-established precedent for driving ``execute_trade()`` from outside a PM cycle. It
-diverges on one point that matters: ``execute_triggered_plan()`` passes the fresh
-quote as the entry price, so the deviation tiers are harmless there. A pending
-order's limit sits deliberately away from the live price, so this caller must
-also pass ``price_authoritative=True`` — otherwise Tier 2 would repair the fill to
-the chased price and Tier 3 would refuse a legitimate crossing.
+Drives ``execute_trade()`` from outside a PM cycle. A pending order's limit sits
+deliberately away from the live price, so this caller must pass
+``price_authoritative=True`` — otherwise Tier 2 would repair the fill to the
+chased price and Tier 3 would refuse a legitimate crossing.
 
 Fail-CLOSED throughout: gates, position sizing, and ``validate_trade()`` all still
 run, and no position is created on any validation failure. The one fail-open
@@ -338,7 +335,7 @@ def _parse_signal(order: PendingOrder, session: Any) -> dict:
 
 
 def _rejecting_gate(gate_notes: Any) -> str:
-    """Extract the rejecting gate's name, matching execute_triggered_plan()."""
+    """Extract the rejecting gate's name from the gate pipeline notes."""
     if isinstance(gate_notes, list):
         for note in gate_notes:
             if isinstance(note, dict) and note.get("decision") == "reject":

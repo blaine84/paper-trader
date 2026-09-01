@@ -1,8 +1,8 @@
 """Pending limit order persistence and CAS state machine.
 
-Structural sibling of ``utils/trade_plan_registry.py``: every state transition
-is a compare-and-swap (``UPDATE ... WHERE state = :expected``) with rowcount
-verification, so two concurrent monitor ticks can never both act on one order.
+Every state transition is a compare-and-swap (``UPDATE ... WHERE state =
+:expected``) with rowcount verification, so two concurrent monitor ticks can
+never both act on one order.
 
 Permitted transitions:
 
@@ -419,8 +419,8 @@ class PendingOrderRegistry:
     def mark_canceled(self, order_id: str, reason: str) -> None:
         """PENDING|FILLING -> CANCELED.
 
-        Tries PENDING first, then FILLING, following the ``mark_missed()``
-        cascade in TradePlanRegistry. Raises if the order is already terminal.
+        Tries PENDING first, then FILLING. Raises if the order is already
+        terminal.
         """
         if reason not in CANCEL_REASONS:
             logger.warning(

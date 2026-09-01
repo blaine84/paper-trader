@@ -413,8 +413,8 @@ def _is_gap_through(
 def _to_decimal(value) -> Decimal:
     """Convert to Decimal via str, rejecting non-finite values.
 
-    ``Decimal(str(value))`` is the codebase idiom (see plan_executor), and it
-    avoids binary float artifacts that direct ``Decimal(float)`` introduces.
+    ``Decimal(str(value))`` is the codebase idiom, and it avoids the binary
+    float artifacts that direct ``Decimal(float)`` introduces.
     """
     if value is None:
         raise ValueError("Cannot convert None to Decimal")
