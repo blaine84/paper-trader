@@ -683,7 +683,7 @@ def _create_test_engine():
     return engine
 
 
-def _seed_strategy_recommendations(engine, strategies=None, timestamp=None):
+def _seed_strategy_recommendations(engine, strategies=None, timestamp=None, regime_evidence=None):
     """Seed AgentMemory with quant_researcher strategy_recommendations."""
     if strategies is None:
         strategies = [
@@ -734,6 +734,7 @@ def _seed_strategy_recommendations(engine, strategies=None, timestamp=None):
         "market_conditions_summary": "Risk-on regime with strong momentum",
         "primary_strategy": "gap_and_go",
         "regime_note": "Bullish bias across sectors",
+        "regime_evidence": regime_evidence,
         "strategies": strategies,
         "strategies_to_avoid": ["range_breakout"],
     }
@@ -958,3 +959,37 @@ class TestBuildPmStrategyContext:
 
         assert "Regime note:" in result
         assert "Bullish bias" in result
+
+    def test_regime_evidence_included_when_available(self):
+        """PM strategy context includes macro proxy evidence."""
+        engine = _create_test_engine()
+        evidence = {
+            "evidence_quality": "complete",
+            "proxies": {
+                "vix": {"symbol": "^VIX", "value": 18.0, "change_pct": -4.5},
+                "ten_year_yield": {
+                    "symbol": "^TNX",
+                    "value_pct": 4.325,
+                    "change_pct": 0.2,
+                },
+                "tech_value_ratio": {
+                    "ratio": 2.0833,
+                    "change_pct": 2.8,
+                    "symbols": ["XLK", "VLUE"],
+                },
+                "breadth_proxy": {
+                    "ratio": 0.2846,
+                    "change_pct": 0.3,
+                    "symbols": ["RSP", "SPY"],
+                },
+            },
+            "errors": {},
+        }
+        _seed_strategy_recommendations(engine, regime_evidence=evidence)
+
+        result = build_pm_strategy_context(engine)
+
+        assert "Regime evidence:" in result
+        assert "Evidence quality: complete" in result
+        assert "VIX (^VIX): 18.0" in result
+        assert "Tech/value: ratio 2.0833" in result

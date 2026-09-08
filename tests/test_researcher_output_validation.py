@@ -33,12 +33,16 @@ def _valid_result(symbols):
 
 
 @patch("agents.researcher.FinnhubClient")
+@patch("agents.researcher.build_regime_evidence")
 @patch("agents.researcher.call_llm")
-def test_retries_primary_tier_when_medium_output_omits_symbols(mock_llm, mock_client, engine):
+def test_retries_primary_tier_when_medium_output_omits_symbols(
+    mock_llm, mock_evidence, mock_client, engine
+):
     symbols = ["SPY", "AMD"]
     mock_client.return_value.get_market_news.return_value = []
     mock_client.return_value.get_news.return_value = []
     mock_client.return_value.get_quote.return_value = {}
+    mock_evidence.return_value = {"evidence_quality": "complete", "proxies": {}, "errors": {}}
     mock_llm.side_effect = [json.dumps({"analysis": "wrong shape"}), json.dumps(_valid_result(symbols))]
 
     result = researcher.run(engine, symbols)
@@ -49,15 +53,21 @@ def test_retries_primary_tier_when_medium_output_omits_symbols(mock_llm, mock_cl
     db = get_session(engine)
     rows = db.query(AgentMemory).filter_by(agent="researcher", key="sentiment").all()
     assert {row.symbol for row in rows} == set(symbols)
+    evidence = db.query(AgentMemory).filter_by(agent="researcher", key="regime_evidence").one()
+    assert json.loads(evidence.value)["evidence_quality"] == "complete"
     db.close()
 
 
 @patch("agents.researcher.FinnhubClient")
+@patch("agents.researcher.build_regime_evidence")
 @patch("agents.researcher.call_llm")
-def test_does_not_write_empty_success_when_fallback_remains_incomplete(mock_llm, mock_client, engine):
+def test_does_not_write_empty_success_when_fallback_remains_incomplete(
+    mock_llm, mock_evidence, mock_client, engine
+):
     mock_client.return_value.get_market_news.return_value = []
     mock_client.return_value.get_news.return_value = []
     mock_client.return_value.get_quote.return_value = {}
+    mock_evidence.return_value = {"evidence_quality": "missing", "proxies": {}, "errors": {}}
     mock_llm.return_value = json.dumps({"market_context": ""})
 
     with pytest.raises(ValueError, match="incomplete after fallback"):

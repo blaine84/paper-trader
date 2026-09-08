@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, date
 from typing import Optional
 from utils.llm import call_llm, parse_json_response
 from utils.case_library import query_cases, get_win_rate_by_setup, format_cases_for_prompt
+from utils.regime_evidence import format_regime_evidence_for_prompt
 from db.schema import AgentMemory, get_session
 from models.strategies import STRATEGIES, SETUP_TYPE_MAP
 from rich.console import Console
@@ -105,7 +106,12 @@ def _has_real_market_context(text: Optional[str]) -> bool:
     return bool((text or "").strip())
 
 
-def _normalize_quant_result(result: dict, market_regime: Optional[str], market_context_text: Optional[str]) -> dict:
+def _normalize_quant_result(
+    result: dict,
+    market_regime: Optional[str],
+    market_context_text: Optional[str],
+    regime_evidence: Optional[dict] = None,
+) -> dict:
     """Normalize Quant Researcher output before persistence/prompt injection."""
     if not isinstance(result, dict):
         result = {}
@@ -119,6 +125,8 @@ def _normalize_quant_result(result: dict, market_regime: Optional[str], market_c
     if inferred_regime not in {"risk_on", "risk_off", "mixed"}:
         inferred_regime = "unknown"
     result["market_regime"] = inferred_regime
+    if regime_evidence:
+        result["regime_evidence"] = regime_evidence
 
     no_regime_basis = inferred_regime == "unknown" and not _has_real_market_context(market_context_text)
     if no_regime_basis:
@@ -164,16 +172,21 @@ def _normalize_quant_result(result: dict, market_regime: Optional[str], market_c
 
 def _strategy_context_header(data: dict) -> list[str]:
     regime = data.get("market_regime", "unknown")
+    evidence_text = format_regime_evidence_for_prompt(data.get("regime_evidence"))
     if regime == "unknown":
         return [
             "Market conditions: No deterministic current market regime available.",
             "Regime note: Do not treat Quant context as a reason to globally downgrade signals to HOLD.",
+            "Regime evidence:",
+            evidence_text,
             "",
         ]
     return [
         f"Market conditions: {data.get('market_conditions_summary', '')}",
         f"Primary strategy today: {data.get('primary_strategy', '?')}",
         f"Regime note: {data.get('regime_note', '')}",
+        "Regime evidence:",
+        evidence_text,
         "",
     ]
 
@@ -382,6 +395,19 @@ def run(engine, market_regime: str = None, context: dict = None) -> dict:
     )
     market_context_text = regime_mem.value if regime_mem else "No market context available."
 
+    evidence_mem = (
+        db.query(AgentMemory)
+        .filter_by(agent="researcher", key="regime_evidence")
+        .order_by(AgentMemory.timestamp.desc())
+        .first()
+    )
+    regime_evidence = None
+    if evidence_mem:
+        try:
+            regime_evidence = json.loads(evidence_mem.value)
+        except Exception:
+            regime_evidence = None
+
     # Pull weekly briefing if available
     weekly_mem = (
         db.query(AgentMemory)
@@ -467,6 +493,9 @@ Current market regime: {market_regime or 'unknown'}
 MARKET CONTEXT (from Researcher):
 {market_context_text}
 
+MACRO REGIME EVIDENCE (from Researcher):
+{format_regime_evidence_for_prompt(regime_evidence)}
+
 WEEKLY BRIEFING:
 {json.dumps(weekly_briefing, indent=2) if weekly_briefing else 'Not available'}
 
@@ -509,7 +538,7 @@ If no new strategies are warranted, return "proposed_strategies": [].
     result = parse_json_response(raw)
     result["timestamp"] = datetime.utcnow().isoformat()
 
-    result = _normalize_quant_result(result, market_regime, market_context_text)
+    result = _normalize_quant_result(result, market_regime, market_context_text, regime_evidence)
     inferred_regime = result.get("market_regime", "unknown")
 
     # Some models return a looser schema (for example top_strategies). Normalize
@@ -540,7 +569,11 @@ If no new strategies are warranted, return "proposed_strategies": [].
         agent="quant_researcher",
         symbol=None,
         key="regime",
-        value=json.dumps({"regime": inferred_regime, "source": "quant_researcher"}),
+        value=json.dumps({
+            "regime": inferred_regime,
+            "source": "quant_researcher",
+            "regime_evidence": regime_evidence,
+        }),
     ))
     db.commit()
     db.close()

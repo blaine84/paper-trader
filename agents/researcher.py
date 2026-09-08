@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 from utils.finnhub_client import FinnhubClient
 from utils.llm import call_llm, parse_json_response
+from utils.regime_evidence import build_regime_evidence, format_regime_evidence_for_prompt
 from db.schema import AgentMemory, get_session
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ Respond in JSON format:
 {
   "market_context": "brief overall market narrative",
   "market_regime": "risk_on|risk_off|mixed|unknown",
+  "regime_evidence_summary": "brief explanation of the macro evidence behind market_regime",
   "symbols": {
     "SPY": {
       "sentiment": "bullish|bearish|neutral",
@@ -72,6 +74,9 @@ def run(engine, symbols: list[str]) -> dict:
         symbol_news[sym] = fh.get_news(sym, days=1)
         quotes[sym] = fh.get_quote(sym)
 
+    regime_evidence = build_regime_evidence()
+    regime_evidence_text = format_regime_evidence_for_prompt(regime_evidence)
+
     # Build prompt
     user_prompt = f"""
 Today is {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.
@@ -85,6 +90,9 @@ PER-SYMBOL NEWS:
 
 CURRENT QUOTES:
 {json.dumps(quotes, indent=2)}
+
+MACRO REGIME EVIDENCE:
+{regime_evidence_text}
 
 Analyze the above and return your research JSON.
 """
@@ -112,6 +120,7 @@ Analyze the above and return your research JSON.
 
     result["market_context"] = result.get("market_context", "")
     result["market_regime"] = result.get("market_regime", "unknown")
+    result["regime_evidence"] = regime_evidence
     for sym in expected_symbols:
         data = result["symbols"][sym]
         mem = AgentMemory(
@@ -129,6 +138,13 @@ Analyze the above and return your research JSON.
         value=result.get("market_context", ""),
     )
     db.add(market_mem)
+    evidence_mem = AgentMemory(
+        agent="researcher",
+        symbol=None,
+        key="regime_evidence",
+        value=json.dumps(regime_evidence),
+    )
+    db.add(evidence_mem)
     db.commit()
     db.close()
 
