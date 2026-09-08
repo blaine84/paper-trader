@@ -12,6 +12,151 @@ prompt assembly paths that need smaller token footprints.
 import json
 
 
+def _truncate_text(text: object, max_chars: int) -> str:
+    """Truncate text near a natural boundary while keeping deterministic output."""
+    value = "" if text is None else str(text).strip()
+    if len(value) <= max_chars:
+        return value
+
+    cut = value[:max_chars].rstrip()
+    boundary = max(cut.rfind("\n"), cut.rfind(". "), cut.rfind("; "), cut.rfind(", "))
+    if boundary > max_chars * 0.55:
+        cut = cut[: boundary + 1].rstrip()
+    return cut + "..."
+
+
+def compact_strategy_context_for_analyst(text: str, max_chars: int = 1400) -> str:
+    """
+    Compact Quant Researcher strategy context for Analyst prompts.
+
+    Keeps decision-useful Analyst guidance and strategy stats while omitting
+    PM guidance and verbose strategy-pipeline inventory that the Analyst cannot
+    act on directly.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "No strategy recommendations available yet."
+
+    lines = []
+    pending_analyst_guidance = None
+    saw_strategy = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("Market conditions:"):
+            lines.append("Market: " + _truncate_text(line.split(":", 1)[1], 260))
+            continue
+        if line.startswith("Primary strategy today:"):
+            lines.append(line)
+            continue
+        if line.startswith("Regime note:"):
+            # Market conditions already carries this signal in shorter form.
+            continue
+        if line.startswith("Avoid today:"):
+            lines.append(line)
+            continue
+
+        if line.startswith(("✅", "⚠️")):
+            saw_strategy = True
+            cleaned = line.replace("✅", "-").replace("⚠️", "-")
+            lines.append(cleaned)
+            pending_analyst_guidance = len(lines) - 1
+            continue
+
+        if "Analyst:" in line and pending_analyst_guidance is not None:
+            guidance = line.split("Analyst:", 1)[1].strip()
+            lines.append("  Analyst: " + _truncate_text(guidance, 150))
+            pending_analyst_guidance = None
+            continue
+
+        if line.startswith(("Agent-proposed strategies", "🔬", "📝", "📌")):
+            continue
+
+    if not saw_strategy and not lines:
+        return _truncate_text(text, max_chars)
+
+    result = "\n".join(lines)
+    return _truncate_text(result, max_chars)
+
+
+def format_cases_digest_for_analyst(cases: list[dict], max_cases: int = 2) -> str:
+    """
+    Compact case digest for Analyst prompts.
+
+    Shows only setup/regime/outcome/lesson fields that help classify setups.
+    The full case formatter is intentionally avoided because it emits many
+    low-signal columns that bloat per-symbol Analyst calls.
+    """
+    if not cases:
+        return "No relevant past cases found."
+
+    lines = []
+    for c in cases[:max_cases]:
+        symbol = c.get("symbol", "?")
+        case_date = c.get("date", "?")
+        setup_type = c.get("setup_type", "?")
+        catalyst_type = c.get("catalyst_type") or "none"
+        market_regime = c.get("market_regime") or "unknown_regime"
+        bias = c.get("bias") or "unknown_bias"
+        outcome = c.get("outcome") or "unknown_outcome"
+        pnl_pct = c.get("pnl_pct")
+        pnl_text = f"{pnl_pct}%" if pnl_pct is not None else "pnl n/a"
+
+        header = (
+            f"[{case_date} {symbol}] setup={setup_type}; catalyst={catalyst_type}; "
+            f"regime={market_regime}; bias={bias}; outcome={outcome} ({pnl_text})"
+        )
+        lines.append(header)
+
+        lesson = c.get("lesson")
+        if lesson:
+            lines.append("  lesson: " + _truncate_text(lesson, 180))
+
+        avoid = c.get("conditions_to_avoid") or []
+        if isinstance(avoid, str):
+            try:
+                avoid = json.loads(avoid)
+            except (json.JSONDecodeError, TypeError):
+                avoid = [avoid] if avoid else []
+        if avoid:
+            lines.append("  avoid: " + _truncate_text("; ".join(map(str, avoid[:2])), 180))
+
+    return "\n".join(lines)
+
+
+def compact_historical_advisory_for_analyst(
+    selection_feedback: str,
+    meta_recommendations: str,
+    feedback_loop: str,
+    max_chars: int = 1000,
+) -> str:
+    """Merge historical advisory sections into one capped Analyst block."""
+    sections = []
+    for label, value in (
+        ("Selection", selection_feedback),
+        ("Meta", meta_recommendations),
+        ("Feedback loop", feedback_loop),
+    ):
+        value = (value or "").strip()
+        if not value or value == "None.":
+            continue
+        sections.append(f"{label}: {_truncate_text(value, 520)}")
+
+    if not sections:
+        return "None."
+    return _truncate_text("\n\n".join(sections), max_chars)
+
+
+ANALYST_COMPACT_CONTEXT_BOUNDARY = (
+    "CONTEXT BOUNDARY: Historical review/meta/case content is historical lessons "
+    "only. Treat quote, indicators, MTF context, freshness, and breaking news as "
+    "current evidence; do not use facts as blockers unless they also appear in "
+    "the current evidence sections."
+)
+
+
 def format_cases_digest_for_pm(cases: list[dict]) -> str:
     """
     Compact case digest for PM entry prompts.

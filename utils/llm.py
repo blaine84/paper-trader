@@ -272,6 +272,14 @@ def _call_anthropic(system_prompt: str, user_prompt: str, model: str = None) -> 
         if response.stop_reason == "max_tokens" and max_tokens < 16384:
             log.warning(f"Anthropic response truncated at {max_tokens} tokens, retrying with {max_tokens * 2}")
             continue
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            log.info(
+                "Anthropic usage: model=%s input_tokens=%s output_tokens=%s",
+                model,
+                getattr(usage, "input_tokens", None),
+                getattr(usage, "output_tokens", None),
+            )
         return response.content[0].text
 
     log.error("Anthropic response truncated even at max tokens")

@@ -11,7 +11,11 @@ Tests each helper function in utils/prompt_compaction.py:
 """
 
 from utils.prompt_compaction import (
+    ANALYST_COMPACT_CONTEXT_BOUNDARY,
+    compact_historical_advisory_for_analyst,
+    compact_strategy_context_for_analyst,
     format_cases_digest_for_pm,
+    format_cases_digest_for_analyst,
     compact_signal_for_pm,
     compact_daily_log_for_narrator,
     compact_case_trends_for_narrator,
@@ -242,6 +246,76 @@ class TestFormatCasesDigestForPm:
         assert "gap_and_go" in result
         assert "success" in result
         assert "2.5" in result
+
+
+# ===========================================================================
+# Tests for Analyst prompt compaction helpers
+# ===========================================================================
+
+class TestAnalystPromptCompaction:
+    """Analyst-specific helpers keep live prompts compact and decision-useful."""
+
+    def test_strategy_context_keeps_analyst_guidance_not_pm_guidance(self):
+        strategy_context = """
+Market conditions: Risk-on regime with fragile breadth and rising yields that make weak breakouts vulnerable.
+Primary strategy today: gap_and_go
+Regime note: Risk-on but mixed.
+
+⚠️ Gap and Go (fit: 8.5/10, internal: 60% over 103 cases)
+   → Analyst: Require fresh catalyst and strong premarket volume before issuing a long.
+   → PM: Size down and monitor exits.
+⚠️ Sector Rotation (fit: 8.0/10, internal: 48% over 35 cases)
+   → Analyst: Confirm sector breadth before treating the move as rotation.
+   → PM: Use smaller sizing.
+
+Agent-proposed strategies (in pipeline):
+  🔬 Example Pipeline Strategy (example) — long experimental text [pending, 0 trades]
+Avoid today: catalyst-free tech breakouts
+"""
+        result = compact_strategy_context_for_analyst(strategy_context, max_chars=700)
+
+        assert len(result) <= 703  # allow trailing ellipsis
+        assert "Gap and Go" in result
+        assert "Sector Rotation" in result
+        assert "Analyst:" in result
+        assert "PM:" not in result
+        assert "Agent-proposed strategies" not in result
+        assert "Avoid today" in result
+
+    def test_cases_digest_for_analyst_uses_structured_summary(self):
+        cases = [_make_case(0), _make_case(1), _make_case(2)]
+        result = format_cases_digest_for_analyst(cases, max_cases=2)
+
+        assert cases[0]["symbol"] in result
+        assert cases[0]["setup_type"] in result
+        assert cases[0]["market_regime"] in result
+        assert "lesson:" in result
+        assert "avoid:" in result
+        assert cases[2]["symbol"] not in result
+        assert "premarket_volume_rank" not in result
+        assert "above_daily_resistance" not in result
+
+    def test_historical_advisory_for_analyst_is_capped(self):
+        selection = "Selection: " + ("technical-only risk_off warning. " * 80)
+        meta = "Meta: " + ("quota and invalidation recommendation. " * 80)
+        feedback = "Feedback loop: " + ("active mitigation reminder. " * 80)
+
+        result = compact_historical_advisory_for_analyst(
+            selection,
+            meta,
+            feedback,
+            max_chars=900,
+        )
+
+        assert len(result) <= 903
+        assert "Selection:" in result
+        assert "Meta:" in result
+        assert "Feedback loop:" in result or result.endswith("...")
+
+    def test_compact_context_boundary_preserves_evidence_rule(self):
+        assert "Historical" in ANALYST_COMPACT_CONTEXT_BOUNDARY
+        assert "current evidence" in ANALYST_COMPACT_CONTEXT_BOUNDARY
+        assert len(ANALYST_COMPACT_CONTEXT_BOUNDARY) < 260
 
 
 # ===========================================================================

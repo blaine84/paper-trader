@@ -34,6 +34,12 @@ from feedback_loop.analyst_feedback import (
     process_pending_feedback,
     write_feedback_health_status,
 )
+from utils.prompt_compaction import (
+    ANALYST_COMPACT_CONTEXT_BOUNDARY,
+    compact_historical_advisory_for_analyst,
+    compact_strategy_context_for_analyst,
+    format_cases_digest_for_analyst,
+)
 from utils.trigger_status import compute_trigger_status
 from utils.symbol_class import classify_symbol, validate_setup_for_symbol
 from utils.gate_config import MARKET_STATE_MODE
@@ -1575,7 +1581,7 @@ def run(engine, symbols: list[str], *, cycle_id: str | None = None) -> dict:
                 "bias": "long" if indicators.get("trend") == "bullish" else "short",
             }
             relevant_cases = get_relevant_cases(engine, case_context, limit=3)
-            cases_text = format_cases_for_prompt(relevant_cases)
+            cases_text = format_cases_digest_for_analyst(relevant_cases)
 
             # --- Catalyst freshness: query breaking news (isolated) ---
             breaking_alerts = []
@@ -1642,6 +1648,12 @@ CATALYST FRESHNESS:
             safe_meta_recommendations = sanitize_historical_context_for_prompt(meta_text)
             safe_cases_text = sanitize_historical_context_for_prompt(cases_text)
             safe_feedback_context = sanitize_historical_context_for_prompt(feedback_context)
+            historical_advisory_context = compact_historical_advisory_for_analyst(
+                safe_selection_feedback,
+                safe_meta_recommendations if meta_text else "",
+                safe_feedback_context,
+            )
+            compact_strategy_context = compact_strategy_context_for_analyst(strategy_context)
 
             user_prompt = f"""
 Symbol: {sym}
@@ -1650,11 +1662,8 @@ Time: {datetime.now(dt_tz.utc).strftime('%Y-%m-%d %H:%M UTC')}
 VALID SETUP TYPES (use one of these):
 {', '.join(valid_setups)}
 
-SELECTION FEEDBACK (historical advisory only — not current evidence):
-{safe_selection_feedback}
-
-META-REVIEWER RECOMMENDATIONS (historical advisory only — not current evidence):
-{safe_meta_recommendations if meta_text else 'None yet'}
+HISTORICAL ADVISORY CONTEXT (not current evidence):
+{historical_advisory_context}
 
 CURRENT QUOTE:
 {json.dumps(quote, indent=2)}
@@ -1669,19 +1678,17 @@ TECHNICAL INDICATORS:
 DETERMINISTIC TECHNICAL SANITY CHECK:
 {deterministic_precheck_context}
 
-{ANALYST_CONTEXT_BOUNDARY}
+{ANALYST_COMPACT_CONTEXT_BOUNDARY}
 
 RESEARCH SENTIMENT:
 {json.dumps(sentiment, indent=2)}
 
 STRATEGY RECOMMENDATIONS (from Quant Researcher):
-{strategy_context}
+{compact_strategy_context}
 
 RELEVANT PAST CASES (historical advisory only — not current evidence):
 {safe_cases_text}
 
-ANALYST FEEDBACK LOOP (structured advisory only — not current evidence):
-{safe_feedback_context}
 {freshness_context}
 Produce your trading signal JSON for {sym}.
 """
