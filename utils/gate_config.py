@@ -73,6 +73,30 @@ MIN_ROLLING_CASES: int = 3
 CONSECUTIVE_LOSS_PAUSE_THRESHOLD: int = 3
 CONSECUTIVE_LOSS_PAUSE_EXEMPT_SETUPS: set[str] = {"gap_and_go"}
 
+# Macro regime guardrail. These are technical/catalyst-light long-biased setup
+# families that should not enter when the analyst has explicitly called the
+# tape defensive/risk-off unless there is an actual catalyst attached.
+HOSTILE_MARKET_REGIMES: set[str] = {"risk_off", "defensive", "bearish"}
+HOSTILE_REGIME_TECHNICAL_ONLY_SETUPS: set[str] = {
+    "technical_breakout",
+    "sector_rotation",
+    "sector_rotation_swing",
+    "breakout_continuation",
+    "pullback_continuation",
+}
+NON_CATALYST_VALUES: set[str] = {
+    "",
+    "none",
+    "null",
+    "unknown",
+    "technical",
+    "technical_only",
+    "technical-only",
+}
+HOSTILE_REGIME_CONFIRMATION_SIZE_MULTIPLIER: float = 0.50
+HOSTILE_REGIME_STRONG_VOLUME_RATIO: float = 1.50
+HOSTILE_REGIME_AGGRESSIVE_PROBE_VOLUME_RATIO: float = 1.25
+
 # Recovery override
 # Recovery evaluates the configured rolling window, so this minimum must be
 # attainable within that window.

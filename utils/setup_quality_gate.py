@@ -3,12 +3,13 @@
 Evaluates whether a setup type should be allowed based on case-library
 performance.  Uses a deterministic first-match-wins evaluation chain:
 
-1. Insufficient data → allow
-2. Consecutive losses → warn
-3. Historical underperformance (with recovery override check) → reject / allow
-4. Rolling underperformance → profile-aware (reduce_size / reject)
-5. Weak but allowed → downgrade
-6. Otherwise → allow
+1. Hostile macro regime with technical-only setup → require stronger confirmation / reduce size
+2. Insufficient data → allow
+3. Consecutive losses → warn
+4. Historical underperformance (with recovery override check) → reject / allow
+5. Rolling underperformance → profile-aware (reduce_size / reject)
+6. Weak but allowed → downgrade
+7. Otherwise → allow
 
 All thresholds are imported from ``utils/gate_config`` — no hardcoded
 constants in this module.
@@ -30,11 +31,17 @@ from utils.gate_config import (
     DEFAULT_MIN_WIN_RATE,
     DEFAULT_MIN_WIN_RATE_BY_PROFILE,
     GATE_EVENT_TYPES,
+    HOSTILE_REGIME_AGGRESSIVE_PROBE_VOLUME_RATIO,
+    HOSTILE_REGIME_CONFIRMATION_SIZE_MULTIPLIER,
+    HOSTILE_REGIME_STRONG_VOLUME_RATIO,
+    HOSTILE_MARKET_REGIMES,
+    HOSTILE_REGIME_TECHNICAL_ONLY_SETUPS,
     MIN_CASES_FOR_BLOCK,
     MIN_ROLLING_CASES,
     MIN_WIN_RATE_BY_SETUP,
     MIN_WIN_RATE_BY_SETUP_PROFILE,
     NEAR_MISS_MARGIN_PCT,
+    NON_CATALYST_VALUES,
     OVERRIDE_MIN_CONFIDENCE_SCORE,
     RECOVERY_MIN_ROLLING_CASES,
     RECOVERY_WIN_RATE_MARGIN,
@@ -120,6 +127,95 @@ def _resolve_threshold(setup_type: str, profile: str | None) -> float:
     if profile_key and profile_key in DEFAULT_MIN_WIN_RATE_BY_PROFILE:
         return float(DEFAULT_MIN_WIN_RATE_BY_PROFILE[profile_key])
     return float(MIN_WIN_RATE_BY_SETUP.get(setup_type, DEFAULT_MIN_WIN_RATE))
+
+
+def _normalize_token(value: str | None) -> str:
+    """Normalize classifier labels for deterministic gate comparisons."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _has_actionable_catalyst(catalyst_type: str | None) -> bool:
+    """Return True when catalyst_type names more than technical price action."""
+    return _normalize_token(catalyst_type) not in NON_CATALYST_VALUES
+
+
+def _is_hostile_regime_technical_only_entry(
+    setup_type: str,
+    market_regime: str | None,
+    catalyst_type: str | None,
+) -> bool:
+    """Block catalyst-free technical entries in defensive/risk-off tape."""
+    return (
+        _normalize_token(setup_type) in HOSTILE_REGIME_TECHNICAL_ONLY_SETUPS
+        and _normalize_token(market_regime) in HOSTILE_MARKET_REGIMES
+        and not _has_actionable_catalyst(catalyst_type)
+    )
+
+
+def _numeric_confidence_from_labels(
+    confidence_score: float | None,
+    signal_confidence: str | None,
+) -> float | None:
+    """Return a 0-10 confidence score from explicit score or analyst label."""
+    if confidence_score is not None:
+        return confidence_score
+    label = _normalize_token(signal_confidence)
+    if label == "high":
+        return 8.0
+    if label == "medium":
+        return 6.0
+    if label == "low":
+        return 3.0
+    return None
+
+
+def _hostile_regime_confirmation_signals(
+    *,
+    profile: str | None,
+    confidence_score: float | None,
+    signal_strength: str | None,
+    signal_confidence: str | None,
+    price_above_vwap: bool | None,
+    volume_ratio: float | None,
+) -> list[str]:
+    """Identify confirmation that justifies a reduced-size counter-regime probe."""
+    profile_key = _normalize_token(profile)
+    strength = _normalize_token(signal_strength)
+    confidence_value = _numeric_confidence_from_labels(confidence_score, signal_confidence)
+    confirms: list[str] = []
+
+    strong_directional_read = strength == "strong" or (
+        confidence_value is not None and confidence_value >= 8.0
+    )
+    strong_market_confirmation = (
+        price_above_vwap is True
+        and volume_ratio is not None
+        and volume_ratio >= HOSTILE_REGIME_STRONG_VOLUME_RATIO
+    )
+    if strong_directional_read and strong_market_confirmation:
+        confirms.append(
+            f"strong signal with VWAP/volume confirmation "
+            f"(volume_ratio={volume_ratio:.2f})"
+        )
+
+    aggressive_probe_confirmation = (
+        profile_key == "aggressive"
+        and strength in {"moderate", "strong"}
+        and (confidence_value is None or confidence_value >= 6.0)
+        and (
+            price_above_vwap is True
+            or (
+                volume_ratio is not None
+                and volume_ratio >= HOSTILE_REGIME_AGGRESSIVE_PROBE_VOLUME_RATIO
+            )
+        )
+    )
+    if aggressive_probe_confirmation:
+        confirms.append("aggressive profile probe with moderate+ confirmation")
+
+    return confirms
 
 
 def _check_recovery_override(
@@ -420,6 +516,8 @@ def evaluate_setup_quality(
     profile: str | None = None,
     agent: str = "portfolio_manager",
     confidence_score: float | None = None,
+    signal_strength: str | None = None,
+    signal_confidence: str | None = None,
     catalyst_type: str | None = None,
     price_above_vwap: bool | None = None,
     volume_ratio: float | None = None,
@@ -432,14 +530,15 @@ def evaluate_setup_quality(
     performance.
 
     Evaluation order (first match wins):
-    1. Insufficient data (< MIN_CASES_FOR_BLOCK) → allow
-    2. Consecutive losses (>= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) → warn
-    3. Historical underperformance (all-time WR < threshold) → warn
+    1. Hostile macro regime with technical-only setup and no catalyst → reduce_size with strong confirmation, else reject
+    2. Insufficient data (< MIN_CASES_FOR_BLOCK) → allow
+    3. Consecutive losses (>= CONSECUTIVE_LOSS_PAUSE_THRESHOLD) → warn
+    4. Historical underperformance (all-time WR < threshold) → warn
        UNLESS recovery override criteria are met → allow
        UNLESS near-miss pilot override applies (moderate profile only) → reduce_size
-    4. Rolling underperformance (rolling WR < threshold, >= MIN_ROLLING_CASES) → profile-aware
-    5. Weak but allowed (WR >= threshold but < 50%) → downgrade
-    6. Otherwise → allow
+    5. Rolling underperformance (rolling WR < threshold, >= MIN_ROLLING_CASES) → profile-aware
+    6. Weak but allowed (WR >= threshold but < 50%) → downgrade
+    7. Otherwise → allow
 
     Args:
         engine: SQLAlchemy engine for case library queries
@@ -450,6 +549,8 @@ def evaluate_setup_quality(
         profile: Optional PM profile for event logging context
         agent: Agent name for event logging (default: "portfolio_manager")
         confidence_score: Optional confidence score for near-miss pilot evaluation
+        signal_strength: Optional analyst strength label for hostile-regime probe evaluation
+        signal_confidence: Optional analyst confidence label for hostile-regime probe evaluation
         catalyst_type: Optional catalyst type for near-miss pilot evaluation
         price_above_vwap: Optional VWAP indicator for near-miss pilot evaluation
         volume_ratio: Optional volume ratio for near-miss pilot evaluation
@@ -537,10 +638,51 @@ def evaluate_setup_quality(
             "sample_size": sample_size,
             "rolling_sample_size": rolling_sample_size,
             "threshold": threshold,
+            "market_regime": market_regime,
+            "catalyst_type": catalyst_type,
+            "signal_strength": signal_strength,
+            "signal_confidence": signal_confidence,
             "reason": reason,
         }
 
-    # 1. Insufficient data ------------------------------------------------
+    # 1. Hostile macro regime for catalyst-free technical setups -----------
+    if _is_hostile_regime_technical_only_entry(
+        setup_type=setup_type,
+        market_regime=market_regime,
+        catalyst_type=catalyst_type,
+    ):
+        confirming_signals = _hostile_regime_confirmation_signals(
+            profile=profile,
+            confidence_score=confidence_score,
+            signal_strength=signal_strength,
+            signal_confidence=signal_confidence,
+            price_above_vwap=price_above_vwap,
+            volume_ratio=volume_ratio,
+        )
+        if confirming_signals:
+            result = {
+                **_result(
+                    "reduce_size",
+                    "hostile_regime_confirmation_probe",
+                    f"Setup '{setup_type}' in {market_regime} regime has no "
+                    "actionable catalyst, but confirmation supports a reduced-size probe.",
+                ),
+                "size_multiplier": HOSTILE_REGIME_CONFIRMATION_SIZE_MULTIPLIER,
+                "confirming_signals": confirming_signals,
+            }
+            _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
+            return result
+
+        result = _result(
+            "reject",
+            "hostile_regime_technical_only",
+            f"Setup '{setup_type}' rejected: {market_regime} regime requires "
+            "stronger confirmation for technical-only/catalyst-free entries.",
+        )
+        _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
+        return result
+
+    # 2. Insufficient data ------------------------------------------------
     if sample_size < p_min_cases_for_block:
         result = _result(
             "allow",
@@ -551,7 +693,7 @@ def evaluate_setup_quality(
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
-    # 2. Consecutive losses -----------------------------------------------
+    # 3. Consecutive losses -----------------------------------------------
     if (
         setup_type not in CONSECUTIVE_LOSS_PAUSE_EXEMPT_SETUPS
         and _check_consecutive_losses(cases, p_consecutive_loss_pause)
@@ -565,7 +707,7 @@ def evaluate_setup_quality(
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
-    # 3. Historical underperformance (with recovery check) ----------------
+    # 4. Historical underperformance (with recovery check) ----------------
     if win_rate is not None and win_rate < threshold:
         # Check recovery override (policy-aware)
         recovery_met = False
@@ -656,7 +798,7 @@ def evaluate_setup_quality(
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
-    # 4. Rolling underperformance — PROFILE-AWARE
+    # 5. Rolling underperformance — PROFILE-AWARE
     if (
         rolling_wr is not None
         and rolling_sample_size >= p_min_rolling_cases
@@ -678,7 +820,7 @@ def evaluate_setup_quality(
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
-    # 5. Weak but allowed -------------------------------------------------
+    # 6. Weak but allowed -------------------------------------------------
     if win_rate is not None and win_rate < 0.50:
         result = _result(
             "downgrade",
@@ -689,7 +831,7 @@ def evaluate_setup_quality(
         _log_gate_event(db, result, symbol=symbol, profile=profile, agent=agent, event_sink=event_sink)
         return result
 
-    # 6. Pass — all checks cleared ----------------------------------------
+    # 7. Pass — all checks cleared ----------------------------------------
     result = _result(
         "allow",
         "pass",

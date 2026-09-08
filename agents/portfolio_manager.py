@@ -2882,6 +2882,8 @@ def _run_gate_pipeline(db, engine, decision, signal, profile_id):
             engine, db, setup_type, market_regime,
             symbol=symbol, profile=profile_id,
             confidence_score=confidence_score,
+            signal_strength=signal.get("strength") if signal else decision.get("strength"),
+            signal_confidence=signal.get("confidence") if signal else decision.get("confidence"),
             catalyst_type=catalyst_type,
             price_above_vwap=price_above_vwap,
             volume_ratio=volume_ratio,

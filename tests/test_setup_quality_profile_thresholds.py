@@ -198,3 +198,119 @@ def test_recovery_override_can_fire_with_the_configured_rolling_window():
     assert result["rolling_sample_size"] == 5
     assert result["decision"] == "allow"
     assert result["reason_type"] == "recovery_override"
+
+
+def test_technical_breakout_rejected_in_risk_off_without_catalyst():
+    engine, db = _engine_and_session()
+
+    result = evaluate_setup_quality(
+        engine,
+        db,
+        "technical_breakout",
+        market_regime="risk_off",
+        profile="aggressive",
+        symbol="META",
+    )
+
+    assert result["decision"] == "reject"
+    assert result["canonical_decision"] == "reject"
+    assert result["reason_type"] == "hostile_regime_technical_only"
+    assert result["market_regime"] == "risk_off"
+    assert result["catalyst_type"] is None
+
+
+def test_aggressive_technical_breakout_in_risk_off_can_probe_with_confirmation():
+    engine, db = _engine_and_session()
+
+    result = evaluate_setup_quality(
+        engine,
+        db,
+        "technical_breakout",
+        market_regime="risk_off",
+        profile="aggressive",
+        symbol="META",
+        signal_strength="moderate",
+        signal_confidence="medium",
+        price_above_vwap=True,
+        volume_ratio=1.30,
+    )
+
+    assert result["decision"] == "reduce_size"
+    assert result["canonical_decision"] == "reduce_size"
+    assert result["reason_type"] == "hostile_regime_confirmation_probe"
+    assert result["size_multiplier"] == 0.50
+    assert any("aggressive profile probe" in item for item in result["confirming_signals"])
+
+
+def test_moderate_technical_breakout_in_risk_off_needs_stronger_confirmation():
+    engine, db = _engine_and_session()
+
+    result = evaluate_setup_quality(
+        engine,
+        db,
+        "technical_breakout",
+        market_regime="risk_off",
+        profile="moderate",
+        symbol="META",
+        signal_strength="strong",
+        signal_confidence="high",
+        price_above_vwap=True,
+        volume_ratio=1.60,
+    )
+
+    assert result["decision"] == "reduce_size"
+    assert result["reason_type"] == "hostile_regime_confirmation_probe"
+    assert result["size_multiplier"] == 0.50
+    assert any("VWAP/volume confirmation" in item for item in result["confirming_signals"])
+
+
+def test_technical_breakout_with_catalyst_uses_existing_history_logic():
+    engine, db = _engine_and_session()
+
+    result = evaluate_setup_quality(
+        engine,
+        db,
+        "technical_breakout",
+        market_regime="risk_off",
+        catalyst_type="earnings",
+        profile="aggressive",
+        symbol="META",
+    )
+
+    assert result["decision"] == "allow"
+    assert result["reason_type"] == "insufficient_data"
+    assert result["market_regime"] == "risk_off"
+    assert result["catalyst_type"] == "earnings"
+
+
+def test_defensive_sector_rotation_swing_rejected_without_catalyst():
+    engine, db = _engine_and_session()
+
+    result = evaluate_setup_quality(
+        engine,
+        db,
+        "sector_rotation_swing",
+        market_regime="defensive",
+        catalyst_type="technical_only",
+        profile="moderate",
+        symbol="NVDA",
+    )
+
+    assert result["decision"] == "reject"
+    assert result["reason_type"] == "hostile_regime_technical_only"
+
+
+def test_risk_off_macro_short_not_blocked_by_hostile_regime_filter():
+    engine, db = _engine_and_session()
+
+    result = evaluate_setup_quality(
+        engine,
+        db,
+        "risk_off_macro_short",
+        market_regime="risk_off",
+        profile="moderate",
+        symbol="QQQ",
+    )
+
+    assert result["decision"] == "allow"
+    assert result["reason_type"] == "insufficient_data"
