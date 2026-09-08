@@ -219,6 +219,20 @@ class TestKeyLevelProximity:
         assert score == 1.0
         assert results[0].met is True
 
+    def test_scalar_level_value_is_supported(self):
+        """Live analyst payloads may store a single support/resistance as a scalar."""
+        conds = _mat_conds({
+            "type": "key_level_proximity",
+            "params": {"level_type": "resistance", "within_pct": 1.0},
+            "weight": 1.0,
+        })
+        ctx = _market_context(current_price=155.0, key_levels={"support": 145.0, "resistance": 155.0})
+
+        score, results = evaluate_maturation_conditions(conds, ctx)
+
+        assert score == 1.0
+        assert results[0].met is True
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Test 3: price_breach triggers on correct side only (Decimal)

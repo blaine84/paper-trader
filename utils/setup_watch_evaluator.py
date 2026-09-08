@@ -468,6 +468,9 @@ def _handle_key_level_proximity(params: dict, ctx: dict) -> tuple[bool, str | No
     if threshold_pct is None:
         return False, "invalid numeric values"
 
+    if not isinstance(levels_raw, list):
+        levels_raw = [levels_raw]
+
     levels = []
     for lv in levels_raw:
         parsed = _safe_decimal(lv)
