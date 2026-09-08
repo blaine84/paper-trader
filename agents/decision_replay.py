@@ -195,6 +195,14 @@ def run(
     if mode not in ("batch", "adhoc"):
         raise ValueError(f"Unsupported mode: {mode!r}. Must be 'batch' or 'adhoc'.")
 
+    if candidate_policy is not None:
+        is_valid, missing_fields = validate_candidate_policy(candidate_policy)
+        if not is_valid:
+            raise ValueError(
+                f"Candidate policy is incomplete. Missing or ambiguous fields: "
+                f"{', '.join(missing_fields)}"
+            )
+
     # --- Step 1b: Market-hours enforcement for ad-hoc mode (Requirement 10.4) ---
     if mode == "adhoc" and _is_market_hours():
         if not operator_override:
@@ -230,14 +238,6 @@ def run(
             duration_seconds=(ended_at - started_at).total_seconds(),
             status="blocked_market_hours",
         )
-
-    if candidate_policy is not None:
-        is_valid, missing_fields = validate_candidate_policy(candidate_policy)
-        if not is_valid:
-            raise ValueError(
-                f"Candidate policy is incomplete. Missing or ambiguous fields: "
-                f"{', '.join(missing_fields)}"
-            )
 
     # Ensure replay schema is initialized
     init_replay_db(engine)
