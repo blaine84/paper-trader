@@ -47,8 +47,14 @@ CREATE TABLE IF NOT EXISTS pm_raw_responses (
 )
 """
 
+_PM_RAW_RESPONSES_INDEX_MIGRATIONS = [
+    # Older builds keyed raw responses by cycle+attempt only, which collides
+    # when conservative/moderate/aggressive all run in the same cycle.
+    "DROP INDEX IF EXISTS ux_raw_resp_cycle_attempt",
+]
+
 _PM_RAW_RESPONSES_INDEXES = [
-    "CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_resp_cycle_attempt ON pm_raw_responses(pm_cycle_id, attempt_ordinal)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_resp_profile_cycle_attempt ON pm_raw_responses(profile, pm_cycle_id, attempt_ordinal)",
     "CREATE INDEX IF NOT EXISTS ix_raw_resp_profile_ts ON pm_raw_responses(profile, timestamp)",
 ]
 
@@ -223,6 +229,8 @@ def init_provenance_schema(engine) -> None:
     with engine.connect() as conn:
         # --- pm_raw_responses ---
         conn.execute(text(_PM_RAW_RESPONSES_DDL))
+        for idx_sql in _PM_RAW_RESPONSES_INDEX_MIGRATIONS:
+            conn.execute(text(idx_sql))
         for idx_sql in _PM_RAW_RESPONSES_INDEXES:
             conn.execute(text(idx_sql))
 

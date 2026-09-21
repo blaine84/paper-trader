@@ -5103,6 +5103,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
             parse_decision_contract,
             should_retry_candidate_contract,
             build_candidate_retry_prompt,
+            force_missing_candidate_rejections,
         )
         from utils.candidate_pipeline import execute_candidate_pipeline, dry_run_candidate_pipeline, _write_candidate_event
 
@@ -5414,6 +5415,7 @@ def run_profile(engine, symbols: list[str], profile_id: str, tier: str = "high",
                 parse_result = parse_decision_contract(
                     raw_response, registry.get_registered_ids(), candidate_metadata
                 )
+            parse_result = force_missing_candidate_rejections(parse_result)
 
             # Record PM decisions for audit (Requirements 12.2, 12.4)
             if PM_PROVENANCE_MODE != "disabled" and _prov_raw_response_obj is not None:

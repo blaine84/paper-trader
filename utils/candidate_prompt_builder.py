@@ -127,6 +127,9 @@ def build_candidate_pm_prompt(
 You are selecting from the candidates above by their candidate_id ONLY.
 
 For each candidate, decide: accept (take the trade) or reject (pass on it).
+Every candidate shown above must appear exactly once in decisions[].
+If you do not want to trade a candidate, return a reject decision for that candidate
+with a concrete rationale from the data provided.
 
 {rejection_guidance}
 
@@ -137,7 +140,7 @@ Rules:
 - The table above is the complete executable candidate set; Entry, Stop, Target, R:R, Setup, Trigger, Invalidation, and Target Basis are already provided by the deterministic scaffold
 - Do NOT reject a candidate because setup data, entry, stop, target, risk/reward, trigger, invalidation, or target basis is missing
 - Use the MTF column as shared Analyst context: it summarizes 5m/60m/daily trend, relative strength, volume, and directional alignment
-- An empty accepted set is a valid response — passing on all candidates is acceptable
+- Passing on all candidates is acceptable, but do it by rejecting each candidate with a rationale
 - If you accept a candidate, you may optionally specify a risk_multiplier (0.01 to 1.0) to reduce position size
 - If you reject a candidate, cite concrete portfolio, timing, exposure, confidence, or market-quality criteria from your PM profile
 
@@ -247,8 +250,11 @@ def build_decision_schema(candidate_ids: set[str]) -> dict:
                             "type": "string",
                             "maxLength": 280,
                         },
+                        "rejection_reason_code": {
+                            "type": "string",
+                        },
                     },
-                    "required": ["candidate_id", "decision"],
+                    "required": ["candidate_id", "decision", "rationale"],
                     "additionalProperties": False,
                 },
             },

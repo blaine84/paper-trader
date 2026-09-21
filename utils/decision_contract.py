@@ -31,6 +31,7 @@ VALID_REJECTION_REASON_CODES: frozenset[str] = frozenset({
     "exposure_conflict",
     "liquidity_or_spread",
     "event_risk",
+    "missing_pm_decision",
     "other",
 })
 
@@ -52,6 +53,11 @@ _PROHIBITED_FIELDS = {
 # Benign explanatory fields that some models add despite the contract.
 # Strip them quietly so execution warnings stay focused on actionable issues.
 _IGNORED_CONTEXT_FIELDS = {"symbol_context"}
+
+MISSING_PM_DECISION_RATIONALE = (
+    "PM response omitted this offered candidate instead of accepting or "
+    "rejecting it with a rationale."
+)
 
 
 @dataclass
@@ -423,8 +429,36 @@ def parse_decision_contract(
     # Step 8: Compute not_selected_ids
     # All valid IDs that were not mentioned at all (including in duplicates/invalid)
     result.not_selected_ids = valid_candidate_ids - mentioned_ids
+    if result.not_selected_ids:
+        result.violations.append(
+            {
+                "type": "MISSING_CANDIDATE_DECISION",
+                "candidate_ids": sorted(result.not_selected_ids),
+                "reason": "PM response must accept or reject every offered candidate",
+            }
+        )
 
     return result
+
+
+def force_missing_candidate_rejections(parse_result: ParseResult) -> ParseResult:
+    """Convert omitted candidates into explicit rejection decisions.
+
+    This is applied after the one allowed contract retry. It preserves the
+    audit signal that the PM failed to provide a rationale while ensuring
+    downstream state no longer lands in the vague NOT_SELECTED bucket.
+    """
+    for candidate_id in sorted(parse_result.not_selected_ids):
+        parse_result.rejected.append(
+            CandidateDecision(
+                candidate_id=candidate_id,
+                decision="reject",
+                rationale=MISSING_PM_DECISION_RATIONALE,
+                rejection_reason_code="missing_pm_decision",
+            )
+        )
+    parse_result.not_selected_ids.clear()
+    return parse_result
 
 
 def should_retry_candidate_contract(parse_result: ParseResult) -> bool:
@@ -441,6 +475,13 @@ def should_retry_candidate_contract(parse_result: ParseResult) -> bool:
 
     Returns True if retry is warranted, False otherwise.
     """
+    missing_candidate_decision = any(
+        v.get("type") == "MISSING_CANDIDATE_DECISION"
+        for v in parse_result.violations
+    )
+    if missing_candidate_decision:
+        return True
+
     # If there are any accepted, rejected, or adjusted decisions, the response had
     # some valid content — no retry needed
     if parse_result.accepted or parse_result.rejected or parse_result.adjusted:
@@ -497,6 +538,15 @@ def build_candidate_retry_prompt(
             error_descriptions.append("Invalid decision value (must be 'accept', 'reject', or 'adjust')")
         elif vtype == "INVALID_RISK_MULTIPLIER":
             error_descriptions.append("Invalid risk_multiplier (must be > 0.0 and <= 1.0)")
+        elif vtype == "MISSING_CANDIDATE_DECISION":
+            missing_ids = v.get("candidate_ids") or []
+            if missing_ids:
+                error_descriptions.append(
+                    "Missing accept/reject decision for candidate_id(s): "
+                    + ", ".join(str(cid) for cid in missing_ids[:10])
+                )
+            else:
+                error_descriptions.append("Missing accept/reject decisions for offered candidates")
         else:
             error_descriptions.append(f"Contract violation: {vtype}")
 
@@ -511,10 +561,12 @@ def build_candidate_retry_prompt(
         "Please provide a corrected response using ONLY these valid candidate IDs:\n"
         f"{id_list}\n\n"
         "Requirements:\n"
+        "- Include every listed candidate_id exactly once with decision 'accept', 'reject', or 'adjust'\n"
+        "- Reject any candidate you do not want to trade, and include a concrete rationale\n"
         "- Each decision must have: candidate_id, decision ('accept', 'reject', or 'adjust')\n"
         "- Optional: risk_multiplier (number > 0.0 and <= 1.0), rationale (string), adjustment_request (dict with 'type' key)\n"
         "- Response format: {\"decisions\": [{\"candidate_id\": \"...\", \"decision\": \"accept\"|\"reject\"|\"adjust\"}]}\n"
-        "- An empty decisions list [] is a valid response (no trades is acceptable)\n"
+        "- Do not return an empty decisions list when candidate IDs are listed; pass by rejecting each candidate with rationale\n"
         "- Do NOT guess or invent candidate IDs — use only the IDs listed above\n"
         "- Do NOT replace symbols or suggest alternative candidates\n"
     )

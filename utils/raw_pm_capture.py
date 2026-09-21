@@ -303,16 +303,18 @@ def persist_raw_response(engine, response: RawPMResponse) -> None:
     except IntegrityError:
         log.warning(
             "Duplicate raw response record skipped: response_id=%s, "
-            "pm_cycle_id=%s, attempt=%d",
+            "profile=%s, pm_cycle_id=%s, attempt=%d",
             response.response_id,
+            response.profile,
             response.pm_cycle_id,
             response.attempt_ordinal,
         )
     except Exception:
         log.error(
             "Failed to persist raw PM response: response_id=%s, "
-            "pm_cycle_id=%s, attempt=%d",
+            "profile=%s, pm_cycle_id=%s, attempt=%d",
             response.response_id,
+            response.profile,
             response.pm_cycle_id,
             response.attempt_ordinal,
             exc_info=True,

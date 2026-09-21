@@ -71,7 +71,7 @@ _SHADOW_EVENT_TYPES = (
 _SHADOW_EVENT_SQL_LIST = ", ".join(f"'{event_type}'" for event_type in _SHADOW_EVENT_TYPES)
 _SHADOW_EVENT_LABELS = {
     "pm_reject": "PM Reject",
-    "pm_not_selected": "PM Not Selected",
+    "pm_not_selected": "PM Omitted Candidate",
     "preflight_excluded": "Preflight Excluded",
     "pipeline_executed": "Executed",
     "pipeline_gate_rejected": "Pipeline Gate",
@@ -139,6 +139,11 @@ def _normalize_shadow_event(row: dict) -> dict:
     )
     if raw_label and reason_code and reason == str(reason_code):
         reason = f"{reason_code}: {raw_label}"
+    if not reason and event_type == "pm_not_selected":
+        reason = (
+            "Candidate was offered to the PM, but the PM response did not "
+            "accept or explicitly reject it; no PM rationale was provided."
+        )
 
     return {
         "id": f"event-{row.get('event_id')}",

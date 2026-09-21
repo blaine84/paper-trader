@@ -29,8 +29,11 @@ from hypothesis import given, settings, strategies as st, assume
 from sqlalchemy import create_engine, text
 
 from utils.decision_contract import (
+    MISSING_PM_DECISION_RATIONALE,
     VALID_REJECTION_REASON_CODES,
+    force_missing_candidate_rejections,
     parse_decision_contract,
+    should_retry_candidate_contract,
 )
 from utils.candidate_registry import CandidateState, _compute_integrity_hash
 
@@ -48,6 +51,40 @@ rejection_code_st = st.one_of(
     st.just(""),  # empty string
     st.text(min_size=1, max_size=50),  # arbitrary non-empty strings
 )
+
+
+def test_omitted_candidate_triggers_retry_then_forced_reason():
+    """Omitted offered candidates must not remain vague not-selected rows."""
+    selected_id = "candidate-selected"
+    omitted_id = "candidate-omitted"
+    raw_response = {
+        "decisions": [
+            {
+                "candidate_id": selected_id,
+                "decision": "reject",
+                "rationale": "Weak breadth and low confidence",
+                "rejection_reason_code": "low_confidence",
+            }
+        ]
+    }
+    valid_ids = {selected_id, omitted_id}
+    metadata = {
+        selected_id: {"symbol": "AMD", "source_signal_id": "sig1", "profile_id": "prof1"},
+        omitted_id: {"symbol": "NVDA", "source_signal_id": "sig2", "profile_id": "prof1"},
+    }
+
+    result = parse_decision_contract(raw_response, valid_ids, metadata)
+
+    assert result.not_selected_ids == {omitted_id}
+    assert any(v["type"] == "MISSING_CANDIDATE_DECISION" for v in result.violations)
+    assert should_retry_candidate_contract(result) is True
+
+    forced = force_missing_candidate_rejections(result)
+    forced_reject = next(d for d in forced.rejected if d.candidate_id == omitted_id)
+
+    assert forced.not_selected_ids == set()
+    assert forced_reject.rationale == MISSING_PM_DECISION_RATIONALE
+    assert forced_reject.rejection_reason_code == "missing_pm_decision"
 
 # Strategy for feature flag mode values (including valid and arbitrary)
 mode_st = st.one_of(

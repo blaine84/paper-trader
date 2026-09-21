@@ -349,6 +349,81 @@ class TestPersistRawResponse(unittest.TestCase):
         assert count == 1
 
     @patch("utils.raw_pm_capture.PM_PROVENANCE_DETAIL", "full")
+    def test_same_cycle_attempt_allowed_for_different_profiles(self):
+        moderate = capture_raw_pm_response(
+            pm_cycle_id="cycle-shared",
+            profile="moderate",
+            model_id="gpt-4",
+            prompt_version_id="candidate_entry:moderate",
+            candidate_ids_supplied=["m1"],
+            raw_payload='{"decisions": []}',
+            parse_status="parse_success",
+            attempt_ordinal=1,
+        )
+        aggressive = capture_raw_pm_response(
+            pm_cycle_id="cycle-shared",
+            profile="aggressive",
+            model_id="gpt-4",
+            prompt_version_id="candidate_entry:aggressive",
+            candidate_ids_supplied=["a1"],
+            raw_payload='{"decisions": []}',
+            parse_status="parse_success",
+            attempt_ordinal=1,
+        )
+
+        persist_raw_response(self.engine, moderate)
+        persist_raw_response(self.engine, aggressive)
+
+        with self.engine.connect() as conn:
+            count = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM pm_raw_responses "
+                    "WHERE pm_cycle_id = :cycle AND attempt_ordinal = 1"
+                ),
+                {"cycle": "cycle-shared"},
+            ).scalar()
+
+        assert count == 2
+
+    @patch("utils.raw_pm_capture.PM_PROVENANCE_DETAIL", "full")
+    def test_same_profile_cycle_attempt_remains_unique(self):
+        first = capture_raw_pm_response(
+            pm_cycle_id="cycle-dupe",
+            profile="aggressive",
+            model_id="gpt-4",
+            prompt_version_id="candidate_entry:aggressive",
+            candidate_ids_supplied=["a1"],
+            raw_payload='{"decisions": []}',
+            parse_status="parse_success",
+            attempt_ordinal=1,
+        )
+        second = capture_raw_pm_response(
+            pm_cycle_id="cycle-dupe",
+            profile="aggressive",
+            model_id="gpt-4",
+            prompt_version_id="candidate_entry:aggressive",
+            candidate_ids_supplied=["a2"],
+            raw_payload='{"decisions": []}',
+            parse_status="parse_success",
+            attempt_ordinal=1,
+        )
+
+        persist_raw_response(self.engine, first)
+        persist_raw_response(self.engine, second)
+
+        with self.engine.connect() as conn:
+            count = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM pm_raw_responses "
+                    "WHERE pm_cycle_id = :cycle AND profile = :profile "
+                    "AND attempt_ordinal = 1"
+                ),
+                {"cycle": "cycle-dupe", "profile": "aggressive"},
+            ).scalar()
+
+        assert count == 1
+
+    @patch("utils.raw_pm_capture.PM_PROVENANCE_DETAIL", "full")
     def test_persist_lineage_links(self):
         resp = capture_raw_pm_response(
             pm_cycle_id="cycle-012",
