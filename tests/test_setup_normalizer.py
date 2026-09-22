@@ -143,6 +143,23 @@ class TestInsufficientEvidenceMissingEvidenceList:
         assert "no_key_levels_and_neutral_ema" in result.missing_evidence
 
 
+class TestRiskOffMacroShortEvidence:
+    def test_unknown_regime_reports_unknown_not_not_risk_off(self):
+        ctx = TechnicalContext(
+            key_levels={"support": 100.0, "resistance": 110.0},
+            ema_trend="bearish",
+            market_regime="unknown",
+        )
+
+        result = normalize_setup("risk_off_macro_short", "SHORT", "strong", "high", ctx)
+
+        assert not result.success
+        assert result.reason_code == "context_mismatch"
+        assert result.missing_evidence is not None
+        assert "market_regime_unknown" in result.missing_evidence
+        assert "market_regime_not_risk_off" not in result.missing_evidence
+
+
 class TestLlmVetoReason:
     """Requirement 7.5: llm_veto_reason handling."""
 

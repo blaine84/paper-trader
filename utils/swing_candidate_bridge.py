@@ -652,7 +652,7 @@ def process_swing_signals(
         tc = TechnicalContext(
             key_levels=signal.get("key_levels", {"support": None, "resistance": None}),
             ema_trend=signal.get("ema_trend", "neutral"),
-            market_regime=signal.get("market_regime", "mixed"),
+            market_regime=signal.get("market_regime") or "unknown",
         )
 
         # Normalize
@@ -694,6 +694,7 @@ def process_swing_signals(
                     "swing_candidate_rejected", {
                         "signal_id": signal_id, "symbol": symbol,
                         "raw_label": raw_label, "reason_code": norm_result.reason_code,
+                        "missing_evidence": norm_result.missing_evidence,
                     })
             continue
 

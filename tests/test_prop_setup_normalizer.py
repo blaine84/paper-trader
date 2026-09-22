@@ -29,7 +29,7 @@ technical_context_st = st.builds(
         }
     ),
     ema_trend=st.sampled_from(["bullish", "bearish", "neutral"]),
-    market_regime=st.sampled_from(["risk_on", "risk_off", "mixed"]),
+    market_regime=st.sampled_from(["risk_on", "risk_off", "mixed", "unknown"]),
 )
 
 # Labels that trigger specific normalizer code paths

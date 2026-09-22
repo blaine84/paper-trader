@@ -760,11 +760,13 @@ def _modern_candidate_from_event(row: dict[str, Any]) -> dict[str, Any]:
         row.get("direction"),
     )
     direction = _first_text(data.get("direction"), row.get("direction"), action)
+    missing_evidence_reason = _format_missing_evidence_reason(data, raw_label, reason_code)
     block_reason = _first_text(
         data.get("rationale"),
         data.get("reason"),
         data.get("block_reason"),
         _format_modern_reasons(data, row),
+        missing_evidence_reason,
         row.get("rejection_reason"),
         data.get("failure_reason"),
         reason_code,
@@ -808,6 +810,24 @@ def _modern_candidate_from_event(row: dict[str, Any]) -> dict[str, Any]:
         "blocked_by": event_type or "pm_candidate_event",
         "block_reason": block_reason or event_type or "modern PM candidate event",
     }
+
+
+def _format_missing_evidence_reason(
+    data: dict[str, Any],
+    raw_label: Any,
+    reason_code: Any,
+) -> str | None:
+    evidence = data.get("missing_evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return None
+    detail = ", ".join(str(item) for item in evidence if item)
+    if not detail:
+        return None
+    if raw_label and reason_code:
+        return f"{reason_code}: {raw_label} ({detail})"
+    if reason_code:
+        return f"{reason_code} ({detail})"
+    return detail
 
 
 def _modern_outcome_row(candidate: dict[str, Any], scored: dict[str, Any]) -> dict[str, Any]:

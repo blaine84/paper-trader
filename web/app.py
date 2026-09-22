@@ -121,6 +121,22 @@ def _format_shadow_blocking_reasons(data: dict, row: dict) -> str | None:
     return reason or None
 
 
+def _format_shadow_missing_evidence(data: dict) -> str | None:
+    evidence = data.get("missing_evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return None
+    raw_label = data.get("raw_label")
+    reason_code = data.get("reason_code") or data.get("rejection_reason_code")
+    detail = ", ".join(str(item) for item in evidence if item)
+    if not detail:
+        return None
+    if raw_label and reason_code:
+        return f"{reason_code}: {raw_label} ({detail})"
+    if reason_code:
+        return f"{reason_code} ({detail})"
+    return detail
+
+
 def _normalize_shadow_event(row: dict) -> dict:
     data = _parse_shadow_event_data(row.get("event_data"))
     event_type = row.get("event_type")
@@ -132,6 +148,7 @@ def _normalize_shadow_event(row: dict) -> dict:
         data.get("reason"),
         data.get("block_reason"),
         _format_shadow_blocking_reasons(data, row),
+        _format_shadow_missing_evidence(data),
         row.get("rejection_reason"),
         reason_code,
         data.get("error"),

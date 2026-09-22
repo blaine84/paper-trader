@@ -13,6 +13,7 @@ Tests that:
 from __future__ import annotations
 
 from unittest.mock import patch, MagicMock
+import json
 
 from hypothesis import given, settings, strategies as st, assume
 
@@ -87,6 +88,46 @@ def _make_signal(
         "catalyst_freshness": catalyst_freshness,
         "sector": "technology",
     }
+
+
+@patch("utils.swing_candidate_bridge._get_swing_mode", return_value="enabled")
+def test_swing_candidate_rejected_event_includes_missing_evidence(mock_mode):
+    signal = _make_signal(
+        symbol="XLF",
+        setup_type="risk_off_macro_short",
+        direction="HOLD",
+        ema_trend="neutral",
+        market_regime="unknown",
+        signal_age_hours=0,
+        catalyst_freshness="fresh",
+    )
+    mock_conn = MagicMock()
+    mock_db = MagicMock()
+    mock_db.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
+    mock_db.begin.return_value.__exit__ = MagicMock(return_value=False)
+    mock_db.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
+    mock_db.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+    result = process_swing_signals(
+        signals={"XLF": signal},
+        profile_id="moderate",
+        profile={"risk_per_trade_pct": "0.01"},
+        portfolio={"equity": 100000},
+        cycle_id="cycle-1",
+        db=mock_db,
+        engine=None,
+    )
+
+    assert result == []
+    event_payloads = [
+        json.loads(call.args[1]["event_data"])
+        for call in mock_conn.execute.call_args_list
+        if call.args[1].get("event_type") == "swing_candidate_rejected"
+    ]
+    assert event_payloads
+    assert event_payloads[0]["reason_code"] == "context_mismatch"
+    assert event_payloads[0]["raw_label"] == "risk_off_macro_short"
+    assert "market_regime_unknown" in event_payloads[0]["missing_evidence"]
 
 
 # ---------------------------------------------------------------------------

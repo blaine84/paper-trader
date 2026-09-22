@@ -12,7 +12,7 @@ class TechnicalContext:
 
     key_levels: dict[str, float | None]  # {"support": float|None, "resistance": float|None}
     ema_trend: Literal["bullish", "bearish", "neutral"]
-    market_regime: Literal["risk_on", "risk_off", "mixed"]
+    market_regime: Literal["risk_on", "risk_off", "mixed", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -174,7 +174,9 @@ def _normalize_risk_off_macro_short(
         missing.append("direction_not_short")
     if technical_context.ema_trend != "bearish":
         missing.append("ema_trend_not_bearish")
-    if technical_context.market_regime != "risk_off":
+    if technical_context.market_regime in ("", "unknown", None):
+        missing.append("market_regime_unknown")
+    elif technical_context.market_regime != "risk_off":
         missing.append("market_regime_not_risk_off")
 
     if not missing:
