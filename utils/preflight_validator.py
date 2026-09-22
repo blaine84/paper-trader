@@ -10,7 +10,7 @@ See: design.md §Preflight Validator
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from utils.candidate_registry import CandidateRecord
@@ -37,6 +37,7 @@ class PreflightSummary:
     max_positions_available: bool
     same_symbol_allowed: bool
     blocking_reason_codes: list[str]
+    warning_reason_codes: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -69,6 +70,7 @@ def compute_preflight(
         PreflightSummary with boolean check results and blocking reason codes.
     """
     blocking_reason_codes: list[str] = []
+    warning_reason_codes: list[str] = []
 
     # 1. has_entry_stop_target: all three geometry prices are non-null and non-zero
     has_entry_stop_target = (
@@ -85,7 +87,13 @@ def compute_preflight(
     # 2. min_risk_reward_met: candidate's risk_reward >= profile threshold (default 1.5)
     min_rr_threshold = profile.get("min_risk_reward", 1.5)
     candidate_rr = candidate.risk_reward if candidate.risk_reward is not None else 0.0
+    rr_tolerance = _risk_reward_near_miss_tolerance(candidate, profile)
     min_risk_reward_met = candidate_rr >= min_rr_threshold
+    if not min_risk_reward_met and rr_tolerance > 0:
+        near_miss_floor = max(0.0, min_rr_threshold - rr_tolerance)
+        min_risk_reward_met = candidate_rr >= near_miss_floor
+        if min_risk_reward_met:
+            warning_reason_codes.append("min_risk_reward_near_miss")
     if not min_risk_reward_met:
         blocking_reason_codes.append("min_risk_reward_not_met")
 
@@ -149,6 +157,7 @@ def compute_preflight(
         max_positions_available=max_positions_available,
         same_symbol_allowed=same_symbol_allowed,
         blocking_reason_codes=blocking_reason_codes,
+        warning_reason_codes=warning_reason_codes,
     )
 
 
@@ -171,6 +180,7 @@ def _make_passing_preflight(candidate_id: str) -> PreflightSummary:
         max_positions_available=True,
         same_symbol_allowed=True,
         blocking_reason_codes=[],
+        warning_reason_codes=[],
     )
 
 
@@ -251,6 +261,36 @@ def _has_recent_same_direction_stop_loss(
             return True
 
     return False
+
+
+def _risk_reward_near_miss_tolerance(
+    candidate: CandidateRecord,
+    profile: dict,
+) -> float:
+    """Return an absolute R:R near-miss tolerance for non-conservative profiles.
+
+    The gate should not discard aggressive/moderate candidates for one-cent
+    geometry rounding misses such as 1.99 vs 2.00 or 1.49 vs 1.50. Keep the
+    conservative profile exact unless explicitly configured otherwise.
+    """
+    configured = profile.get("min_risk_reward_near_miss_tolerance")
+    if configured is None:
+        configured = profile.get("risk_reward_near_miss_tolerance")
+    if configured is not None:
+        try:
+            return max(0.0, float(configured))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid risk reward near-miss tolerance for %s/%s: %r",
+                candidate.profile_id,
+                candidate.candidate_id,
+                configured,
+            )
+            return 0.0
+
+    if candidate.profile_id in {"aggressive", "moderate"}:
+        return 0.05
+    return 0.0
 
 
 def _as_aware_utc(value) -> datetime | None:

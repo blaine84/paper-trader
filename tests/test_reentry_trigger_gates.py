@@ -97,6 +97,78 @@ def test_old_or_opposite_direction_closed_trade_does_not_block_reentry():
     assert "recent_same_symbol_direction_stop_loss" not in result.blocking_reason_codes
 
 
+def test_aggressive_rr_near_miss_passes_with_warning():
+    now = datetime.now(timezone.utc)
+    candidate = _candidate(profile_id="aggressive")
+    candidate = CandidateRecord(
+        **{
+            **candidate.__dict__,
+            "risk_reward": 1.49,
+        }
+    )
+
+    result = compute_preflight(
+        candidate,
+        {"min_risk_reward": 1.5, "max_positions": 10},
+        {"available_cash": 100_000},
+        [],
+        now,
+    )
+
+    assert result.passed is True
+    assert result.min_risk_reward_met is True
+    assert "min_risk_reward_not_met" not in result.blocking_reason_codes
+    assert "min_risk_reward_near_miss" in result.warning_reason_codes
+
+
+def test_moderate_rr_near_miss_passes_with_warning():
+    now = datetime.now(timezone.utc)
+    candidate = _candidate(profile_id="moderate")
+    candidate = CandidateRecord(
+        **{
+            **candidate.__dict__,
+            "risk_reward": 1.99,
+        }
+    )
+
+    result = compute_preflight(
+        candidate,
+        {"min_risk_reward": 2.0, "max_positions": 10},
+        {"available_cash": 100_000},
+        [],
+        now,
+    )
+
+    assert result.passed is True
+    assert result.min_risk_reward_met is True
+    assert "min_risk_reward_not_met" not in result.blocking_reason_codes
+    assert "min_risk_reward_near_miss" in result.warning_reason_codes
+
+
+def test_conservative_rr_near_miss_stays_strict_by_default():
+    now = datetime.now(timezone.utc)
+    candidate = _candidate(profile_id="conservative")
+    candidate = CandidateRecord(
+        **{
+            **candidate.__dict__,
+            "risk_reward": 2.99,
+        }
+    )
+
+    result = compute_preflight(
+        candidate,
+        {"min_risk_reward": 3.0, "max_positions": 10},
+        {"available_cash": 100_000},
+        [],
+        now,
+    )
+
+    assert result.passed is False
+    assert result.min_risk_reward_met is False
+    assert "min_risk_reward_not_met" in result.blocking_reason_codes
+    assert result.warning_reason_codes == []
+
+
 def test_breakdown_short_requires_current_price_below_support():
     signal = {
         "symbol": "MU",

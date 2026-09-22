@@ -31,6 +31,7 @@ from sqlalchemy import create_engine, text
 from utils.decision_contract import (
     MISSING_PM_DECISION_RATIONALE,
     VALID_REJECTION_REASON_CODES,
+    build_candidate_retry_prompt,
     force_missing_candidate_rejections,
     parse_decision_contract,
     should_retry_candidate_contract,
@@ -85,6 +86,75 @@ def test_omitted_candidate_triggers_retry_then_forced_reason():
     assert forced.not_selected_ids == set()
     assert forced_reject.rationale == MISSING_PM_DECISION_RATIONALE
     assert forced_reject.rejection_reason_code == "missing_pm_decision"
+
+
+def test_candidate_retry_prompt_repeats_executable_trade_details():
+    """Retry prompt must not degrade into ID-only context."""
+    selected_id = "candidate-selected"
+    omitted_id = "candidate-omitted"
+    raw_response = {
+        "decisions": [
+            {
+                "candidate_id": selected_id,
+                "decision": "reject",
+                "rationale": "Weak breadth",
+                "rejection_reason_code": "hostile_breadth",
+            }
+        ]
+    }
+    valid_ids = {selected_id, omitted_id}
+    metadata = {
+        selected_id: {"symbol": "AMD", "source_signal_id": "sig1", "profile_id": "aggressive"},
+        omitted_id: {"symbol": "META", "source_signal_id": "sig2", "profile_id": "aggressive"},
+    }
+    parse_result = parse_decision_contract(raw_response, valid_ids, metadata)
+
+    class FakeRegistry:
+        def get_registered_ids(self):
+            return valid_ids
+
+        def get_offered_summary(self):
+            return [
+                {
+                    "candidate_id": selected_id,
+                    "symbol": "AMD",
+                    "direction": "BUY",
+                    "entry_price": 150.0,
+                    "stop_price": 149.0,
+                    "target_price": 151.49,
+                    "risk_reward": 1.49,
+                    "setup_type": "technical_breakout",
+                    "geometry_name": "breakout_continuation",
+                    "trigger": "Breakout above day high",
+                    "invalidation_basis": "Fails breakout level",
+                    "target_basis": "Measured move",
+                },
+                {
+                    "candidate_id": omitted_id,
+                    "symbol": "META",
+                    "direction": "BUY",
+                    "entry_price": 729.89,
+                    "stop_price": 728.69,
+                    "target_price": 732.29,
+                    "risk_reward": 2.0,
+                    "setup_type": "technical_breakout",
+                    "geometry_name": "breakout_continuation",
+                    "trigger": "Momentum breakout in supportive tape",
+                    "invalidation_basis": "Breaks below VWAP",
+                    "target_basis": "2R continuation target",
+                },
+            ]
+
+    prompt = build_candidate_retry_prompt(parse_result, FakeRegistry())
+
+    assert "Valid candidate trade details" in prompt
+    assert f"candidate_id={omitted_id}" in prompt
+    assert "symbol=META" in prompt
+    assert "entry=$729.89" in prompt
+    assert "stop=$728.69" in prompt
+    assert "target=$732.29" in prompt
+    assert "risk_reward=2.00:1" in prompt
+    assert "Do NOT reject a listed candidate for missing trade details" in prompt
 
 # Strategy for feature flag mode values (including valid and arbitrary)
 mode_st = st.one_of(

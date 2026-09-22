@@ -407,6 +407,7 @@ def _write_preflight_passed_event(
             "max_positions_available": preflight_summary.max_positions_available,
             "same_symbol_allowed": preflight_summary.same_symbol_allowed,
             "blocking_reason_codes": [],
+            "warning_reason_codes": list(getattr(preflight_summary, "warning_reason_codes", [])),
         }
         _write_candidate_event(
             engine, candidate.candidate_id, cycle_id, profile_id,
@@ -446,6 +447,7 @@ def _write_preflight_failed_event(
             "max_positions_available": preflight_summary.max_positions_available,
             "same_symbol_allowed": preflight_summary.same_symbol_allowed,
             "blocking_reason_codes": list(preflight_summary.blocking_reason_codes),
+            "warning_reason_codes": list(getattr(preflight_summary, "warning_reason_codes", [])),
         }
         _write_candidate_event(
             engine, candidate.candidate_id, cycle_id, profile_id,
@@ -486,6 +488,7 @@ def _write_preflight_excluded_event(
         )
         event_data = {
             "blocking_reason_codes": list(preflight_summary.blocking_reason_codes),
+            "warning_reason_codes": list(getattr(preflight_summary, "warning_reason_codes", [])),
             "signal_snapshot_json": candidate.signal_snapshot_json,
             "entry_price": candidate.entry_price,
             "stop_price": candidate.stop_price,

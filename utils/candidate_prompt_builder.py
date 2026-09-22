@@ -140,7 +140,7 @@ Rules:
 - The table above is the complete executable candidate set; Entry, Stop, Target, R:R, Setup, Trigger, Invalidation, and Target Basis are already provided by the deterministic scaffold
 - Do NOT reject a candidate because setup data, entry, stop, target, risk/reward, trigger, invalidation, or target basis is missing
 - Use the MTF column as shared Analyst context: it summarizes 5m/60m/daily trend, relative strength, volume, and directional alignment
-- Passing on all candidates is acceptable, but do it by rejecting each candidate with a rationale
+- An empty accepted set is valid: passing on all candidates is acceptable, but do it by rejecting each candidate with a rationale
 - If you accept a candidate, you may optionally specify a risk_multiplier (0.01 to 1.0) to reduce position size
 - If you reject a candidate, cite concrete portfolio, timing, exposure, confidence, or market-quality criteria from your PM profile
 

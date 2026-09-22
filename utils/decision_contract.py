@@ -507,7 +507,7 @@ def build_candidate_retry_prompt(
     parse_result: ParseResult,
     registry: 'CandidateRegistry',
 ) -> str:
-    """Build retry prompt with current valid candidate IDs only.
+    """Build retry prompt with current valid candidate IDs and trade specs.
 
     Rules (Requirements 8.2–8.7):
     - Include only IDs from registry that are still in REGISTERED state
@@ -552,17 +552,24 @@ def build_candidate_retry_prompt(
 
     errors_text = "; ".join(error_descriptions[:5])  # Limit to 5 errors
 
-    # Build valid ID list for prompt
-    id_list = ", ".join(sorted(valid_ids)[:20])  # Limit display to 20 IDs
+    # Build valid ID list and compact details for prompt. The first PM prompt
+    # already contained geometry, but retry turns are where models most often
+    # claim "no trade details provided" unless the setup is repeated.
+    sorted_valid_ids = sorted(valid_ids)
+    id_list = ", ".join(sorted_valid_ids[:20])  # Limit display to 20 IDs
+    detail_text = _format_retry_candidate_details(registry, valid_ids)
 
     prompt = (
         "Your previous response could not be processed. "
         f"Issues: {errors_text}\n\n"
         "Please provide a corrected response using ONLY these valid candidate IDs:\n"
         f"{id_list}\n\n"
+        "Valid candidate trade details:\n"
+        f"{detail_text}\n\n"
         "Requirements:\n"
         "- Include every listed candidate_id exactly once with decision 'accept', 'reject', or 'adjust'\n"
         "- Reject any candidate you do not want to trade, and include a concrete rationale\n"
+        "- Do NOT reject a listed candidate for missing trade details; entry, stop, target, risk/reward, setup, trigger, invalidation, and target basis are repeated above\n"
         "- Each decision must have: candidate_id, decision ('accept', 'reject', or 'adjust')\n"
         "- Optional: risk_multiplier (number > 0.0 and <= 1.0), rationale (string), adjustment_request (dict with 'type' key)\n"
         "- Response format: {\"decisions\": [{\"candidate_id\": \"...\", \"decision\": \"accept\"|\"reject\"|\"adjust\"}]}\n"
@@ -572,6 +579,57 @@ def build_candidate_retry_prompt(
     )
 
     return prompt
+
+
+def _format_retry_candidate_details(
+    registry: 'CandidateRegistry',
+    valid_ids: set[str],
+) -> str:
+    """Return compact executable specs for currently registered candidates."""
+    try:
+        summaries = registry.get_offered_summary()
+    except Exception:
+        logger.warning(
+            "Failed to load candidate retry details; falling back to ID-only retry prompt",
+            exc_info=True,
+        )
+        return "(candidate details unavailable; use only the valid IDs above)"
+
+    details: list[str] = []
+    for summary in summaries:
+        candidate_id = str(summary.get("candidate_id", ""))
+        if candidate_id not in valid_ids:
+            continue
+        details.append(_format_retry_candidate_detail(summary))
+
+    if not details:
+        return "(no registered candidate details available; use only the valid IDs above)"
+    return "\n".join(details[:20])
+
+
+def _format_retry_candidate_detail(summary: dict) -> str:
+    def price(key: str) -> str:
+        try:
+            return f"${float(summary.get(key)):.2f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def rr() -> str:
+        try:
+            return f"{float(summary.get('risk_reward')):.2f}:1"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    return (
+        f"- candidate_id={summary.get('candidate_id')}; "
+        f"symbol={summary.get('symbol')}; direction={summary.get('direction')}; "
+        f"entry={price('entry_price')}; stop={price('stop_price')}; "
+        f"target={price('target_price')}; risk_reward={rr()}; "
+        f"setup={summary.get('setup_type')}; geometry={summary.get('geometry_name')}; "
+        f"trigger={summary.get('trigger') or 'n/a'}; "
+        f"invalidation={summary.get('invalidation_basis') or 'n/a'}; "
+        f"target_basis={summary.get('target_basis') or 'n/a'}"
+    )
 
 
 def record_parse_provenance(
