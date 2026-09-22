@@ -137,6 +137,41 @@ def _format_shadow_missing_evidence(data: dict) -> str | None:
     return detail
 
 
+def _is_stale_entry_missed_move(reason: object) -> bool:
+    text_value = str(reason or "").lower()
+    return "stale entry rejected" in text_value and (
+        "already crossed" in text_value or "moved" in text_value
+    )
+
+
+def _shadow_display_blocked_by(event_type: object, reason: object) -> str:
+    event_label = _SHADOW_EVENT_LABELS.get(
+        str(event_type),
+        str(event_type or "PM Telemetry"),
+    )
+    if str(event_type) in {"pipeline_execution_failed", "execution_failed"}:
+        if _is_stale_entry_missed_move(reason):
+            return "Missed Move"
+    return event_label
+
+
+def _normalize_shadow_display_row(row: dict) -> dict:
+    """Make existing shadow rows read like decisions, not raw plumbing."""
+    reason = row.get("block_reason")
+    blocked_by = str(row.get("blocked_by") or "")
+    event_type = str(row.get("event_type") or "")
+    if (
+        _is_stale_entry_missed_move(reason)
+        and blocked_by in {"pipeline_execution_failed", "execution_failed", "Execution Failed"}
+    ):
+        row["blocked_by"] = "Missed Move"
+        if not row.get("outcome_label"):
+            row["outcome_label"] = "missed_move"
+    elif event_type:
+        row["blocked_by"] = _shadow_display_blocked_by(event_type, reason)
+    return row
+
+
 def _normalize_shadow_event(row: dict) -> dict:
     data = _parse_shadow_event_data(row.get("event_data"))
     event_type = row.get("event_type")
@@ -179,7 +214,7 @@ def _normalize_shadow_event(row: dict) -> dict:
         ),
         "stop_price": _first_present(data.get("stop_price"), row.get("stop_price")),
         "target_price": _first_present(data.get("target_price"), row.get("target_price")),
-        "blocked_by": _SHADOW_EVENT_LABELS.get(str(event_type), str(event_type or "PM Telemetry")),
+        "blocked_by": _shadow_display_blocked_by(event_type, reason),
         "block_reason": reason,
         "row_type": "event",
         "display_window": "event",
@@ -1585,8 +1620,8 @@ def api_shadow_outcomes():
     event_summary = {r["event_type"]: r["count"] for r in event_summary_rows}
     event_summary["total"] = event_count
 
-    combined_rows = [dict(r) for r in rows]
-    combined_rows.extend(dict(r) for r in modern_rows)
+    combined_rows = [_normalize_shadow_display_row(dict(r)) for r in rows]
+    combined_rows.extend(_normalize_shadow_display_row(dict(r)) for r in modern_rows)
     combined_rows.extend(_normalize_shadow_event(dict(r)) for r in event_rows)
     combined_rows.sort(key=_shadow_sort_key, reverse=True)
     return jsonify({
