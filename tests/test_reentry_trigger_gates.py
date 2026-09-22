@@ -169,6 +169,34 @@ def test_conservative_rr_near_miss_stays_strict_by_default():
     assert result.warning_reason_codes == []
 
 
+def test_preflight_blocks_buy_target_already_crossed_in_snapshot():
+    now = datetime.now(timezone.utc)
+    candidate = _candidate(symbol="META", direction="BUY", profile_id="aggressive")
+    candidate = CandidateRecord(
+        **{
+            **candidate.__dict__,
+            "entry_price": 740.01,
+            "stop_price": 738.53,
+            "target_price": 744.45,
+            "risk_reward": 1.5,
+            "setup_type": "gap_and_go",
+            "geometry_name": "support_bounce",
+            "signal_snapshot_json": '{"current_price": 744.99}',
+        }
+    )
+
+    result = compute_preflight(
+        candidate,
+        {"min_risk_reward": 1.5, "max_positions": 10},
+        {"available_cash": 100_000},
+        [],
+        now,
+    )
+
+    assert result.passed is False
+    assert "target_already_crossed_in_snapshot" in result.blocking_reason_codes
+
+
 def test_breakdown_short_requires_current_price_below_support():
     signal = {
         "symbol": "MU",

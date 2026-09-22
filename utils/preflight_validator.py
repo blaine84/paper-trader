@@ -10,6 +10,7 @@ See: design.md §Preflight Validator
 from __future__ import annotations
 
 import logging
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -83,6 +84,8 @@ def compute_preflight(
     )
     if not has_entry_stop_target:
         blocking_reason_codes.append("missing_geometry")
+    elif _target_already_crossed_in_snapshot(candidate):
+        blocking_reason_codes.append("target_already_crossed_in_snapshot")
 
     # 2. min_risk_reward_met: candidate's risk_reward >= profile threshold (default 1.5)
     min_rr_threshold = profile.get("min_risk_reward", 1.5)
@@ -291,6 +294,37 @@ def _risk_reward_near_miss_tolerance(
     if candidate.profile_id in {"aggressive", "moderate"}:
         return 0.05
     return 0.0
+
+
+def _target_already_crossed_in_snapshot(candidate: CandidateRecord) -> bool:
+    """Use the candidate's own signal snapshot to reject already-missed moves."""
+    try:
+        snapshot = json.loads(candidate.signal_snapshot_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(snapshot, dict):
+        return False
+
+    current_price = _positive_float(snapshot.get("current_price"))
+    target_price = _positive_float(candidate.target_price)
+    if current_price is None or target_price is None:
+        return False
+
+    if candidate.direction == "BUY":
+        return current_price >= target_price
+    if candidate.direction == "SHORT":
+        return current_price <= target_price
+    return False
+
+
+def _positive_float(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
 
 
 def _as_aware_utc(value) -> datetime | None:

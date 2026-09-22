@@ -40,7 +40,7 @@ def test_short_scaffold_produces_valid_executable_candidates():
     signal = {
         "symbol": "XYZ",
         "signal": "SHORT",
-        "current_price": 100.0,
+        "current_price": 100.8,
         "key_levels": {
             "support": 98.0,
             "resistance": 101.0,
@@ -132,3 +132,26 @@ def test_risk_reward_is_recomputed_after_rounding():
         target = candidate["target"]
         expected_rr = round((target - entry) / (entry - stop), 2)
         assert candidate["risk_reward"] == expected_rr
+
+
+def test_long_scaffold_excludes_targets_already_crossed_by_current_price():
+    """Regression: META support-bounce target below live quote was offered to PM."""
+    result = build_entry_geometry_scaffold(
+        {
+            "symbol": "META",
+            "signal": "LONG",
+            "current_price": 744.99,
+            "key_levels": {
+                "support": 740.01,
+                "resistance": 749.49,
+                "vwap": 723.53,
+                "day_high": 749.49,
+                "day_low": 679.52,
+            },
+        },
+        profile_id="aggressive",
+    )
+
+    assert result["status"] == "ok"
+    assert all(candidate["target"] > 744.99 for candidate in result["candidates"])
+    assert all(candidate["name"] != "support_bounce" for candidate in result["candidates"])

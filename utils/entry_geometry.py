@@ -556,6 +556,22 @@ def _passes_long_sanity(
     return False
 
 
+def _target_has_remaining_reward(
+    *,
+    direction: str,
+    current_price: float,
+    target: float,
+) -> bool:
+    """Reject candidates whose profit target is already crossed by the quote."""
+    if not (_is_finite_number(current_price) and _is_finite_number(target)):
+        return False
+    if direction == "LONG":
+        return target > current_price
+    if direction == "SHORT":
+        return target < current_price
+    return False
+
+
 def _generate_long_candidates(
     levels: dict[str, float],
     current_price: float,
@@ -594,7 +610,14 @@ def _generate_long_candidates(
                 target = entry_price + risk * target_multiplier
                 risk_reward = (target - entry_price) / (entry_price - stop_loss)
 
-                if risk_reward >= min_risk_reward:
+                if (
+                    risk_reward >= min_risk_reward
+                    and _target_has_remaining_reward(
+                        direction="LONG",
+                        current_price=current_price,
+                        target=target,
+                    )
+                ):
                     ordinal += 1
                     candidates.append({
                         "candidate_id": f"{norm_symbol}_long_pullback_to_vwap_{ordinal}",
@@ -621,7 +644,14 @@ def _generate_long_candidates(
                 target = entry_price + risk * target_multiplier
                 risk_reward = (target - entry_price) / (entry_price - stop_loss)
 
-                if risk_reward >= min_risk_reward:
+                if (
+                    risk_reward >= min_risk_reward
+                    and _target_has_remaining_reward(
+                        direction="LONG",
+                        current_price=current_price,
+                        target=target,
+                    )
+                ):
                     ordinal += 1
                     candidates.append({
                         "candidate_id": f"{norm_symbol}_long_support_bounce_{ordinal}",
@@ -655,7 +685,14 @@ def _generate_long_candidates(
                 target = entry_price + risk * target_multiplier
                 risk_reward = (target - entry_price) / (entry_price - stop_loss)
 
-                if risk_reward >= min_risk_reward:
+                if (
+                    risk_reward >= min_risk_reward
+                    and _target_has_remaining_reward(
+                        direction="LONG",
+                        current_price=current_price,
+                        target=target,
+                    )
+                ):
                     ordinal += 1
                     candidates.append({
                         "candidate_id": f"{norm_symbol}_long_breakout_continuation_{ordinal}",
@@ -747,7 +784,14 @@ def _generate_short_candidates(
                     if stop_loss > entry_price and entry_price > target:
                         risk_reward = (entry_price - target) / (stop_loss - entry_price)
 
-                        if risk_reward >= min_risk_reward:
+                        if (
+                            risk_reward >= min_risk_reward
+                            and _target_has_remaining_reward(
+                                direction="SHORT",
+                                current_price=current_price,
+                                target=target,
+                            )
+                        ):
                             ordinal += 1
                             candidates.append({
                                 "candidate_id": f"{norm_symbol}_short_resistance_rejection_{ordinal}",
@@ -791,7 +835,14 @@ def _generate_short_candidates(
                     if stop_loss > entry_price and entry_price > target:
                         risk_reward = (entry_price - target) / (stop_loss - entry_price)
 
-                        if risk_reward >= min_risk_reward:
+                        if (
+                            risk_reward >= min_risk_reward
+                            and _target_has_remaining_reward(
+                                direction="SHORT",
+                                current_price=current_price,
+                                target=target,
+                            )
+                        ):
                             ordinal += 1
                             candidates.append({
                                 "candidate_id": f"{norm_symbol}_short_breakdown_continuation_{ordinal}",
@@ -828,7 +879,14 @@ def _generate_short_candidates(
                     if stop_loss > entry_price and entry_price > target:
                         risk_reward = (entry_price - target) / (stop_loss - entry_price)
 
-                        if risk_reward >= min_risk_reward:
+                        if (
+                            risk_reward >= min_risk_reward
+                            and _target_has_remaining_reward(
+                                direction="SHORT",
+                                current_price=current_price,
+                                target=target,
+                            )
+                        ):
                             ordinal += 1
                             candidates.append({
                                 "candidate_id": f"{norm_symbol}_short_fade_{ordinal}",

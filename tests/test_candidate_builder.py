@@ -125,7 +125,7 @@ def test_moderate_profile_candidate_builder_produces_candidates_with_live_shape(
                 "signal": "SHORT",
                 "strength": "moderate",
                 "setup_type": "momentum_fade",
-                "current_price": 53.9,
+                "current_price": 54.5,
                 "key_levels": {
                     "support": 53.88,
                     "resistance": 54.61,
